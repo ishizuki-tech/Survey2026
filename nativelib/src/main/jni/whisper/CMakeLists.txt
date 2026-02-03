@@ -38,10 +38,10 @@ set(ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../../..")
 
 set(CANDIDATE_PATHS
         "${ROOT_DIR}/nativelib/whisper.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/../../../../whisper.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../../../whisper.cpp"
         "${ROOT_DIR}/whisper.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/../../../../../whisper.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/../../../../whisper_core"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../../../../whisper.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../../../whisper_core"
 )
 
 set(WHISPER_LIB_DIR "")
