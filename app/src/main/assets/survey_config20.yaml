@@ -1,0 +1,290 @@
+graph:
+  startId: Start
+  nodes:
+    - id: Start
+      type: START
+      title: Start
+      question: Start
+      nextId: Q1
+
+    - id: Q1
+      type: AI
+      title: FAW Yield Loss (3 Seasons)
+      question: >-
+        How much yield do you lose because of fall armyworm? Please think back over the last 3 seasons. (Percent or bags per acre are fine.)
+      nextId: Q2
+
+    - id: Q2
+      type: AI
+      title: Trade-off for 10-Day Earlier Harvest
+      question: >-
+        If you could harvest 10 days earlier, how much yield would you be willing to give up? (Percent or bags per acre.)
+      nextId: Q3
+
+    - id: Q3
+      type: AI
+      title: Damage Threshold to Switch Variety
+      question: >-
+        What level of pest or disease damage would make you stop using your current maize variety and switch to a new variety? (Give a clear threshold, e.g., % plants/ears damaged or severity.)
+      nextId: Q4
+
+    - id: Q4
+      type: AI
+      title: Expectations for Replacement Variety
+      question: >-
+        What would you expect from a new maize variety to replace the one you currently grow? Please be as detailed as possible (e.g., DTM, FAW tolerance, drought stage tolerance, typical yield).
+      nextId: Q5
+
+    - id: Q5
+      type: AI
+      title: Minimum Acceptable Harvest in Bad Year
+      question: >-
+        In a bad year, what is the smallest harvest you would accept and still plant this maize again next season? (Percent of usual harvest or bags per acre.)
+      nextId: Q6
+
+    - id: Q6
+      type: AI
+      title: Most Damaging Drought Timing
+      question: >-
+        When in the season is drought most devastating for your crop? What is the most difficult drought moment? (e.g., pre-tassel, tasseling/silking, grain fill, pre-harvest.)
+      nextId: Review
+
+    - id: Review
+      type: REVIEW
+      title: Review
+      question: ''
+      nextId: Done
+
+    - id: Done
+      type: DONE
+      title: Done
+      question: ''
+
+slm:
+  # Runtime
+  # NOTE: For debugging stability, prefer "CPU" to avoid EGL/OpenGL context issues.
+  # accelerator: "CPU"
+  accelerator: "GPU"
+
+  # NOTE: EVAL/FOLLOWUP do not need 4096 tokens; smaller budgets reduce drift and failures.
+  max_tokens: 4096
+  top_k: 64
+  top_p: 0.95
+  temperature: 1.0
+
+  # Turn formatting (LiteRT-LM chat style)
+  # NOTE: Newlines help make boundaries explicit; remove '\n' only if your code already injects them.
+  user_turn_prefix: "<start_of_turn>user\n"
+  model_turn_prefix: "<start_of_turn>model\n"
+  turn_end: "<end_of_turn>\n"
+
+  # System prompt pieces
+  empty_json_instruction: "Respond with an empty JSON object: {}"
+  preamble: "You are a well-known farmer survey expert. Read the Question and the Answer."
+
+  key_contract_eval: |
+    OUTPUT FORMAT:
+    - In English.
+    - Keys exactly:
+      • "analysis": short string
+      • "weakness": short string
+      • "followup_needed": boolean
+      • "followup_target": short string
+      • "score": integer 1–100
+
+    RULES:
+    - Judge ONLY content relevance/completeness/accuracy.
+    - Do NOT generate a follow-up question here.
+    - followup_target must be single-scope (one biggest uncertainty).
+    - Do NOT use double quotes (") inside string values. Use single quotes or no quotes.
+    - Do NOT copy the Answer verbatim into the JSON.
+
+  # FOLLOWUP (Call 2) is TEXT ONLY (no JSON).
+  key_contract_followup: |
+    OUTPUT FORMAT:
+    - In English.
+    - Return ONLY the follow-up question as plain text on ONE LINE.
+    - Do NOT output JSON.
+    - Do NOT wrap the question in quotes.
+    - No prefixes, no bullet points, no extra text.
+
+    RULES:
+    - Use ONLY the EVAL JSON input.
+    - If followup_needed is false, output an EMPTY string (no characters).
+    - If true, target exactly followup_target.
+    - Single-scope, concrete, answerable immediately.
+    - Do not introduce new topics or additional objectives.
+
+  length_budget_eval: |
+    LENGTH LIMITS:
+    - analysis<=60 chars
+    - weakness<=120 chars
+    - followup_target<=80 chars
+    - score is integer 1–100
+
+  length_budget_followup: |
+    LENGTH LIMITS:
+    - follow-up question (text)<=120 chars
+
+  scoring_rule: "Scoring rule: Judge ONLY content relevance/completeness/accuracy. Do NOT penalize style or formatting."
+
+  # IMPORTANT: This field may be appended to BOTH calls by your code.
+  # Therefore it contains explicit branching rules for EVAL vs FOLLOWUP.
+  strict_output: |-
+    STRICT OUTPUT (NO MARKDOWN):
+    - If the task is EVAL: output RAW JSON only, ONE LINE.
+      - Use COMPACT JSON (no spaces around ':' and ',').
+      - No extra text.
+    - If the task is FOLLOWUP: output ONLY the follow-up question as plain text on ONE LINE, or EMPTY output if none.
+      - No JSON, no quotes, no extra text.
+
+prompts_eval:
+  - nodeId: Q1
+    prompt: |-
+      Task: EVAL
+      - Evaluate the Answer to the Question.
+      - Write weakness (what is missing/unclear).
+      - Identify the single biggest missing/unclear point as followup_target.
+      - Set followup_needed true if clarification is required, else false.
+      - Score 1–100.
+
+      Question: {{QUESTION}}
+      Answer: {{ANSWER}}
+
+  - nodeId: Q2
+    prompt: |-
+      Task: EVAL
+      - Evaluate the Answer to the Question.
+      - Write weakness (what is missing/unclear).
+      - Identify the single biggest missing/unclear point as followup_target.
+      - Set followup_needed true if clarification is required, else false.
+      - Score 1–100.
+
+      Question: {{QUESTION}}
+      Answer: {{ANSWER}}
+
+  - nodeId: Q3
+    prompt: |-
+      Task: EVAL
+      - Evaluate the Answer to the Question.
+      - Write weakness (what is missing/unclear).
+      - Identify the single biggest missing/unclear point as followup_target.
+      - Set followup_needed true if clarification is required, else false.
+      - Score 1–100.
+
+      Question: {{QUESTION}}
+      Answer: {{ANSWER}}
+
+  - nodeId: Q4
+    prompt: |-
+      Task: EVAL
+      - Evaluate the Answer to the Question.
+      - Write weakness (what is missing/unclear).
+      - Identify the single biggest missing/unclear point as followup_target.
+      - Set followup_needed true if clarification is required, else false.
+      - Score 1–100.
+
+      Question: {{QUESTION}}
+      Answer: {{ANSWER}}
+
+  - nodeId: Q5
+    prompt: |-
+      Task: EVAL
+      - Evaluate the Answer to the Question.
+      - Write weakness (what is missing/unclear).
+      - Identify the single biggest missing/unclear point as followup_target.
+      - Set followup_needed true if clarification is required, else false.
+      - Score 1–100.
+
+      Question: {{QUESTION}}
+      Answer: {{ANSWER}}
+
+  - nodeId: Q6
+    prompt: |-
+      Task: EVAL
+      - Evaluate the Answer to the Question.
+      - Write weakness (what is missing/unclear).
+      - Identify the single biggest missing/unclear point as followup_target.
+      - Set followup_needed true if clarification is required, else false.
+      - Score 1–100.
+
+      Question: {{QUESTION}}
+      Answer: {{ANSWER}}
+
+prompts_followup:
+  - nodeId: Q1
+    prompt: |-
+      Task: FOLLOWUP
+      - Read the EVAL JSON.
+      - If followup_needed is false: output EMPTY (no characters).
+      - If true: output ONE follow-up question as plain text, one line, targeting exactly followup_target.
+      - Do NOT output JSON.
+
+      EVAL_JSON: {{EVAL_JSON}}
+
+  - nodeId: Q2
+    prompt: |-
+      Task: FOLLOWUP
+      - Read the EVAL JSON.
+      - If followup_needed is false: output EMPTY (no characters).
+      - If true: output ONE follow-up question as plain text, one line, targeting exactly followup_target.
+      - Do NOT output JSON.
+
+      EVAL_JSON: {{EVAL_JSON}}
+
+  - nodeId: Q3
+    prompt: |-
+      Task: FOLLOWUP
+      - Read the EVAL JSON.
+      - If followup_needed is false: output EMPTY (no characters).
+      - If true: output ONE follow-up question as plain text, one line, targeting exactly followup_target.
+      - Do NOT output JSON.
+
+      EVAL_JSON: {{EVAL_JSON}}
+
+  - nodeId: Q4
+    prompt: |-
+      Task: FOLLOWUP
+      - Read the EVAL JSON.
+      - If followup_needed is false: output EMPTY (no characters).
+      - If true: output ONE follow-up question as plain text, one line, targeting exactly followup_target.
+      - Do NOT output JSON.
+
+      EVAL_JSON: {{EVAL_JSON}}
+
+  - nodeId: Q5
+    prompt: |-
+      Task: FOLLOWUP
+      - Read the EVAL JSON.
+      - If followup_needed is false: output EMPTY (no characters).
+      - If true: output ONE follow-up question as plain text, one line, targeting exactly followup_target.
+      - Do NOT output JSON.
+
+      EVAL_JSON: {{EVAL_JSON}}
+
+  - nodeId: Q6
+    prompt: |-
+      Task: FOLLOWUP
+      - Read the EVAL JSON.
+      - If followup_needed is false: output EMPTY (no characters).
+      - If true: output ONE follow-up question as plain text, one line, targeting exactly followup_target.
+      - Do NOT output JSON.
+
+      EVAL_JSON: {{EVAL_JSON}}
+
+model_defaults:
+  default_model_url: "https://huggingface.co/google/gemma-3n-E4B-it-litert-lm/resolve/main/gemma-3n-E4B-it-int4.litertlm"
+  default_file_name: "Gemma3n4B.litertlm"
+  timeout_ms: 1800000
+  ui_throttle_ms: 250
+  ui_min_delta_bytes: 1048576
+
+whisper:
+  enabled: true
+  asset_model_path: "models/ggml-small-q5_1.bin"
+  language: "en"
+  translate: false
+  print_timestamp: false
+  target_sample_rate: 16000
+  record_sample_rates: [16000, 48000, 44100]
+  compute_checksum: true

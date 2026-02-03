@@ -1,0 +1,191 @@
+graph:
+  startId: Start
+  nodes:
+    - id: Start
+      type: START
+      title: Start
+      question: Start
+      nextId: Q1
+
+    - id: Q1
+      type: AI
+      title: Hasara ya Mavuno kwa FAW (Misimu 3)
+      question: >-
+        Unapoteza kiasi gani cha mavuno kwa sababu ya funza jeshi vamizi (Fall Armyworm/FAW)? Tafadhali fikiria misimu 3 iliyopita. (Asilimia au magunia kwa ekari vyote vinakubalika.)
+      nextId: Q2
+
+    - id: Q2
+      type: AI
+      title: Kubadilishana Hasara kwa Kuvuna Siku 10 Mapema
+      question: >-
+        Kama ungeweza kuvuna siku 10 mapema, ungekuwa tayari kupoteza kiasi gani cha mavuno? (Asilimia au magunia kwa ekari.)
+      nextId: Q3
+
+    - id: Q3
+      type: AI
+      title: Kizingiti cha Uharibifu cha Kubadilisha Aina ya Mahindi
+      question: >-
+        Ni kiwango gani cha uharibifu wa wadudu au magonjwa kingekufanya uache kutumia aina ya mahindi unayotumia sasa na ubadilishe aina mpya? (Toa kizingiti kilicho wazi, kwa mfano: % ya mimea/masuke yaliyoharibika au kiwango cha ukali.)
+      nextId: Q4
+
+    - id: Q4
+      type: AI
+      title: Unachotarajia kwa Aina Mbadala ya Mahindi
+      question: >-
+        Ungetarajia nini kutoka kwa aina mpya ya mahindi ili kuchukua nafasi ya unayolima sasa? Tafadhali toa maelezo kadri iwezekanavyo (kwa mfano: siku hadi kukomaa (DTM), ustahimilivu wa FAW, ustahimilivu wa ukame kwenye hatua fulani, mavuno ya kawaida).
+      nextId: Q5
+
+    - id: Q5
+      type: AI
+      title: Mavuno ya Chini Unayokubali Katika Mwaka Mbaya
+      question: >-
+        Katika mwaka mbaya, mavuno madogo kabisa ambayo ungeyakubali na bado upande mahindi haya tena msimu ujao ni kiasi gani? (Asilimia ya mavuno ya kawaida au magunia kwa ekari.)
+      nextId: Q6
+
+    - id: Q6
+      type: AI
+      title: Wakati wa Ukame Unaodhuru Zaidi
+      question: >-
+        Ni lini katika msimu ukame huwa na madhara makubwa zaidi kwa zao lako? Ni wakati gani wa ukame unaokuwa mgumu zaidi? (kwa mfano: kabla ya kutokeza kishada, kutokeza kishada/kutoa hariri, kujaza punje, kabla ya kuvuna.)
+      nextId: Review
+
+    - id: Review
+      type: REVIEW
+      title: Review
+      question: ''
+      nextId: Done
+
+    - id: Done
+      type: DONE
+      title: Done
+      question: ''
+
+slm:
+  # Runtime
+  accelerator: "GPU"
+  max_tokens: 4096
+  top_k: 64
+  top_p: 0.95
+  temperature: 1.0
+
+  # Turn formatting (LiteRT-LM chat style)
+  user_turn_prefix: "<start_of_turn>user"
+  model_turn_prefix: "<start_of_turn>model"
+  turn_end: ""
+
+  # System prompt pieces
+  empty_json_instruction: "Jibu kwa kitu cha JSON kilicho tupu: {}"
+  preamble: "Wewe ni mtaalamu mashuhuri wa tafiti za wakulima. Soma Swali na Jibu."
+
+  key_contract: |
+    OUTPUT FORMAT:
+    - In Swahili.
+    - Keys exactly:
+      • "analysis": short string
+      • "expected_answer": short string
+      • "followup_question": a single short confirm/validate question (NOT an array; may be empty string)
+      • "score": integer 1–100
+
+    FOLLOW-UP INTENT:
+    - The follow-up must confirm or clarify the respondent's original answer to the SAME question.
+    - Target the biggest uncertainty: missing unit/scale, missing number, time window, baseline, or method used.
+    - Keep it single-scope (no multi-part), concrete, and answerable immediately.
+    - Do not introduce new topics or additional objectives.
+
+  length_budget: |
+    LENGTH LIMITS:
+    - analysis<=60 chars
+    - expected_answer<=120 chars
+    - followup_question<=120 chars
+
+  scoring_rule: "Scoring rule: Judge ONLY content relevance/completeness/accuracy. Do NOT penalize style or formatting."
+
+  strict_output: |-
+    STRICT OUTPUT (NO MARKDOWN):
+    - RAW JSON only, ONE LINE.
+    - Use COMPACT JSON (no spaces around ':' and ',').
+    - No extra text.
+
+prompts:
+  - nodeId: Q1
+    prompt: |-
+      Kazi:
+      - Tambua udhaifu (vipimo visivyo wazi, misimu kukosekana, baseline kutoeleweka).
+      - Toa expected_answer moja thabiti: wastani wa hasara ya FAW kwa misimu 3 iliyopita (% au magunia/ekari).
+      - Uliza followup_question 1 tu ili kuthibitisha JIBU HILO HILO (au "" ikiwa halihitajiki).
+      - Toa score 1–100.
+
+      Swali: {{QUESTION}}
+      Jibu: {{ANSWER}}
+
+  - nodeId: Q2
+    prompt: |-
+      Kazi:
+      - Tambua udhaifu (hakuna kipimo, kiwango cha juu hakijawekwa, mpaka kutoeleweka).
+      - Toa expected_answer moja thabiti: hasara ya juu ya mavuno unayokubali ili kuvuna siku 10 mapema (% au magunia/ekari).
+      - Uliza followup_question 1 tu ili kuthibitisha JIBU HILO HILO (au "" ikiwa halihitajiki).
+      - Toa score 1–100.
+
+      Swali: {{QUESTION}}
+      Jibu: {{ANSWER}}
+
+  - nodeId: Q3
+    prompt: |-
+      Kazi:
+      - Tambua udhaifu (hakuna kizingiti, kipimo kutoeleweka, wadudu vs magonjwa kuchanganywa).
+      - Toa expected_answer moja thabiti: kizingiti wazi cha kubadilisha (kipimo + kiwango + hatua ya zao).
+      - Uliza followup_question 1 tu ili kuthibitisha JIBU HILO HILO (au "" ikiwa halihitajiki).
+      - Toa score 1–100.
+
+      Swali: {{QUESTION}}
+      Jibu: {{ANSWER}}
+
+  - nodeId: Q4
+    prompt: |-
+      Kazi:
+      - Tambua udhaifu (sifa za jumla tu, namba hazipo).
+      - Toa expected_answer moja thabiti: malengo ya aina mbadala, angalau kigezo 1 kinachopimika (DTM, FAW, hatua ya ukame, mavuno).
+      - Uliza followup_question 1 tu ili kuthibitisha JIBU HILO HILO (au "" ikiwa halihitajiki).
+      - Toa score 1–100.
+
+      Swali: {{QUESTION}}
+      Jibu: {{ANSWER}}
+
+  - nodeId: Q5
+    prompt: |-
+      Kazi:
+      - Tambua udhaifu (baseline haipo, kipimo hakipo, kanuni ya uamuzi haijabainishwa).
+      - Toa expected_answer moja thabiti: mavuno ya chini unayokubali katika mwaka mbaya (% au magunia/ekari) yakirejea baseline.
+      - Uliza followup_question 1 tu ili kuthibitisha JIBU HILO HILO (au "" ikiwa halihitajiki).
+      - Toa score 1–100.
+
+      Swali: {{QUESTION}}
+      Jibu: {{ANSWER}}
+
+  - nodeId: Q6
+    prompt: |-
+      Kazi:
+      - Tambua udhaifu (wakati haueleweki, hatua ya ukuaji haijafafanuliwa).
+      - Toa expected_answer moja thabiti: wakati/hatua ya ukame unaodhuru zaidi + sababu fupi (sentensi moja ya sababu).
+      - Uliza followup_question 1 tu ili kuthibitisha JIBU HILO HILO (au "" ikiwa halihitajiki).
+      - Toa score 1–100.
+
+      Swali: {{QUESTION}}
+      Jibu: {{ANSWER}}
+
+model_defaults:
+  default_model_url: "https://huggingface.co/google/gemma-3n-E4B-it-litert-lm/resolve/main/gemma-3n-E4B-it-int4.litertlm"
+  default_file_name: "Gemma3n4B.litertlm"
+  timeout_ms: 1800000
+  ui_throttle_ms: 250
+  ui_min_delta_bytes: 1048576
+
+whisper:
+  enabled: true
+  asset_model_path: "models/ggml-model-q5_0.bin"
+  language: "sw"
+  translate: false
+  print_timestamp: false
+  target_sample_rate: 16000
+  record_sample_rates: [16000, 48000, 44100]
+  compute_checksum: true

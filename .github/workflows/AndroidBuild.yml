@@ -1,0 +1,699 @@
+name: Android CI & Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      module:
+        description: "Android module (e.g. app)"
+        default: "app"
+        required: true
+
+      create_release:
+        description: "Publish GitHub Release with artifacts"
+        type: boolean
+        default: true
+        required: true
+
+      base_version:
+        description: "Base semantic version used to form the tag when version_name is empty (e.g. 0.0.1)"
+        default: "0.0.1"
+        required: true
+
+      version_name:
+        description: "Override versionName/tag directly (optional). Example: v0.0.2-20251212-1030"
+        default: ""
+        required: false
+
+      version_code:
+        description: "Override versionCode directly (optional). Example: 123"
+        default: ""
+        required: false
+
+      tag_prefix:
+        description: "Tag prefix used when version_name is empty (e.g. v)"
+        default: "v"
+        required: true
+
+      tag_datetime_format:
+        description: "date(1) format for tag suffix when version_name is empty (default: %Y%m%d-%H%M%S)"
+        default: "%Y%m%d-%H%M%S"
+        required: true
+
+      ndk_version:
+        description: "Android NDK version"
+        default: "25.2.9519653"
+        required: true
+
+      compile_sdk:
+        description: "Android compileSdk version (API level). Must match Gradle compileSdk."
+        default: "36"
+        required: true
+
+      build_tools:
+        description: "Android build-tools version"
+        default: "36.0.0"
+        required: true
+
+permissions:
+  contents: write
+  pages: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  OWNER: ${{ github.repository_owner }}
+  REPO: ${{ github.repository }} # e.g. ishizuki-tech/SurveyNav2025
+  ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+  ANDROID_HOME: /usr/local/lib/android/sdk
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      MODULE_PATH: ${{ inputs.module }}
+
+      # Signing (optional)
+      ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+      ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+      ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+      ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+
+      # Gradle property injection (consumed by signingConfig, etc.)
+      ORG_GRADLE_PROJECT_releaseStorePassword: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+      ORG_GRADLE_PROJECT_releaseKeyAlias: ${{ secrets.ANDROID_KEY_ALIAS }}
+      ORG_GRADLE_PROJECT_releaseKeyPassword: ${{ secrets.ANDROID_KEY_PASSWORD }}
+
+    outputs:
+      tag: ${{ steps.ver.outputs.tag }}
+      base_version: ${{ steps.ver.outputs.base_version }}
+      version_code: ${{ steps.ver.outputs.version_code }}
+      build_sha: ${{ steps.gitdebug.outputs.sha }}
+
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: true
+
+      - name: Debug git context (branch/sha)
+        id: gitdebug
+        run: |-
+          set -euo pipefail
+          echo "::group::GitHub context"
+          echo "GITHUB_REF=${GITHUB_REF}"
+          echo "GITHUB_SHA=${GITHUB_SHA}"
+          echo "::endgroup::"
+
+          echo "::group::Git state"
+          echo "branch=$(git branch --show-current || true)"
+          echo "sha=$(git rev-parse HEAD)"
+          git log -1 --oneline --decorate --no-color
+          echo "::endgroup::"
+
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure gradlew is executable
+        run: chmod +x ./gradlew
+
+      - name: Validate Gradle wrapper
+        uses: gradle/wrapper-validation-action@v3
+
+      - name: Set up JDK 17 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Install Android SDK & NDK
+        uses: android-actions/setup-android@v3
+        with:
+          ndk-version: ${{ inputs.ndk_version }}
+
+      - name: Install required SDK components
+        run: |-
+          set -euo pipefail
+          COMPILE_SDK="${{ inputs.compile_sdk }}"
+          BUILD_TOOLS="${{ inputs.build_tools }}"
+
+          echo "::group::Android SDK install"
+          echo "Installing:"
+          echo "  - platforms;android-${COMPILE_SDK}"
+          echo "  - build-tools;${BUILD_TOOLS}"
+          echo "  - platform-tools"
+          echo "::endgroup::"
+
+          set +o pipefail
+          yes | sdkmanager --install \
+            "platforms;android-${COMPILE_SDK}" \
+            "build-tools;${BUILD_TOOLS}" \
+            "platform-tools"
+          set -o pipefail
+
+      - name: Accept Android SDK licenses
+        run: |-
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null || true
+
+      - name: Configure Gradle cache
+        uses: gradle/actions/setup-gradle@v3
+
+      - name: Configure ~/.gradle/gradle.properties (tokens for runtime/export)
+        run: |-
+          set -euo pipefail
+          mkdir -p "$HOME/.gradle"
+
+          # Secrets may be empty. Keep builds working.
+          GH_TOKEN="${{ secrets.GH_TOKEN }}"
+          HF_TOKEN="${{ secrets.HF_TOKEN }}"
+
+          if [[ -z "${GH_TOKEN}" ]]; then
+            echo "::warning::GH_TOKEN is not configured. BuildConfig GH_TOKEN will be empty."
+          fi
+
+          cat <<PROPS > "$HOME/.gradle/gradle.properties"
+          gh.owner=${{ env.OWNER }}
+          gh.token=${GH_TOKEN}
+          HF_TOKEN=${HF_TOKEN}
+          PROPS
+
+          echo "::group::gradle.properties (redacted view)"
+          sed -E 's/(gh\\.token=).+/\1***REDACTED***/g; s/(HF_TOKEN=).+/\1***REDACTED***/g' "$HOME/.gradle/gradle.properties" || true
+          echo "::endgroup::"
+
+      - name: Resolve versionName/tag + versionCode (with validation)
+        id: ver
+        run: |-
+          set -euo pipefail
+
+          BASE_VERSION="${{ inputs.base_version }}"
+          OVERRIDE_NAME="${{ inputs.version_name }}"
+          OVERRIDE_CODE="${{ inputs.version_code }}"
+          TAG_PREFIX="${{ inputs.tag_prefix }}"
+          DATE_FMT="${{ inputs.tag_datetime_format }}"
+
+          # Decide versionName/tag
+          if [[ -n "${OVERRIDE_NAME}" ]]; then
+            TAG="${OVERRIDE_NAME}"
+          else
+            TAG="${TAG_PREFIX}${BASE_VERSION}-$(date "+${DATE_FMT}")"
+          fi
+
+          # Decide versionCode
+          if [[ -n "${OVERRIDE_CODE}" ]]; then
+            VERSION_CODE="${OVERRIDE_CODE}"
+          else
+            VERSION_CODE="${GITHUB_RUN_NUMBER}"
+          fi
+
+          # Validate tag/versionName: keep it tag-safe (no spaces, no weird chars)
+          # Allowed: A-Z a-z 0-9 . _ -
+          if [[ "${TAG}" =~ [[:space:]] ]]; then
+            echo "::error::TAG contains whitespace: '${TAG}'"
+            exit 1
+          fi
+          if ! [[ "${TAG}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "::error::TAG has illegal characters. Allowed: [A-Za-z0-9._-]"
+            echo "::error::TAG='${TAG}'"
+            exit 1
+          fi
+
+          # Validate versionCode is numeric
+          if ! [[ "${VERSION_CODE}" =~ ^[0-9]+$ ]]; then
+            echo "::error::versionCode must be numeric. Got: '${VERSION_CODE}'"
+            exit 1
+          fi
+
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "base_version=${BASE_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "version_code=${VERSION_CODE}" >> "$GITHUB_OUTPUT"
+
+          # Export to environment for Gradle scripts that read env vars.
+          echo "CI_APP_VERSION_NAME=${TAG}" >> "$GITHUB_ENV"
+          echo "CI_VERSION_CODE=${VERSION_CODE}" >> "$GITHUB_ENV"
+
+          echo "::group::Resolved version info"
+          echo "TAG / versionName : ${TAG}"
+          echo "Base version      : ${BASE_VERSION}"
+          echo "Version code      : ${VERSION_CODE}"
+          echo "::endgroup::"
+
+      - name: Decode signing keystore (optional)
+        if: ${{ env.ANDROID_KEYSTORE_BASE64 != '' }}
+        run: |-
+          set -euo pipefail
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > keystore.jks
+          echo "ANDROID_KEYSTORE_FILE=$PWD/keystore.jks" >> "$GITHUB_ENV"
+          echo "Keystore decoded: $PWD/keystore.jks"
+
+      - name: Detect and run :<module>:downloadModel (optional, once)
+        id: model
+        run: |-
+          set -euo pipefail
+          MODULE="${{ env.MODULE_PATH }}"
+
+          echo "::group::List module tasks"
+          ./gradlew ":${MODULE}:tasks" --all --no-daemon | tee gradle_tasks.log
+          echo "::endgroup::"
+
+          if grep -qE '(^|:)(downloadModel)\b' gradle_tasks.log; then
+            echo "Found task :${MODULE}:downloadModel. Running it once..."
+            echo "::group::downloadModel"
+            ./gradlew ":${MODULE}:downloadModel" --stacktrace --no-daemon
+            echo "::endgroup::"
+            echo "RAN_DOWNLOAD_MODEL=1" >> "$GITHUB_ENV"
+          else
+            echo "::notice::Task :${MODULE}:downloadModel not found. Skipping."
+            echo "RAN_DOWNLOAD_MODEL=0" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build release artifacts (inject versionName/versionCode; avoid duplicate downloadModel)
+        run: |-
+          set -euo pipefail
+          MODULE="${{ env.MODULE_PATH }}"
+          TAG="${{ steps.ver.outputs.tag }}"
+          VCODE="${{ steps.ver.outputs.version_code }}"
+
+          # Pass both -P and env-based values for maximum compatibility.
+          EXTRA_ARGS=()
+          EXTRA_ARGS+=("-Papp.versionName=${TAG}")
+          EXTRA_ARGS+=("-Papp.versionCode=${VCODE}")
+
+          # If downloadModel was already executed, exclude it from the build graph.
+          if [[ "${RAN_DOWNLOAD_MODEL:-0}" == "1" ]]; then
+            EXTRA_ARGS+=("-x" ":${MODULE}:downloadModel")
+          fi
+
+          echo "::group::Gradle build command"
+          echo "./gradlew :${MODULE}:clean :${MODULE}:assembleRelease :${MODULE}:bundleRelease --no-daemon --stacktrace ${EXTRA_ARGS[*]}"
+          echo "::endgroup::"
+
+          ./gradlew \
+            ":${MODULE}:clean" \
+            ":${MODULE}:assembleRelease" \
+            ":${MODULE}:bundleRelease" \
+            --no-daemon --stacktrace \
+            "${EXTRA_ARGS[@]}"
+
+      - name: Collect outputs
+        id: collect
+        run: |-
+          set -euo pipefail
+          MODULE="${{ env.MODULE_PATH }}"
+          ROOT="${MODULE}/build/outputs"
+
+          echo "::group::Outputs tree"
+          ls -R "${MODULE}/build" || true
+          echo "::endgroup::"
+
+          APKs=$(find "$ROOT" -type f -name '*.apk' -print | sort || true)
+          AABs=$(find "$ROOT" -type f -name '*.aab' -print | sort || true)
+          MAPs=$(find "$ROOT" -type f -name 'mapping.txt' -print | sort || true)
+
+          APK_COUNT=$(printf '%s\n' "$APKs" | sed '/^$/d' | wc -l | tr -d ' ')
+          AAB_COUNT=$(printf '%s\n' "$AABs" | sed '/^$/d' | wc -l | tr -d ' ')
+          MAP_COUNT=$(printf '%s\n' "$MAPs" | sed '/^$/d' | wc -l | tr -d ' ')
+
+          printf '%s\n' "apk_count=$APK_COUNT" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "aab_count=$AAB_COUNT" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "map_count=$MAP_COUNT" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "apk_list<<EOF"
+            printf '%s\n' "$APKs"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "aab_list<<EOF"
+            printf '%s\n' "$AABs"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "map_list<<EOF"
+            printf '%s\n' "$MAPs"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create and push git tag (ensures GitHub “Source code” matches this build)
+        id: tagpush
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.ver.outputs.tag }}
+          REPO: ${{ env.REPO }}
+        run: |-
+          set -euo pipefail
+
+          # Fail-fast if tag already exists (prevents “old Source code” accidents).
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "::error::Tag '${TAG}' already exists locally."
+            exit 1
+          fi
+          if git ls-remote --tags origin "refs/tags/${TAG}" | grep -q "${TAG}"; then
+            echo "::error::Tag '${TAG}' already exists on origin. Refusing to reuse it."
+            echo "::error::Delete the old tag/release or change tag_datetime_format to be unique."
+            exit 1
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git tag -a "${TAG}" -m "Release ${TAG}"
+
+          # Ensure authenticated push (uses GITHUB_TOKEN).
+          git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO}.git"
+          git push origin "refs/tags/${TAG}"
+
+          echo "::group::Tag pushed"
+          echo "tag=${TAG}"
+          echo "sha=$(git rev-parse HEAD)"
+          echo "::endgroup::"
+
+      - name: Upload APK artifacts
+        if: ${{ steps.collect.outputs.apk_count != '0' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-apk
+          path: ${{ steps.collect.outputs.apk_list }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload AAB artifacts
+        if: ${{ steps.collect.outputs.aab_count != '0' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-aab
+          path: ${{ steps.collect.outputs.aab_list }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload mapping files
+        if: ${{ steps.collect.outputs.map_count != '0' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: proguard-mapping
+          path: ${{ steps.collect.outputs.map_list }}
+          retention-days: 14
+
+      - name: Prepare release body
+        id: notes
+        run: |-
+          set -euo pipefail
+
+          TAG="${{ steps.ver.outputs.tag }}"
+          VCODE="${{ steps.ver.outputs.version_code }}"
+
+          APKs=$(printf '%s\n' "${{ steps.collect.outputs.apk_list }}" | sed '/^$/d')
+          AABs=$(printf '%s\n' "${{ steps.collect.outputs.aab_list }}" | sed '/^$/d')
+          NOTES=$(git log -10 --pretty='* %s (%an)' || echo "* Commit history not available")
+
+          APK_SAMPLE=$(printf '%s\n' "$APKs" | head -n1)
+          AAB_SAMPLE=$(printf '%s\n' "$AABs" | head -n1)
+          [[ -n "$APK_SAMPLE" ]] || APK_SAMPLE="your-release.apk"
+          [[ -n "$AAB_SAMPLE" ]] || AAB_SAMPLE="your-release.aab"
+
+          DELIM="BODY_$(date +%s)"
+          {
+            echo "body<<$DELIM"
+            echo "## Version"
+            echo "- versionName(tag): ${TAG}"
+            echo "- versionCode     : ${VCODE}"
+            echo
+            echo "## Build Source"
+            echo "- commit: $(git rev-parse HEAD)"
+            echo "- ref   : ${GITHUB_REF}"
+            echo
+            echo "## What's Changed"
+            echo "$NOTES"
+            echo
+            echo "## Install Guide"
+            echo "1. adb install -r -g $(basename "$APK_SAMPLE")"
+            echo "2. bundletool build-apks --bundle $(basename "$AAB_SAMPLE") --output app.apks --mode=universal"
+            echo "3. bundletool install-apks --apks app.apks"
+            echo
+            echo "## Assets"
+            printf '%s\n' "$APKs" | sed '/^$/d' | while IFS= read -r f; do
+              echo "- $(basename "$f")"
+            done
+            printf '%s\n' "$AABs" | sed '/^$/d' | while IFS= read -r f; do
+              echo "- $(basename "$f")"
+            done
+            echo "$DELIM"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release
+        if: ${{ inputs.create_release && (steps.collect.outputs.apk_count != '0' || steps.collect.outputs.aab_count != '0') }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          body: ${{ steps.notes.outputs.body }}
+          files: |
+            ${{ steps.collect.outputs.apk_list }}
+            ${{ steps.collect.outputs.aab_list }}
+          draft: false
+          prerelease: false
+
+      - name: Skip release
+        if: ${{ !inputs.create_release || (steps.collect.outputs.apk_count == '0' && steps.collect.outputs.aab_count == '0') }}
+        run: echo "Release publishing skipped."
+
+  publish:
+    name: Publish Wiki + GH Pages
+    runs-on: ubuntu-latest
+    needs: build
+    env:
+      TAG: ${{ needs.build.outputs.tag }}
+      BASE_VERSION: ${{ needs.build.outputs.base_version }}
+      VERSION_CODE: ${{ needs.build.outputs.version_code }}
+
+    steps:
+      - name: Checkout (tagged source for consistency)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.build.outputs.tag }}
+
+      - name: Resolve TAG/DATE/BASE
+        id: info
+        run: |-
+          set -euo pipefail
+          DATE="$(date '+%Y-%m-%d %H:%M')"
+          REPO="${{ env.REPO }}"
+          OWNER="${{ env.OWNER }}"
+          BASE_URL="https://${OWNER}.github.io/${REPO#*/}"
+
+          echo "date=$DATE" >> "$GITHUB_OUTPUT"
+          echo "repo=$REPO" >> "$GITHUB_OUTPUT"
+          echo "base=$BASE_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve APK URL for this tag (GitHub Release API)
+        id: apk
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |-
+          set -euo pipefail
+          REPO="${{ steps.info.outputs.repo }}"
+          TAG_THIS="${{ env.TAG }}"
+
+          if ! command -v jq >/dev/null 2>&1; then
+            sudo apt-get update -y >/dev/null
+            sudo apt-get install -y jq >/dev/null
+          fi
+
+          if ! curl -fsSL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/releases/tags/${TAG_THIS}" \
+            -o release.json; then
+            echo "::warning::Release for tag ${TAG_THIS} not found; fallback to Releases page."
+            echo "apk_tag=${TAG_THIS}" >> "$GITHUB_OUTPUT"
+            echo "apk_name=" >> "$GITHUB_OUTPUT"
+            echo "apk_url=https://github.com/${REPO}/releases" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          APK_NAME="$(
+            jq -r '.assets[]?.name // empty' release.json \
+            | grep -E '\.apk$' \
+            | head -n1 || true
+          )"
+
+          if [[ -n "$APK_NAME" ]]; then
+            APK_URL="https://github.com/${REPO}/releases/download/${TAG_THIS}/${APK_NAME}"
+          else
+            APK_URL="https://github.com/${REPO}/releases/tag/${TAG_THIS}"
+          fi
+
+          echo "apk_tag=${TAG_THIS}" >> "$GITHUB_OUTPUT"
+          echo "apk_name=${APK_NAME}" >> "$GITHUB_OUTPUT"
+          echo "apk_url=${APK_URL}" >> "$GITHUB_OUTPUT"
+
+      - name: Update Wiki (Home + TAG.md)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APK_URL: ${{ steps.apk.outputs.apk_url }}
+        run: |-
+          set -euo pipefail
+
+          TAG="${{ env.TAG }}"
+          DATE="${{ steps.info.outputs.date }}"
+          REPO="${{ steps.info.outputs.repo }}"
+          BASE_URL="${{ steps.info.outputs.base }}"
+          BUILD_APK_URL="${APK_URL:-}"
+
+          rm -rf wiki
+          if git clone "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO}.wiki.git" wiki 2>/dev/null; then
+            echo "Wiki repo cloned."
+          else
+            echo "No existing wiki repo or clone failed; starting fresh."
+            mkdir -p wiki
+          fi
+
+          cd wiki
+          if [ ! -d ".git" ]; then
+            git init
+          fi
+
+          {
+            echo "# 📦 SurveyNav — Build ${TAG}"
+            echo "Generated: ${DATE}"
+            echo ""
+            echo "## Version"
+            echo "- versionName(tag): ${TAG}"
+            echo "- versionCode     : ${{ env.VERSION_CODE }}"
+            echo ""
+            echo "## ⬇️ Download"
+            if [ -n "$BUILD_APK_URL" ]; then
+              echo "- [This build APK](${BUILD_APK_URL})"
+            else
+              echo "- [Releases](https://github.com/${REPO}/releases)"
+            fi
+            echo "- [This tag assets](https://github.com/${REPO}/releases/tag/${TAG})"
+            echo "- [All Releases](https://github.com/${REPO}/releases)"
+          } > "${TAG}.md"
+
+          {
+            echo "# 🏠 SurveyNav Wiki Home"
+            echo "Updated: ${DATE}"
+            echo ""
+            echo "## 📜 Build History (latest 20)"
+          } > Home.md
+
+          MAP_TMP="_link-map.txt"
+          : > "$MAP_TMP"
+
+          LIST=$(
+            find . -maxdepth 1 -type f -name '*.md' ! -name 'Home.md' -printf '%T@ %P\n' \
+              | sort -nr \
+              | head -n 20 \
+              | awk '{ $1=""; sub(/^ /,""); print }'
+          )
+
+          if [ -z "$LIST" ]; then
+            echo "_No builds yet._" >> Home.md
+          else
+            echo "$LIST" | while read -r f; do
+              base="$(basename "$f" .md)"
+              slug="$(printf '%s' "$base" | sed -E 's@[[:space:]]+@-@g; s@/@-@g; s/-+/-/g')"
+              printf -- "- [%s](https://github.com/%s/wiki/%s)\n" "$base" "$REPO" "$slug" >> Home.md
+              printf -- "%s.md -> %s\n" "$base.md" "$slug" >> "$MAP_TMP"
+            done
+          fi
+
+          {
+            echo ""
+            echo "## 🌐 GitHub Pages"
+            echo "- [Downloads Page](${BASE_URL})"
+          } >> Home.md
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .
+          git commit -m "Update Wiki ${TAG}" || git commit --allow-empty -m "Ensure wiki"
+          git branch -M master
+          git remote remove origin 2>/dev/null || true
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO}.wiki.git"
+          git push origin master --force || echo "::warning::Failed to push wiki (is Wiki enabled?)"
+
+      - name: Generate GH Pages (Downloads)
+        env:
+          APK_URL: ${{ steps.apk.outputs.apk_url }}
+          APK_TAG: ${{ steps.apk.outputs.apk_tag }}
+        run: |-
+          set -euo pipefail
+
+          DATE="${{ steps.info.outputs.date }}"
+          REPO="${{ steps.info.outputs.repo }}"
+          BASE_URL="${{ steps.info.outputs.base }}"
+          BUILD_APK_URL="${APK_URL:-}"
+          BUILD_APK_TAG="${APK_TAG:-${{ env.TAG }}}"
+
+          if [ -z "$BUILD_APK_URL" ]; then
+            BUILD_APK_URL="https://github.com/${REPO}/releases"
+          fi
+
+          mkdir -p gh-pages
+
+          cat > gh-pages/index.html <<HTML
+          <!doctype html><html lang="en"><head>
+          <meta charset="utf-8"/>
+          <meta name="viewport" content="width=device-width,initial-scale=1"/>
+          <title>📦 SurveyNav Downloads</title>
+          <style>
+            body{font-family:system-ui,Roboto,Inter,Arial;background:#0b0f17;color:#eee;margin:0}
+            .wrap{max-width:960px;margin:auto;padding:40px}
+            .glass{background:rgba(255,255,255,0.08);border-radius:20px;
+                   box-shadow:0 8px 40px rgba(0,0,0,0.4);
+                   padding:32px;backdrop-filter:blur(14px)}
+            a{color:#72d0ff;text-decoration:none}
+            footer{margin-top:24px;font-size:.85em;opacity:.7;text-align:center}
+            code{background:rgba(255,255,255,.08);padding:2px 6px;border-radius:6px}
+            .muted{opacity:.8}
+          </style>
+          </head>
+          <body><div class="wrap"><div class="glass">
+          <h1>📦 SurveyNav — Latest Downloads</h1>
+          <p class="muted"><strong>Generated:</strong> ${DATE}</p>
+
+          <h2>⬇️ This Build</h2>
+          <p><a href="${BUILD_APK_URL}">Download APK for <code>${BUILD_APK_TAG}</code></a></p>
+          <p class="muted">versionCode: <code>${{ env.VERSION_CODE }}</code></p>
+
+          <p style="margin-top:8px;">
+            <a href="https://github.com/${REPO}/releases/tag/${BUILD_APK_TAG}">🔖 This tag on GitHub</a> •
+            <a href="https://github.com/${REPO}/releases">📘 All Releases</a>
+          </p>
+
+          <hr style="border-color:rgba(255,255,255,.15);margin:24px 0">
+
+          <h2>🔎 Project</h2>
+          <p>
+            <a href="https://github.com/${REPO}">
+              View <code>${REPO#*/}</code> on GitHub
+            </a>
+          </p>
+
+          <p style="margin-top:16px;">
+            <img src="https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=${BASE_URL}" alt="QR">
+          </p>
+          <footer>Generated by SurveyNav CI — ${DATE}</footer>
+          </div></div></body></html>
+          HTML
+
+      - name: Publish GH Pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: gh-pages
+          publish_branch: gh-pages
+          force_orphan: true
+          commit_message: "Update GH Pages + Wiki (${{ env.TAG }})"

@@ -1,0 +1,290 @@
+graph:
+  startId: Start
+  nodes:
+    - id: Start
+      type: START
+      title: Start
+      question: Start
+      nextId: Q1
+
+    - id: Q1
+      type: AI
+      title: Hasara ya Mavuno kwa FAW (Misimu 3)
+      question: >-
+        Unapoteza kiasi gani cha mavuno kwa sababu ya funza jeshi vamizi (Fall Armyworm/FAW)? Tafadhali fikiria misimu 3 iliyopita. (Asilimia au magunia kwa ekari vyote vinakubalika.)
+      nextId: Q2
+
+    - id: Q2
+      type: AI
+      title: Kubadilishana Hasara kwa Kuvuna Siku 10 Mapema
+      question: >-
+        Kama ungeweza kuvuna siku 10 mapema, ungekuwa tayari kupoteza kiasi gani cha mavuno? (Asilimia au magunia kwa ekari.)
+      nextId: Q3
+
+    - id: Q3
+      type: AI
+      title: Kizingiti cha Uharibifu cha Kubadilisha Aina ya Mahindi
+      question: >-
+        Ni kiwango gani cha uharibifu wa wadudu au magonjwa kingekufanya uache kutumia aina ya mahindi unayotumia sasa na ubadilishe aina mpya? (Toa kizingiti kilicho wazi, kwa mfano: % ya mimea/masuke yaliyoharibika au kiwango cha ukali.)
+      nextId: Q4
+
+    - id: Q4
+      type: AI
+      title: Unachotarajia kwa Aina Mbadala ya Mahindi
+      question: >-
+        Ungetarajia nini kutoka kwa aina mpya ya mahindi ili kuchukua nafasi ya unayolima sasa? Tafadhali toa maelezo kadri iwezekanavyo (kwa mfano: siku hadi kukomaa (DTM), ustahimilivu wa FAW, ustahimilivu wa ukame kwenye hatua fulani, mavuno ya kawaida).
+      nextId: Q5
+
+    - id: Q5
+      type: AI
+      title: Mavuno ya Chini Unayokubali Katika Mwaka Mbaya
+      question: >-
+        Katika mwaka mbaya, mavuno madogo kabisa ambayo ungeyakubali na bado upande mahindi haya tena msimu ujao ni kiasi gani? (Asilimia ya mavuno ya kawaida au magunia kwa ekari.)
+      nextId: Q6
+
+    - id: Q6
+      type: AI
+      title: Wakati wa Ukame Unaodhuru Zaidi
+      question: >-
+        Ni lini katika msimu ukame huwa na madhara makubwa zaidi kwa zao lako? Ni wakati gani wa ukame unaokuwa mgumu zaidi? (kwa mfano: kabla ya kutokeza kishada, kutokeza kishada/kutoa hariri, kujaza punje, kabla ya kuvuna.)
+      nextId: Review
+
+    - id: Review
+      type: REVIEW
+      title: Kagua
+      question: ''
+      nextId: Done
+
+    - id: Done
+      type: DONE
+      title: Imekamilika
+      question: ''
+
+slm:
+  # Runtime
+  # NOTE: For debugging stability, prefer "CPU" to avoid EGL/OpenGL context issues.
+  # accelerator: "CPU"
+  accelerator: "GPU"
+
+  # NOTE: EVAL/FOLLOWUP do not need 4096 tokens; smaller budgets reduce drift and failures.
+  max_tokens: 4096
+  top_k: 64
+  top_p: 0.95
+  temperature: 1.0
+
+  # Turn formatting (LiteRT-LM chat style)
+  # NOTE: Newlines help make boundaries explicit; remove '\n' only if your code already injects them.
+  user_turn_prefix: "<start_of_turn>user\n"
+  model_turn_prefix: "<start_of_turn>model\n"
+  turn_end: "<end_of_turn>\n"
+
+  # System prompt pieces
+  empty_json_instruction: "Jibu kwa kitu cha JSON kilicho tupu: {}"
+  preamble: "Wewe ni mtaalamu mashuhuri wa tafiti za wakulima. Soma Swali na Jibu."
+
+  key_contract_eval: |
+    OUTPUT FORMAT:
+    - In Swahili.
+    - Keys exactly:
+      • "analysis": short string
+      • "weakness": short string
+      • "followup_needed": boolean
+      • "followup_target": short string
+      • "score": integer 1–100
+
+    RULES:
+    - Judge ONLY content relevance/completeness/accuracy.
+    - Do NOT generate a follow-up question here.
+    - followup_target must be single-scope (one biggest uncertainty).
+    - Do NOT use double quotes (") inside string values. Use single quotes or no quotes.
+    - Do NOT copy the Answer verbatim into the JSON.
+
+  # FOLLOWUP (Call 2) is TEXT ONLY (no JSON).
+  key_contract_followup: |
+    OUTPUT FORMAT:
+    - In Swahili.
+    - Return ONLY the follow-up question as plain text on ONE LINE.
+    - Do NOT output JSON.
+    - Do NOT wrap the question in quotes.
+    - No prefixes, no bullet points, no extra text.
+
+    RULES:
+    - Use ONLY the EVAL JSON input.
+    - If followup_needed is false, output an EMPTY string (no characters).
+    - If true, target exactly followup_target.
+    - Single-scope, concrete, answerable immediately.
+    - Do not introduce new topics or additional objectives.
+
+  length_budget_eval: |
+    LENGTH LIMITS:
+    - analysis<=60 chars
+    - weakness<=120 chars
+    - followup_target<=80 chars
+    - score is integer 1–100
+
+  length_budget_followup: |
+    LENGTH LIMITS:
+    - follow-up question (text)<=120 chars
+
+  scoring_rule: "Scoring rule: Judge ONLY content relevance/completeness/accuracy. Do NOT penalize style or formatting."
+
+  # IMPORTANT: This field may be appended to BOTH calls by your code.
+  # Therefore it contains explicit branching rules for EVAL vs FOLLOWUP.
+  strict_output: |-
+    STRICT OUTPUT (NO MARKDOWN):
+    - If the task is EVAL: output RAW JSON only, ONE LINE.
+      - Use COMPACT JSON (no spaces around ':' and ',').
+      - No extra text.
+    - If the task is FOLLOWUP: output ONLY the follow-up question as plain text on ONE LINE, or EMPTY output if none.
+      - No JSON, no quotes, no extra text.
+
+prompts_eval:
+  - nodeId: Q1
+    prompt: |-
+      Kazi: EVAL
+      - Tathmini Jibu kwa Swali.
+      - Andika weakness (kile kinachokosekana/kisicho wazi).
+      - Tambua hoja moja kubwa zaidi iliyokosekana/kutoeleweka kama followup_target.
+      - Weka followup_needed true ikiwa ufafanuzi unahitajika, vinginevyo false.
+      - Toa score 1–100.
+
+      Swali: {{QUESTION}}
+      Jibu: {{ANSWER}}
+
+  - nodeId: Q2
+    prompt: |-
+      Kazi: EVAL
+      - Tathmini Jibu kwa Swali.
+      - Andika weakness (kile kinachokosekana/kisicho wazi).
+      - Tambua hoja moja kubwa zaidi iliyokosekana/kutoeleweka kama followup_target.
+      - Weka followup_needed true ikiwa ufafanuzi unahitajika, vinginevyo false.
+      - Toa score 1–100.
+
+      Swali: {{QUESTION}}
+      Jibu: {{ANSWER}}
+
+  - nodeId: Q3
+    prompt: |-
+      Kazi: EVAL
+      - Tathmini Jibu kwa Swali.
+      - Andika weakness (kile kinachokosekana/kisicho wazi).
+      - Tambua hoja moja kubwa zaidi iliyokosekana/kutoeleweka kama followup_target.
+      - Weka followup_needed true ikiwa ufafanuzi unahitajika, vinginevyo false.
+      - Toa score 1–100.
+
+      Swali: {{QUESTION}}
+      Jibu: {{ANSWER}}
+
+  - nodeId: Q4
+    prompt: |-
+      Kazi: EVAL
+      - Tathmini Jibu kwa Swali.
+      - Andika weakness (kile kinachokosekana/kisicho wazi).
+      - Tambua hoja moja kubwa zaidi iliyokosekana/kutoeleweka kama followup_target.
+      - Weka followup_needed true ikiwa ufafanuzi unahitajika, vinginevyo false.
+      - Toa score 1–100.
+
+      Swali: {{QUESTION}}
+      Jibu: {{ANSWER}}
+
+  - nodeId: Q5
+    prompt: |-
+      Kazi: EVAL
+      - Tathmini Jibu kwa Swali.
+      - Andika weakness (kile kinachokosekana/kisicho wazi).
+      - Tambua hoja moja kubwa zaidi iliyokosekana/kutoeleweka kama followup_target.
+      - Weka followup_needed true ikiwa ufafanuzi unahitajika, vinginevyo false.
+      - Toa score 1–100.
+
+      Swali: {{QUESTION}}
+      Jibu: {{ANSWER}}
+
+  - nodeId: Q6
+    prompt: |-
+      Kazi: EVAL
+      - Tathmini Jibu kwa Swali.
+      - Andika weakness (kile kinachokosekana/kisicho wazi).
+      - Tambua hoja moja kubwa zaidi iliyokosekana/kutoeleweka kama followup_target.
+      - Weka followup_needed true ikiwa ufafanuzi unahitajika, vinginevyo false.
+      - Toa score 1–100.
+
+      Swali: {{QUESTION}}
+      Jibu: {{ANSWER}}
+
+prompts_followup:
+  - nodeId: Q1
+    prompt: |-
+      Kazi: FOLLOWUP
+      - Soma EVAL JSON.
+      - Ikiwa followup_needed ni false: toa TUPU (hakuna herufi).
+      - Ikiwa ni true: toa SWALI MOJA la ufuatiliaji kama maandishi (safu moja), likilenga hasa followup_target.
+      - Usitoe JSON.
+
+      EVAL_JSON: {{EVAL_JSON}}
+
+  - nodeId: Q2
+    prompt: |-
+      Kazi: FOLLOWUP
+      - Soma EVAL JSON.
+      - Ikiwa followup_needed ni false: toa TUPU (hakuna herufi).
+      - Ikiwa ni true: toa SWALI MOJA la ufuatiliaji kama maandishi (safu moja), likilenga hasa followup_target.
+      - Usitoe JSON.
+
+      EVAL_JSON: {{EVAL_JSON}}
+
+  - nodeId: Q3
+    prompt: |-
+      Kazi: FOLLOWUP
+      - Soma EVAL JSON.
+      - Ikiwa followup_needed ni false: toa TUPU (hakuna herufi).
+      - Ikiwa ni true: toa SWALI MOJA la ufuatiliaji kama maandishi (safu moja), likilenga hasa followup_target.
+      - Usitoe JSON.
+
+      EVAL_JSON: {{EVAL_JSON}}
+
+  - nodeId: Q4
+    prompt: |-
+      Kazi: FOLLOWUP
+      - Soma EVAL JSON.
+      - Ikiwa followup_needed ni false: toa TUPU (hakuna herufi).
+      - Ikiwa ni true: toa SWALI MOJA la ufuatiliaji kama maandishi (safu moja), likilenga hasa followup_target.
+      - Usitoe JSON.
+
+      EVAL_JSON: {{EVAL_JSON}}
+
+  - nodeId: Q5
+    prompt: |-
+      Kazi: FOLLOWUP
+      - Soma EVAL JSON.
+      - Ikiwa followup_needed ni false: toa TUPU (hakuna herufi).
+      - Ikiwa ni true: toa SWALI MOJA la ufuatiliaji kama maandishi (safu moja), likilenga hasa followup_target.
+      - Usitoe JSON.
+
+      EVAL_JSON: {{EVAL_JSON}}
+
+  - nodeId: Q6
+    prompt: |-
+      Kazi: FOLLOWUP
+      - Soma EVAL JSON.
+      - Ikiwa followup_needed ni false: toa TUPU (hakuna herufi).
+      - Ikiwa ni true: toa SWALI MOJA la ufuatiliaji kama maandishi (safu moja), likilenga hasa followup_target.
+      - Usitoe JSON.
+
+      EVAL_JSON: {{EVAL_JSON}}
+
+model_defaults:
+  default_model_url: "https://huggingface.co/google/gemma-3n-E4B-it-litert-lm/resolve/main/gemma-3n-E4B-it-int4.litertlm"
+  default_file_name: "Gemma3n4B.litertlm"
+  timeout_ms: 1800000
+  ui_throttle_ms: 250
+  ui_min_delta_bytes: 1048576
+
+whisper:
+  enabled: true
+  asset_model_path: "models/ggml-model-q4_0.bin"
+  language: "sw"
+  translate: false
+  print_timestamp: false
+  target_sample_rate: 16000
+  record_sample_rates: [16000, 48000, 44100]
+  compute_checksum: true

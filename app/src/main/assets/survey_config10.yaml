@@ -1,0 +1,191 @@
+graph:
+  startId: Start
+  nodes:
+    - id: Start
+      type: START
+      title: Start
+      question: Start
+      nextId: Q1
+
+    - id: Q1
+      type: AI
+      title: FAW Yield Loss (3 Seasons)
+      question: >-
+        How much yield do you lose because of fall armyworm? Please think back over the last 3 seasons. (Percent or bags per acre are fine.)
+      nextId: Q2
+
+    - id: Q2
+      type: AI
+      title: Trade-off for 10-Day Earlier Harvest
+      question: >-
+        If you could harvest 10 days earlier, how much yield would you be willing to give up? (Percent or bags per acre.)
+      nextId: Q3
+
+    - id: Q3
+      type: AI
+      title: Damage Threshold to Switch Variety
+      question: >-
+        What level of pest or disease damage would make you stop using your current maize variety and switch to a new variety? (Give a clear threshold, e.g., % plants/ears damaged or severity.)
+      nextId: Q4
+
+    - id: Q4
+      type: AI
+      title: Expectations for Replacement Variety
+      question: >-
+        What would you expect from a new maize variety to replace the one you currently grow? Please be as detailed as possible (e.g., DTM, FAW tolerance, drought stage tolerance, typical yield).
+      nextId: Q5
+
+    - id: Q5
+      type: AI
+      title: Minimum Acceptable Harvest in Bad Year
+      question: >-
+        In a bad year, what is the smallest harvest you would accept and still plant this maize again next season? (Percent of usual harvest or bags per acre.)
+      nextId: Q6
+
+    - id: Q6
+      type: AI
+      title: Most Damaging Drought Timing
+      question: >-
+        When in the season is drought most devastating for your crop? What is the most difficult drought moment? (e.g., pre-tassel, tasseling/silking, grain fill, pre-harvest.)
+      nextId: Review
+
+    - id: Review
+      type: REVIEW
+      title: Review
+      question: ''
+      nextId: Done
+
+    - id: Done
+      type: DONE
+      title: Done
+      question: ''
+
+slm:
+  # Runtime
+  accelerator: "GPU"
+  max_tokens: 4096
+  top_k: 64
+  top_p: 0.95
+  temperature: 1.0
+
+  # Turn formatting (LiteRT-LM chat style)
+  user_turn_prefix: "<start_of_turn>user"
+  model_turn_prefix: "<start_of_turn>model"
+  turn_end: ""
+
+  # System prompt pieces
+  empty_json_instruction: "Respond with an empty JSON object: {}"
+  preamble: "You are a well-known farmer survey expert. Read the Question and the Answer."
+
+  key_contract: |
+    OUTPUT FORMAT:
+    - In English.
+    - Keys exactly:
+      • "analysis": short string
+      • "expected_answer": short string
+      • "followup_question": a single short confirm/validate question (NOT an array; may be empty string)
+      • "score": integer 1–100
+
+    FOLLOW-UP INTENT:
+    - The follow-up must confirm or clarify the respondent's original answer to the SAME question.
+    - Target the biggest uncertainty: missing unit/scale, missing number, time window, baseline, or method used.
+    - Keep it single-scope (no multi-part), concrete, and answerable immediately.
+    - Do not introduce new topics or additional objectives.
+
+  length_budget: |
+    LENGTH LIMITS:
+    - analysis<=60 chars
+    - expected_answer<=120 chars
+    - followup_question<=120 chars
+
+  scoring_rule: "Scoring rule: Judge ONLY content relevance/completeness/accuracy. Do NOT penalize style or formatting."
+
+  strict_output: |-
+    STRICT OUTPUT (NO MARKDOWN):
+    - RAW JSON only, ONE LINE.
+    - Use COMPACT JSON (no spaces around ':' and ',').
+    - No extra text.
+
+prompts:
+  - nodeId: Q1
+    prompt: |-
+      Task:
+      - Note weaknesses (unclear units, missing seasons, baseline ambiguity).
+      - Provide ONE strong expected_answer: avg FAW loss over last 3 seasons (% or bags/acre).
+      - Ask exactly 1 followup_question to confirm the SAME answer (or empty string if not needed).
+      - Score 1–100.
+
+      Question: {{QUESTION}}
+      Answer: {{ANSWER}}
+
+  - nodeId: Q2
+    prompt: |-
+      Task:
+      - Note weaknesses (no unit, vague max trade-off, no boundary).
+      - Provide ONE strong expected_answer: max yield loss willing to accept to harvest 10 days earlier (% or bags/acre).
+      - Ask exactly 1 followup_question to confirm the SAME answer (or empty string if not needed).
+      - Score 1–100.
+
+      Question: {{QUESTION}}
+      Answer: {{ANSWER}}
+
+  - nodeId: Q3
+    prompt: |-
+      Task:
+      - Note weaknesses (no threshold, unclear metric, pest vs disease mixed).
+      - Provide ONE strong expected_answer: a clear switching threshold (metric + level + stage).
+      - Ask exactly 1 followup_question to confirm the SAME answer (or empty string if not needed).
+      - Score 1–100.
+
+      Question: {{QUESTION}}
+      Answer: {{ANSWER}}
+
+  - nodeId: Q4
+    prompt: |-
+      Task:
+      - Note weaknesses (generic traits, missing numbers).
+      - Provide ONE strong expected_answer: top replacement targets with at least 1 measurable threshold (DTM, FAW tolerance, drought stage, yield).
+      - Ask exactly 1 followup_question to confirm the SAME answer (or empty string if not needed).
+      - Score 1–100.
+
+      Question: {{QUESTION}}
+      Answer: {{ANSWER}}
+
+  - nodeId: Q5
+    prompt: |-
+      Task:
+      - Note weaknesses (no baseline, no unit, no decision rule).
+      - Provide ONE strong expected_answer: minimum acceptable harvest in a bad year (% or bags/acre) referencing baseline.
+      - Ask exactly 1 followup_question to confirm the SAME answer (or empty string if not needed).
+      - Score 1–100.
+
+      Question: {{QUESTION}}
+      Answer: {{ANSWER}}
+
+  - nodeId: Q6
+    prompt: |-
+      Task:
+      - Note weaknesses (vague timing, no stage definition).
+      - Provide ONE strong expected_answer: most damaging drought moment as a crop stage + one-clause reason.
+      - Ask exactly 1 followup_question to confirm the SAME answer (or empty string if not needed).
+      - Score 1–100.
+
+      Question: {{QUESTION}}
+      Answer: {{ANSWER}}
+
+model_defaults:
+  default_model_url: "https://huggingface.co/google/gemma-3n-E4B-it-litert-lm/resolve/main/gemma-3n-E4B-it-int4.litertlm"
+  default_file_name: "Gemma3n4B.litertlm"
+  timeout_ms: 1800000
+  ui_throttle_ms: 250
+  ui_min_delta_bytes: 1048576
+
+whisper:
+  enabled: true
+  asset_model_path: "models/ggml-small-q5_1.bin"
+  language: "en"
+  translate: false
+  print_timestamp: false
+  target_sample_rate: 16000
+  record_sample_rates: [16000, 48000, 44100]
+  compute_checksum: true

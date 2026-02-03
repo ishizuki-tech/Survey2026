@@ -1,0 +1,151 @@
+# -------------------------------
+# OS 一時ファイル
+# -------------------------------
+.DS_Store
+Thumbs.db
+
+# -------------------------------
+# IDE/エディタ
+# -------------------------------
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+captures/
+misc.xml
+deploymentTargetDropDown.xml
+render.experimental.xml
+
+# -------------------------------
+# Gradle / Kotlin ビルド生成物
+# -------------------------------
+.gradle/
+.gradle-cache/
+build/
+*/build/
+.kotlinc/
+.kotlin/
+
+# -------------------------------
+# Android/NDK ビルド生成物
+# -------------------------------
+.externalNativeBuild/
+.cxx/
+output-metadata.json
+
+# -------------------------------
+# パッケージ出力物
+# -------------------------------
+*.apk
+*.ap_
+*.aab
+*.aar
+
+# -------------------------------
+# ローカル設定・資格情報（絶対コミットしない）
+# -------------------------------
+local.properties
+gradle.properties.local
+keystore.properties
+signing.properties
+release.properties
+*.jks
+*.keystore
+*.pem
+*.p12
+*.cer
+*.key
+*.der
+*.crt
+.env
+.env.*
+secrets*.gradle
+secret*.properties
+
+# -------------------------------
+# Google/Firebase 関連
+# -------------------------------
+google-services.json
+GoogleService-Info.plist
+**/outputs/mapping/
+**/crashlytics-build.properties
+
+# -------------------------------
+# ログ / プロファイル / ダンプ
+# -------------------------------
+*.log
+*.hprof
+.traces/
+perf-*.json
+
+# -------------------------------
+# Lint / レポート / カバレッジ
+# -------------------------------
+**/lint-results*.xml
+**/lint-results*.html
+**/lint-baseline.txt
+**/reports/
+**/test-results*/
+**/jacoco/*.exec
+**/jacocoTestReport.xml
+**/coverage.ec
+
+# -------------------------------
+# KAPT / KSP / 生成物
+# -------------------------------
+**/kapt*/
+**/ksp*/
+**/generated/
+
+# -------------------------------
+# 依存キャッシュ等
+# -------------------------------
+.caches/
+.cache/
+node_modules/
+
+# -------------------------------
+# リリース補助
+# -------------------------------
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots
+fastlane/test_output
+RELEASE_NOTES*.md
+
+# -------------------------------
+# ★ モデル / 大容量アセット（litertlm含む）完全除外
+#   - 代表的拡張子を網羅
+#   - どの階層の models/ でも除外
+#   - assets/models/ も除外（空ディレクトリ維持は .keep を使う）
+# -------------------------------
+# ディレクトリ除外
+models/**
+**/models/**
+app/src/main/assets/models/**
+# 例外：空ディレクトリ維持用
+!app/src/main/assets/models/.keep
+
+# 拡張子除外（LiteRT/LLM/ONNX/TFLite/他）
+*.litertlm
+*.task
+*.gguf
+*.safetensors
+*.bin
+*.onnx
+*.tflite
+*.pt
+*.ckpt
+*.dlc
+*.mlmodel
+*.mlpackage
+
+# -------------------------------
+# その他一時/バックアップ
+# -------------------------------
+*.swp
+*.swo
+*~
+*.orig
+*.bak
