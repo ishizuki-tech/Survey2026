@@ -607,6 +607,7 @@ jobs:
           echo "apk_name=${APK_NAME}" >> "$GITHUB_OUTPUT"
           echo "apk_url=${APK_URL}" >> "$GITHUB_OUTPUT"
 
+
       - name: Update Wiki (Home + Latest + TAG + Sidebar/Footer)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -649,8 +650,11 @@ jobs:
           git status --porcelain || true
           echo "::endgroup::"
 
-          # --- Build page: TAG.md ---
+          # -----------------------------
+          # 1) Build page: TAG.md
+          # -----------------------------
           {
+            echo "<!-- CI_BUILD_PAGE -->"
             echo "# 📦 ${WIKI_BRAND} — Build ${TAG}"
             echo "Generated: ${DATE}"
             echo ""
@@ -671,7 +675,9 @@ jobs:
             echo "- [Downloads Page](${BASE_URL})"
           } > "${TAG}.md"
 
-          # --- Latest.md (stable page) ---
+          # -----------------------------
+          # 2) Latest.md (stable URL)
+          # -----------------------------
           {
             echo "# ⬇️ ${WIKI_BRAND} — Latest Build"
             echo "Updated: ${DATE}"
@@ -693,7 +699,9 @@ jobs:
             echo "- [Downloads Page](${BASE_URL})"
           } > "Latest.md"
 
-          # --- Home.md (top page content title is customizable) ---
+          # -----------------------------
+          # 3) Home.md (title customizable)
+          # -----------------------------
           {
             echo "# ${HOME_TITLE}"
             echo "Updated: ${DATE}"
@@ -710,37 +718,71 @@ jobs:
             echo "## 📜 Build History (latest ${LIMIT})"
           } > Home.md
 
-          # List build pages (exclude Home/Latest/system pages), newest first
-          LIST="$(
-            find . -maxdepth 1 -type f -name '*.md' \
-              ! -name 'Home.md' \
-              ! -name 'Latest.md' \
-              ! -name '_Sidebar.md' \
-              ! -name '_Footer.md' \
-              -printf '%T@ %P\n' \
-              | sort -nr \
-              | sed -E 's/^[^ ]+ //'
+          # -----------------------------
+          # 4) Build History generation (FIXED)
+          #    - DO NOT use filesystem mtime
+          #    - Use git last-commit timestamp per file
+          #    - Prefer files with CI marker; fallback to date-like tag filenames
+          # -----------------------------
+          echo "::group::Build history candidates"
+          find . -maxdepth 1 -type f -name '*.md' -print | sort || true
+          echo "::endgroup::"
+
+          CI_MARKER="CI_BUILD_PAGE"
+
+          # Create a sortable list: "<epoch> <filename>"
+          # For uncommitted new files (e.g., this run's TAG.md), git log returns empty -> fallback to now.
+          BUILD_LIST="$(
+            while IFS= read -r f; do
+              base="$(basename "$f")"
+              case "$base" in
+                Home.md|Latest.md|_Sidebar.md|_Footer.md) continue ;;
+              esac
+
+              ok=0
+              if grep -q "${CI_MARKER}" "$f" 2>/dev/null; then
+                ok=1
+              elif [[ "$base" =~ [0-9]{8}-[0-9]{4,6} ]]; then
+                ok=1
+              fi
+              if [[ "$ok" != "1" ]]; then
+                continue
+              fi
+
+              ts="$(git log -1 --format=%ct -- "$f" 2>/dev/null || true)"
+              if [[ -z "${ts}" ]]; then
+                ts="$(date +%s)"
+              fi
+
+              printf '%s %s\n' "$ts" "$base"
+            done < <(find . -maxdepth 1 -type f -name '*.md' -print)
           )"
 
-          echo "::group::Wiki pages (candidate build pages)"
-          if [ -n "$LIST" ]; then
-            printf '%s\n' "$LIST"
+          echo "::group::Build list with timestamps (debug)"
+          if [[ -n "${BUILD_LIST}" ]]; then
+            printf '%s\n' "${BUILD_LIST}" | sort -nr
           else
             echo "(empty)"
           fi
           echo "::endgroup::"
 
-          if [ -z "$LIST" ]; then
+          if [[ -z "${BUILD_LIST}" ]]; then
             echo "_No builds yet._" >> Home.md
           else
-            printf '%s\n' "$LIST" | head -n "${LIMIT}" | while IFS= read -r f; do
-              [ -z "$f" ] && continue
-              base="$(basename "$f" .md)"
-              echo "- [[${base}]]" >> Home.md
-            done
+            # Sort by ts desc, take LIMIT, and output as wiki internal links
+            printf '%s\n' "${BUILD_LIST}" \
+              | sort -nr \
+              | head -n "${LIMIT}" \
+              | while IFS= read -r line; do
+                  page="${line#* }"
+                  base="${page%.md}"
+                  echo "- [[${base}]]" >> Home.md
+                done
           fi
 
-          # --- Sidebar / Footer (this is how you “change” the top nav feel) ---
+          # -----------------------------
+          # 5) Sidebar / Footer
+          # -----------------------------
           {
             echo "* [[🏠 ${WIKI_BRAND}|Home]]"
             echo "* [[⬇️ Latest Build|Latest]]"
@@ -753,17 +795,16 @@ jobs:
           } > _Footer.md
 
           echo "::group::Home.md preview"
-          sed -n '1,200p' Home.md || true
+          sed -n '1,220p' Home.md || true
           echo "::endgroup::"
 
           echo "::group::Sidebar preview"
-          sed -n '1,200p' _Sidebar.md || true
+          sed -n '1,120p' _Sidebar.md || true
           echo "::endgroup::"
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # Use -A to include deletions if you later decide to prune pages
           git add -A
 
           echo "::group::Git diff (wiki)"
