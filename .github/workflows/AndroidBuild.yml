@@ -75,7 +75,7 @@ defaults:
 
 env:
   OWNER: ${{ github.repository_owner }}
-  REPO: ${{ github.repository }} # e.g. ishizuki-tech/SurveyNav2026
+  REPO: ${{ github.repository }} # e.g. ishizuki-tech/Survey2026
 
 jobs:
   build:
@@ -150,6 +150,16 @@ jobs:
       - name: Set up Android SDK (cmdline-tools)
         uses: android-actions/setup-android@v3
 
+      - name: Debug Android SDK env
+        run: |-
+          set -euo pipefail
+          echo "::group::Android SDK env"
+          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-}"
+          echo "ANDROID_HOME=${ANDROID_HOME:-}"
+          command -v sdkmanager || true
+          sdkmanager --version || true
+          echo "::endgroup::"
+
       - name: Install required SDK components (platforms/build-tools/NDK/CMake)
         run: |-
           set -euo pipefail
@@ -167,6 +177,8 @@ jobs:
           echo "  - cmake;${CMAKE_VERSION}"
           echo "::endgroup::"
 
+          # NOTE: `yes | sdkmanager ...` may produce SIGPIPE on `yes` (exit 141).
+          # Turning off pipefail avoids failing the step due to the `yes` side.
           set +o pipefail
           yes | sdkmanager --install \
             "platforms;android-${COMPILE_SDK}" \
@@ -179,7 +191,10 @@ jobs:
       - name: Accept Android SDK licenses
         run: |-
           set -euo pipefail
+          # Same SIGPIPE caveat as above.
+          set +o pipefail
           yes | sdkmanager --licenses >/dev/null || true
+          set -o pipefail
 
       - name: Configure Gradle cache
         uses: gradle/actions/setup-gradle@v3
@@ -283,7 +298,9 @@ jobs:
           ./gradlew ":${MODULE}:tasks" --all --no-daemon | tee gradle_tasks.log
           echo "::endgroup::"
 
-          if grep -qE '(^|:)(downloadModel)\b' gradle_tasks.log; then
+          # NOTE: grep -E does NOT reliably support \b as a word boundary.
+          # Use a portable pattern that matches Gradle's "downloadModel - ..." task line.
+          if grep -qE '^[[:space:]]*downloadModel([[:space:]]|-|$)' gradle_tasks.log; then
             echo "Found task :${MODULE}:downloadModel. Running it once..."
             echo "::group::downloadModel"
             ./gradlew ":${MODULE}:downloadModel" --stacktrace --no-daemon
