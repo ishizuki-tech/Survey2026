@@ -576,7 +576,7 @@ jobs:
           echo "apk_name=${APK_NAME}" >> "$GITHUB_OUTPUT"
           echo "apk_url=${APK_URL}" >> "$GITHUB_OUTPUT"
 
-      - name: Update Wiki (Home + TAG.md)
+      - name: Update Wiki (Home + Build Page + Sidebar)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           APK_URL: ${{ steps.apk.outputs.apk_url }}
@@ -588,6 +588,10 @@ jobs:
           REPO="${{ steps.info.outputs.repo }}"
           BASE_URL="${{ steps.info.outputs.base }}"
           BUILD_APK_URL="${APK_URL:-}"
+
+          # Stable naming for wiki pages (avoid slug guessing / emoji issues)
+          BUILD_PAGE="Build-${TAG}.md"
+          BUILD_TITLE="Build-${TAG}"
 
           rm -rf wiki
           if git clone "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO}.wiki.git" wiki 2>/dev/null; then
@@ -607,8 +611,11 @@ jobs:
           git status --porcelain || true
           echo "::endgroup::"
 
+          # -----------------------------
+          # Build page (Build-<TAG>.md)
+          # -----------------------------
           {
-            echo "# 📦 SurveyNav2026 — Build ${TAG}"
+            echo "# 📦 SurveyNav2026 — ${BUILD_TITLE}"
             echo "Generated: ${DATE}"
             echo ""
             echo "## Version"
@@ -623,48 +630,117 @@ jobs:
             fi
             echo "- [This tag assets](https://github.com/${REPO}/releases/tag/${TAG})"
             echo "- [All Releases](https://github.com/${REPO}/releases)"
-          } > "${TAG}.md"
+          } > "${BUILD_PAGE}"
+
+          # -----------------------------
+          # Home.md (Latest + Table)
+          # -----------------------------
+          LIST_RECORDS="$(
+            find . -maxdepth 1 -type f -name 'Build-*.md' \
+              -printf '%T@ %P\n' \
+              | sort -nr \
+              | head -n 30
+          )"
+
+          tag_from_page() {
+            local page="$1"
+            printf '%s' "${page#Build-}"
+          }
+
+          extract_vcode() {
+            local f="$1"
+            local v
+            v="$(
+              grep -m1 -E 'versionCode' "$f" \
+                | sed -E 's/.*versionCode[^0-9]*([0-9]+).*/\1/' \
+                || true
+            )"
+            printf '%s' "$v"
+          }
+
+          extract_generated() {
+            local f="$1"
+            local g
+            g="$(grep -m1 -E '^Generated:' "$f" | sed -E 's/^Generated:[[:space:]]*//g' || true)"
+            printf '%s' "$g"
+          }
+
+          extract_apk_url() {
+            local f="$1"
+            local u
+            u="$(
+              grep -m1 -E 'This build APK' "$f" \
+                | sed -E 's/.*\((https?:\/\/[^)]+)\).*/\1/' \
+                || true
+            )"
+            if [[ "$u" == *"This build APK"* ]]; then
+              u=""
+            fi
+            printf '%s' "$u"
+          }
+
+          LATEST_TAG="${TAG}"
+          LATEST_VCODE="${{ env.VERSION_CODE }}"
+          LATEST_PAGE="${BUILD_TITLE}"
+          LATEST_RELEASE_URL="https://github.com/${REPO}/releases/tag/${LATEST_TAG}"
+          LATEST_APK_LINK="-"
+          if [ -n "$BUILD_APK_URL" ]; then
+            LATEST_APK_LINK="[APK](${BUILD_APK_URL})"
+          fi
 
           {
             echo "# 🏠 SurveyNav2026 Wiki Home"
             echo "Updated: ${DATE}"
             echo ""
-            echo "## 📜 Build History (latest 20)"
+            echo "## 🔗 Quick Links"
+            echo "- [Downloads Page](${BASE_URL})"
+            echo "- [GitHub Repo](https://github.com/${REPO})"
+            echo "- [All Releases](https://github.com/${REPO}/releases)"
+            echo ""
+            echo "## ⭐ Latest Build"
+            echo "- Page: [[${LATEST_PAGE}]]"
+            echo "- Tag : \`${LATEST_TAG}\`"
+            echo "- Code: \`${LATEST_VCODE}\`"
+            echo "- Download: ${LATEST_APK_LINK}"
+            echo "- Release: [This tag](${LATEST_RELEASE_URL})"
+            echo ""
+            echo "## 📜 Build History"
+            echo "| Build | Generated | versionCode | Download | Release |"
+            echo "|---|---:|---:|---|---|"
           } > Home.md
 
-          # Build list:
-          # - print: "<mtime_epoch> <filename>"
-          # - sort by mtime desc
-          # - take latest 20
-          # - drop the first field only (works even if filename contains spaces)
-          LIST="$(
-            find . -maxdepth 1 -type f -name '*.md' \
-              ! -name 'Home.md' \
-              ! -name '_Sidebar.md' \
-              ! -name '_Footer.md' \
-              -printf '%T@ %P\n' \
-              | sort -nr \
-              | head -n 20 \
-              | sed -E 's/^[^ ]+ //'
-          )"
-
-          echo "::group::Wiki markdown list (latest 20)"
-          if [ -n "$LIST" ]; then
-            printf '%s\n' "$LIST"
+          if [ -z "$LIST_RECORDS" ]; then
+            echo "| _No builds yet._ |  |  |  |  |" >> Home.md
           else
-            echo "(empty)"
-          fi
-          echo "::endgroup::"
+            while IFS= read -r line; do
+              [ -z "$line" ] && continue
+              epoch="${line%% *}"
+              file="${line#* }"
+              [ -f "$file" ] || continue
 
-          if [ -z "$LIST" ]; then
-            echo "_No builds yet._" >> Home.md
-          else
-            while IFS= read -r f; do
-              [ -z "$f" ] && continue
-              base="$(basename "$f" .md)"
-              slug="$(printf '%s' "$base" | sed -E 's@[[:space:]]+@-@g; s@/@-@g; s/-+/-/g')"
-              printf -- "- [%s](https://github.com/%s/wiki/%s)\n" "$base" "$REPO" "$slug" >> Home.md
-            done <<< "$LIST"
+              page="$(basename "$file" .md)"
+              tag="$(tag_from_page "$page")"
+
+              gen="$(extract_generated "$file")"
+              if [ -z "$gen" ]; then
+                gen="$(date -u -d "@${epoch%.*}" '+%Y-%m-%d %H:%M UTC' 2>/dev/null || true)"
+              fi
+
+              vcode="$(extract_vcode "$file")"
+              [ -n "$vcode" ] || vcode="?"
+
+              apk_url="$(extract_apk_url "$file")"
+              if [ -n "$apk_url" ]; then
+                dl="[APK](${apk_url})"
+              else
+                dl="-"
+              fi
+
+              rel="https://github.com/${REPO}/releases/tag/${tag}"
+
+              printf '| [[%s]] | %s | `%s` | %s | [tag](%s) |\n' \
+                "$page" "$gen" "$vcode" "$dl" "$rel" >> Home.md
+            done <<< "$LIST_RECORDS"
           fi
 
           {
@@ -673,10 +749,33 @@ jobs:
             echo "- [Downloads Page](${BASE_URL})"
           } >> Home.md
 
+          # -----------------------------
+          # Sidebar / Footer (stable nav)
+          # -----------------------------
+          {
+            echo "* [[Home]]"
+            echo "* [[${BUILD_TITLE}]]"
+            echo "* [Downloads Page](${BASE_URL})"
+            echo "* [All Releases](https://github.com/${REPO}/releases)"
+            echo "* [This tag assets](https://github.com/${REPO}/releases/tag/${TAG})"
+          } > _Sidebar.md
+
+          {
+            echo "---"
+            echo "_Updated: ${DATE}_"
+          } > _Footer.md
+
           echo "::group::Home.md preview"
-          sed -n '1,200p' Home.md || true
+          sed -n '1,260p' Home.md || true
           echo "::endgroup::"
 
+          echo "::group::_Sidebar.md preview"
+          sed -n '1,120p' _Sidebar.md || true
+          echo "::endgroup::"
+
+          # -----------------------------
+          # Commit + push
+          # -----------------------------
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add .
