@@ -42,7 +42,7 @@ on:
       # Native toolchain
       ndk_version:
         description: "Android NDK version (side-by-side package id suffix)"
-        default: "25.2.9519653"
+        default: "29.0.14206865"
         required: true
 
       cmake_version:
