@@ -12,7 +12,7 @@ project(whisper_jni LANGUAGES C CXX)
 #  Summary:
 #  ---------------------------------------------------------------------
 #  - Builds ggml-org/whisper.cpp as Android JNI shared library (CPU-only).
-#  - Fixes link errors caused by "GGML_USE_CUDA=0" style defines.
+#  - Avoids link errors caused by "GGML_USE_CUDA=0" style defines.
 #    (ggml uses #ifdef, so "0" still enables code -> undefined symbols)
 #  - Excludes non-Android backends (CUDA/Vulkan/Metal/OpenCL/SYCL/BLAS/etc).
 #  - Supports arm64-v8a and armeabi-v7a.
@@ -27,38 +27,87 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+# ---------------------------------------------------------------------
+# Options / cache variables (consume Gradle -D... to avoid "unused variable" warnings)
+# ---------------------------------------------------------------------
 option(WHISPER_ANDROID_AUTO_CLONE "Auto-clone whisper.cpp when missing" OFF)
+option(WHISPER_ANDROID_VERBOSE "Verbose configure/build messages" ON)
+option(WHISPER_ENABLE_LTO "Enable LTO on non-Debug builds" ON)
+
+# Compatibility options (often passed by Gradle). This project is CPU-only.
+option(GGML_CUDA "Compatibility: GGML CUDA backend (CPU-only build forces OFF)" OFF)
+option(GGML_METAL "Compatibility: GGML Metal backend (CPU-only build forces OFF)" OFF)
+option(GGML_OPENCL "Compatibility: GGML OpenCL backend (CPU-only build forces OFF)" OFF)
+option(GGML_VULKAN "Compatibility: GGML Vulkan backend (CPU-only build forces OFF)" OFF)
+
+# Some setups pass WHISPER_EXTRA. Treat as a compatibility flag.
+option(WHISPER_EXTRA "Compatibility: extra whisper build features (no-op here)" OFF)
+set(WHISPER_EXTRA_LIBS "" CACHE STRING "Extra link libs (semicolon-separated). Example: foo;bar")
+
+# Optional explicit override for whisper.cpp repository location.
+set(WHISPER_DIR "" CACHE PATH "Path to whisper.cpp repo (overrides auto-detection)")
+
+# Optional compatibility variable (some builds pass GGML_HOME).
+set(GGML_HOME "" CACHE PATH "Compatibility: GGML_HOME (unused unless you wire it)")
+
+if (WHISPER_ANDROID_VERBOSE)
+    set(CMAKE_VERBOSE_MAKEFILE ON)
+endif()
+
+# Force-off GPU backend options if someone tries to enable them.
+if (GGML_CUDA OR GGML_METAL OR GGML_OPENCL OR GGML_VULKAN)
+    message(WARNING "GPU backend options were requested, but this build is CPU-only. Forcing OFF.")
+    set(GGML_CUDA   OFF CACHE BOOL "" FORCE)
+    set(GGML_METAL  OFF CACHE BOOL "" FORCE)
+    set(GGML_OPENCL OFF CACHE BOOL "" FORCE)
+    set(GGML_VULKAN OFF CACHE BOOL "" FORCE)
+endif()
 
 # ---------------------------------------------------------------------
 # Root path auto-detection
 # Expected location:
 #   nativelib/src/main/jni/whisper/CMakeLists.txt
 # ---------------------------------------------------------------------
-set(ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../../..")
+get_filename_component(ROOT_DIR "${CMAKE_CURRENT_LIST_DIR}/../../../../.." ABSOLUTE)
 
-set(CANDIDATE_PATHS
-        "${ROOT_DIR}/nativelib/whisper.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/../../../whisper.cpp"
-        "${ROOT_DIR}/whisper.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/../../../../whisper.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/../../../whisper_core"
-)
-
+# ---------------------------------------------------------------------
+# Resolve whisper.cpp repo directory
+# ---------------------------------------------------------------------
 set(WHISPER_LIB_DIR "")
-foreach(path IN LISTS CANDIDATE_PATHS)
-    if (EXISTS "${path}/src/whisper.cpp")
-        set(WHISPER_LIB_DIR "${path}")
-        break()
-    endif()
-endforeach()
+
+if (WHISPER_DIR AND EXISTS "${WHISPER_DIR}/src/whisper.cpp")
+    set(WHISPER_LIB_DIR "${WHISPER_DIR}")
+endif()
+
+if (NOT WHISPER_LIB_DIR)
+    set(CANDIDATE_PATHS
+            "${ROOT_DIR}/nativelib/whisper.cpp"
+            "${CMAKE_CURRENT_LIST_DIR}/../../../whisper.cpp"
+            "${ROOT_DIR}/whisper.cpp"
+            "${CMAKE_CURRENT_LIST_DIR}/../../../../whisper.cpp"
+            "${CMAKE_CURRENT_LIST_DIR}/../../../whisper_core"
+    )
+
+    foreach(path IN LISTS CANDIDATE_PATHS)
+        if (EXISTS "${path}/src/whisper.cpp")
+            set(WHISPER_LIB_DIR "${path}")
+            break()
+        endif()
+    endforeach()
+endif()
 
 if (NOT WHISPER_LIB_DIR)
     if (WHISPER_ANDROID_AUTO_CLONE)
         set(AUTO_CLONE_DIR "${ROOT_DIR}/nativelib/whisper.cpp")
         message(WARNING "whisper.cpp not found. Auto-clone is ON. Cloning into: ${AUTO_CLONE_DIR}")
 
+        find_program(GIT_EXE git)
+        if (NOT GIT_EXE)
+            message(FATAL_ERROR "git not found in PATH. Disable auto-clone or provide whisper.cpp as a submodule.")
+        endif()
+
         execute_process(
-                COMMAND git clone --depth=1 https://github.com/ggml-org/whisper.cpp.git "${AUTO_CLONE_DIR}"
+                COMMAND "${GIT_EXE}" clone --depth=1 https://github.com/ggml-org/whisper.cpp.git "${AUTO_CLONE_DIR}"
                 WORKING_DIRECTORY "${ROOT_DIR}"
                 RESULT_VARIABLE CLONE_RESULT
         )
@@ -74,6 +123,7 @@ if (NOT WHISPER_LIB_DIR)
                 "whisper.cpp source not found.\n"
                 "Expected submodule at: ${ROOT_DIR}/nativelib/whisper.cpp\n"
                 "Fix: git submodule update --init --recursive\n"
+                "Or pass -DWHISPER_DIR=/path/to/whisper.cpp\n"
         )
     endif()
 endif()
@@ -88,11 +138,11 @@ file(GLOB WHISPER_SRC
         "${WHISPER_LIB_DIR}/src/*.cpp"
 )
 
-# Just in case
+# Exclude standalone tools if they slip in
 list(FILTER WHISPER_SRC EXCLUDE REGEX ".*/main\\.c$")
 list(FILTER WHISPER_SRC EXCLUDE REGEX ".*/main\\.cpp$")
 
-set(JNI_SRC "${CMAKE_CURRENT_SOURCE_DIR}/whisperLib.c")
+set(JNI_SRC "${CMAKE_CURRENT_LIST_DIR}/whisperLib.c")
 if (NOT EXISTS "${JNI_SRC}")
     message(FATAL_ERROR "Missing JNI source: ${JNI_SRC}")
 endif()
@@ -154,6 +204,23 @@ set(SOURCE_FILES
         ${GGML_QUANTS_SRC}
 )
 
+if (WHISPER_ANDROID_VERBOSE)
+    list(LENGTH WHISPER_SRC WHISPER_SRC_COUNT)
+    list(LENGTH GGML_CORE_SRC GGML_CORE_SRC_COUNT)
+    list(LENGTH GGML_CPU_SRC GGML_CPU_SRC_COUNT)
+    list(LENGTH GGML_CPU_ARCH_SRC GGML_CPU_ARCH_SRC_COUNT)
+    list(LENGTH GGML_QUANTS_SRC GGML_QUANTS_SRC_COUNT)
+    list(LENGTH SOURCE_FILES SOURCE_FILES_COUNT)
+
+    message(STATUS "Source counts:")
+    message(STATUS "  WHISPER_SRC        = ${WHISPER_SRC_COUNT}")
+    message(STATUS "  GGML_CORE_SRC      = ${GGML_CORE_SRC_COUNT}")
+    message(STATUS "  GGML_CPU_SRC       = ${GGML_CPU_SRC_COUNT}")
+    message(STATUS "  GGML_CPU_ARCH_SRC  = ${GGML_CPU_ARCH_SRC_COUNT}")
+    message(STATUS "  GGML_QUANTS_SRC    = ${GGML_QUANTS_SRC_COUNT}")
+    message(STATUS "  TOTAL              = ${SOURCE_FILES_COUNT}")
+endif()
+
 # ---------------------------------------------------------------------
 # Include paths
 # ---------------------------------------------------------------------
@@ -171,12 +238,16 @@ target_include_directories(ggml_interface INTERFACE
 # Version macros
 # ---------------------------------------------------------------------
 set(LOCAL_GIT_COMMIT "local-build")
-execute_process(
-        COMMAND git -C "${WHISPER_LIB_DIR}" rev-parse --short HEAD
-        OUTPUT_VARIABLE LOCAL_GIT_COMMIT
-        OUTPUT_STRIP_TRAILING_WHITESPACE
-        ERROR_QUIET
-)
+
+find_program(GIT_EXE git)
+if (GIT_EXE)
+    execute_process(
+            COMMAND "${GIT_EXE}" -C "${WHISPER_LIB_DIR}" rev-parse --short HEAD
+            OUTPUT_VARIABLE LOCAL_GIT_COMMIT
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET
+    )
+endif()
 
 # ---------------------------------------------------------------------
 # Android system libs
@@ -233,9 +304,11 @@ function(build_library target_name)
     )
 
     # ABI-specific tuning
-    if (${target_name} STREQUAL "whisper_v8fp16_va")
+    if (target_name STREQUAL "whisper_v8fp16_va")
+        # NOTE: This enables ARMv8.2 FP16 instructions.
+        # Make sure your runtime loader only loads this on compatible devices.
         target_compile_options(${target_name} PRIVATE -march=armv8.2-a+fp16)
-    elseif (${target_name} STREQUAL "whisper_vfpv4")
+    elseif (target_name STREQUAL "whisper_vfpv4")
         target_compile_options(${target_name} PRIVATE -mfpu=neon-vfpv4 -mfloat-abi=softfp)
     endif()
 
@@ -243,16 +316,36 @@ function(build_library target_name)
     if (CMAKE_BUILD_TYPE STREQUAL "Debug")
         target_compile_options(${target_name} PRIVATE -O0 -g -DDEBUG)
     else()
-        target_compile_options(${target_name} PRIVATE -O3 -fvisibility=hidden -ffunction-sections -fdata-sections -flto)
-        target_link_options(${target_name} PRIVATE -Wl,--gc-sections -flto -Wl,--exclude-libs,ALL)
+        target_compile_options(${target_name} PRIVATE
+                -O3
+                -fvisibility=hidden
+                -ffunction-sections
+                -fdata-sections
+        )
+
+        if (WHISPER_ENABLE_LTO)
+            target_compile_options(${target_name} PRIVATE -flto)
+            target_link_options(${target_name} PRIVATE -flto)
+        endif()
+
+        target_link_options(${target_name} PRIVATE
+                -Wl,--gc-sections
+                -Wl,--exclude-libs,ALL
+        )
     endif()
 
     target_link_libraries(${target_name} PRIVATE ${LOG_LIB} ${ANDROID_LIB} ggml_interface)
+
     if (ATOMIC_LIB)
         target_link_libraries(${target_name} PRIVATE ${ATOMIC_LIB})
     endif()
     if (M_LIB)
         target_link_libraries(${target_name} PRIVATE ${M_LIB})
+    endif()
+
+    # Optional extra libs
+    if (WHISPER_EXTRA_LIBS)
+        target_link_libraries(${target_name} PRIVATE ${WHISPER_EXTRA_LIBS})
     endif()
 endfunction()
 
@@ -280,3 +373,16 @@ message(STATUS "Build type : ${CMAKE_BUILD_TYPE}")
 message(STATUS "ABI target : ${ANDROID_ABI}")
 message(STATUS "whisper dir: ${WHISPER_LIB_DIR}")
 message(STATUS "Commit     : ${LOCAL_GIT_COMMIT}")
+
+if (WHISPER_ANDROID_VERBOSE)
+    message(STATUS "Compatibility flags (forced CPU-only):")
+    message(STATUS "  GGML_CUDA   = ${GGML_CUDA}")
+    message(STATUS "  GGML_METAL  = ${GGML_METAL}")
+    message(STATUS "  GGML_OPENCL = ${GGML_OPENCL}")
+    message(STATUS "  GGML_VULKAN = ${GGML_VULKAN}")
+    message(STATUS "  WHISPER_EXTRA      = ${WHISPER_EXTRA}")
+    message(STATUS "  WHISPER_EXTRA_LIBS = ${WHISPER_EXTRA_LIBS}")
+    message(STATUS "  GGML_HOME          = ${GGML_HOME}")
+    message(STATUS "  WHISPER_DIR        = ${WHISPER_DIR}")
+    message(STATUS "  WHISPER_ENABLE_LTO = ${WHISPER_ENABLE_LTO}")
+endif()
