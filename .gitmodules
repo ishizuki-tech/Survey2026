@@ -1,6 +1,3 @@
-[submodule "nativelib/whisper.cpp"]
-	path = nativelib/whisper.cpp
-	url = https://github.com/ggml-org/whisper.cpp.git
 [submodule "whisper.cpp"]
 	path = whisper.cpp
 	url = https://github.com/ggerganov/whisper.cpp.git
