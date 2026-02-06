@@ -52,13 +52,13 @@ graph:
     - id: Review
       type: REVIEW
       title: Kagua
-      question: ''
+      question: ""
       nextId: Done
 
     - id: Done
       type: DONE
       title: Imekamilika
-      question: ''
+      question: ""
 
 slm:
   # Runtime
@@ -66,14 +66,13 @@ slm:
   # accelerator: "CPU"
   accelerator: "GPU"
 
-  # NOTE: EVAL/FOLLOWUP do not need 4096 tokens; smaller budgets reduce drift and failures.
+  # Decoding (lower entropy helps keep Kiswahili in FOLLOWUP)
   max_tokens: 4096
-  top_k: 64
-  top_p: 0.95
-  temperature: 1.0
+  top_k: 10
+  top_p: 0.2
+  temperature: 0.1
 
   # Turn formatting (LiteRT-LM chat style)
-  # NOTE: Newlines help make boundaries explicit; remove '\n' only if your code already injects them.
   user_turn_prefix: "<start_of_turn>user\n"
   model_turn_prefix: "<start_of_turn>model\n"
   turn_end: "<end_of_turn>\n"
@@ -84,7 +83,7 @@ slm:
 
   key_contract_eval: |
     OUTPUT FORMAT:
-    - In Swahili.
+    - Values must be in Swahili ONLY (Kiswahili tu). Usitumie Kiingereza.
     - Keys exactly:
       • "analysis": short string
       • "weakness": short string
@@ -102,7 +101,7 @@ slm:
   # FOLLOWUP (Call 2) is TEXT ONLY (no JSON).
   key_contract_followup: |
     OUTPUT FORMAT:
-    - In Swahili.
+    - In Swahili ONLY (Kiswahili tu). Usitumie Kiingereza.
     - Return ONLY the follow-up question as plain text on ONE LINE.
     - Do NOT output JSON.
     - Do NOT wrap the question in quotes.
@@ -110,7 +109,7 @@ slm:
 
     RULES:
     - Use ONLY the EVAL JSON input.
-    - If followup_needed is false, output an EMPTY string (no characters).
+    - If followup_needed is false, output an EMPTY string (no characters, no spaces).
     - If true, target exactly followup_target.
     - Single-scope, concrete, answerable immediately.
     - Do not introduce new topics or additional objectives.
@@ -129,7 +128,6 @@ slm:
   scoring_rule: "Scoring rule: Judge ONLY content relevance/completeness/accuracy. Do NOT penalize style or formatting."
 
   # IMPORTANT: This field may be appended to BOTH calls by your code.
-  # Therefore it contains explicit branching rules for EVAL vs FOLLOWUP.
   strict_output: |-
     STRICT OUTPUT (NO MARKDOWN):
     - If the task is EVAL: output RAW JSON only, ONE LINE.
@@ -137,11 +135,13 @@ slm:
       - No extra text.
     - If the task is FOLLOWUP: output ONLY the follow-up question as plain text on ONE LINE, or EMPTY output if none.
       - No JSON, no quotes, no extra text.
+      - No leading/trailing spaces. If none, output nothing at all.
 
 prompts_eval:
   - nodeId: Q1
     prompt: |-
       Kazi: EVAL
+      Lugha: Kiswahili tu. Usitumie Kiingereza.
       - Tathmini Jibu kwa Swali.
       - Andika weakness (kile kinachokosekana/kisicho wazi).
       - Tambua hoja moja kubwa zaidi iliyokosekana/kutoeleweka kama followup_target.
@@ -154,6 +154,7 @@ prompts_eval:
   - nodeId: Q2
     prompt: |-
       Kazi: EVAL
+      Lugha: Kiswahili tu. Usitumie Kiingereza.
       - Tathmini Jibu kwa Swali.
       - Andika weakness (kile kinachokosekana/kisicho wazi).
       - Tambua hoja moja kubwa zaidi iliyokosekana/kutoeleweka kama followup_target.
@@ -166,6 +167,7 @@ prompts_eval:
   - nodeId: Q3
     prompt: |-
       Kazi: EVAL
+      Lugha: Kiswahili tu. Usitumie Kiingereza.
       - Tathmini Jibu kwa Swali.
       - Andika weakness (kile kinachokosekana/kisicho wazi).
       - Tambua hoja moja kubwa zaidi iliyokosekana/kutoeleweka kama followup_target.
@@ -178,6 +180,7 @@ prompts_eval:
   - nodeId: Q4
     prompt: |-
       Kazi: EVAL
+      Lugha: Kiswahili tu. Usitumie Kiingereza.
       - Tathmini Jibu kwa Swali.
       - Andika weakness (kile kinachokosekana/kisicho wazi).
       - Tambua hoja moja kubwa zaidi iliyokosekana/kutoeleweka kama followup_target.
@@ -190,6 +193,7 @@ prompts_eval:
   - nodeId: Q5
     prompt: |-
       Kazi: EVAL
+      Lugha: Kiswahili tu. Usitumie Kiingereza.
       - Tathmini Jibu kwa Swali.
       - Andika weakness (kile kinachokosekana/kisicho wazi).
       - Tambua hoja moja kubwa zaidi iliyokosekana/kutoeleweka kama followup_target.
@@ -202,6 +206,7 @@ prompts_eval:
   - nodeId: Q6
     prompt: |-
       Kazi: EVAL
+      Lugha: Kiswahili tu. Usitumie Kiingereza.
       - Tathmini Jibu kwa Swali.
       - Andika weakness (kile kinachokosekana/kisicho wazi).
       - Tambua hoja moja kubwa zaidi iliyokosekana/kutoeleweka kama followup_target.
@@ -215,8 +220,9 @@ prompts_followup:
   - nodeId: Q1
     prompt: |-
       Kazi: FOLLOWUP
+      Lugha: Kiswahili tu. Usitumie Kiingereza.
       - Soma EVAL JSON.
-      - Ikiwa followup_needed ni false: toa TUPU (hakuna herufi).
+      - Ikiwa followup_needed ni false: toa TUPU (hakuna herufi, hakuna spaces).
       - Ikiwa ni true: toa SWALI MOJA la ufuatiliaji kama maandishi (safu moja), likilenga hasa followup_target.
       - Usitoe JSON.
 
@@ -225,8 +231,9 @@ prompts_followup:
   - nodeId: Q2
     prompt: |-
       Kazi: FOLLOWUP
+      Lugha: Kiswahili tu. Usitumie Kiingereza.
       - Soma EVAL JSON.
-      - Ikiwa followup_needed ni false: toa TUPU (hakuna herufi).
+      - Ikiwa followup_needed ni false: toa TUPU (hakuna herufi, hakuna spaces).
       - Ikiwa ni true: toa SWALI MOJA la ufuatiliaji kama maandishi (safu moja), likilenga hasa followup_target.
       - Usitoe JSON.
 
@@ -235,8 +242,9 @@ prompts_followup:
   - nodeId: Q3
     prompt: |-
       Kazi: FOLLOWUP
+      Lugha: Kiswahili tu. Usitumie Kiingereza.
       - Soma EVAL JSON.
-      - Ikiwa followup_needed ni false: toa TUPU (hakuna herufi).
+      - Ikiwa followup_needed ni false: toa TUPU (hakuna herufi, hakuna spaces).
       - Ikiwa ni true: toa SWALI MOJA la ufuatiliaji kama maandishi (safu moja), likilenga hasa followup_target.
       - Usitoe JSON.
 
@@ -245,8 +253,9 @@ prompts_followup:
   - nodeId: Q4
     prompt: |-
       Kazi: FOLLOWUP
+      Lugha: Kiswahili tu. Usitumie Kiingereza.
       - Soma EVAL JSON.
-      - Ikiwa followup_needed ni false: toa TUPU (hakuna herufi).
+      - Ikiwa followup_needed ni false: toa TUPU (hakuna herufi, hakuna spaces).
       - Ikiwa ni true: toa SWALI MOJA la ufuatiliaji kama maandishi (safu moja), likilenga hasa followup_target.
       - Usitoe JSON.
 
@@ -255,8 +264,9 @@ prompts_followup:
   - nodeId: Q5
     prompt: |-
       Kazi: FOLLOWUP
+      Lugha: Kiswahili tu. Usitumie Kiingereza.
       - Soma EVAL JSON.
-      - Ikiwa followup_needed ni false: toa TUPU (hakuna herufi).
+      - Ikiwa followup_needed ni false: toa TUPU (hakuna herufi, hakuna spaces).
       - Ikiwa ni true: toa SWALI MOJA la ufuatiliaji kama maandishi (safu moja), likilenga hasa followup_target.
       - Usitoe JSON.
 
@@ -265,8 +275,9 @@ prompts_followup:
   - nodeId: Q6
     prompt: |-
       Kazi: FOLLOWUP
+      Lugha: Kiswahili tu. Usitumie Kiingereza.
       - Soma EVAL JSON.
-      - Ikiwa followup_needed ni false: toa TUPU (hakuna herufi).
+      - Ikiwa followup_needed ni false: toa TUPU (hakuna herufi, hakuna spaces).
       - Ikiwa ni true: toa SWALI MOJA la ufuatiliaji kama maandishi (safu moja), likilenga hasa followup_target.
       - Usitoe JSON.
 

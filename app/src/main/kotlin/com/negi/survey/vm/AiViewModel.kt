@@ -13,6 +13,7 @@
 
 package com.negi.survey.vm
 
+import android.os.SystemClock
 import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -38,6 +39,7 @@ import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeout
+import org.json.JSONArray
 import org.json.JSONObject
 
 /**
@@ -66,8 +68,17 @@ class AiViewModel(
         private const val DEBUG_LOGS = true
         private const val DEBUG_WHITESPACE = true
         private const val DEBUG_PREVIEW_CHARS = 240
+        private const val DEBUG_PARSE_FALLBACK = true
 
         private const val DEFAULT_TIMEOUT_MS = 120_000L
+
+        /**
+         * Stream emission throttling:
+         * - Reduce StateFlow churn under token streaming.
+         * - UI already throttles typing bubble, but VM-side throttling prevents excessive recompositions.
+         */
+        private const val STREAM_EMIT_THROTTLE_MS = 45L
+        private const val STREAM_EMIT_MIN_CHARS = 64
     }
 
     // ───────────────────────── UI state ─────────────────────────
@@ -149,7 +160,8 @@ class AiViewModel(
         val score: Int?,
         val followups: List<String>,
         val timedOut: Boolean,
-        val error: String?
+        val error: String?,
+        val durationMs: Long
     )
 
     private val _stepHistory = MutableStateFlow<List<StepSnapshot>>(emptyList())
@@ -171,7 +183,7 @@ class AiViewModel(
                 TAG,
                 "stepHistory+ runId=${s.runId} phase=${s.phase} mode=${s.mode} " +
                         "raw.len=${s.raw.length} score=${s.score} FU=${s.followups.size} " +
-                        "FU0='${debugVisible(fu0)}' timeout=${s.timedOut} err=${s.error}"
+                        "FU0='${debugVisible(fu0)}' timeout=${s.timedOut} err=${s.error} durMs=${s.durationMs}"
             )
         }
     }
@@ -218,7 +230,6 @@ class AiViewModel(
         }
 
         cancelDanglingJobIfAny(reason = "dangling_before_new_run")
-
         prepareUiForNewChain(clearHistory = true)
 
         val runId = runSeq.incrementAndGet()
@@ -234,7 +245,12 @@ class AiViewModel(
                 commitToPrimaryState = true
             )
             evalJob = job
-            job.join()
+            runCatching { job.join() }
+                .onFailure { t ->
+                    if (DEBUG_LOGS) {
+                        Log.w(TAG, "evaluate: job.join() failed (likely cancelled) err=${t::class.java.simpleName}:${t.message}")
+                    }
+                }
         }
 
         Log.d(TAG, "evaluate: finished in ${elapsed}ms, score=${_score.value}, err=${_error.value}")
@@ -256,7 +272,6 @@ class AiViewModel(
         }
 
         cancelDanglingJobIfAny(reason = "dangling_before_new_run")
-
         prepareUiForNewChain(clearHistory = true)
 
         val runId = runSeq.incrementAndGet()
@@ -299,7 +314,6 @@ class AiViewModel(
         }
 
         cancelDanglingJobIfAny(reason = "dangling_before_new_chain")
-
         prepareUiForNewChain(clearHistory = true)
 
         val chainJob = viewModelScope.launch(ioDispatcher) {
@@ -380,7 +394,6 @@ class AiViewModel(
         }
 
         cancelDanglingJobIfAny(reason = "dangling_before_new_chain")
-
         prepareUiForNewChain(clearHistory = true)
 
         val chainJob = viewModelScope.launch(ioDispatcher) {
@@ -575,6 +588,25 @@ class AiViewModel(
     }
 
     /**
+     * Compute "inheritance distance" from [from] to [to].
+     *
+     * - 0 means same class.
+     * - Larger means further in the superclass chain.
+     * - Int.MAX_VALUE means unrelated.
+     */
+    private fun classDistance(from: Class<*>, to: Class<*>): Int {
+        if (from == to) return 0
+        var d = 0
+        var c: Class<*>? = from
+        while (c != null) {
+            if (c == to) return d
+            c = c.superclass
+            d++
+        }
+        return Int.MAX_VALUE
+    }
+
+    /**
      * Build prompt via reflection with maximum compatibility across overload variants.
      *
      * Supported overload shapes:
@@ -594,7 +626,7 @@ class AiViewModel(
                 .filter { it.name == "buildPrompt" }
                 .distinctBy { m ->
                     val params = m.parameterTypes.joinToString(",") { it.name }
-                    "${m.declaringClass.name}#${m.name}($params):${m.returnType.name}"
+                    "${m.name}($params):${m.returnType.name}"
                 }
                 .toList()
 
@@ -605,17 +637,22 @@ class AiViewModel(
             // Prefer 2-arg overloads first: (String, X)
             val twoArg = methods
                 .filter { it.parameterTypes.size == 2 && it.parameterTypes[0] == String::class.java }
-                .sortedBy { m ->
-                    // Lower = higher priority
-                    val c = m.parameterTypes[1]
-                    when {
-                        c == PromptPhase::class.java -> 0
-                        c.isEnum -> 1
-                        isStringParam(c) -> 2
-                        isIntegralParam(c) -> 3
-                        else -> 9
+                .sortedWith(
+                    compareBy<java.lang.reflect.Method> { m ->
+                        // Lower = higher priority for param type
+                        val c = m.parameterTypes[1]
+                        when {
+                            c == PromptPhase::class.java -> 0
+                            c.isEnum -> 1
+                            isStringParam(c) -> 2
+                            isIntegralParam(c) -> 3
+                            else -> 9
+                        }
+                    }.thenBy { m ->
+                        // Prefer methods declared closer to repo's concrete class
+                        classDistance(cls, m.declaringClass)
                     }
-                }
+                )
 
             for (m in twoArg) {
                 val param1 = m.parameterTypes[1]
@@ -652,9 +689,11 @@ class AiViewModel(
             }
 
             // Fallback to 1-arg overload: (String)
-            val oneArg = methods.firstOrNull {
-                it.parameterTypes.size == 1 && it.parameterTypes[0] == String::class.java
-            }
+            val oneArg = methods
+                .asSequence()
+                .filter { it.parameterTypes.size == 1 && it.parameterTypes[0] == String::class.java }
+                .sortedBy { m -> classDistance(cls, m.declaringClass) }
+                .firstOrNull()
 
             if (oneArg != null) {
                 ensureAccessible(oneArg)
@@ -737,11 +776,16 @@ class AiViewModel(
         phase: PromptPhase,
         commitToPrimaryState: Boolean
     ): EvalResult {
+        val tStart = SystemClock.uptimeMillis()
+
         val buf = StringBuilder()
         var chunkCount = 0
         var totalChars = 0
         var timedOut = false
         var stepError: String? = null
+
+        var lastEmitMs = 0L
+        var lastEmitChars = 0
 
         fun isActiveRun(): Boolean = activeRunId.get() == runId
 
@@ -775,8 +819,20 @@ class AiViewModel(
                             buf.append(part)
                             totalChars += part.length
 
-                            _stream.update { it + part }
+                            // Emit chunk event immediately (lightweight).
                             _events.tryEmit(AiEvent.Stream(part))
+
+                            // Throttle the heavy StateFlow string rebuild.
+                            val now = SystemClock.uptimeMillis()
+                            val shouldEmit =
+                                (now - lastEmitMs) >= STREAM_EMIT_THROTTLE_MS ||
+                                        (totalChars - lastEmitChars) >= STREAM_EMIT_MIN_CHARS
+
+                            if (shouldEmit) {
+                                lastEmitMs = now
+                                lastEmitChars = totalChars
+                                _stream.value = buf.toString()
+                            }
 
                             if (DEBUG_LOGS) {
                                 Log.d(TAG, "run[$runId] chunk[$chunkCount].preview='${debugVisible(preview(part))}'")
@@ -803,8 +859,10 @@ class AiViewModel(
                 return EvalResult(runId = runId, raw = "", score = null, followups = emptyList(), timedOut = timedOut)
             }
 
+            // Ensure final stream is up-to-date even if throttled.
+            if (buf.isNotEmpty()) _stream.value = buf.toString()
+
             val rawText = buf.toString().ifBlank { _stream.value }
-            val rawTrim = rawText.trim()
 
             if (DEBUG_LOGS) {
                 Log.d(TAG, "run[$runId] stats: chunks=$chunkCount, chars=$totalChars, raw.len=${rawText.length}")
@@ -814,56 +872,70 @@ class AiViewModel(
                 Log.d(TAG, "run[$runId] rawVisible='${debugVisible(preview(rawText))}'")
             }
 
+            val durationMs = SystemClock.uptimeMillis() - tStart
+
             val parsedScore: Int?
             val top3: List<String>
             val q0: String?
 
             when (mode) {
                 EvalMode.EVAL_JSON -> {
-                    if (rawTrim.isBlank() || isEmptyJsonObject(rawTrim)) {
+                    val parseBase = normalizeForJsonParsing(rawText)
+
+                    if (parseBase.isBlank() || isEmptyJsonObject(parseBase)) {
                         parsedScore = null
                         top3 = emptyList()
                         q0 = null
                         if (DEBUG_LOGS) {
                             Log.w(
                                 TAG,
-                                "run[$runId]: EVAL_JSON output is empty/trivial ('${debugVisible(preview(rawTrim))}') -> score=null, followups=0"
+                                "run[$runId]: EVAL_JSON output is empty/trivial ('${debugVisible(preview(parseBase))}') -> score=null, followups=0"
                             )
                         }
                     } else {
-                        val (s, f) = runCatching {
-                            val s1 = clampScore(FollowupExtractor.extractScore(rawText))
-                            val f1 = sanitizeFollowups(FollowupExtractor.fromRaw(rawText, max = 3))
-                            s1 to f1
-                        }.onFailure { t ->
-                            Log.e(TAG, "run[$runId]: parsing failed (EVAL_JSON)", t)
-                        }.getOrElse {
-                            null to emptyList()
-                        }
+                        val (s, f, usedPath) = parseEvalJsonRobust(parseBase)
 
-                        parsedScore = s
-                        top3 = f
+                        parsedScore = clampScore(s)
+                        top3 = sanitizeFollowups(f)
                         q0 = top3.firstOrNull()
 
                         if (DEBUG_LOGS) {
                             Log.d(
                                 TAG,
-                                "run[$runId]: EVAL_JSON parsed score=$parsedScore followups=${top3.size} fu0='${debugVisible(preview(q0.orEmpty()))}'"
+                                "run[$runId]: EVAL_JSON parsed score=$parsedScore followups=${top3.size} " +
+                                        "fu0='${debugVisible(preview(q0.orEmpty()))}' via=$usedPath"
                             )
                         }
                     }
                 }
 
                 EvalMode.FOLLOWUP_JSON_OR_TEXT -> {
-                    val jsonSlice = sliceLikelyJsonObject(rawText)
-                    val jsonQ = jsonSlice?.let { extractFollowupFromJsonObject(it) }
-                    val textQ = extractFollowupFromPlainText(rawText)
+                    /**
+                     * Step2 may be:
+                     * - JSON object containing follow-up question(s)
+                     * - Plain text follow-up question
+                     * - Meta text ("analysis:", "weakness", etc.)
+                     *
+                     * FIX:
+                     * - If meta prefixes exist, strip them and retry prompt detection.
+                     * - Expand Swahili imperative vocabulary (e.g., "tathmini").
+                     */
+                    val base = stripCodeFenceAtHead(rawText).trim()
 
-                    val best = (jsonQ ?: textQ)
+                    val jsonSlice = sliceLikelyJsonObject(base)
+                    val jsonQ = jsonSlice?.let { extractFollowupFromJsonObject(it) }
+                    val textQ = extractFollowupFromPlainText(base)
+
+                    val best0 = (jsonQ ?: textQ)
                         ?.trim()
                         ?.takeIf { it.isNotBlank() }
                         ?.takeIf { !isEmptyJsonObject(it) }
                         ?.takeIf { !isJsonLike(it) }
+
+                    val best = best0
+                        ?.let { normalizeLine(it) }
+                        ?.let { stripMetaPrefixIfAny(it) ?: it }
+                        ?.takeIf { isLikelyPromptLine(it) }
 
                     parsedScore = null
                     top3 = best?.let { listOf(it) } ?: emptyList()
@@ -884,7 +956,7 @@ class AiViewModel(
             // Reflect step-local error state to the global UI error flow.
             if (stepError != null) {
                 _error.value = stepError
-            } else if (_error.value != "timeout" && _error.value != "cancelled") {
+            } else {
                 _error.value = null
             }
 
@@ -897,7 +969,8 @@ class AiViewModel(
                     score = parsedScore,
                     followups = top3,
                     timedOut = timedOut,
-                    error = stepError
+                    error = stepError,
+                    durationMs = durationMs
                 )
             )
 
@@ -917,7 +990,7 @@ class AiViewModel(
 
             Log.i(
                 TAG,
-                "run[$runId] done: phase=$phase mode=$mode score=$parsedScore FU[0]=${q0 ?: "<none>"} commit=$commitToPrimaryState err=${stepError ?: "<none>"}"
+                "run[$runId] done: phase=$phase mode=$mode score=$parsedScore FU[0]=${q0 ?: "<none>"} commit=$commitToPrimaryState err=${stepError ?: "<none>"} durMs=$durationMs"
             )
 
             if (DEBUG_LOGS) {
@@ -927,9 +1000,6 @@ class AiViewModel(
             return EvalResult(runId = runId, raw = rawText, score = parsedScore, followups = top3, timedOut = timedOut)
         } catch (e: CancellationException) {
             if (DEBUG_LOGS) Log.w(TAG, "run[$runId]: cancelled", e)
-            if (isActiveRun() && _error.value == "cancelled") {
-                _events.tryEmit(AiEvent.Cancelled)
-            }
             throw e
         } catch (t: Throwable) {
             if (!isActiveRun()) {
@@ -942,6 +1012,7 @@ class AiViewModel(
             Log.e(TAG, "run[$runId]: error", t)
 
             val rawText = _stream.value
+            val durationMs = SystemClock.uptimeMillis() - tStart
 
             appendStepSnapshot(
                 StepSnapshot(
@@ -952,7 +1023,8 @@ class AiViewModel(
                     score = null,
                     followups = emptyList(),
                     timedOut = false,
-                    error = msg
+                    error = msg,
+                    durationMs = durationMs
                 )
             )
 
@@ -978,18 +1050,19 @@ class AiViewModel(
         _raw.value = null
         _followupQuestion.value = null
         _followups.value = emptyList()
-        if (_error.value != "timeout" && _error.value != "cancelled") {
-            _error.value = null
-        }
+
+        // Always clear error at the start of a new chain.
+        _error.value = null
+
         if (clearHistory) clearStepHistory()
     }
 
     private fun prepareUiForNextStep() {
         _loading.value = true
         _stream.value = ""
-        if (_error.value != "timeout" && _error.value != "cancelled") {
-            _error.value = null
-        }
+
+        // Always clear error at the start of the next step.
+        _error.value = null
     }
 
     private fun finalizeRunFlagsIfActive(runId: Long) {
@@ -1084,10 +1157,14 @@ class AiViewModel(
         return s.take(n)
     }
 
-    /** Return true if the output is a trivial empty JSON object (optionally with whitespace). */
+    /**
+     * Return true if the output is a trivial empty JSON object (optionally with whitespace).
+     */
     private fun isEmptyJsonObject(text: String): Boolean {
         val t = text.trim()
-        return t == "{}" || t == "{ }"
+        if (t.isEmpty()) return false
+        val compact = t.replace(Regex("\\s+"), "")
+        return compact == "{}"
     }
 
     /** Return true if the string starts like JSON. Used for filtering follow-up candidates. */
@@ -1097,76 +1174,426 @@ class AiViewModel(
     }
 
     /**
-     * Filter out garbage follow-up candidates.
+     * Normalize a single-line prompt candidate:
+     * - Strip surrounding quotes
+     * - Collapse whitespace
+     */
+    private fun normalizeLine(s: String): String {
+        return s
+            .trim()
+            .trim('"')
+            .lines()
+            .joinToString(" ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+    }
+
+    /**
+     * Strip meta prefixes like:
+     * - "analysis: ..."
+     * - "weakness ..."
+     * - "strength - ..."
      *
-     * - Removes empty lines and trivial "{}".
-     * - Removes JSON-like values to avoid polluting shouldRunSecond() with invalid followups.
+     * Returns the stripped payload if matched; otherwise null.
+     */
+    private fun stripMetaPrefixIfAny(s: String): String? {
+        val t = normalizeLine(s)
+        if (t.isBlank()) return null
+
+        val r1 = Regex(
+            pattern = "^(analysis|weakness|strength|note|notes|reason|explanation)\\s*[:\\-]\\s*(.+)$",
+            options = setOf(RegexOption.IGNORE_CASE)
+        )
+        r1.matchEntire(t)?.let { m ->
+            val payload = normalizeLine(m.groupValues[2])
+            return payload.takeIf { it.isNotBlank() }
+        }
+
+        val r2 = Regex(
+            pattern = "^(analysis|weakness|strength|note|notes|reason|explanation)\\s+(.+)$",
+            options = setOf(RegexOption.IGNORE_CASE)
+        )
+        r2.matchEntire(t)?.let { m ->
+            val payload = normalizeLine(m.groupValues[2])
+            return payload.takeIf { it.isNotBlank() }
+        }
+
+        return null
+    }
+
+    /**
+     * Return true if the string looks like a meta/debug line rather than a prompt.
+     */
+    private fun looksLikeMetaLine(s: String): Boolean {
+        val t = s.trim().lowercase()
+        return t.startsWith("analysis:") ||
+                t.startsWith("analysis ") ||
+                t.startsWith("weakness") ||
+                t.startsWith("strength") ||
+                t.startsWith("notes:") ||
+                t.startsWith("note:") ||
+                t.startsWith("reason:") ||
+                t.startsWith("explanation:") ||
+                t.startsWith("score:")
+    }
+
+    /**
+     * Heuristic: accept only lines that look like a question OR an instruction-style prompt.
+     */
+    private fun isLikelyPromptLine(line: String): Boolean {
+        val s0 = normalizeLine(line)
+        if (s0.length !in 3..260) return false
+
+        // If it is meta, try stripping and re-check.
+        val stripped = stripMetaPrefixIfAny(s0)
+        val base = stripped ?: s0
+        if (looksLikeMetaLine(base)) return false
+
+        // Direct question punctuation.
+        if (base.contains('?') || base.contains('？')) return true
+
+        val s = base.trimStart('-', '•', '*', ' ', '\t')
+        val lower = s.lowercase()
+
+        // Japanese question ending heuristic (no punctuation).
+        if (s.endsWith("か") || s.endsWith("か。")) return true
+
+        // English interrogatives.
+        val enQ = listOf(
+            "is ", "are ", "do ", "does ", "did ",
+            "what ", "why ", "how ", "when ", "where ", "which ", "who ", "whom ", "whose "
+        )
+        if (enQ.any { lower.startsWith(it) }) return true
+
+        // Swahili interrogatives.
+        if (lower.startsWith("kwa nini")) return true
+        val swQ = listOf("je ", "vipi ", "nini ", "lini ", "wapi ", "gani ")
+        if (swQ.any { lower.startsWith(it) }) return true
+
+        // English directive prompts (imperative).
+        val enCmd = listOf(
+            "describe ", "explain ", "specify ", "provide ", "tell ",
+            "list ", "share ", "clarify ", "elaborate ", "identify ",
+            "estimate ", "confirm ", "compare ", "assess ", "evaluate "
+        )
+        if (enCmd.any { lower.startsWith(it) }) return true
+        if (lower.startsWith("please ")) return true
+
+        // Swahili directive prompts (imperative).
+        val swCmd = listOf(
+            "eleza ", "elezea ", "fafanua ", "taja ", "bainisha ",
+            "toa ", "orodhesha ", "sema ", "andika ", "onyesha ",
+            "tathmini ", "kadiria ", "thibitisha ", "linganisha "
+        )
+        if (swCmd.any { lower.startsWith(it) }) return true
+
+        return false
+    }
+
+    /**
+     * Filter out garbage follow-up candidates.
      */
     private fun sanitizeFollowups(list: List<String>): List<String> {
         return list
             .asSequence()
-            .map { it.trim() }
+            .map { normalizeLine(it) }
+            .map { stripMetaPrefixIfAny(it) ?: it }
             .filter { it.isNotBlank() }
             .filterNot { isEmptyJsonObject(it) }
             .filterNot { isJsonLike(it) }
+            .filterNot { looksLikeMetaLine(it) }
+            .filter { isLikelyPromptLine(it) }
             .distinct()
             .take(3)
             .toList()
     }
 
-    /** Extract a plausible follow-up question from raw text output (non-JSON fallback). */
+    /** Extract a plausible follow-up prompt from raw text output (non-JSON fallback). */
     private fun extractFollowupFromPlainText(raw: String): String? {
-        val t = raw.trim()
-        if (t.isBlank()) return null
-        if (isEmptyJsonObject(t)) return null
+        val t0 = stripCodeFenceAtHead(raw).trim()
+        if (t0.isBlank()) return null
+        if (isEmptyJsonObject(t0)) return null
+        if (isJsonLike(t0)) return null
 
-        val unquoted = t.removePrefix("\"").removeSuffix("\"").trim()
-        val lines = unquoted.lineSequence().map { it.trim() }.filter { it.isNotBlank() }.toList()
-        val qLine = lines.firstOrNull { it.contains("?") }
-        return qLine ?: lines.firstOrNull()
+        val unquoted = t0.removePrefix("\"").removeSuffix("\"").trim()
+
+        val lines = unquoted
+            .lineSequence()
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .toList()
+
+        // Prefer a line that looks like a question/prompt.
+        for (ln in lines) {
+            val n = normalizeLine(ln)
+            val cand = stripMetaPrefixIfAny(n) ?: n
+            if (isLikelyPromptLine(cand)) return cand
+        }
+
+        return null
+    }
+
+    /**
+     * Normalize model output for JSON parsing robustness:
+     * - If there is a code fence anywhere, extract the first fence body.
+     * - Else, try slicing the first JSON object from the text.
+     * - Else, fall back to head-stripped text.
+     */
+    private fun normalizeForJsonParsing(raw: String): String {
+        val fenceBody = extractFirstCodeFenceBody(raw)
+        if (fenceBody != null) return fenceBody.trim()
+
+        val headStripped = stripCodeFenceAtHead(raw).trim()
+        val sliced = sliceLikelyJsonObject(headStripped)
+        if (sliced != null) return sliced.trim()
+
+        return headStripped
+    }
+
+    /**
+     * Extract the body of the first Markdown code fence found in the text.
+     *
+     * Supports:
+     * - ```json\n{...}\n```
+     * - ```\n...\n```
+     */
+    private fun extractFirstCodeFenceBody(text: String): String? {
+        val i0 = text.indexOf("```")
+        if (i0 < 0) return null
+        val i1 = text.indexOf('\n', startIndex = i0 + 3)
+        if (i1 < 0) return null
+        val i2 = text.indexOf("```", startIndex = i1 + 1)
+        if (i2 < 0) return null
+        return text.substring(i1 + 1, i2)
     }
 
     /**
      * Best-effort JSON object slicing from possibly noisy text.
      *
      * Strategy:
-     * - Slice from first '{' to last '}'.
-     * - Reject trivial "{}".
+     * - Strip head code fences.
+     * - Scan for a '{' that can form a valid matching '}' boundary.
+     * - Return the first non-trivial object slice.
      */
     private fun sliceLikelyJsonObject(text: String): String? {
-        val a = text.indexOf('{')
-        val b = text.lastIndexOf('}')
-        if (a < 0 || b <= a) return null
-        val s = text.substring(a, b + 1)
-        if (isEmptyJsonObject(s)) return null
-        return s
+        val t = stripCodeFenceAtHead(text).trim()
+        if (t.isEmpty()) return null
+
+        var i = 0
+        while (i < t.length) {
+            if (t[i] == '{') {
+                val end = findMatchingJsonBoundary(t, i)
+                if (end != -1) {
+                    val s = t.substring(i, end + 1)
+                    if (!isEmptyJsonObject(s)) return s
+                    i = end
+                }
+            }
+            i++
+        }
+        return null
     }
 
-    /** Extract follow-up question from JSON using multiple key spellings. */
-    private fun extractFollowupFromJsonObject(jsonText: String): String? {
+    /**
+     * Parse EVAL JSON output robustly.
+     *
+     * Priority:
+     * 1) Existing FollowupExtractor on the base text
+     * 2) Slice JSON object and parse via org.json
+     *
+     * Returns: Triple(score, followups, usedPathTag)
+     */
+    private fun parseEvalJsonRobust(text: String): Triple<Int?, List<String>, String> {
+        // 1) Primary: existing extractor
+        runCatching {
+            val s = FollowupExtractor.extractScore(text)
+            val f = FollowupExtractor.fromRaw(text, max = 3)
+            if (s != null || f.isNotEmpty()) {
+                return Triple(s, f, "FollowupExtractor(base)")
+            }
+        }.onFailure { t ->
+            if (DEBUG_PARSE_FALLBACK) Log.w(TAG, "parseEvalJsonRobust: FollowupExtractor(base) failed: ${t::class.java.simpleName}:${t.message}")
+        }
+
+        // 2) Fallback: slice JSON and parse with JSONObject
+        val slice = sliceLikelyJsonObject(text)
+        if (slice != null) {
+            val (s2, f2) = extractEvalFromJsonObject(slice)
+            if (s2 != null || f2.isNotEmpty()) {
+                return Triple(s2, f2, "JSONObject(slice)")
+            }
+        }
+
+        // 3) Last attempt: try JSONObject on the whole text (if it is exactly JSON)
+        val (s3, f3) = extractEvalFromJsonObject(text)
+        return Triple(s3, f3, "JSONObject(base)")
+    }
+
+    /**
+     * Extract (score, followups) from an EVAL JSON object using multiple key spellings.
+     */
+    private fun extractEvalFromJsonObject(jsonText: String): Pair<Int?, List<String>> {
         return runCatching {
             val obj = JSONObject(jsonText)
 
-            fun pick(vararg keys: String): String? {
+            fun optIntFlexible(vararg keys: String): Int? {
                 for (k in keys) {
                     if (!obj.has(k)) continue
-                    val v = obj.optString(k, "").trim()
-                    if (v.isNotBlank()) return v
+                    val v = obj.opt(k) ?: continue
+                    when (v) {
+                        is Number -> return v.toInt()
+                        is String -> v.trim().toIntOrNull()?.let { return it }
+                    }
                 }
                 return null
             }
 
-            pick(
+            fun optStringListFlexible(vararg keys: String): List<String> {
+                for (k in keys) {
+                    if (!obj.has(k)) continue
+                    val v = obj.opt(k) ?: continue
+                    when (v) {
+                        is JSONArray -> {
+                            val out = mutableListOf<String>()
+                            for (i in 0 until v.length()) {
+                                val s = v.optString(i, "").trim()
+                                if (s.isNotBlank()) out.add(s)
+                            }
+                            if (out.isNotEmpty()) return out
+                        }
+                        is String -> {
+                            val s = v.trim()
+                            if (s.isNotBlank()) return listOf(s)
+                        }
+                        else -> {
+                            val s = v.toString().trim()
+                            if (s.isNotBlank()) return listOf(s)
+                        }
+                    }
+                }
+                return emptyList()
+            }
+
+            val score = optIntFlexible(
+                "score",
+                "Score",
+                "evaluation_score",
+                "eval_score",
+                "final_score",
+                "rating"
+            )
+
+            val followups = optStringListFlexible(
+                "followups",
+                "follow_up_questions",
+                "follow_up",
+                "follow_up_question",
+                "followup_question",
+                "questions",
+                "next_questions"
+            )
+
+            score to followups
+        }.getOrElse { t ->
+            if (DEBUG_PARSE_FALLBACK) Log.w(TAG, "extractEvalFromJsonObject failed: ${t::class.java.simpleName}:${t.message}")
+            null to emptyList()
+        }
+    }
+
+    /** Extract follow-up question from JSON using multiple key spellings (supports arrays too). */
+    private fun extractFollowupFromJsonObject(jsonText: String): String? {
+        return runCatching {
+            val obj = JSONObject(jsonText)
+
+            fun pickStringOrFirstArrayString(vararg keys: String): String? {
+                for (k in keys) {
+                    if (!obj.has(k)) continue
+                    val vAny = obj.opt(k) ?: continue
+                    when (vAny) {
+                        is String -> {
+                            val v = vAny.trim()
+                            if (v.isNotBlank()) return v
+                        }
+                        is JSONArray -> {
+                            for (i in 0 until vAny.length()) {
+                                val s = vAny.optString(i, "").trim()
+                                if (s.isNotBlank()) return s
+                            }
+                        }
+                        else -> {
+                            val s = vAny.toString().trim()
+                            if (s.isNotBlank()) return s
+                        }
+                    }
+                }
+                return null
+            }
+
+            val raw = pickStringOrFirstArrayString(
                 "follow_up_question",
                 "followup_question",
                 "follow-up question",
                 "follow-up_question",
                 "followUpQuestion",
-                "question",
-                "followup",
+                "followups",
                 "follow_up",
-            )
+                "followup",
+                "question"
+            ) ?: return@runCatching null
+
+            val normalized = normalizeLine(raw)
+            val cand = stripMetaPrefixIfAny(normalized) ?: normalized
+            cand.takeIf { isLikelyPromptLine(it) }
         }.getOrNull()
+    }
+
+    /**
+     * Strip Markdown code fences from the response ONLY when the text starts with "```".
+     */
+    private fun stripCodeFenceAtHead(text: String): String {
+        val t = text.trim()
+        if (!t.startsWith("```")) return t
+        val last = t.lastIndexOf("```")
+        if (last <= 3) return t
+        val firstNewline = t.indexOf('\n', startIndex = 3)
+        val contentStart = if (firstNewline == -1) 3 else firstNewline + 1
+        return t.substring(contentStart, last).trim()
+    }
+
+    /**
+     * Find the matching JSON boundary for an object starting at [start].
+     *
+     * This is a minimal brace matcher that respects string literals and escapes.
+     */
+    private fun findMatchingJsonBoundary(text: String, start: Int): Int {
+        if (start !in text.indices) return -1
+        if (text[start] != '{') return -1
+
+        var depth = 1
+        var i = start + 1
+        var inString = false
+
+        while (i < text.length) {
+            val c = text[i]
+            if (inString) {
+                if (c == '\\' && i + 1 < text.length) {
+                    i += 2
+                    continue
+                }
+                if (c == '"') inString = false
+            } else {
+                when (c) {
+                    '"' -> inString = true
+                    '{' -> depth++
+                    '}' -> {
+                        depth--
+                        if (depth == 0) return i
+                    }
+                }
+            }
+            i++
+        }
+        return -1
     }
 }
 

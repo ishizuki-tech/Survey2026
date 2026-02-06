@@ -808,7 +808,7 @@ fun AppNav() {
                 }
             }
         ) {
-            val backStack = rememberNavBackStack(FlowHome)
+            val backStack = rememberNavBackStack(FlowHome(nodeId = "home"))
 
             val repo: Repository = remember(slmModel, cfg) {
                 LiteRtRepository(slmModel, cfg)
