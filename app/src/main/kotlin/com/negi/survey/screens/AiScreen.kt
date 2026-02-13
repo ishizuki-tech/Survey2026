@@ -36,13 +36,6 @@
  *   • Prevent main answer overwrite while answering follow-ups.
  *   • Follow-up question becomes the next "active prompt question" (UI main).
  *   • Two-step step2 trigger uses followup_needed from EVAL JSON (not score threshold).
- *
- *  Update (2026-02-03):
- *  ---------------------------------------------------------------------
- *   • Migrated deprecated LocalClipboardManager to LocalClipboard (suspend API).
- *   • Copy now uses clipboard.setClipEntry(ClipEntry(ClipData)).
- *   • Fixed AnimatedVisibility receiver ambiguity by fully-qualifying call
- *     and restructuring the scroll container to a single Box overlay.
  * =====================================================================
  */
 
@@ -51,9 +44,9 @@
 package com.negi.survey.screens
 
 import android.annotation.SuppressLint
-import android.content.ClipData
 import android.os.SystemClock
 import android.util.Log
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.LinearEasing
@@ -139,11 +132,12 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.platform.ClipEntry
 import androidx.compose.ui.platform.LocalClipboard
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.Dp
@@ -983,13 +977,6 @@ fun AiScreen(
                         .weight(1f)
                         .fillMaxWidth()
                 ) {
-                    /**
-                     * Single scroll container for the chat list.
-                     *
-                     * NOTE:
-                     * - This removes the duplicated Column/Box block that could
-                     *   confuse scope resolution and cause AnimatedVisibility receiver errors.
-                     */
                     Column(
                         modifier = Modifier
                             .fillMaxSize()
@@ -1018,11 +1005,6 @@ fun AiScreen(
                     /**
                      * Jump-to-bottom affordance:
                      * Visible only when user is not pinned and chat has content.
-                     *
-                     * IMPORTANT:
-                     * - Fully qualify AnimatedVisibility to force the top-level overload.
-                     * - This avoids accidental resolution to ColumnScope.AnimatedVisibility
-                     *   under nested receivers + DSL markers.
                      */
                     androidx.compose.animation.AnimatedVisibility(
                         visible = !isPinnedToBottom && chat.isNotEmpty(),
@@ -1031,7 +1013,9 @@ fun AiScreen(
                             .padding(bottom = 8.dp)
                     ) {
                         JumpToBottomPill(
-                            onClick = { scope.launch { scroll.animateScrollTo(scroll.maxValue) } }
+                            onClick = {
+                                scope.launch { scroll.animateScrollTo(scroll.maxValue) }
+                            }
                         )
                     }
                 }
@@ -1516,7 +1500,7 @@ private fun JsonBubbleMono(
     var expanded by remember(pretty) { mutableStateOf(false) }
 
     val cs = MaterialTheme.colorScheme
-    val clipboard = LocalClipboard.current
+    val clipboard = LocalClipboardManager.current
     val scope = rememberCoroutineScope()
     val clip = RoundedCornerShape(10.dp)
 
@@ -1569,14 +1553,7 @@ private fun JsonBubbleMono(
                 IconButton(
                     onClick = {
                         scope.launch {
-                            /**
-                             * Copy JSON using the new Clipboard API.
-                             *
-                             * NOTE:
-                             * - setClipEntry is suspend, so we call it in a coroutine.
-                             */
-                            val clipData = ClipData.newPlainText("Result JSON", pretty)
-                            clipboard.setClipEntry(ClipEntry(clipData))
+                            clipboard.setText(AnnotatedString(pretty))
                             snack?.showSnackbar("JSON copied")
                         }
                     },
@@ -1777,6 +1754,7 @@ private fun animatedMonotoneBackplate(): Brush {
     )
 }
 
+@Composable
 private fun Modifier.neutralEdge(
     alpha: Float = 0.16f,
     corner: Dp = 12.dp,
@@ -1989,7 +1967,6 @@ private fun stripCodeFence(text: String): String {
     return t.substring(contentStart, last).trim()
 }
 
-@SuppressLint("SameParameterValue")
 private fun findMatchingJsonBoundary(text: String, start: Int): Int {
     if (start !in text.indices) return -1
     val open = text[start]

@@ -4,15 +4,24 @@
 
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
-    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="32"
+        tools:ignore="ScopedStorage" />
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- IMPORTANT: Required for any Foreground Service on API 28+ -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"
+        tools:ignore="ForegroundServicesPolicy" />
+
+    <!-- Android 14+ (type-specific) -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
 
     <application
+        android:name=".SurveyApp"
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="@xml/backup_rules"
@@ -34,7 +43,6 @@
             </intent-filter>
         </activity>
 
-        <!-- AndroidManifest.xml -->
         <receiver
             android:name="com.negi.survey.net.UploadRescheduleReceiver"
             android:exported="true"
@@ -49,8 +57,7 @@
             android:name="androidx.work.impl.foreground.SystemForegroundService"
             android:exported="false"
             android:foregroundServiceType="dataSync"
-            tools:node="merge"
-            />
+            tools:node="merge" />
 
     </application>
 </manifest>

@@ -22,19 +22,25 @@
 package com.negi.survey.net
 
 import android.content.Context
+import android.content.pm.PackageInfo
+import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Process
 import android.util.Log
-import androidx.room.util.copy
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.InputStream
 import java.io.PrintWriter
 import java.io.StringWriter
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.TimeZone
+import java.util.UUID
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.zip.GZIPOutputStream
+import kotlin.system.exitProcess
 
 private const val TAG = "CrashLogStore"
 
@@ -61,17 +67,50 @@ object CrashLogStore {
     private const val MAX_UNCOMPRESSED_BYTES = 850_000
 
     /**
+     * Operational cap for gz crash payload bytes to keep repo bloat under control.
+     *
+     * This is NOT an official GitHub limit. It is a practical cap for diagnostics files.
+     */
+    private const val CRASH_GZ_MAX_BYTES_DEFAULT = 900_000
+
+    /**
+     * Safety cap for command output read (even if logcat ignores -t on some devices).
+     * Keep this comfortably below MAX_UNCOMPRESSED_BYTES.
+     */
+    private const val COMMAND_STDOUT_MAX_BYTES = 260_000
+
+    /** Prevent handler being installed multiple times in the same process. */
+    private val installed = AtomicBoolean(false)
+
+    /**
      * Install an UncaughtExceptionHandler that writes a crash bundle to disk.
      *
      * IMPORTANT:
      * - This does NOT prevent the crash.
      * - It chains to the previous default handler after writing.
+     *
+     * Also:
+     * - On every normal app start, it schedules pending crash bundle uploads using saved config.
+     *   This prevents "we forgot to call schedule()" incidents.
      */
     fun install(context: Context) {
         val appContext = context.applicationContext
-        val prev = Thread.getDefaultUncaughtExceptionHandler()
 
-        Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
+        // On each start, try to schedule any pending crash bundles.
+        runCatching {
+            schedulePendingUploadsFromSavedConfig(appContext)
+        }.onFailure { e ->
+            Log.w(TAG, "Failed to schedule pending crash uploads: ${e.message}", e)
+        }
+
+        // Avoid double-install within the same process.
+        if (!installed.compareAndSet(false, true)) {
+            Log.d(TAG, "CrashLogStore already installed; skip handler re-install.")
+            return
+        }
+
+        val prev = Thread.getDefaultUncaughtExceptionHandler()
+        val handler = Thread.UncaughtExceptionHandler { thread, throwable ->
             runCatching {
                 writeCrashBundle(appContext, thread, throwable)
             }.onFailure { e ->
@@ -79,9 +118,16 @@ object CrashLogStore {
             }
 
             // Always delegate to the original handler (keeps system behavior).
-            prev?.uncaughtException(thread, throwable)
+            try {
+                prev?.uncaughtException(thread, throwable)
+            } catch (t: Throwable) {
+                // Last resort: ensure process terminates even if the previous handler misbehaves.
+                runCatching { Process.killProcess(Process.myPid()) }
+                runCatching { exitProcess(10) }
+            }
         }
 
+        Thread.setDefaultUncaughtExceptionHandler(handler)
         Log.i(TAG, "CrashLogStore installed.")
     }
 
@@ -110,7 +156,10 @@ object CrashLogStore {
         cfg: GitHubUploader.GitHubConfig
     ) {
         val dir = pendingDir(context)
-        val files = dir.listFiles()?.filter { it.isFile && it.length() > 0L } ?: emptyList()
+        val files = dir.listFiles()
+            ?.filter { it.isFile && it.length() > 0L }
+            ?.filter { !it.name.endsWith(".tmp", ignoreCase = true) } // avoid partial crash writes
+            ?: emptyList()
 
         if (files.isEmpty()) {
             Log.d(TAG, "No pending crash bundles.")
@@ -119,7 +168,7 @@ object CrashLogStore {
 
         // Oldest first (stable behavior).
         files.sortedBy { it.lastModified() }.forEach { f ->
-            GitHubUploadWorker.Companion.enqueueExistingPayload(
+            GitHubUploadWorker.enqueueExistingPayload(
                 context = context,
                 cfg = cfg,
                 file = f
@@ -135,8 +184,8 @@ object CrashLogStore {
      * The bundle contains:
      * - Device/app header
      * - Stacktrace
-     * - logcat tail (main/system/events depending on device)
-     * - crash buffer tail (if available)
+     * - logcat tail (PID-filtered, best-effort)
+     * - crash buffer tail (best-effort)
      */
     private fun writeCrashBundle(
         context: Context,
@@ -144,9 +193,17 @@ object CrashLogStore {
         throwable: Throwable
     ) {
         val pid = Process.myPid()
-        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-        val name = "crash_${stamp}_pid${pid}.log.gz"
-        val outFile = File(pendingDir(context), name)
+
+        // Use millis + short UUID suffix to avoid filename collisions on rapid repeated crashes.
+        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).apply {
+            timeZone = TimeZone.getTimeZone("UTC")
+        }.format(Date())
+        val nonce = UUID.randomUUID().toString().substring(0, 8)
+        val name = "crash_${stamp}_pid${pid}_$nonce.log.gz"
+
+        val dir = pendingDir(context)
+        val outFile = File(dir, name)
+        val tmpFile = File(dir, "$name.tmp")
 
         val header = buildHeader(context, pid, thread)
         val stack = buildStacktrace(throwable)
@@ -172,10 +229,20 @@ object CrashLogStore {
         }.toByteArray(Charsets.UTF_8)
 
         val trimmed = trimToTail(combined, MAX_UNCOMPRESSED_BYTES)
-        val gz = gzip(trimmed)
+        val gz = gzipAndFitToMaxBytesBestEffort(trimmed, CRASH_GZ_MAX_BYTES_DEFAULT)
 
-        outFile.parentFile?.mkdirs()
-        outFile.writeBytes(gz)
+        runCatching {
+            tmpFile.writeBytes(gz)
+            if (outFile.exists()) runCatching { outFile.delete() }
+            val renamed = tmpFile.renameTo(outFile)
+            if (!renamed) {
+                // Fallback to direct write if rename fails.
+                outFile.writeBytes(gz)
+                runCatching { tmpFile.delete() }
+            }
+        }.onFailure {
+            runCatching { tmpFile.delete() }
+        }
 
         Log.i(TAG, "Crash bundle written: ${outFile.absolutePath} (${gz.size} bytes gz)")
     }
@@ -187,16 +254,15 @@ object CrashLogStore {
         val pkg = context.packageName
         val pm = context.packageManager
 
-        val versionName = runCatching {
-            pm.getPackageInfo(pkg, 0).versionName ?: "unknown"
-        }.getOrElse { "unknown" }
+        val pkgInfo = getPackageInfoCompat(pm, pkg)
 
-        val versionCode = runCatching {
-            @Suppress("DEPRECATION")
-            pm.getPackageInfo(pkg, 0).longVersionCode
-        }.getOrElse { -1L }
+        val versionName = pkgInfo?.versionName ?: "unknown"
+        val versionCode = getVersionCodeCompat(pkgInfo)
 
-        val utc = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US).format(Date())
+        val sdf = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US).apply {
+            timeZone = TimeZone.getTimeZone("UTC")
+        }
+        val utc = sdf.format(Date())
 
         return buildString {
             appendLine("time_utc=$utc")
@@ -207,6 +273,33 @@ object CrashLogStore {
             appendLine("thread=${thread.name}")
             appendLine("device=${Build.MANUFACTURER} ${Build.MODEL}")
             appendLine("sdk=${Build.VERSION.SDK_INT}")
+        }
+    }
+
+    /**
+     * Get PackageInfo safely on all API levels.
+     */
+    private fun getPackageInfoCompat(pm: PackageManager, pkg: String): PackageInfo? {
+        return runCatching {
+            if (Build.VERSION.SDK_INT >= 33) {
+                pm.getPackageInfo(pkg, PackageManager.PackageInfoFlags.of(0L))
+            } else {
+                @Suppress("DEPRECATION")
+                pm.getPackageInfo(pkg, 0)
+            }
+        }.getOrNull()
+    }
+
+    /**
+     * Get versionCode as Long safely on all API levels (minSdk=26+).
+     */
+    private fun getVersionCodeCompat(pkgInfo: PackageInfo?): Long {
+        if (pkgInfo == null) return -1L
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            pkgInfo.longVersionCode
+        } else {
+            @Suppress("DEPRECATION")
+            pkgInfo.versionCode.toLong()
         }
     }
 
@@ -224,7 +317,7 @@ object CrashLogStore {
      *
      * Notes:
      * - Uses `--pid` so it should mainly capture your app logs.
-     * - Some devices may still restrict access; returns an error string then.
+     * - Some devices may still restrict access; returns a short error string then.
      */
     private fun collectLogcatTail(pid: Int, tailLines: Int): String {
         val cmd = listOf(
@@ -234,7 +327,24 @@ object CrashLogStore {
             "-v", "threadtime",
             "-t", tailLines.toString()
         )
-        return runCommand(cmd, timeoutMs = 1200L)
+        val out = runCommand(cmd, timeoutMs = 1200L, maxStdoutBytes = COMMAND_STDOUT_MAX_BYTES)
+        if (!looksLikePidUnsupported(out)) return out
+
+        // Fallback without --pid
+        val fb = listOf(
+            "logcat",
+            "-d",
+            "-v", "threadtime",
+            "-t", tailLines.toString()
+        )
+        return buildString {
+            appendLine("=== WARNING ===")
+            appendLine("PID-filtered logcat is not available on this device/runtime.")
+            appendLine("Fallback logcat dump may include other processes.")
+            appendLine("================")
+            appendLine()
+            append(runCommand(fb, timeoutMs = 1200L, maxStdoutBytes = COMMAND_STDOUT_MAX_BYTES))
+        }
     }
 
     /**
@@ -252,22 +362,32 @@ object CrashLogStore {
             "-v", "threadtime",
             "-t", tailLines.toString()
         )
-        return runCommand(cmd, timeoutMs = 1200L)
+        return runCommand(cmd, timeoutMs = 1200L, maxStdoutBytes = COMMAND_STDOUT_MAX_BYTES)
     }
 
     /**
      * Run a shell command and return stdout as text (best-effort).
+     *
+     * Crash handler safety rules:
+     * - If the process does not finish within [timeoutMs], we do NOT read the stream
+     *   to avoid blocking. We return a short timeout message.
+     * - Even if the command returns a lot of output, we cap reads to [maxStdoutBytes]
+     *   to avoid memory blowups on crash-time paths.
      */
-    private fun runCommand(cmd: List<String>, timeoutMs: Long): String {
+    private fun runCommand(cmd: List<String>, timeoutMs: Long, maxStdoutBytes: Int): String {
         return try {
             val proc = ProcessBuilder(cmd)
                 .redirectErrorStream(true)
                 .start()
 
-            // Try to finish quickly; do not block forever in crash handler.
-            proc.waitFor(timeoutMs, TimeUnit.MILLISECONDS)
+            val finished = proc.waitFor(timeoutMs, TimeUnit.MILLISECONDS)
+            if (!finished) {
+                runCatching { proc.destroy() }
+                runCatching { proc.destroyForcibly() }
+                return "(command timeout: ${cmd.joinToString(" ")})\n"
+            }
 
-            val out = proc.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+            val out = proc.inputStream.use { readTextLimited(it, maxStdoutBytes) }
             runCatching { proc.destroy() }
 
             if (out.isBlank()) "(logcat empty or restricted)\n" else out
@@ -277,12 +397,93 @@ object CrashLogStore {
     }
 
     /**
+     * Read at most [maxBytes] from [input] and decode as UTF-8.
+     */
+    private fun readTextLimited(input: InputStream, maxBytes: Int): String {
+        return runCatching {
+            val buf = ByteArray(8_192)
+            val bos = ByteArrayOutputStream()
+            var total = 0
+            while (true) {
+                val n = input.read(buf)
+                if (n <= 0) break
+                val remain = maxBytes - total
+                if (remain <= 0) break
+                val toWrite = minOf(n, remain)
+                bos.write(buf, 0, toWrite)
+                total += toWrite
+                if (total >= maxBytes) break
+            }
+            bos.toString(Charsets.UTF_8.name())
+        }.getOrElse { t ->
+            "(read failed: ${t.message})\n"
+        }
+    }
+
+    /**
+     * Heuristic: detect PID option unsupported patterns.
+     */
+    private fun looksLikePidUnsupported(output: String): Boolean {
+        val s = output.lowercase(Locale.US)
+        val mentionsPid = s.contains("pid") || s.contains("--pid")
+        val looksLikeOptionError =
+            s.contains("unknown option") ||
+                    s.contains("unrecognized option") ||
+                    s.contains("invalid option") ||
+                    s.contains("unknown argument") ||
+                    (s.contains("unknown") && s.contains("--pid")) ||
+                    (s.contains("usage:") && s.contains("logcat") && s.contains("pid"))
+
+        return mentionsPid && looksLikeOptionError
+    }
+
+    /**
      * Keep only the tail portion when exceeding max bytes.
      */
     private fun trimToTail(bytes: ByteArray, maxBytes: Int): ByteArray {
         if (bytes.size <= maxBytes) return bytes
         val start = bytes.size - maxBytes
         return bytes.copyOfRange(start, bytes.size)
+    }
+
+    /**
+     * Gzip compress and best-effort fit under [maxGzBytes].
+     *
+     * This function must never throw (crash-time path).
+     */
+    private fun gzipAndFitToMaxBytesBestEffort(input: ByteArray, maxGzBytes: Int): ByteArray {
+        return runCatching {
+            var current = input
+            repeat(4) { attempt ->
+                val gz = safeGzip(current)
+                if (gz.size in 1..maxGzBytes) return@runCatching gz
+
+                val nextMax = (current.size * 0.75).toInt().coerceAtLeast(50_000)
+                current = trimToTail(current, nextMax)
+
+                Log.w(
+                    TAG,
+                    "gzip too large (attempt=$attempt gz=${gz.size} > maxGzBytes=$maxGzBytes). " +
+                            "Trimming tail to $nextMax bytes and retrying."
+                )
+            }
+            safeGzip(current)
+        }.getOrElse { t ->
+            Log.w(TAG, "gzipAndFitToMaxBytesBestEffort failed: ${t.message}", t)
+            // Last resort: try to gzip a tiny message. Never throw.
+            safeGzip("(gzip failed: ${t.message})\n".toByteArray(Charsets.UTF_8))
+        }
+    }
+
+    /**
+     * Gzip compress in a crash-safe way (never throws).
+     */
+    private fun safeGzip(input: ByteArray): ByteArray {
+        return runCatching { gzip(input) }
+            .getOrElse { t ->
+                runCatching { gzip("(gzip failed: ${t.message})\n".toByteArray(Charsets.UTF_8)) }
+                    .getOrElse { ByteArray(1) } // non-empty sentinel to avoid "length=0" filters
+            }
     }
 
     /**

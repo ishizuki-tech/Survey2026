@@ -121,6 +121,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.max
 import androidx.compose.ui.unit.min
 import androidx.compose.ui.unit.sp
+import com.negi.survey.BuildConfig
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -201,6 +202,14 @@ fun IntroScreen(
                 onRestart = onRestart,
                 onResolveConfigDetails = onResolveConfigDetails,
             )
+
+            if (BuildConfig.DEBUG) {
+                OutlinedButton(
+                    onClick = { throw RuntimeException("Debug crash button pressed") }
+                ) {
+                    Text("Crash now (debug)")
+                }
+            }
         }
     }
 }

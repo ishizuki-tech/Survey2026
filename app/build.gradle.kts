@@ -2,6 +2,7 @@
 import java.io.ByteArrayOutputStream
 import java.util.Properties
 import org.gradle.api.GradleException
+import org.gradle.api.Project
 import org.gradle.api.tasks.Exec
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
@@ -20,11 +21,17 @@ plugins {
 val isCi: Boolean = System.getenv("CI")?.equals("true", ignoreCase = true) == true
 
 /**
- * Load local.properties once.
+ * Load developer-local property files once.
  *
- * This file is developer-local and should NOT be committed.
- * We use it for safe overrides (appId, local tokens, version overrides, etc.).
+ * These files should NOT be committed.
+ * - gradle.properties.local: optional repo-root override file (gitignored)
+ * - local.properties: Android standard local override file (gitignored)
  */
+val gradleLocalProps: Properties = Properties().apply {
+    val f = rootProject.file("gradle.properties.local")
+    if (f.exists()) f.inputStream().use { load(it) }
+}
+
 val localProps: Properties = Properties().apply {
     val f = rootProject.file("local.properties")
     if (f.exists()) f.inputStream().use { load(it) }
@@ -32,24 +39,51 @@ val localProps: Properties = Properties().apply {
 
 /**
  * Resolve a property from (highest priority first):
- *  1) Gradle project property: -Pname=value  OR  ~/.gradle/gradle.properties
- *  2) local.properties (developer-local)
- *  3) default
+ *  1) Standard Gradle properties (-Pname=..., ~/.gradle/gradle.properties, gradle.properties, ORG_GRADLE_PROJECT_*)
+ *  2) gradle.properties.local (repo-root, gitignored)
+ *  3) local.properties (Android standard, gitignored)
+ *  4) default
  *
- * This keeps CI reproducible while allowing local convenience overrides.
+ * Notes:
+ * - Never log returned values (may contain secrets).
  */
-fun prop(name: String, default: String = ""): String =
-    (project.findProperty(name) as String?)
-        ?.takeIf { it.isNotBlank() }
-        ?: localProps.getProperty(name)
-            ?.takeIf { it.isNotBlank() }
-        ?: default
+fun prop(name: String, default: String = ""): String {
+    val fromGradle = providers.gradleProperty(name).orNull
+        ?.trim()
+        ?.takeIf { it.isNotEmpty() }
+    if (fromGradle != null) return fromGradle
+
+    val fromGradleLocal = gradleLocalProps.getProperty(name)
+        ?.trim()
+        ?.takeIf { it.isNotEmpty() }
+    if (fromGradleLocal != null) return fromGradleLocal
+
+    val fromLocal = localProps.getProperty(name)
+        ?.trim()
+        ?.takeIf { it.isNotEmpty() }
+    if (fromLocal != null) return fromLocal
+
+    return default
+}
+
+/**
+ * Read the first non-blank property value from multiple keys.
+ *
+ * Notes:
+ * - Useful during migration (e.g., github.* -> gh.*).
+ */
+fun propAny(vararg names: String, default: String = ""): String {
+    for (n in names) {
+        val v = prop(n).trim()
+        if (v.isNotEmpty()) return v
+    }
+    return default
+}
 
 /**
  * Escape a string literal for BuildConfig fields.
  *
- * This is required because buildConfigField takes a raw Java literal string,
- * not a Kotlin string.
+ * BuildConfig fields expect a Java literal string, not a Kotlin string.
  */
 fun quote(v: String): String = "\"" + v.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
 
@@ -60,18 +94,18 @@ fun quote(v: String): String = "\"" + v.replace("\\", "\\\\").replace("\"", "\\\
  */
 fun sanitizeVersionName(raw: String): String =
     raw.trim()
-        .replace("\\s+".toRegex(), "") // versionName must be tag-safe
-        .take(64) // defensive bound to avoid insane strings
+        .replace("\\s+".toRegex(), "")
+        .take(64)
 
 /**
  * Resolve versionName with explicit precedence:
  *  1) -Papp.versionName=...
  *  2) env CI_APP_VERSION_NAME
- *  3) local.properties app.versionName=...
+ *  3) local override files (via prop)
  *  4) fallback
  */
 fun resolveVersionName(): String {
-    val fromGradle = (project.findProperty("app.versionName") as String?)?.trim()
+    val fromGradle = providers.gradleProperty("app.versionName").orNull?.trim()
     val fromEnv = System.getenv("CI_APP_VERSION_NAME")?.trim()
     val fromLocal = prop("app.versionName").trim()
 
@@ -88,11 +122,11 @@ fun resolveVersionName(): String {
  * Resolve versionCode with explicit precedence:
  *  1) -Papp.versionCode=...
  *  2) env CI_VERSION_CODE
- *  3) env GITHUB_RUN_NUMBER (nice CI default)
+ *  3) env GITHUB_RUN_NUMBER
  *  4) fallback
  */
 fun resolveVersionCode(): Int {
-    val fromGradle = (project.findProperty("app.versionCode") as String?)?.toIntOrNull()
+    val fromGradle = providers.gradleProperty("app.versionCode").orNull?.toIntOrNull()
     val fromEnv = System.getenv("CI_VERSION_CODE")?.toIntOrNull()
     val fromRunNumber = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull()
     return fromGradle ?: fromEnv ?: fromRunNumber ?: 1
@@ -102,24 +136,10 @@ fun resolveVersionCode(): Int {
  * Setup tasks (Submodule / Model download)
  * ========================================================================== */
 
-/**
- * Initialize git submodules recursively.
- *
- * Behavior:
- * - Only runs when the expected submodule directory is missing/empty.
- * - Fails in CI (so you immediately see the root cause).
- * - Warns locally (so devs can still open the project even if git is weird).
- *
- * Notes:
- * - IMPORTANT: Use rootProject paths (submodules usually live at repo root).
- * - IMPORTANT: Always ignore exit value so we can print captured output,
- *   then fail with a clear GradleException.
- */
 tasks.register<Exec>("checkSubmodule") {
     description = "Recursively initialize the native submodule if not yet set up"
     group = "setup"
 
-    // Root-based path (NOT app/).
     val subDir = rootProject.layout.projectDirectory.dir("nativelib/whisper_core").asFile
 
     val out = ByteArrayOutputStream()
@@ -135,9 +155,7 @@ tasks.register<Exec>("checkSubmodule") {
     commandLine("git", "submodule", "update", "--init", "--recursive")
     environment("GIT_TERMINAL_PROMPT", "0")
 
-    // Always ignore so doLast can print buffered logs.
     isIgnoreExitValue = true
-
     standardOutput = out
     errorOutput = err
 
@@ -158,19 +176,6 @@ tasks.register<Exec>("checkSubmodule") {
     }
 }
 
-/**
- * Download models via a project-local script.
- *
- * Controls:
- * - Skip via -PskipModelDownload=true (recommended for CI if already handled)
- * - Skip via env SKIP_MODEL_DOWNLOAD=1
- *
- * Notes:
- * - The script should be idempotent (download only missing files).
- * - Token can be forwarded via env HF_TOKEN when needed.
- * - We look for the script in app/ first, then repo root as a fallback.
- * - Always ignore exit value so we can print captured output, then fail clearly.
- */
 tasks.register<Exec>("downloadModel") {
     description = "Run the model download script safely"
     group = "setup"
@@ -180,7 +185,7 @@ tasks.register<Exec>("downloadModel") {
     val script = when {
         scriptInModule.exists() -> scriptInModule
         scriptInRoot.exists() -> scriptInRoot
-        else -> scriptInModule // placeholder; onlyIf will skip
+        else -> scriptInModule
     }
 
     val out = ByteArrayOutputStream()
@@ -207,23 +212,16 @@ tasks.register<Exec>("downloadModel") {
             script.setExecutable(true)
         }
 
-        /**
-         * Forward tokens as environment variables if your script expects them.
-         * This keeps the script logic simple and CI-friendly.
-         */
-        val hfToken = prop("HF_TOKEN").trim()
+        val hfToken = propAny("hf.token", "HF_TOKEN").trim()
         if (hfToken.isNotBlank()) {
             environment("HF_TOKEN", hfToken)
         }
     }
 
-    // Run from the directory that contains the script.
     workingDir = script.parentFile
     commandLine("bash", script.absolutePath)
 
-    // Always ignore so doLast can print buffered logs.
     isIgnoreExitValue = true
-
     standardOutput = out
     errorOutput = err
 
@@ -241,13 +239,6 @@ tasks.register<Exec>("downloadModel") {
     }
 }
 
-/**
- * Ensure setup tasks run before Android preBuild.
- *
- * This guarantees:
- * - native submodule is present
- * - model assets are available (unless explicitly skipped)
- */
 tasks.named("preBuild").configure {
     dependsOn("checkSubmodule", "downloadModel")
 }
@@ -257,11 +248,21 @@ tasks.named("preBuild").configure {
  * ========================================================================== */
 
 android {
-    /**
-     * Single source of truth for appId (override via local.properties: appId=...).
-     * Keep namespace aligned unless you have a deliberate reason to split them.
-     */
     val appId = prop("appId", "com.negi.survey")
+
+    // ---- GitHub config (supports both github.* and legacy gh.*) ----
+    val ghOwner = propAny("github.owner", "gh.owner")
+    val ghRepo = propAny("github.repo", "gh.repo", default = "SurveyExports")
+    val ghBranch = propAny("github.branch", "gh.branch", default = "main")
+    val ghPathPrefix = propAny("github.pathPrefix", "gh.pathPrefix", default = "")
+    val ghToken = propAny("github.token", "gh.token")
+    val hfToken = propAny("hf.token", "HF_TOKEN")
+
+    // ---- Supabase config (optional) ----
+    val supabaseUrl = prop("supabase.url")
+    val supabaseAnonKey = prop("supabase.anonKey")
+    val supabaseLogBucket = prop("supabase.logBucket", "logs")
+    val supabaseLogPrefix = prop("supabase.logPrefix", "surveyapp")
 
     namespace = appId
     compileSdk = 36
@@ -271,50 +272,25 @@ android {
         minSdk = 26
         targetSdk = 36
 
-        /**
-         * Versioning:
-         * - versionName is a tag-safe string intended to match CI release tags.
-         * - versionCode is a monotonically increasing int (Play Store requirement).
-         */
         val resolvedVersionName = resolveVersionName()
         val resolvedVersionCode = resolveVersionCode()
-
         versionName = resolvedVersionName
         versionCode = resolvedVersionCode
 
-        /**
-         * Human-readable display version for UI/logs.
-         * Always use quote(...) to avoid breaking BuildConfig on special chars.
-         */
         val displayVersion = "$resolvedVersionName with WhisperCpp"
         buildConfigField("String", "DISPLAY_VERSION", quote(displayVersion))
 
-        /** AndroidX Test Runner (required for Orchestrator). */
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-
-        /**
-         * Instrumentation args to reduce flakiness on Android 14+:
-         * - clearPackageData: isolates state between tests (good with Orchestrator)
-         * - useTestStorageService: avoids legacy external storage behavior
-         * - numShards=1: prevents accidental parallel sharding unless explicitly overridden
-         */
         testInstrumentationRunnerArguments["clearPackageData"] = "true"
         testInstrumentationRunnerArguments["useTestStorageService"] = "true"
         testInstrumentationRunnerArguments["numShards"] = "1"
     }
 
-    /** Always run androidTest against the debug build (stable applicationId). */
     testBuildType = "debug"
 
     testOptions {
-        /**
-         * ANDROIDX_TEST_ORCHESTRATOR:
-         * - each test runs in its own Instrumentation instance
-         * - drastically reduces shared-state flakiness
-         */
         execution = "ANDROIDX_TEST_ORCHESTRATOR"
         animationsDisabled = true
-        // unitTests.isIncludeAndroidResources = true
     }
 
     buildFeatures {
@@ -323,18 +299,12 @@ android {
     }
 
     compileOptions {
-        /** Keep Java 17 toolchain consistent with Kotlin jvmTarget. */
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
 
-    /* ============================================================================
-     * Kotlin compiler options (migrated from android.kotlinOptions{})
-     * ========================================================================== */
-
     kotlin {
         jvmToolchain(17)
-
         compilerOptions {
             jvmTarget.set(JvmTarget.JVM_17)
             freeCompilerArgs.add("-XXLanguage:+BreakContinueInInlineLambdas")
@@ -344,25 +314,39 @@ android {
     buildTypes {
         debug {
             /** Avoid applicationIdSuffix to keep MediaStore ownership stable. */
-            buildConfigField("String", "GH_OWNER", quote(prop("gh.owner")))
-            buildConfigField("String", "GH_REPO", quote("SurveyExports"))
-            buildConfigField("String", "GH_BRANCH", quote("main"))
-            buildConfigField("String", "GH_PATH_PREFIX", quote(""))
-            buildConfigField("String", "GH_TOKEN", quote(prop("gh.token")))
-            buildConfigField("String", "HF_TOKEN", quote(prop("HF_TOKEN")))
+            buildConfigField("String", "GH_OWNER", quote(ghOwner))
+            buildConfigField("String", "GH_REPO", quote(ghRepo))
+            buildConfigField("String", "GH_BRANCH", quote(ghBranch))
+            buildConfigField("String", "GH_PATH_PREFIX", quote(ghPathPrefix))
+            buildConfigField("String", "GH_TOKEN", quote(ghToken))
+            buildConfigField("String", "HF_TOKEN", quote(hfToken))
+
+            // Supabase (optional)
+            buildConfigField("String", "SUPABASE_URL", quote(supabaseUrl))
+            buildConfigField("String", "SUPABASE_ANON_KEY", quote(supabaseAnonKey))
+            buildConfigField("String", "SUPABASE_LOG_BUCKET", quote(supabaseLogBucket))
+            buildConfigField("String", "SUPABASE_LOG_PATH_PREFIX", quote(supabaseLogPrefix))
         }
+
         release {
             isMinifyEnabled = false
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
             )
-            buildConfigField("String", "GH_OWNER", quote(prop("gh.owner")))
-            buildConfigField("String", "GH_REPO", quote("SurveyExports"))
-            buildConfigField("String", "GH_BRANCH", quote("main"))
-            buildConfigField("String", "GH_PATH_PREFIX", quote(""))
-            buildConfigField("String", "GH_TOKEN", quote(prop("gh.token")))
-            buildConfigField("String", "HF_TOKEN", quote(prop("HF_TOKEN")))
+
+            buildConfigField("String", "GH_OWNER", quote(ghOwner))
+            buildConfigField("String", "GH_REPO", quote(ghRepo))
+            buildConfigField("String", "GH_BRANCH", quote(ghBranch))
+            buildConfigField("String", "GH_PATH_PREFIX", quote(ghPathPrefix))
+            buildConfigField("String", "GH_TOKEN", quote(ghToken))
+            buildConfigField("String", "HF_TOKEN", quote(hfToken))
+
+            // Supabase (optional)
+            buildConfigField("String", "SUPABASE_URL", quote(supabaseUrl))
+            buildConfigField("String", "SUPABASE_ANON_KEY", quote(supabaseAnonKey))
+            buildConfigField("String", "SUPABASE_LOG_BUCKET", quote(supabaseLogBucket))
+            buildConfigField("String", "SUPABASE_LOG_PATH_PREFIX", quote(supabaseLogPrefix))
 
             /**
              * Debug signing for CI/dev convenience.
@@ -372,10 +356,6 @@ android {
         }
     }
 
-    /**
-     * Broad META-INF excludes to avoid conflicts among OkHttp/Coroutines/Media3/MediaPipe, etc.
-     * Prefer excludes over pickFirst to reduce hidden runtime surprises.
-     */
     packaging {
         resources {
             excludes += setOf(
@@ -488,12 +468,6 @@ dependencies {
  * Diagnostic tasks
  * ========================================================================== */
 
-/**
- * Print resolved instrumentation runner arguments.
- *
- * Usage:
- *  ./gradlew :app:printAndroidTestArgs
- */
 tasks.register("printAndroidTestArgs") {
     group = "verification"
     description = "Print resolved default instrumentation runner arguments."
@@ -506,12 +480,6 @@ tasks.register("printAndroidTestArgs") {
     }
 }
 
-/**
- * Fail if more than one device is connected.
- *
- * This prevents duplicate test runs caused by multiple attached devices/emulators.
- * Note: Requires adb to be available on PATH.
- */
 tasks.register("checkSingleConnectedDevice") {
     group = "verification"
     description = "Fails if more than one device is connected (helps avoid double runs)."
@@ -527,7 +495,7 @@ tasks.register("checkSingleConnectedDevice") {
         process.waitFor()
 
         val lines = out.lineSequence()
-            .drop(1) // skip header
+            .drop(1)
             .map { it.trim() }
             .filter { it.isNotEmpty() && it.contains("\tdevice") }
             .toList()
@@ -543,12 +511,6 @@ tasks.register("checkSingleConnectedDevice") {
     }
 }
 
-/**
- * Print all assets included in src/main/assets.
- *
- * Usage:
- *  ./gradlew :app:printAssets
- */
 tasks.register("printAssets") {
     group = "diagnostic"
     description = "Print all assets included in src/main/assets"

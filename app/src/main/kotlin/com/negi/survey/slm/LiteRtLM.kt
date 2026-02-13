@@ -73,7 +73,7 @@ private const val RETIRED_CLOSE_GRACE_MS = 1_500L
 private const val POST_TERMINATE_COOLDOWN_MS = 250L
 
 /** Init await timeout. */
-private const val INIT_AWAIT_TIMEOUT_MS = 60_000L
+private const val INIT_AWAIT_TIMEOUT_MS = 90_000L
 
 /** Streaming watchdog. */
 private const val STREAM_WATCHDOG_MS = 120_000L

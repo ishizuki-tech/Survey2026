@@ -414,7 +414,7 @@ class LiteRtRepository(
 
         private val REQ_SEQ = AtomicLong(0L)
 
-        private const val INIT_TIMEOUT_MS = 60_000L
+        private const val INIT_TIMEOUT_MS = 90_000L
 
         /** Overall safety cap for a single request (GPU cold start can be slow). */
         private const val HARD_WATCHDOG_MS = 120_000L

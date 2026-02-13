@@ -262,43 +262,21 @@ private fun getMethodBucket(cls: Class<*>, methodName: String, argc: Int): List<
 }
 
 /**
- * Convert a Java primitive class (e.g., Int::class.javaPrimitiveType) to its boxed class.
- *
- * Why:
- * - Referencing java.lang.Integer / java.lang.Boolean directly triggers Kotlin warnings
- *   ("This class is not recommended for use in Kotlin").
- * - Kotlin provides javaPrimitiveType / javaObjectType which are the idiomatic way.
- *
- * @param p A Java Class that may represent a primitive type.
- * @return The boxed (wrapper) class if p is primitive; otherwise null.
+ * Convert primitive parameter class to its boxed counterpart.
  */
 private fun boxedOfPrimitive(p: Class<*>): Class<*>? {
     if (!p.isPrimitive) return null
-
-    // NOTE: javaPrimitiveType can be null in weird edge cases; be defensive.
     return when (p) {
-        Boolean::class.javaPrimitiveType -> Boolean::class.javaObjectType
-        Int::class.javaPrimitiveType -> Int::class.javaObjectType
-        Long::class.javaPrimitiveType -> Long::class.javaObjectType
-        Float::class.javaPrimitiveType -> Float::class.javaObjectType
-        Double::class.javaPrimitiveType -> Double::class.javaObjectType
-        Short::class.javaPrimitiveType -> Short::class.javaObjectType
-        Byte::class.javaPrimitiveType -> Byte::class.javaObjectType
-        Char::class.javaPrimitiveType -> Char::class.javaObjectType
+        java.lang.Boolean.TYPE -> java.lang.Boolean::class.java
+        java.lang.Integer.TYPE -> java.lang.Integer::class.java
+        java.lang.Long.TYPE -> java.lang.Long::class.java
+        java.lang.Float.TYPE -> java.lang.Float::class.java
+        java.lang.Double.TYPE -> java.lang.Double::class.java
+        java.lang.Short.TYPE -> java.lang.Short::class.java
+        java.lang.Byte.TYPE -> java.lang.Byte::class.java
+        java.lang.Character.TYPE -> java.lang.Character::class.java
         else -> null
     }
-}
-
-/**
- * Check whether a reflection parameter expects either the primitive or boxed form of a Kotlin type.
- *
- * @param param The reflection parameter class.
- * @param primitive The primitive class (e.g., Int::class.javaPrimitiveType).
- * @param boxed The boxed class (e.g., Int::class.javaObjectType).
- */
-private fun wantsType(param: Class<*>, primitive: Class<*>?, boxed: Class<*>): Boolean {
-    // NOTE: primitive can be null in some edge cases; keep it safe.
-    return (primitive != null && param == primitive) || (param == boxed)
 }
 
 /**
@@ -320,13 +298,13 @@ private fun coerceArgForParam(param: Class<*>, arg: Any?): Any? {
     val boxed = boxedOfPrimitive(param)
     if (boxed != null && boxed.isInstance(arg)) return arg
 
-    // Usage
-    val wantsInt = wantsType(param, Int::class.javaPrimitiveType, Int::class.javaObjectType)
-    val wantsLong = wantsType(param, Long::class.javaPrimitiveType, Long::class.javaObjectType)
-    val wantsFloat = wantsType(param, Float::class.javaPrimitiveType, Float::class.javaObjectType)
-    val wantsDouble = wantsType(param, Double::class.javaPrimitiveType, Double::class.javaObjectType)
-    val wantsShort = wantsType(param, Short::class.javaPrimitiveType, Short::class.javaObjectType)
-    val wantsByte = wantsType(param, Byte::class.javaPrimitiveType, Byte::class.javaObjectType)
+    /** Numeric coercions. */
+    val wantsInt = (param == java.lang.Integer.TYPE || param == java.lang.Integer::class.java)
+    val wantsLong = (param == java.lang.Long.TYPE || param == java.lang.Long::class.java)
+    val wantsFloat = (param == java.lang.Float.TYPE || param == java.lang.Float::class.java)
+    val wantsDouble = (param == java.lang.Double.TYPE || param == java.lang.Double::class.java)
+    val wantsShort = (param == java.lang.Short.TYPE || param == java.lang.Short::class.java)
+    val wantsByte = (param == java.lang.Byte.TYPE || param == java.lang.Byte::class.java)
 
     if (arg is Number) {
         return when {

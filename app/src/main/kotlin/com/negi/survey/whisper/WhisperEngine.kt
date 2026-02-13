@@ -30,6 +30,8 @@ import kotlinx.coroutines.withContext
 private const val LOG_TAG = "WhisperEngine"
 private const val DEFAULT_TARGET_SAMPLE_RATE = 16_000
 private const val ASSET_KEY_PREFIX = "asset:"
+private const val WAV_HEADER_BYTES_PCM16_MONO = 44L
+private const val PCM16_BYTES_PER_SAMPLE = 2L
 
 /**
  * Timing breakdown for a single transcription run.
@@ -170,6 +172,32 @@ object WhisperEngine {
      */
     fun isInitializedForAsset(assetPath: String): Boolean =
         whisperContext != null && modelKey == ASSET_KEY_PREFIX + assetPath
+
+    /**
+     * Estimate a PCM_16BIT MONO WAV file size in bytes.
+     *
+     * NOTE:
+     * - This is an approximation that assumes a standard 44-byte WAV header.
+     * - It does NOT account for extra chunks or non-PCM encodings.
+     */
+    fun estimatePcm16MonoWavBytes(seconds: Int, sampleRateHz: Int): Long {
+        val s = seconds.coerceAtLeast(0).toLong()
+        val sr = sampleRateHz.coerceAtLeast(1).toLong()
+        return WAV_HEADER_BYTES_PCM16_MONO + (s * sr * PCM16_BYTES_PER_SAMPLE)
+    }
+
+    /**
+     * Estimate audio duration (seconds) from a PCM_16BIT MONO WAV byte length.
+     *
+     * NOTE:
+     * - This is an approximation that assumes a standard 44-byte WAV header.
+     * - Returns 0.0 when bytes <= header size.
+     */
+    fun estimatePcm16MonoWavSeconds(bytes: Long, sampleRateHz: Int): Double {
+        val sr = sampleRateHz.coerceAtLeast(1).toDouble()
+        val payload = (bytes - WAV_HEADER_BYTES_PCM16_MONO).coerceAtLeast(0L).toDouble()
+        return payload / (sr * PCM16_BYTES_PER_SAMPLE.toDouble())
+    }
 
     /**
      * Ensure that a Whisper model is loaded from [modelFile].
@@ -608,36 +636,10 @@ object WhisperEngine {
     /**
      * Transcribe the given WAV [file] and return plain-text output.
      *
-     * Steps:
-     * 1) Decode WAV to mono float PCM via [decodeWaveFile].
-     * 2) Log basic PCM statistics (size, min, max, RMS).
-     * 3) Call [WhisperContext.transcribeData] for one or more languages:
-     *    - If [lang] == "auto", tries "auto" then "en", "ja", "sw".
-     *    - Otherwise, tries only the specified [lang].
-     *
-     * Timing:
-     * - Measures decode time, mutex wait time, per-language transcribe time, and total time.
-     * - Provides [onTiming] callback for UI/analytics.
-     *
-     * Return policy:
-     * - The first non-empty trimmed transcript is returned as success.
-     * - If all attempts produce empty text without throwing, the last empty
-     *   trimmed result is returned as success.
-     *
-     * Thread-safety:
-     * - The Whisper JNI call is protected by [engineMutex].
-     *
      * IMPORTANT (format safety):
      * - Do NOT call String.format / "…".format() on strings that already include
      *   dynamic text (e.g., transcript previews). '%' inside the transcript can
      *   crash Formatter with UnknownFormatConversionException.
-     *
-     * @param file Input WAV file (PCM16 or Float32). Must exist.
-     * @param lang Language code ("en", "ja", "sw", or "auto").
-     * @param translate If true, runs Whisper in translation-to-English mode.
-     * @param printTimestamp If true, appends timestamps to each output line.
-     * @param targetSampleRate Target sample rate for decoding.
-     * @param onTiming Optional callback receiving a timing breakdown for this call.
      */
     suspend fun transcribeWaveFile(
         file: File,
@@ -657,10 +659,15 @@ object WhisperEngine {
             )
         }
 
+        val fileBytes = runCatching { file.length() }.getOrDefault(-1L)
+        val approxSecFromBytes = if (fileBytes >= 0L) estimatePcm16MonoWavSeconds(fileBytes, targetSampleRate) else -1.0
+
         val activeKeyAtStart = modelKey
         Log.d(
             LOG_TAG,
-            "[$requestId][asr] Start. file=${file.name} lang=$lang translate=$translate printTimestamp=$printTimestamp sr=$targetSampleRate modelKey=$activeKeyAtStart thread=${Thread.currentThread().name}"
+            "[$requestId][asr] Start. file=${file.name} bytes=${formatBytes(fileBytes)} " +
+                    "approxSec(pcm16mono@${targetSampleRate}Hz)=${formatFixed2(approxSecFromBytes)} " +
+                    "lang=$lang translate=$translate printTimestamp=$printTimestamp sr=$targetSampleRate modelKey=$activeKeyAtStart thread=${Thread.currentThread().name}"
         )
         logMemory("[$requestId][asr]")
 

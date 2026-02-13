@@ -27,16 +27,23 @@
 package com.negi.survey.net
 
 import android.content.Context
+import android.content.pm.PackageInfo
+import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Process
 import android.util.Log
 import java.io.ByteArrayOutputStream
+import java.io.InputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.TimeZone
+import java.util.concurrent.TimeUnit
 import java.util.zip.GZIPOutputStream
+import kotlin.math.min
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlin.system.measureTimeMillis
 
 private const val TAG = "GitHubLogUploader"
 
@@ -48,6 +55,16 @@ private const val TAG = "GitHubLogUploader"
  * - Contents API has practical size constraints; we trim tail and gzip.
  */
 object GitHubLogUploader {
+
+    /**
+     * Operational cap for gzip log payload bytes to keep repo bloat under control.
+     *
+     * This is NOT an official GitHub limit. It is a practical cap for diagnostics files.
+     */
+    private const val LOG_GZ_MAX_BYTES_DEFAULT = 900_000
+
+    /** Timeout for each logcat dump command. */
+    private const val LOGCAT_CMD_TIMEOUT_MS = 1800L
 
     /**
      * Result payload for log upload.
@@ -86,8 +103,14 @@ object GitHubLogUploader {
         onProgress(0)
 
         val pid = Process.myPid()
-        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-        val dateDir = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
+
+        // Use UTC for stable correlation across devices/timezones.
+        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).apply {
+            timeZone = TimeZone.getTimeZone("UTC")
+        }.format(Date())
+        val dateDir = SimpleDateFormat("yyyy-MM-dd", Locale.US).apply {
+            timeZone = TimeZone.getTimeZone("UTC")
+        }.format(Date())
 
         val remoteName = "logcat_${stamp}_pid${pid}.log.gz"
         val remotePath = buildRemotePath(
@@ -100,8 +123,29 @@ object GitHubLogUploader {
         val header = if (includeDeviceHeader) buildHeader(context, pid) else ""
 
         onProgress(5)
-        val mainLog = collectLogcatForPid(pid = pid, buffer = null)
-        val crashLog = if (includeCrashBuffer) collectLogcatForPid(pid = pid, buffer = "crash") else ""
+
+        // Split uncompressed budget to avoid holding too much in memory at once.
+        val budgetTotal = maxUncompressedBytes.coerceAtLeast(50_000)
+        val budgetMain = if (includeCrashBuffer) (budgetTotal * 3) / 4 else budgetTotal
+        val budgetCrash = (budgetTotal - budgetMain).coerceAtLeast(10_000)
+
+        val mainLog = collectLogcatForPidTail(
+            pid = pid,
+            buffer = null,
+            maxBytes = budgetMain,
+            timeoutMs = LOGCAT_CMD_TIMEOUT_MS
+        )
+
+        val crashLog = if (includeCrashBuffer) {
+            collectLogcatForPidTail(
+                pid = pid,
+                buffer = "crash",
+                maxBytes = budgetCrash,
+                timeoutMs = LOGCAT_CMD_TIMEOUT_MS
+            )
+        } else {
+            ""
+        }
 
         onProgress(15)
 
@@ -115,12 +159,15 @@ object GitHubLogUploader {
             }
         }
 
+        // Final tail trim across the whole combined text (header included).
         val combinedBytes = combinedText.toByteArray(Charsets.UTF_8)
-        val trimmed = trimToTail(combinedBytes, maxUncompressedBytes)
+        val trimmed = trimToTail(combinedBytes, budgetTotal)
 
         onProgress(20)
 
-        val gz = gzipAndFitToContentsLimit(trimmed)
+        val cfgRawHint = cfg.maxRawBytesHint.takeIf { it > 0 } ?: LOG_GZ_MAX_BYTES_DEFAULT
+        val maxGzBytes = min(cfgRawHint, LOG_GZ_MAX_BYTES_DEFAULT).coerceAtLeast(50_000)
+        val gz = gzipAndFitToMaxBytesBestEffort(trimmed, maxGzBytes)
 
         onProgress(35)
 
@@ -135,7 +182,9 @@ object GitHubLogUploader {
             onProgress = { p ->
                 val mapped = 35 + ((p.coerceIn(0, 100) / 100.0) * 65.0).toInt()
                 onProgress(mapped.coerceIn(35, 100))
-            }
+            },
+            maxRawBytesHint = cfg.maxRawBytesHint,
+            maxRequestBytesHint = cfg.maxRequestBytesHint,
         )
 
         onProgress(100)
@@ -157,9 +206,14 @@ object GitHubLogUploader {
      * - optionally: -b <buffer>
      *
      * If --pid is not supported on the device, this will fall back to a non-PID
-     * dump. This may include other processes. We still tail-trim and gzip.
+     * dump. Output is tail-captured to avoid large allocations.
      */
-    private fun collectLogcatForPid(pid: Int, buffer: String?): String {
+    private fun collectLogcatForPidTail(
+        pid: Int,
+        buffer: String?,
+        maxBytes: Int,
+        timeoutMs: Long
+    ): String {
         val base = mutableListOf("logcat", "-d", "-v", "threadtime")
         if (!buffer.isNullOrBlank()) {
             base.add("-b")
@@ -167,7 +221,10 @@ object GitHubLogUploader {
         }
         base.add("--pid=$pid")
 
-        val firstTry = runCatching { runProcess(base.toTypedArray()) }.getOrElse { "" }
+        val firstTry = runCatching {
+            runProcessTail(base.toTypedArray(), maxBytes, timeoutMs)
+        }.getOrElse { "" }
+
         if (firstTry.isNotBlank() && !looksLikePidUnsupported(firstTry)) return firstTry
 
         val fallback = mutableListOf("logcat", "-d", "-v", "threadtime")
@@ -176,15 +233,17 @@ object GitHubLogUploader {
             fallback.add(buffer)
         }
 
-        val out = runCatching { runProcess(fallback.toTypedArray()) }.getOrElse { t ->
-            Log.w(TAG, "collectLogcatForPid failed: ${t.message}", t)
-            "collectLogcatForPid failed: ${t.message}\n"
+        val out = runCatching {
+            runProcessTail(fallback.toTypedArray(), maxBytes, timeoutMs)
+        }.getOrElse { t ->
+            Log.w(TAG, "collectLogcatForPidTail failed: ${t.message}", t)
+            "collectLogcatForPidTail failed: ${t.message}\n"
         }
 
         return buildString {
             appendLine("=== WARNING ===")
             appendLine("PID-filtered logcat is not available on this device/runtime.")
-            appendLine("Fallback logcat dump may include other processes. Output is tail-trimmed.")
+            appendLine("Fallback logcat dump may include other processes. Output is tail-captured.")
             appendLine("================")
             appendLine()
             append(out)
@@ -192,24 +251,87 @@ object GitHubLogUploader {
     }
 
     /**
-     * Run a process and return UTF-8 output.
+     * Run a process and return tail-captured UTF-8 output.
+     *
+     * This avoids building a giant String in memory when logcat output is large.
+     * A timeout is enforced to avoid hung diagnostics collection on some devices.
      */
-    private fun runProcess(cmd: Array<String>): String {
+    private fun runProcessTail(cmd: Array<String>, maxBytes: Int, timeoutMs: Long): String {
+        val cap = maxBytes.coerceAtLeast(10_000)
+        val tail = TailBuffer(cap)
+
         val proc = ProcessBuilder(*cmd)
             .redirectErrorStream(true)
             .start()
 
-        val out = proc.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+        var readError: Throwable? = null
+
+        val reader = Thread {
+            runCatching {
+                proc.inputStream.use { stream ->
+                    pumpToTail(stream, tail)
+                }
+            }.onFailure { t ->
+                readError = t
+            }
+        }.apply {
+            isDaemon = true
+            name = "SurveyFix-LogcatReader"
+            start()
+        }
+
+        val elapsedMs = measureTimeMillis {
+            val finished = runCatching { proc.waitFor(timeoutMs, TimeUnit.MILLISECONDS) }.getOrDefault(false)
+            if (!finished) {
+                runCatching { proc.destroy() }
+                runCatching { proc.destroyForcibly() }
+            }
+        }
+
+        // Give the reader a moment to observe EOF after destroy().
+        runCatching { reader.join(250L) }
+
         runCatching { proc.destroy() }
+
+        val out = if (readError != null) {
+            "(logcat read failed: ${readError?.message})\n"
+        } else {
+            String(tail.toByteArray(), Charsets.UTF_8)
+        }
+
+        if (out.isBlank()) return "(logcat empty or restricted)\n"
+        if (elapsedMs >= timeoutMs) {
+            return "(logcat command timeout after ${timeoutMs}ms: ${cmd.joinToString(" ")})\n$out"
+        }
         return out
     }
 
     /**
-     * Heuristic: detect "unknown option" patterns.
+     * Pump stream into a tail buffer.
+     */
+    private fun pumpToTail(stream: InputStream, tail: TailBuffer) {
+        val buf = ByteArray(8 * 1024)
+        while (true) {
+            val n = stream.read(buf)
+            if (n <= 0) break
+            tail.append(buf, 0, n)
+        }
+    }
+
+    /**
+     * Heuristic: detect PID option unsupported patterns.
      */
     private fun looksLikePidUnsupported(output: String): Boolean {
         val s = output.lowercase(Locale.US)
-        return s.contains("unknown option") && s.contains("pid")
+        val mentionsPid = s.contains("pid") || s.contains("--pid")
+        val looksLikeOptionError =
+            s.contains("unknown option") ||
+                    s.contains("unrecognized option") ||
+                    s.contains("invalid option") ||
+                    s.contains("unknown argument") ||
+                    (s.contains("unknown") && s.contains("--pid")) ||
+                    (s.contains("usage:") && s.contains("logcat") && s.contains("pid"))
+        return mentionsPid && looksLikeOptionError
     }
 
     /**
@@ -219,16 +341,15 @@ object GitHubLogUploader {
         val pkg = context.packageName
         val pm = context.packageManager
 
-        val versionName = runCatching {
-            pm.getPackageInfo(pkg, 0).versionName ?: "unknown"
-        }.getOrElse { "unknown" }
+        val pkgInfo = getPackageInfoCompat(pm, pkg)
 
-        val versionCode = runCatching {
-            @Suppress("DEPRECATION")
-            pm.getPackageInfo(pkg, 0).longVersionCode
-        }.getOrElse { -1L }
+        val versionName = pkgInfo?.versionName ?: "unknown"
+        val versionCode = getVersionCodeCompat(pkgInfo)
 
-        val utc = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US).format(Date())
+        val sdf = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US).apply {
+            timeZone = TimeZone.getTimeZone("UTC")
+        }
+        val utc = sdf.format(Date())
 
         return buildString {
             appendLine("=== Diagnostics Header ===")
@@ -245,6 +366,33 @@ object GitHubLogUploader {
     }
 
     /**
+     * Get PackageInfo safely on all API levels.
+     */
+    private fun getPackageInfoCompat(pm: PackageManager, pkg: String): PackageInfo? {
+        return runCatching {
+            if (Build.VERSION.SDK_INT >= 33) {
+                pm.getPackageInfo(pkg, PackageManager.PackageInfoFlags.of(0L))
+            } else {
+                @Suppress("DEPRECATION")
+                pm.getPackageInfo(pkg, 0)
+            }
+        }.getOrNull()
+    }
+
+    /**
+     * Get versionCode as Long safely on all API levels (minSdk=26+).
+     */
+    private fun getVersionCodeCompat(pkgInfo: PackageInfo?): Long {
+        if (pkgInfo == null) return -1L
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            pkgInfo.longVersionCode
+        } else {
+            @Suppress("DEPRECATION")
+            pkgInfo.versionCode.toLong()
+        }
+    }
+
+    /**
      * Keep only the tail of the log when it exceeds [maxBytes].
      */
     private fun trimToTail(bytes: ByteArray, maxBytes: Int): ByteArray {
@@ -254,31 +402,42 @@ object GitHubLogUploader {
     }
 
     /**
-     * Gzip compress and ensure the gzip size is under GitHub Contents API raw-byte guard.
+     * Gzip compress and best-effort fit under [maxGzBytes].
      *
-     * GitHubUploader uses a raw bytes guard (~900k). Logs compress well, but we still
-     * handle worst cases by trimming further and recompressing a few times.
+     * This function should not throw; diagnostics should "upload something" even under pressure.
      */
-    private fun gzipAndFitToContentsLimit(input: ByteArray): ByteArray {
-        val hardLimit = 900_000 // must match your GitHubUploader guard
+    private fun gzipAndFitToMaxBytesBestEffort(input: ByteArray, maxGzBytes: Int): ByteArray {
+        return runCatching {
+            var current = input
+            repeat(5) { attempt ->
+                val gz = safeGzip(current)
+                if (gz.size in 1..maxGzBytes) return@runCatching gz
 
-        var current = input
-        repeat(4) { attempt ->
-            val gz = gzip(current)
-            if (gz.size <= hardLimit) return gz
+                val nextMax = (current.size * 0.70).toInt().coerceAtLeast(30_000)
+                current = trimToTail(current, nextMax)
 
-            val nextMax = (current.size * 0.75).toInt().coerceAtLeast(50_000)
-            val trimmed = trimToTail(current, nextMax)
-
-            Log.w(
-                TAG,
-                "gzip too large (attempt=$attempt gz=${gz.size}). " +
-                        "Trimming tail to $nextMax bytes and retrying."
-            )
-            current = trimmed
+                Log.w(
+                    TAG,
+                    "gzip too large (attempt=$attempt gz=${gz.size} > maxGzBytes=$maxGzBytes). " +
+                            "Trimming tail to $nextMax bytes and retrying."
+                )
+            }
+            safeGzip(current)
+        }.getOrElse { t ->
+            Log.w(TAG, "gzipAndFitToMaxBytesBestEffort failed: ${t.message}", t)
+            safeGzip("(gzip failed: ${t.message})\n".toByteArray(Charsets.UTF_8))
         }
+    }
 
-        return gzip(current)
+    /**
+     * Gzip compress in a safe way (never throws).
+     */
+    private fun safeGzip(input: ByteArray): ByteArray {
+        return runCatching { gzip(input) }
+            .getOrElse { t ->
+                runCatching { gzip("(gzip failed: ${t.message})\n".toByteArray(Charsets.UTF_8)) }
+                    .getOrElse { ByteArray(1) } // non-empty sentinel
+            }
     }
 
     /**
@@ -304,5 +463,40 @@ object GitHubLogUploader {
         if (addDateSubdir) parts.add(dateDir)
         parts.add(fileName.trim('/'))
         return parts.joinToString("/")
+    }
+
+    /**
+     * Fixed-size tail buffer for bytes.
+     */
+    private class TailBuffer(private val capacity: Int) {
+        private val buf = ByteArray(capacity)
+        private var pos = 0
+        private var size = 0
+
+        fun append(src: ByteArray, off: Int, len: Int) {
+            var o = off
+            var l = len
+            while (l > 0) {
+                val spaceToEnd = capacity - pos
+                val n = min(spaceToEnd, l)
+                System.arraycopy(src, o, buf, pos, n)
+                pos = (pos + n) % capacity
+                size = min(capacity, size + n)
+                o += n
+                l -= n
+            }
+        }
+
+        fun toByteArray(): ByteArray {
+            if (size == 0) return ByteArray(0)
+            if (size < capacity) {
+                return buf.copyOfRange(0, size)
+            }
+            val out = ByteArray(capacity)
+            val tailLen = capacity - pos
+            System.arraycopy(buf, pos, out, 0, tailLen)
+            System.arraycopy(buf, 0, out, tailLen, pos)
+            return out
+        }
     }
 }
