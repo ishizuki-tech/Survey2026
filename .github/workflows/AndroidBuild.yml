@@ -1,4 +1,4 @@
-name: Android CI & Release (SurveyNav2026)
+name: Android CI & Release
 
 on:
   workflow_dispatch:
@@ -39,18 +39,11 @@ on:
         default: "%Y%m%d-%H%M%S"
         required: true
 
-      # Native toolchain
       ndk_version:
-        description: "Android NDK version (side-by-side package id suffix)"
+        description: "Android NDK version"
         default: "29.0.14206865"
         required: true
 
-      cmake_version:
-        description: "Android CMake version (SDK package: cmake;X.Y.Z)"
-        default: "3.22.1"
-        required: true
-
-      # Android SDK
       compile_sdk:
         description: "Android compileSdk version (API level). Must match Gradle compileSdk."
         default: "36"
@@ -75,7 +68,9 @@ defaults:
 
 env:
   OWNER: ${{ github.repository_owner }}
-  REPO: ${{ github.repository }} # e.g. ishizuki-tech/Survey2026
+  REPO: ${{ github.repository }} # e.g. ishizuki-tech/SurveyNav2025
+  ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+  ANDROID_HOME: /usr/local/lib/android/sdk
 
 jobs:
   build:
@@ -125,16 +120,6 @@ jobs:
 
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-      - name: Validate module input
-        run: |-
-          set -euo pipefail
-          MODULE="${{ env.MODULE_PATH }}"
-          if [[ ! -d "${MODULE}" ]]; then
-            echo "::error::Module directory not found: '${MODULE}'"
-            echo "::error::Check workflow input 'module' (default: app)."
-            exit 1
-          fi
-
       - name: Ensure gradlew is executable
         run: chmod +x ./gradlew
 
@@ -147,54 +132,35 @@ jobs:
           distribution: temurin
           java-version: 17
 
-      - name: Set up Android SDK (cmdline-tools)
+      - name: Install Android SDK & NDK
         uses: android-actions/setup-android@v3
+        with:
+          ndk-version: ${{ inputs.ndk_version }}
 
-      - name: Debug Android SDK env
-        run: |-
-          set -euo pipefail
-          echo "::group::Android SDK env"
-          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-}"
-          echo "ANDROID_HOME=${ANDROID_HOME:-}"
-          command -v sdkmanager || true
-          sdkmanager --version || true
-          echo "::endgroup::"
-
-      - name: Install required SDK components (platforms/build-tools/NDK/CMake)
+      - name: Install required SDK components
         run: |-
           set -euo pipefail
           COMPILE_SDK="${{ inputs.compile_sdk }}"
           BUILD_TOOLS="${{ inputs.build_tools }}"
-          NDK_VERSION="${{ inputs.ndk_version }}"
-          CMAKE_VERSION="${{ inputs.cmake_version }}"
 
           echo "::group::Android SDK install"
           echo "Installing:"
           echo "  - platforms;android-${COMPILE_SDK}"
           echo "  - build-tools;${BUILD_TOOLS}"
           echo "  - platform-tools"
-          echo "  - ndk;${NDK_VERSION}"
-          echo "  - cmake;${CMAKE_VERSION}"
           echo "::endgroup::"
 
-          # NOTE: `yes | sdkmanager ...` may produce SIGPIPE on `yes` (exit 141).
-          # Turning off pipefail avoids failing the step due to the `yes` side.
           set +o pipefail
           yes | sdkmanager --install \
             "platforms;android-${COMPILE_SDK}" \
             "build-tools;${BUILD_TOOLS}" \
-            "platform-tools" \
-            "ndk;${NDK_VERSION}" \
-            "cmake;${CMAKE_VERSION}"
+            "platform-tools"
           set -o pipefail
 
       - name: Accept Android SDK licenses
         run: |-
           set -euo pipefail
-          # Same SIGPIPE caveat as above.
-          set +o pipefail
           yes | sdkmanager --licenses >/dev/null || true
-          set -o pipefail
 
       - name: Configure Gradle cache
         uses: gradle/actions/setup-gradle@v3
@@ -204,22 +170,75 @@ jobs:
           set -euo pipefail
           mkdir -p "$HOME/.gradle"
 
-          # Secrets may be empty. Keep builds working.
+          # ------------------------------
+          # GitHub export target (BuildConfig.*)
+          # ------------------------------
+          GH_OWNER="${{ vars.GH_OWNER }}"
+          GH_REPO="${{ vars.GH_REPO }}"
+          GH_BRANCH="${{ vars.GH_BRANCH }}"
+          GH_PATH_PREFIX="${{ vars.GH_PATH_PREFIX }}"
           GH_TOKEN="${{ secrets.GH_TOKEN }}"
-          HF_TOKEN="${{ secrets.HF_TOKEN }}"
 
-          if [[ -z "${GH_TOKEN}" ]]; then
+          # Fallbacks (keep CI working even if vars are missing)
+          if [[ -z "$GH_OWNER" ]]; then GH_OWNER="${{ env.OWNER }}"; fi
+          if [[ -z "$GH_REPO"  ]]; then GH_REPO="SurveyExports"; fi
+          if [[ -z "$GH_BRANCH" ]]; then GH_BRANCH="main"; fi
+          if [[ -z "$GH_PATH_PREFIX" ]]; then GH_PATH_PREFIX=""; fi
+
+          if [[ -z "$GH_TOKEN" ]]; then
             echo "::warning::GH_TOKEN is not configured. BuildConfig GH_TOKEN will be empty."
           fi
 
-          cat <<PROPS > "$HOME/.gradle/gradle.properties"
-          gh.owner=${{ env.OWNER }}
-          gh.token=${GH_TOKEN}
-          HF_TOKEN=${HF_TOKEN}
+          # ------------------------------
+          # Supabase (optional)
+          # ------------------------------
+          SUPABASE_URL="${{ secrets.SUPABASE_URL }}"
+          SUPABASE_ANON_KEY="${{ secrets.SUPABASE_ANON_KEY }}"
+          SUPABASE_LOG_BUCKET="${{ vars.SUPABASE_LOG_BUCKET }}"
+          SUPABASE_LOG_PREFIX="${{ vars.SUPABASE_LOG_PREFIX }}"
+
+          if [[ -z "$SUPABASE_LOG_BUCKET" ]]; then SUPABASE_LOG_BUCKET="logs"; fi
+          if [[ -z "$SUPABASE_LOG_PREFIX" ]]; then SUPABASE_LOG_PREFIX="surveyapp"; fi
+
+          # ------------------------------
+          # Hugging Face (optional)
+          # ------------------------------
+          HF_TOKEN="${{ secrets.HF_TOKEN }}"
+
+          # Write properties (support both github.* and legacy gh.*)
+          cat > "$HOME/.gradle/gradle.properties" <<PROPS
+          # ---- GitHub config ----
+          github.owner=$GH_OWNER
+          github.repo=$GH_REPO
+          github.branch=$GH_BRANCH
+          github.pathPrefix=$GH_PATH_PREFIX
+          github.token=$GH_TOKEN
+
+          gh.owner=$GH_OWNER
+          gh.repo=$GH_REPO
+          gh.branch=$GH_BRANCH
+          gh.pathPrefix=$GH_PATH_PREFIX
+          gh.token=$GH_TOKEN
+
+          # ---- Supabase config ----
+          supabase.url=$SUPABASE_URL
+          supabase.anonKey=$SUPABASE_ANON_KEY
+          supabase.logBucket=$SUPABASE_LOG_BUCKET
+          supabase.logPrefix=$SUPABASE_LOG_PREFIX
+
+          # ---- Hugging Face token ----
+          hf.token=$HF_TOKEN
+          HF_TOKEN=$HF_TOKEN
           PROPS
 
           echo "::group::gradle.properties (redacted view)"
-          sed -E 's/(gh\\.token=).+/\1***REDACTED***/g; s/(HF_TOKEN=).+/\1***REDACTED***/g' "$HOME/.gradle/gradle.properties" || true
+          sed -E \
+            -e 's/(github\.token=).+/\1***REDACTED***/g' \
+            -e 's/(gh\.token=).+/\1***REDACTED***/g' \
+            -e 's/(supabase\.anonKey=).+/\1***REDACTED***/g' \
+            -e 's/(HF_TOKEN=).+/\1***REDACTED***/g' \
+            -e 's/(hf\.token=).+/\1***REDACTED***/g' \
+            "$HOME/.gradle/gradle.properties" || true
           echo "::endgroup::"
 
       - name: Resolve versionName/tag + versionCode (with validation)
@@ -285,7 +304,6 @@ jobs:
           set -euo pipefail
           echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > keystore.jks
           echo "ANDROID_KEYSTORE_FILE=$PWD/keystore.jks" >> "$GITHUB_ENV"
-          echo "ORG_GRADLE_PROJECT_releaseStoreFile=$PWD/keystore.jks" >> "$GITHUB_ENV"
           echo "Keystore decoded: $PWD/keystore.jks"
 
       - name: Detect and run :<module>:downloadModel (optional, once)
@@ -298,9 +316,7 @@ jobs:
           ./gradlew ":${MODULE}:tasks" --all --no-daemon | tee gradle_tasks.log
           echo "::endgroup::"
 
-          # NOTE: grep -E does NOT reliably support \b as a word boundary.
-          # Use a portable pattern that matches Gradle's "downloadModel - ..." task line.
-          if grep -qE '^[[:space:]]*downloadModel([[:space:]]|-|$)' gradle_tasks.log; then
+          if grep -qE '(^|:)(downloadModel)\b' gradle_tasks.log; then
             echo "Found task :${MODULE}:downloadModel. Running it once..."
             echo "::group::downloadModel"
             ./gradlew ":${MODULE}:downloadModel" --stacktrace --no-daemon
@@ -318,12 +334,10 @@ jobs:
           TAG="${{ steps.ver.outputs.tag }}"
           VCODE="${{ steps.ver.outputs.version_code }}"
 
-          # Pass both custom -P keys and standard AGP injected keys for compatibility.
+          # Pass both -P and env-based values for maximum compatibility.
           EXTRA_ARGS=()
           EXTRA_ARGS+=("-Papp.versionName=${TAG}")
           EXTRA_ARGS+=("-Papp.versionCode=${VCODE}")
-          EXTRA_ARGS+=("-Pandroid.injected.version.name=${TAG}")
-          EXTRA_ARGS+=("-Pandroid.injected.version.code=${VCODE}")
 
           # If downloadModel was already executed, exclude it from the build graph.
           if [[ "${RAN_DOWNLOAD_MODEL:-0}" == "1" ]]; then
@@ -506,7 +520,7 @@ jobs:
         run: echo "Release publishing skipped."
 
   publish:
-    name: Publish Wiki + GH Pages (SurveyNav2026)
+    name: Publish Wiki + GH Pages
     runs-on: ubuntu-latest
     needs: build
     env:
@@ -602,13 +616,8 @@ jobs:
             git init
           fi
 
-          echo "::group::Wiki repo status (before)"
-          ls -la
-          git status --porcelain || true
-          echo "::endgroup::"
-
           {
-            echo "# 📦 SurveyNav2026 — Build ${TAG}"
+            echo "# 📦 SurveyNav — Build ${TAG}"
             echo "Generated: ${DATE}"
             echo ""
             echo "## Version"
@@ -626,45 +635,31 @@ jobs:
           } > "${TAG}.md"
 
           {
-            echo "# 🏠 SurveyNav2026 Wiki Home"
+            echo "# 🏠 SurveyNav Wiki Home"
             echo "Updated: ${DATE}"
             echo ""
             echo "## 📜 Build History (latest 20)"
           } > Home.md
 
-          # Build list:
-          # - print: "<mtime_epoch> <filename>"
-          # - sort by mtime desc
-          # - take latest 20
-          # - drop the first field only (works even if filename contains spaces)
-          LIST="$(
-            find . -maxdepth 1 -type f -name '*.md' \
-              ! -name 'Home.md' \
-              ! -name '_Sidebar.md' \
-              ! -name '_Footer.md' \
-              -printf '%T@ %P\n' \
+          MAP_TMP="_link-map.txt"
+          : > "$MAP_TMP"
+
+          LIST=$(
+            find . -maxdepth 1 -type f -name '*.md' ! -name 'Home.md' -printf '%T@ %P\n' \
               | sort -nr \
               | head -n 20 \
-              | sed -E 's/^[^ ]+ //'
-          )"
-
-          echo "::group::Wiki markdown list (latest 20)"
-          if [ -n "$LIST" ]; then
-            printf '%s\n' "$LIST"
-          else
-            echo "(empty)"
-          fi
-          echo "::endgroup::"
+              | awk '{ $1=""; sub(/^ /,""); print }'
+          )
 
           if [ -z "$LIST" ]; then
             echo "_No builds yet._" >> Home.md
           else
-            while IFS= read -r f; do
-              [ -z "$f" ] && continue
+            echo "$LIST" | while read -r f; do
               base="$(basename "$f" .md)"
               slug="$(printf '%s' "$base" | sed -E 's@[[:space:]]+@-@g; s@/@-@g; s/-+/-/g')"
               printf -- "- [%s](https://github.com/%s/wiki/%s)\n" "$base" "$REPO" "$slug" >> Home.md
-            done <<< "$LIST"
+              printf -- "%s.md -> %s\n" "$base.md" "$slug" >> "$MAP_TMP"
+            done
           fi
 
           {
@@ -673,19 +668,9 @@ jobs:
             echo "- [Downloads Page](${BASE_URL})"
           } >> Home.md
 
-          echo "::group::Home.md preview"
-          sed -n '1,200p' Home.md || true
-          echo "::endgroup::"
-
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add .
-
-          echo "::group::Git diff (wiki)"
-          git status --porcelain || true
-          git diff --stat || true
-          echo "::endgroup::"
-
           git commit -m "Update Wiki ${TAG}" || git commit --allow-empty -m "Ensure wiki"
           git branch -M master
           git remote remove origin 2>/dev/null || true
@@ -715,7 +700,7 @@ jobs:
           <!doctype html><html lang="en"><head>
           <meta charset="utf-8"/>
           <meta name="viewport" content="width=device-width,initial-scale=1"/>
-          <title>📦 SurveyNav2026 Downloads</title>
+          <title>📦 SurveyNav Downloads</title>
           <style>
             body{font-family:system-ui,Roboto,Inter,Arial;background:#0b0f17;color:#eee;margin:0}
             .wrap{max-width:960px;margin:auto;padding:40px}
@@ -729,7 +714,7 @@ jobs:
           </style>
           </head>
           <body><div class="wrap"><div class="glass">
-          <h1>📦 SurveyNav2026 — Latest Downloads</h1>
+          <h1>📦 SurveyNav — Latest Downloads</h1>
           <p class="muted"><strong>Generated:</strong> ${DATE}</p>
 
           <h2>⬇️ This Build</h2>
@@ -753,13 +738,9 @@ jobs:
           <p style="margin-top:16px;">
             <img src="https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=${BASE_URL}" alt="QR">
           </p>
-          <footer>Generated by SurveyNav2026 CI — ${DATE}</footer>
+          <footer>Generated by SurveyNav CI — ${DATE}</footer>
           </div></div></body></html>
           HTML
-
-          echo "::group::GH Pages preview"
-          sed -n '1,200p' gh-pages/index.html || true
-          echo "::endgroup::"
 
       - name: Publish GH Pages
         uses: peaceiris/actions-gh-pages@v4

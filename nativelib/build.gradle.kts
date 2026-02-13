@@ -1,17 +1,16 @@
 // file: nativelib/build.gradle.kts
 // ============================================================
-// ✅ whisper.cpp JNI Library Module — Final Stable v2.0
+// whisper.cpp JNI Library Module — AGP 9+ (Built-in Kotlin)
 // ------------------------------------------------------------
-// • AGP 8.13 / Gradle 8.14 / Kotlin 2.2 / NDK 28.1
-// • Stable externalNativeBuild + GGML flags
-// • No GPU deps (CPU-only Android build)
+// - AGP 9.x / Gradle 8.x / Kotlin (built-in) / NDK 29.0
+// - Stable externalNativeBuild + GGML flags
+// - CPU-only Android build
 // ============================================================
-
-import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
     id("com.android.library")
-    id("org.jetbrains.kotlin.android")
+    // NOTE:
+    // AGP 9+ provides built-in Kotlin. Do NOT apply org.jetbrains.kotlin.android here.
 }
 
 android {
@@ -24,7 +23,7 @@ android {
         consumerProguardFiles("consumer-rules.pro")
 
         ndk {
-            // ✅ Only build for arm64 for Android devices
+            // Only build for arm64 for Android devices
             //noinspection ChromeOsAbiSupport
             abiFilters += listOf("arm64-v8a")
         }
@@ -47,12 +46,13 @@ android {
                     args += "-DGGML_HOME=$ggmlHome"
                 }
 
-                // ✅ Correct Kotlin DSL call
                 arguments.addAll(args)
 
-                // ✅ O2 is faster to build + stable
+                // -O2 is faster to build + stable
                 cFlags.add("-O2")
-                cppFlags.add("-O2 -fexceptions -frtti")
+
+                // Split flags to avoid being treated as a single token
+                cppFlags.addAll(listOf("-O2", "-fexceptions", "-frtti"))
             }
         }
     }
@@ -77,17 +77,7 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
-    kotlin {
-        compilerOptions {
-            jvmTarget.set(JvmTarget.JVM_17)
-            freeCompilerArgs.addAll(
-                "-Xjvm-default=all",
-                "-opt-in=kotlin.RequiresOptIn"
-            )
-        }
-    }
-
-    // ✅ CMake Path (whisper.cpp JNI)
+    // CMake Path (whisper.cpp JNI)
     externalNativeBuild {
         cmake {
             path = file("src/main/jni/whisper/CMakeLists.txt")
@@ -95,12 +85,8 @@ android {
         }
     }
 
-    sourceSets {
-        getByName("main") {
-            java.srcDirs("src/main/java", "src/main/kotlin")
-            jniLibs.srcDirs("src/main/jniLibs")
-        }
-    }
+    // Default Android sources already include src/main/java and src/main/kotlin under built-in Kotlin.
+    // Keep sourceSets only if you truly need non-standard dirs.
 
     buildFeatures {
         buildConfig = true
@@ -114,6 +100,22 @@ android {
     lint {
         abortOnError = false
         checkReleaseBuilds = false
+    }
+}
+
+// IMPORTANT:
+// With AGP 9 built-in Kotlin, migrate android.kotlinOptions{} -> kotlin.compilerOptions{}.
+// This block must be TOP-LEVEL (Project), not inside android{} or dependencies{}.
+kotlin {
+    compilerOptions {
+        // NOTE:
+        // With built-in Kotlin, jvmTarget defaults to android.compileOptions.targetCompatibility.
+        freeCompilerArgs.addAll(
+            listOf(
+                "-Xjvm-default=all",
+                "-opt-in=kotlin.RequiresOptIn"
+            )
+        )
     }
 }
 

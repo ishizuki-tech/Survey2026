@@ -1,14 +1,22 @@
 // file: app/build.gradle.kts
+import com.android.build.api.dsl.ApplicationExtension
 import java.io.ByteArrayOutputStream
 import java.util.Properties
 import org.gradle.api.GradleException
-import org.gradle.api.Project
 import org.gradle.api.tasks.Exec
+import org.gradle.kotlin.dsl.configure
+import org.gradle.kotlin.dsl.getByType
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
     alias(libs.plugins.android.application)
-    alias(libs.plugins.kotlin.android)
+
+    // NOTE:
+    // AGP 9+ uses built-in Kotlin for Android projects.
+    // Do NOT apply org.jetbrains.kotlin.android (kotlin.android) here.
+    // alias(libs.plugins.kotlin.android)
+
+    // KEEP: Kotlin plugins that are still valid with built-in Kotlin.
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.kotlin.serialization)
 }
@@ -244,10 +252,21 @@ tasks.named("preBuild").configure {
 }
 
 /* ============================================================================
- * Android config
+ * Kotlin config (Built-in Kotlin) — keep at top-level
  * ========================================================================== */
 
-android {
+kotlin {
+    compilerOptions {
+        jvmTarget.set(JvmTarget.JVM_17)
+        freeCompilerArgs.add("-XXLanguage:+BreakContinueInInlineLambdas")
+    }
+}
+
+/* ============================================================================
+ * Android config (AGP 9+ public DSL)
+ * ========================================================================== */
+
+extensions.configure<ApplicationExtension> {
     val appId = prop("appId", "com.negi.survey")
 
     // ---- GitHub config (supports both github.* and legacy gh.*) ----
@@ -301,14 +320,6 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
-    }
-
-    kotlin {
-        jvmToolchain(17)
-        compilerOptions {
-            jvmTarget.set(JvmTarget.JVM_17)
-            freeCompilerArgs.add("-XXLanguage:+BreakContinueInInlineLambdas")
-        }
     }
 
     buildTypes {
@@ -473,7 +484,8 @@ tasks.register("printAndroidTestArgs") {
     description = "Print resolved default instrumentation runner arguments."
     doLast {
         println("=== Default Instrumentation Args ===")
-        val args = android.defaultConfig.testInstrumentationRunnerArguments
+        val androidExt = project.extensions.getByType<ApplicationExtension>()
+        val args = androidExt.defaultConfig.testInstrumentationRunnerArguments
         args.forEach { (k, v) -> println(" - $k = $v") }
         println("===================================")
         println("Override example: -Pandroid.testInstrumentationRunnerArguments.numShards=2")
