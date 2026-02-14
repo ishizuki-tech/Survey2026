@@ -86,6 +86,26 @@ fun buildSurveyFileName(
 }
 
 /**
+ * Typed overload for UUID-first flows.
+ *
+ * @param surveyId Typed UUID wrapper.
+ * @param prefix File prefix (default: "survey").
+ * @param stamp Optional precomputed timestamp string.
+ * @param nowMillis Timestamp source when [stamp] is null.
+ */
+fun buildSurveyFileName(
+    surveyId: SurveyUuid,
+    prefix: String = "survey",
+    stamp: String? = null,
+    nowMillis: Long = System.currentTimeMillis()
+): String = buildSurveyFileName(
+    surveyId = surveyId.value,
+    prefix = prefix,
+    stamp = stamp,
+    nowMillis = nowMillis
+)
+
+/**
  * Legacy-friendly overload for call sites that still name by session id.
  *
  * Legacy format:
@@ -178,6 +198,29 @@ fun buildVoiceFileName(
     return "${pfx}_${sid}_${qid}_${ts}.wav"
 }
 
+/**
+ * Typed overload for voice naming.
+ *
+ * @param surveyUuid Typed UUID wrapper.
+ * @param questionId Node ID for the question (nullable).
+ * @param prefix File prefix (default: "voice").
+ * @param stamp Optional precomputed timestamp string.
+ * @param nowMillis Timestamp source when [stamp] is null.
+ */
+fun buildVoiceFileName(
+    surveyUuid: SurveyUuid,
+    questionId: String?,
+    prefix: String = "voice",
+    stamp: String? = null,
+    nowMillis: Long = System.currentTimeMillis()
+): String = buildVoiceFileName(
+    surveyUuid = surveyUuid.value,
+    questionId = questionId,
+    prefix = prefix,
+    stamp = stamp,
+    nowMillis = nowMillis
+)
+
 /* ============================================================
  * Timestamp + sanitization
  * ============================================================ */
@@ -201,6 +244,12 @@ private fun timeStamp(
     return fmt.format(Date(nowMillis))
 }
 
+/** Max length for sanitized filename segments. */
+private const val MAX_SEGMENT_LEN = 80
+
+/** Precompiled regex for sanitization. */
+private val UNSAFE_CHARS_REGEX = Regex("[^A-Za-z0-9._-]+")
+
 /**
  * Sanitize a filename segment to avoid path traversal and unstable characters.
  *
@@ -217,8 +266,8 @@ private fun timeStamp(
 private fun safeSegment(raw: String): String {
     return raw
         .trim()
-        .replace(Regex("[^A-Za-z0-9._-]+"), "_")
+        .replace(UNSAFE_CHARS_REGEX, "_")
         .trim('_')
-        .take(80)
+        .take(MAX_SEGMENT_LEN)
         .ifBlank { "unknown" }
 }

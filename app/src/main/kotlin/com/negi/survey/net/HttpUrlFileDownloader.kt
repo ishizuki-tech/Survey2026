@@ -143,6 +143,7 @@ class HttpUrlFileDownloader(
                 )
 
                 var triesOnThisStream = 0
+                var unauthorizedCount = 0
 
                 STREAM@ while (true) {
                     if (triesOnThisStream > 0) {
@@ -172,7 +173,13 @@ class HttpUrlFileDownloader(
                         when (code) {
                             HttpURLConnection.HTTP_UNAUTHORIZED,
                             HttpURLConnection.HTTP_FORBIDDEN -> {
-                                logw("GET $code: may need refreshed access. Retrying probe.")
+                                // NOTE: Without a cap, this can loop forever when token/ACL is wrong.
+                                unauthorizedCount++
+                                val snippet = readErrorSnippet(conn)
+                                logw("GET $code: unauthorized/forbidden (count=$unauthorizedCount) ${snippet ?: ""}".trim())
+                                if (unauthorizedCount >= MAX_UNAUTHORIZED_RETRIES) {
+                                    throw IOException("GET HTTP $code: access denied. ${snippet ?: ""}".trim())
+                                }
                                 triesOnThisStream++
                                 resumeFrom = part.length().coerceIn(0, total)
                                 continue@STREAM
@@ -205,12 +212,19 @@ class HttpUrlFileDownloader(
                                 throw IOException("416 reconciliation failed repeatedly.")
                             }
 
-                            429, 503 -> {
+                            429, 503, 408 -> {
                                 throw HttpExceptionWithRetryAfter(
                                     message = "GET HTTP $code",
                                     retryAfterMs = readRetryAfterMs(conn)
                                 )
                             }
+                        }
+
+                        if (code in 500..599) {
+                            throw HttpExceptionWithRetryAfter(
+                                message = "GET HTTP $code",
+                                retryAfterMs = readRetryAfterMs(conn)
+                            )
                         }
 
                         if (code !in listOf(
@@ -342,7 +356,7 @@ class HttpUrlFileDownloader(
                     return probeViaRangeGet(current, connectTimeoutMs, readTimeoutMs)
                 }
 
-                if (code == 429 || code == 503) {
+                if (code == 429 || code == 503 || code == 408 || code in 500..599) {
                     throw HttpExceptionWithRetryAfter("HEAD HTTP $code", readRetryAfterMs(conn))
                 }
 
@@ -391,7 +405,7 @@ class HttpUrlFileDownloader(
                     continue
                 }
 
-                if (code == 429 || code == 503) {
+                if (code == 429 || code == 503 || code == 408 || code in 500..599) {
                     throw HttpExceptionWithRetryAfter("GET-probe HTTP $code", readRetryAfterMs(conn))
                 }
 
@@ -481,14 +495,22 @@ class HttpUrlFileDownloader(
         }.getOrNull()
 
         fun write(meta: Meta) {
+            // Atomic-ish write: write to tmp then rename.
             runCatching {
-                file.writeText(
+                val tmp = File(file.parentFile, file.name + ".tmp")
+                tmp.writeText(
                     buildString {
                         meta.etag?.let { append("etag=$it\n") }
                         meta.lastModified?.let { append("lastModified=$it\n") }
                         meta.total?.let { append("total=$it\n") }
                     }
                 )
+                if (file.exists()) runCatching { file.delete() }
+                if (!tmp.renameTo(file)) {
+                    // Fallback
+                    file.writeText(tmp.readText())
+                    runCatching { tmp.delete() }
+                }
             }
         }
 
@@ -695,6 +717,7 @@ class HttpUrlFileDownloader(
         conn.setRequestProperty("Accept", "application/octet-stream")
         conn.setRequestProperty("Accept-Charset", "UTF-8")
         conn.setRequestProperty("Accept-Encoding", "identity")
+        conn.setRequestProperty("Connection", "close")
 
         if (isHfHost(url) && !hfToken.isNullOrBlank()) {
             conn.setRequestProperty("Authorization", "Bearer $hfToken")
@@ -753,7 +776,9 @@ class HttpUrlFileDownloader(
 
     private fun safeDelete(f: File) {
         runCatching {
-            if (f.exists()) f.delete()
+            if (f.exists() && !f.delete()) {
+                logw("Failed to delete: ${f.absolutePath}")
+            }
         }
     }
 
@@ -769,4 +794,9 @@ class HttpUrlFileDownloader(
         message: String,
         val retryAfterMs: Long?
     ) : IOException(message)
+
+    companion object {
+        /** Maximum number of in-stream retries for 401/403 to avoid infinite loops. */
+        private const val MAX_UNAUTHORIZED_RETRIES = 2
+    }
 }

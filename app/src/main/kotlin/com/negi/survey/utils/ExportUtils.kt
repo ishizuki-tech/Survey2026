@@ -28,8 +28,8 @@ import java.util.TimeZone
  * Layout:
  *   <external-or-internal>/exports/
  *     └─ voice/
- *          ├─ voice_<...>_YYYYMMDD_HHmmss.wav
- *          └─ voice_<...>_YYYYMMDD_HHmmss.meta.json
+ *          ├─ voice_<surveyUuid>_<questionId>_<stamp>.wav
+ *          └─ voice_<surveyUuid>_<questionId>_<stamp>.meta.json
  *
  * Design goals:
  * - Prefer app-scoped external storage when available (no runtime permission).
@@ -53,16 +53,6 @@ object ExportUtils {
     private const val WAV_HEADER_BYTES = 44L
 
     /**
-     * Maximum length for each ID segment used in file naming.
-     *
-     * This prevents extremely long survey/question IDs from producing
-     * file names that exceed filesystem limits.
-     */
-    private const val MAX_SEGMENT_LEN = 48
-
-    /**
-     * Time format for file naming.
-     *
      * We use UTC to make exported names stable across devices and locales.
      */
     private val FILE_TS_FORMAT = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).apply {
@@ -113,11 +103,9 @@ object ExportUtils {
      * - [source] must exist and be a file.
      * - [source] must be larger than a minimal WAV header size.
      *
-     * Naming:
-     * - Base pattern:
-     *     voice_<surveyId>_<questionId>_YYYYMMDD_HHmmss.wav
-     * - Each optional ID segment is sanitized and length-capped.
-     * - A uniqueness suffix is added if a collision occurs.
+     * Naming authority:
+     * - Delegates to [buildVoiceFileName] from SurveyFileName.kt
+     * - UTC stamp is supplied by this class to keep exports stable cross-device.
      *
      * Atomicity:
      * - The copy is performed into a temporary ".part" file first.
@@ -150,26 +138,22 @@ object ExportUtils {
         }
 
         val voiceDir = getVoiceExportDir(context)
+        ensureDirOrThrow(voiceDir, "exportRecordedVoice")
 
-        val time = FILE_TS_FORMAT.format(Date())
+        val stampUtc = FILE_TS_FORMAT.format(Date())
 
-        val safeSurvey = surveyId
-            ?.takeIf { it.isNotBlank() }
-            ?.sanitizeSegment()
+        // Fixed-shape naming improves downstream ingestion stability.
+        val sid = surveyId?.trim()?.takeIf { it.isNotBlank() } ?: "unknown"
+        val qid = questionId?.trim()?.takeIf { it.isNotBlank() } ?: "unknown"
 
-        val safeQuestion = questionId
-            ?.takeIf { it.isNotBlank() }
-            ?.sanitizeSegment()
+        val fileName = buildVoiceFileName(
+            surveyUuid = sid,
+            questionId = qid,
+            prefix = "voice",
+            stamp = stampUtc
+        )
 
-        val rawPrefix = buildString {
-            append("voice")
-            if (safeSurvey != null) append("_").append(safeSurvey)
-            if (safeQuestion != null) append("_").append(safeQuestion)
-        }
-
-        val safePrefix = rawPrefix.sanitizeForFileName().ifBlank { "voice" }
-
-        val baseName = "${safePrefix}_$time"
+        val baseName = fileName.substringBeforeLast('.', fileName)
         val target = makeUniqueFile(voiceDir, baseName, "wav")
 
         Log.d(
@@ -268,6 +252,19 @@ object ExportUtils {
     }
 
     /**
+     * Ensure the directory exists or throw.
+     */
+    @Throws(IOException::class)
+    private fun ensureDirOrThrow(dir: File, caller: String) {
+        if (dir.exists()) return
+        if (!dir.mkdirs() && !dir.exists()) {
+            val msg = "$caller: failed to mkdirs() for ${dir.absolutePath}"
+            Log.e(TAG, msg)
+            throw IOException(msg)
+        }
+    }
+
+    /**
      * Create a unique file under [dir] using [baseName] and [ext].
      *
      * If "baseName.ext" already exists, it will attempt:
@@ -298,7 +295,7 @@ object ExportUtils {
     @Throws(IOException::class)
     private fun copyFileAtomic(source: File, target: File) {
         val parent = target.parentFile
-        if (parent != null) ensureDir(parent, "copyFileAtomic")
+        if (parent != null) ensureDirOrThrow(parent, "copyFileAtomic")
 
         val part = File(parent, target.name + ".part")
 
@@ -345,7 +342,10 @@ object ExportUtils {
      * Write text atomically to reduce the risk of partial/corrupt files.
      */
     private fun writeTextAtomic(target: File, text: String) {
-        val tmp = File(target.parentFile, target.name + ".tmp")
+        val parent = target.parentFile
+        if (parent != null) ensureDir(parent, "writeTextAtomic")
+
+        val tmp = File(parent, target.name + ".tmp")
 
         // Best-effort cleanup of stale temp file.
         runCatching { if (tmp.exists()) tmp.delete() }
@@ -362,21 +362,6 @@ object ExportUtils {
             target.writeText(text, Charsets.UTF_8)
             runCatching { tmp.delete() }
         }
-    }
-
-    /**
-     * Convert an ID segment into a file-name-safe representation with a length cap.
-     */
-    private fun String.sanitizeSegment(): String {
-        val safe = sanitizeForFileName()
-        return if (safe.length <= MAX_SEGMENT_LEN) safe else safe.take(MAX_SEGMENT_LEN)
-    }
-
-    /**
-     * Simple file-name sanitizer that replaces non [A-Za-z0-9_-] chars with '_'.
-     */
-    private fun String.sanitizeForFileName(): String {
-        return replace(Regex("""[^\w\-]+"""), "_").trim('_')
     }
 
     /**

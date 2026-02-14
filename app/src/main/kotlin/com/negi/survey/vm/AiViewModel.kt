@@ -34,9 +34,11 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeout
+import org.json.JSONArray
 import org.json.JSONObject
 
 /**
@@ -67,6 +69,20 @@ class AiViewModel(
         private const val DEBUG_PREVIEW_CHARS = 240
 
         private const val DEFAULT_TIMEOUT_MS = 120_000L
+
+        /** Prevent unbounded memory growth in UI history. */
+        private const val MAX_STEP_HISTORY = 12
+
+        /**
+         * Reduce UI churn / O(n^2) string concatenation.
+         * Stream is emitted in chunks of at least this many newly appended chars.
+         */
+        private const val STREAM_EMIT_MIN_DELTA_CHARS = 96
+
+        /**
+         * Boxed Int class name (avoid referencing java.lang.Integer directly to prevent Kotlin warning).
+         */
+        private const val JAVA_LANG_INTEGER = "java.lang.Integer"
     }
 
     // ───────────────────────── UI state ─────────────────────────
@@ -138,6 +154,22 @@ class AiViewModel(
     }
 
     /**
+     * Optional capability interface: repositories can implement this to avoid reflection.
+     */
+    interface PhasePromptRepository {
+        /** Build a full prompt string from input + prompt phase. */
+        fun buildPrompt(input: String, phase: PromptPhase): String
+    }
+
+    /**
+     * Optional capability interface: repositories can implement this to avoid reflection.
+     */
+    interface OneArgPromptRepository {
+        /** Build a full prompt string from input only. */
+        fun buildPrompt(input: String): String
+    }
+
+    /**
      * Immutable record for a completed step to render both Step1 and Step2 in UI.
      *
      * @param runId Internal run id.
@@ -170,9 +202,12 @@ class AiViewModel(
         _stepHistory.value = emptyList()
     }
 
-    /** Append one snapshot to history. */
+    /** Append one snapshot to history with an upper bound to prevent memory bloat. */
     private fun appendStepSnapshot(s: StepSnapshot) {
-        _stepHistory.update { it + s }
+        _stepHistory.update { cur ->
+            val next = cur + s
+            if (next.size <= MAX_STEP_HISTORY) next else next.takeLast(MAX_STEP_HISTORY)
+        }
         if (DEBUG_LOGS) {
             val fu0 = s.followups.firstOrNull()?.let { preview(it) } ?: "<none>"
             Log.d(
@@ -569,31 +604,30 @@ class AiViewModel(
         var chunkCount = 0
         var totalChars = 0
         var timedOut = false
+        var lastStreamEmitLen = 0
 
         fun isActiveRun(): Boolean = activeRunId.get() == runId
 
-        /**
-         * Return true if the output is a trivial empty JSON object (optionally with whitespace).
-         */
+        fun maybeEmitStream(force: Boolean = false) {
+            val delta = buf.length - lastStreamEmitLen
+            if (!force && delta < STREAM_EMIT_MIN_DELTA_CHARS) return
+            lastStreamEmitLen = buf.length
+            _stream.value = buf.toString()
+        }
+
+        /** Return true if the output is a trivial empty JSON object (optionally with whitespace). */
         fun isEmptyJsonObject(text: String): Boolean {
             val t = text.trim()
             return t == "{}" || t == "{ }"
         }
 
-        /**
-         * Return true if the string starts like JSON. Used for filtering follow-up candidates.
-         */
+        /** Return true if the string starts like JSON. */
         fun isJsonLike(text: String): Boolean {
             val t = text.trim()
             return t.startsWith("{") || t.startsWith("[")
         }
 
-        /**
-         * Filter out garbage follow-up candidates.
-         *
-         * - Removes empty lines and trivial "{}".
-         * - Removes JSON-like values to avoid polluting shouldRunSecond() with invalid followups.
-         */
+        /** Filter out garbage follow-up candidates. */
         fun sanitizeFollowups(list: List<String>): List<String> {
             return list
                 .asSequence()
@@ -607,8 +641,8 @@ class AiViewModel(
         }
 
         /** Extract a plausible follow-up question from raw text output (non-JSON fallback). */
-        fun extractFollowupFromPlainText(raw: String): String? {
-            val t = raw.trim()
+        fun extractFollowupFromPlainText(rawText: String): String? {
+            val t = rawText.trim()
             if (t.isBlank()) return null
             if (isEmptyJsonObject(t)) return null
 
@@ -632,6 +666,88 @@ class AiViewModel(
             val s = text.substring(a, b + 1)
             if (isEmptyJsonObject(s)) return null
             return s
+        }
+
+        /**
+         * Extract score from JSON with common key spellings.
+         *
+         * Accepts:
+         * - int, float, stringified int/float
+         */
+        fun extractScoreFromJsonObject(jsonText: String): Int? {
+            return runCatching {
+                val obj = JSONObject(jsonText)
+
+                fun readNumber(key: String): Double? {
+                    if (!obj.has(key)) return null
+                    val v = obj.opt(key)
+                    return when (v) {
+                        is Number -> v.toDouble()
+                        is String -> v.trim().toDoubleOrNull()
+                        else -> null
+                    }
+                }
+
+                val d = readNumber("score")
+                    ?: readNumber("evaluation_score")
+                    ?: readNumber("eval_score")
+                    ?: readNumber("rating")
+                    ?: readNumber("confidence")
+
+                d?.toInt()?.coerceIn(0, 100)
+            }.getOrNull()
+        }
+
+        /**
+         * Extract follow-up candidates from JSON with common key spellings.
+         */
+        fun extractFollowupsFromJsonObject(jsonText: String, max: Int = 3): List<String> {
+            return runCatching {
+                val obj = JSONObject(jsonText)
+
+                fun asStringList(arr: JSONArray?): List<String> {
+                    if (arr == null) return emptyList()
+                    val out = ArrayList<String>(arr.length())
+                    for (i in 0 until arr.length()) {
+                        val s = arr.optString(i, "").trim()
+                        if (s.isNotBlank()) out.add(s)
+                    }
+                    return out
+                }
+
+                fun pickArray(vararg keys: String): JSONArray? {
+                    for (k in keys) {
+                        if (!obj.has(k)) continue
+                        val v = obj.opt(k)
+                        if (v is JSONArray) return v
+                    }
+                    return null
+                }
+
+                val arr = pickArray(
+                    "followups",
+                    "follow_ups",
+                    "follow_up_questions",
+                    "followup_questions",
+                    "follow_up_candidates",
+                    "followup_candidates",
+                    "questions"
+                )
+
+                val list = asStringList(arr)
+
+                // Single-field fallback (some models output only one question).
+                val single = obj.optString("follow_up_question", "").trim()
+                    .ifBlank { obj.optString("followup_question", "").trim() }
+                    .ifBlank { obj.optString("question", "").trim() }
+
+                val combined = buildList {
+                    addAll(list)
+                    if (single.isNotBlank()) add(single)
+                }
+
+                sanitizeFollowups(combined).take(max)
+            }.getOrElse { emptyList() }
         }
 
         /**
@@ -664,43 +780,57 @@ class AiViewModel(
         }
 
         /**
-         * Build prompt using best-effort compatibility:
-         * - Try repo.buildPrompt(String, PromptPhase) if present.
-         * - Try repo.buildPrompt(String, String) with phase.name if present.
-         * - Fallback to repo.buildPrompt(String).
+         * Build prompt using best-effort compatibility.
+         *
+         * Priority:
+         * 1) Capability interfaces (no reflection).
+         * 2) Public reflection (methods only).
+         * 3) Fallback to raw input.
          */
         fun buildPromptCompat(input: String, p: PromptPhase): String {
+            // 1) Non-reflection fast path
+            (repo as? PhasePromptRepository)?.let { return it.buildPrompt(input, p) }
+            (repo as? OneArgPromptRepository)?.let { return it.buildPrompt(input) }
+
+            // 2) Public reflection only (avoid isAccessible / declaredMethods pitfalls)
             return runCatching {
                 val cls = repo.javaClass
-                val methods = (cls.methods.toList() + cls.declaredMethods.toList())
+                val methods = cls.methods
                     .filter { it.name == "buildPrompt" }
                     .distinctBy { m -> "${m.name}/${m.parameterTypes.joinToString(",") { it.name }}" }
 
                 // Prefer 2-arg overload first.
-                val twoArg = methods.filter { it.parameterTypes.size == 2 && it.parameterTypes[0] == String::class.java }
+                val twoArg = methods.filter {
+                    it.parameterTypes.size == 2 && it.parameterTypes[0] == String::class.java
+                }
                 for (m in twoArg) {
-                    try {
-                        m.isAccessible = true
-                        return@runCatching when (m.parameterTypes[1]) {
-                            PromptPhase::class.java -> m.invoke(repo, input, p) as String
-                            String::class.java -> m.invoke(repo, input, p.name) as String
-                            Int::class.javaPrimitiveType,
-                            Integer::class.java -> m.invoke(repo, input, p.ordinal) as String
-                            else -> m.invoke(repo, input, p.name) as String
+                    runCatching {
+                        val p1 = m.parameterTypes[1]
+
+                        val out: String? = when {
+                            p1 == PromptPhase::class.java -> m.invoke(repo, input, p) as? String
+                            p1 == String::class.java -> m.invoke(repo, input, p.name) as? String
+
+                            // Avoid referencing java.lang.Integer directly (Kotlin warns).
+                            p1 == Int::class.javaPrimitiveType || p1.name == JAVA_LANG_INTEGER ->
+                                m.invoke(repo, input, p.ordinal) as? String
+
+                            else -> null
                         }
-                    } catch (_: Throwable) {
-                        // Keep trying next overload.
+
+                        if (!out.isNullOrBlank()) return out
                     }
                 }
 
-                // Fallback to 1-arg.
-                val oneArg = methods.firstOrNull { it.parameterTypes.size == 1 && it.parameterTypes[0] == String::class.java }
+                // Fallback to 1-arg overload.
+                val oneArg = methods.firstOrNull {
+                    it.parameterTypes.size == 1 && it.parameterTypes[0] == String::class.java
+                }
                 if (oneArg != null) {
-                    oneArg.isAccessible = true
-                    return@runCatching oneArg.invoke(repo, input) as String
+                    val out = oneArg.invoke(repo, input) as? String
+                    if (!out.isNullOrBlank()) return out
                 }
 
-                // Absolute fallback.
                 input
             }.getOrElse { input }
         }
@@ -735,7 +865,7 @@ class AiViewModel(
                             buf.append(part)
                             totalChars += part.length
 
-                            _stream.update { it + part }
+                            maybeEmitStream(force = false)
                             _events.tryEmit(AiEvent.Stream(part))
 
                             if (DEBUG_LOGS) {
@@ -749,7 +879,12 @@ class AiViewModel(
                 stepError = "timeout"
                 if (DEBUG_LOGS) Log.w(TAG, "run[$runId]: timeout after ${timeoutMs}ms", e)
             } catch (e: CancellationException) {
-                if (!isActiveRun()) throw e
+                // If this run is no longer active, just stop quietly.
+                if (!isActiveRun()) {
+                    if (DEBUG_LOGS) Log.w(TAG, "run[$runId]: cancelled (stale run) -> stop quietly")
+                    return EvalResult(runId = runId, raw = "", score = null, followups = emptyList(), timedOut = false)
+                }
+
                 if (looksLikeTimeout(e)) {
                     timedOut = true
                     stepError = "timeout"
@@ -762,6 +897,9 @@ class AiViewModel(
             if (!isActiveRun()) {
                 return EvalResult(runId = runId, raw = "", score = null, followups = emptyList(), timedOut = timedOut)
             }
+
+            // Ensure final stream emission.
+            maybeEmitStream(force = true)
 
             val rawText = buf.toString().ifBlank { _stream.value }
             val rawTrim = rawText.trim()
@@ -781,7 +919,6 @@ class AiViewModel(
             when (mode) {
                 EvalMode.EVAL_JSON -> {
                     if (rawTrim.isBlank() || isEmptyJsonObject(rawTrim)) {
-                        // Critical guard: empty JSON must never be treated as a follow-up.
                         parsedScore = null
                         top3 = emptyList()
                         q0 = null
@@ -792,24 +929,34 @@ class AiViewModel(
                             )
                         }
                     } else {
-                        val (s, f, first) = runCatching {
+                        val jsonSlice = sliceLikelyJsonObject(rawText)
+
+                        // Try extractor first (existing behavior), then fallback to JSON parsing.
+                        val extracted = runCatching {
                             val s1 = clampScore(FollowupExtractor.extractScore(rawText))
                             val f1 = sanitizeFollowups(FollowupExtractor.fromRaw(rawText, max = 3))
-                            Triple(s1, f1, f1.firstOrNull())
+                            Pair(s1, f1)
                         }.onFailure { t ->
-                            Log.e(TAG, "run[$runId]: parsing failed (EVAL_JSON)", t)
-                        }.getOrElse {
-                            Triple(null, emptyList(), null)
-                        }
+                            Log.e(TAG, "run[$runId]: parsing failed (FollowupExtractor)", t)
+                        }.getOrNull()
 
-                        parsedScore = s
-                        top3 = f
-                        q0 = first
+                        val sFromExtractor = extracted?.first
+                        val fFromExtractor = extracted?.second ?: emptyList()
+
+                        val sFromJson = jsonSlice?.let { extractScoreFromJsonObject(it) }
+                        val fFromJson = jsonSlice?.let { extractFollowupsFromJsonObject(it, max = 3) } ?: emptyList()
+
+                        val sFinal = sFromExtractor ?: sFromJson
+                        val fFinal = if (fFromExtractor.isNotEmpty()) fFromExtractor else fFromJson
+
+                        parsedScore = sFinal
+                        top3 = fFinal.take(3)
+                        q0 = top3.firstOrNull()
 
                         if (DEBUG_LOGS) {
                             Log.d(
                                 TAG,
-                                "run[$runId]: EVAL_JSON parsed score=$parsedScore followups=${top3.size} fu0='${debugVisible(preview(q0.orEmpty()))}'"
+                                "run[$runId]: EVAL_JSON parsed score=$parsedScore followups=${top3.size} fu0='${debugVisible(preview(q0.orEmpty()))}' jsonSlice=${jsonSlice != null}"
                             )
                         }
                     }
@@ -843,12 +990,7 @@ class AiViewModel(
             }
 
             // Reflect step-local error state to the global UI error flow.
-            if (stepError != null) {
-                _error.value = stepError
-            } else if (_error.value != "timeout" && _error.value != "cancelled") {
-                // Keep sticky timeout/cancelled unless overwritten.
-                _error.value = null
-            }
+            _error.value = stepError
 
             // Always record history so UI can show both Step1 and Step2.
             appendStepSnapshot(
@@ -917,7 +1059,7 @@ class AiViewModel(
                 )
             )
 
-            _events.tryEmit(AiEvent.Final(_stream.value, _score.value, _followups.value))
+            _events.tryEmit(AiEvent.Final(rawText, _score.value, _followups.value))
 
             return EvalResult(
                 runId = runId,
@@ -943,9 +1085,7 @@ class AiViewModel(
         _raw.value = null
         _followupQuestion.value = null
         _followups.value = emptyList()
-        if (_error.value != "timeout" && _error.value != "cancelled") {
-            _error.value = null
-        }
+        _error.value = null
         if (clearHistory) clearStepHistory()
     }
 
@@ -954,14 +1094,12 @@ class AiViewModel(
      *
      * Behavior:
      * - Keeps _score/_raw/_followups/_followupQuestion intact.
-     * - Resets only streaming buffer and transient non-timeout errors.
+     * - Resets only streaming buffer and clears error.
      */
     private fun prepareUiForNextStep() {
         _loading.value = true
         _stream.value = ""
-        if (_error.value != "timeout" && _error.value != "cancelled") {
-            _error.value = null
-        }
+        _error.value = null
     }
 
     /** Finalize flags after an evaluation completes, but only if [runId] is still active. */

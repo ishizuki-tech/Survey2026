@@ -29,6 +29,7 @@ import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
 import kotlin.math.min
+import kotlin.random.Random
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
@@ -41,7 +42,7 @@ import org.json.JSONObject
  * Key behavior:
  * - GET existing file SHA (if present) to decide create/update.
  * - PUT Base64 content to GitHub Contents API.
- * - Retry transient failures with backoff (429, 5xx, network IO).
+ * - Retry transient failures with backoff (429, 5xx, rate-limit, network IO).
  *
  * Notes:
  * - GitHub Contents API is not designed for extremely large binaries.
@@ -83,6 +84,14 @@ object GitHubUploader {
      *   Base64(contentBytes) ≈ ceil(contentBytes/3)*4
      */
     private const val DEFAULT_MAX_REQUEST_BYTES = 32_000_000
+
+    /** Additional overhead margin for JSON wrapper and small header variations. */
+    private const val REQUEST_OVERHEAD_BYTES = 16_384L
+
+    /** Retry defaults. */
+    private const val DEFAULT_MAX_ATTEMPTS = 3
+    private const val BASE_BACKOFF_MS = 600L
+    private const val MAX_BACKOFF_MS = 20_000L
 
     /**
      * Configuration container for GitHub upload operations.
@@ -337,6 +346,11 @@ object GitHubUploader {
         require(path.isNotBlank()) { "GitHub path cannot be blank." }
         require(token.isNotBlank()) { "GitHub token cannot be blank." }
 
+        val repoName = normalizeRepoName(repo)
+        if (repoName != repo) {
+            Log.w(TAG, "uploadStream: repo contains '/'; using repoName='$repoName' (was='$repo')")
+        }
+
         if (rawSize > maxRawBytesHint.toLong()) {
             val msg =
                 "Content too large for upload guard (size=$rawSize, limit=$maxRawBytesHint). " +
@@ -349,13 +363,13 @@ object GitHubUploader {
 
         Log.d(
             TAG,
-            "uploadStream: owner=$owner repo=$repo branch=$branch path=$path size=$rawSize " +
+            "uploadStream: owner=$owner repo=$repoName branch=$branch path=$path size=$rawSize " +
                     "maxRawBytesHint=$maxRawBytesHint maxRequestBytesHint=$maxRequestBytesHint"
         )
 
         // Phase 1 — Lookup existing SHA (retry-capable, 404 allowed)
         onProgress(0)
-        val existingSha = getExistingSha(owner, repo, branch, encodedPath, token)
+        val existingSha = getExistingSha(owner, repoName, branch, encodedPath, token)
         onProgress(10)
 
         // Phase 2 — Prepare streaming body pieces + size guard (estimate, fail-fast)
@@ -372,23 +386,27 @@ object GitHubUploader {
         val b64Len = estimateBase64Length(rawSize)
         val totalLenLong = prefixBytes.size.toLong() + b64Len + suffixBytes.size.toLong()
 
-        if (totalLenLong > maxRequestBytesHint.toLong()) {
+        val guardedTotalLen = totalLenLong + REQUEST_OVERHEAD_BYTES
+        if (guardedTotalLen > maxRequestBytesHint.toLong()) {
             val msg =
                 "Request too large for upload guard " +
-                        "(requestBytes~$totalLenLong, limit=$maxRequestBytesHint). " +
+                        "(requestBytes~$guardedTotalLen, limit=$maxRequestBytesHint). " +
                         "ContentBytes=$rawSize; Base64 expands ~4/3. " +
                         "Consider stronger compression or alternate upload path for long-term scaling."
             throw IOException(msg)
         }
 
-        val url = URL("$API_BASE/repos/$owner/$repo/contents/$encodedPath")
+        val url = URL("$API_BASE/repos/$owner/$repoName/contents/$encodedPath")
 
         val writeBody: (HttpURLConnection) -> Unit = { conn ->
-            val totalLen = totalLenLong
-                .coerceAtMost(Int.MAX_VALUE.toLong())
-                .toInt()
+            val totalLenForMode = totalLenLong
 
-            conn.setFixedLengthStreamingMode(totalLen)
+            if (totalLenForMode <= Int.MAX_VALUE.toLong()) {
+                conn.setFixedLengthStreamingMode(totalLenForMode.toInt())
+            } else {
+                // Should never happen with our guards, but keep it robust.
+                conn.setChunkedStreamingMode(0)
+            }
 
             conn.outputStream.use { os ->
                 // Write JSON prefix
@@ -465,7 +483,8 @@ object GitHubUploader {
     private class TransientHttpException(
         val code: Int,
         val body: String,
-        val retryAfterSeconds: Long?
+        val retryAfterSeconds: Long?,
+        val rateLimitResetEpochSeconds: Long?
     ) : IOException()
 
     private class HttpFailureException(val code: Int, val body: String) :
@@ -477,10 +496,10 @@ object GitHubUploader {
      * Retries:
      * - 429
      * - 5xx
-     * - 403 with Retry-After (secondary rate limit style)
+     * - 403 with Retry-After (secondary rate limit) or primary rate limit signals
      * - IOException network errors
      *
-     * Honors Retry-After if present.
+     * Honors Retry-After or X-RateLimit-Reset if present.
      *
      * @param allowNon2xxCodes Treat these codes as non-fatal and return them as a normal response.
      *                         Use this to allow 404 for "file not found" lookups.
@@ -492,7 +511,7 @@ object GitHubUploader {
         writeBody: ((HttpURLConnection) -> Unit)?,
         connectTimeoutMs: Int = 20_000,
         readTimeoutMs: Int = 30_000,
-        maxAttempts: Int = 3,
+        maxAttempts: Int = DEFAULT_MAX_ATTEMPTS,
         allowNon2xxCodes: Set<Int> = emptySet()
     ): HttpResponse {
         var attempt = 0
@@ -506,6 +525,7 @@ object GitHubUploader {
                 doInput = true
                 doOutput = (writeBody != null)
 
+                // Use Bearer; GitHub accepts Bearer for PAT/OAuth in modern clients.
                 setRequestProperty("Authorization", "Bearer ${token.trim()}")
                 setRequestProperty("Accept", "application/vnd.github+json")
                 setRequestProperty("X-GitHub-Api-Version", API_VERSION)
@@ -527,8 +547,7 @@ object GitHubUploader {
                 val headers = conn.headerFields.filterKeys { it != null }
 
                 if (code in 200..299 || allowNon2xxCodes.contains(code)) {
-                    val bodyStream =
-                        if (code in 200..299) conn.inputStream else conn.errorStream
+                    val bodyStream = if (code in 200..299) conn.inputStream else conn.errorStream
                     val body = bodyStream?.use(::readAll).orEmpty()
                     return HttpResponse(code, body, headers)
                 }
@@ -536,11 +555,16 @@ object GitHubUploader {
                 val errBody = conn.errorStream?.use(::readAll).orEmpty()
 
                 val retryAfter = parseRetryAfterSeconds(headers)
+                val reset = parseRateLimitResetEpochSeconds(headers)
+                val isRateLimit =
+                    (code == 403 || code == 429) &&
+                            (retryAfter != null || isPrimaryRateLimit(headers, errBody) || reset != null)
+
                 val isTransient =
-                    code == 429 || code in 500..599 || (code == 403 && retryAfter != null)
+                    code == 429 || code in 500..599 || isRateLimit
 
                 if (isTransient) {
-                    throw TransientHttpException(code, errBody, retryAfter)
+                    throw TransientHttpException(code, errBody, retryAfter, reset)
                 }
 
                 throw HttpFailureException(code, errBody)
@@ -549,16 +573,19 @@ object GitHubUploader {
                 lastError = IOException("Transient HTTP ${e.code}: ${e.body.take(200)}", e)
                 if (attempt >= maxAttempts) throw lastError
 
-                val backoff =
-                    e.retryAfterSeconds?.times(1000L) ?: (500L shl (attempt - 1))
-                delay(backoff)
+                val delayMs = computeRetryDelayMs(
+                    attempt = attempt,
+                    retryAfterSeconds = e.retryAfterSeconds,
+                    rateLimitResetEpochSeconds = e.rateLimitResetEpochSeconds
+                )
+                delay(delayMs)
 
             } catch (e: IOException) {
                 lastError = e
                 if (attempt >= maxAttempts) throw e
 
-                val backoff = 500L shl (attempt - 1)
-                delay(backoff)
+                val delayMs = computeBackoffMs(attempt)
+                delay(delayMs)
 
             } finally {
                 conn.disconnect()
@@ -601,11 +628,97 @@ object GitHubUploader {
     }
 
     /**
+     * Normalize repo string.
+     *
+     * Allows:
+     * - "SurveyExports"
+     * - "ishizuki-tech/SurveyExports" (returns "SurveyExports")
+     */
+    private fun normalizeRepoName(repo: String): String {
+        val t = repo.trim()
+        return if (t.contains('/')) t.substringAfterLast('/').trim() else t
+    }
+
+    /**
      * Parse Retry-After seconds with case-insensitive header matching.
+     *
+     * Supports:
+     * - integer seconds
+     * - HTTP-date (best-effort; returns null if not parseable)
      */
     private fun parseRetryAfterSeconds(headers: Map<String, List<String>>): Long? {
-        val key = headers.keys.firstOrNull { it.equals("Retry-After", ignoreCase = true) }
-        return key?.let { headers[it]?.firstOrNull()?.toLongOrNull() }
+        val v = getHeaderFirst(headers, "Retry-After") ?: return null
+        v.toLongOrNull()?.let { return it.coerceAtLeast(0L) }
+        // HTTP-date fallback: intentionally omitted (rare for GitHub); treat as null.
+        return null
+    }
+
+    /**
+     * Parse X-RateLimit-Reset (epoch seconds) if present.
+     */
+    private fun parseRateLimitResetEpochSeconds(headers: Map<String, List<String>>): Long? {
+        val v = getHeaderFirst(headers, "X-RateLimit-Reset") ?: return null
+        return v.toLongOrNull()
+    }
+
+    /**
+     * Detect primary rate limit signals.
+     */
+    private fun isPrimaryRateLimit(headers: Map<String, List<String>>, body: String): Boolean {
+        val remaining = getHeaderFirst(headers, "X-RateLimit-Remaining")?.toLongOrNull()
+        if (remaining != null && remaining <= 0L) return true
+
+        val b = body.lowercase(Locale.US)
+        if (b.contains("api rate limit exceeded")) return true
+        if (b.contains("rate limit")) return true
+        if (b.contains("secondary rate limit")) return true
+        return false
+    }
+
+    /**
+     * Case-insensitive header lookup.
+     */
+    private fun getHeaderFirst(headers: Map<String, List<String>>, name: String): String? {
+        val key = headers.keys.firstOrNull { it.equals(name, ignoreCase = true) } ?: return null
+        return headers[key]?.firstOrNull()
+    }
+
+    /**
+     * Compute retry delay for transient HTTP errors.
+     *
+     * Preference:
+     * 1) Retry-After seconds
+     * 2) X-RateLimit-Reset epoch seconds
+     * 3) Exponential backoff with jitter
+     */
+    private fun computeRetryDelayMs(
+        attempt: Int,
+        retryAfterSeconds: Long?,
+        rateLimitResetEpochSeconds: Long?
+    ): Long {
+        retryAfterSeconds?.let {
+            val ms = (it.coerceAtMost(120L) * 1000L)
+            return ms.coerceIn(500L, MAX_BACKOFF_MS)
+        }
+
+        rateLimitResetEpochSeconds?.let { reset ->
+            val nowSec = System.currentTimeMillis() / 1000L
+            val waitSec = (reset - nowSec + 1L).coerceAtLeast(1L)
+            val ms = waitSec * 1000L
+            return ms.coerceIn(1_000L, MAX_BACKOFF_MS)
+        }
+
+        return computeBackoffMs(attempt)
+    }
+
+    /**
+     * Exponential backoff with small jitter.
+     */
+    private fun computeBackoffMs(attempt: Int): Long {
+        val pow = (attempt - 1).coerceIn(0, 6)
+        val base = (BASE_BACKOFF_MS shl pow).coerceAtMost(MAX_BACKOFF_MS)
+        val jitter = Random.nextLong(from = 0L, until = 250L)
+        return (base + jitter).coerceAtMost(MAX_BACKOFF_MS)
     }
 
     /**
@@ -641,7 +754,7 @@ object GitHubUploader {
             writeBody = null,
             connectTimeoutMs = 15_000,
             readTimeoutMs = 20_000,
-            maxAttempts = 3,
+            maxAttempts = DEFAULT_MAX_ATTEMPTS,
             allowNon2xxCodes = setOf(404)
         )
 

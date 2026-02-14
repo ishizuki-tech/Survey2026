@@ -50,7 +50,6 @@ import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
 import java.util.concurrent.TimeUnit
-import kotlin.math.abs
 
 /**
  * Coroutine-based [WorkManager] worker responsible for uploading either:
@@ -103,7 +102,7 @@ class GitHubUploadWorker(
         }
 
         val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-        val notifId = NOTIF_BASE + (abs((mode + stamp).hashCode()) % 8000)
+        val notifId = stableNotificationId(mode, stamp)
 
         setForegroundAsync(
             foregroundInfo(
@@ -413,6 +412,8 @@ class GitHubUploadWorker(
      * Ensure the notification channel for upload progress exists.
      */
     private fun ensureChannel() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+
         val nm = applicationContext.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         val channel = NotificationChannel(
             CHANNEL_ID,
@@ -531,6 +532,15 @@ class GitHubUploadWorker(
         }
 
         /**
+         * Deterministic notification id that never goes negative.
+         */
+        private fun stableNotificationId(mode: String, stamp: String): Int {
+            val h = (mode + stamp).hashCode().toLong()
+            val nonNeg = h and 0x7fffffffL
+            return NOTIF_BASE + (nonNeg % 8000L).toInt()
+        }
+
+        /**
          * Enqueue a work request to upload an existing file.
          */
         fun enqueueExistingPayload(
@@ -543,6 +553,9 @@ class GitHubUploadWorker(
             )
         ) {
             val name = file.name
+
+            // Include size+mtime to avoid suppressing uploads for "same name but different content".
+            val uniqueName = "upload_${name}_${file.length()}_${file.lastModified()}"
 
             val req: OneTimeWorkRequest =
                 OneTimeWorkRequestBuilder<GitHubUploadWorker>()
@@ -572,7 +585,7 @@ class GitHubUploadWorker(
                     .build()
 
             WorkManager.getInstance(context)
-                .enqueueUniqueWork("upload_$name", ExistingWorkPolicy.KEEP, req)
+                .enqueueUniqueWork(uniqueName, ExistingWorkPolicy.KEEP, req)
         }
 
         /**

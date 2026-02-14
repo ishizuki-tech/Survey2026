@@ -50,7 +50,7 @@ private const val TAG = "CrashLogStore"
  * Design goals:
  * - Crash-time code must be fast and never throw.
  * - Upload happens later via WorkManager (GitHubUploadWorker).
- * - Stored artifacts are small (tail + gzip) to fit GitHub Contents API.
+ * - Stored artifacts are small (tail + gzip) to fit GitHub Contents API guards.
  */
 object CrashLogStore {
 
@@ -120,7 +120,7 @@ object CrashLogStore {
             // Always delegate to the original handler (keeps system behavior).
             try {
                 prev?.uncaughtException(thread, throwable)
-            } catch (t: Throwable) {
+            } catch (_: Throwable) {
                 // Last resort: ensure process terminates even if the previous handler misbehaves.
                 runCatching { Process.killProcess(Process.myPid()) }
                 runCatching { exitProcess(10) }
@@ -137,12 +137,13 @@ object CrashLogStore {
      * If no config is available (token not set), this is a no-op.
      */
     fun schedulePendingUploadsFromSavedConfig(context: Context) {
-        val cfg = GitHubDiagnosticsConfigStore.load(context) ?: run {
-            Log.w(TAG, "No GitHub config saved; skip crashlog upload scheduling.")
+        val baseCfg = GitHubDiagnosticsConfigStore.buildGitHubConfigOrNull(context)
+        if (baseCfg == null) {
+            Log.w(TAG, "No usable GitHub diagnostics config; skip crashlog upload scheduling.")
             return
         }
 
-        val uploadCfg = cfg.copy(pathPrefix = "diagnostics/crashlogs")
+        val uploadCfg = baseCfg.copy(pathPrefix = "diagnostics/crashlogs")
         schedulePendingUploads(context, uploadCfg)
     }
 
@@ -171,7 +172,9 @@ object CrashLogStore {
             GitHubUploadWorker.enqueueExistingPayload(
                 context = context,
                 cfg = cfg,
-                file = f
+                file = f,
+                // Pass size hints ~file size to avoid mismatched guards.
+                maxBytesHint = f.length().coerceAtLeast(1L)
             )
         }
 

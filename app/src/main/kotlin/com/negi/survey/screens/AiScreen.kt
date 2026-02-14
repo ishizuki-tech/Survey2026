@@ -46,7 +46,7 @@ package com.negi.survey.screens
 import android.annotation.SuppressLint
 import android.os.SystemClock
 import android.util.Log
-import androidx.compose.animation.AnimatedVisibility
+import android.content.ClipData
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.LinearEasing
@@ -133,16 +133,15 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalClipboard
-import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
-import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.platform.ClipEntry
 import com.negi.survey.slm.FollowupExtractor
 import com.negi.survey.vm.AiViewModel
 import com.negi.survey.vm.SurveyViewModel
@@ -1489,7 +1488,6 @@ private fun Dot(alpha: Float, color: Color) {
 }
 
 /* ───────────────────────────── JSON bubble ──────────────────────────────── */
-
 @Composable
 private fun JsonBubbleMono(
     pretty: String,
@@ -1500,7 +1498,7 @@ private fun JsonBubbleMono(
     var expanded by remember(pretty) { mutableStateOf(false) }
 
     val cs = MaterialTheme.colorScheme
-    val clipboard = LocalClipboardManager.current
+    val clipboard = LocalClipboard.current
     val scope = rememberCoroutineScope()
     val clip = RoundedCornerShape(10.dp)
 
@@ -1553,7 +1551,9 @@ private fun JsonBubbleMono(
                 IconButton(
                     onClick = {
                         scope.launch {
-                            clipboard.setText(AnnotatedString(pretty))
+                            // Use LocalClipboard (suspend) instead of deprecated LocalClipboardManager.
+                            val clipData = ClipData.newPlainText("Result JSON", pretty)
+                            clipboard.setClipEntry(ClipEntry(clipData))
                             snack?.showSnackbar("JSON copied")
                         }
                     },

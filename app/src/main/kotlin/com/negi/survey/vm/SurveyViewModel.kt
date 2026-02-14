@@ -21,6 +21,12 @@
  *       - Prompt source counts (legacy vs split) on init
  *       - Missing AI prompt coverage warnings on init
  *       - Detailed exception messages for missing prompt definitions
+ *
+ *  Robustness upgrades (this revision):
+ *   • Validate graph node IDs (blank / duplicates after trim)
+ *   • Validate startId exists
+ *   • Normalize NavBackStack root to match start node key
+ *   • Warn on unknown node types
  * =====================================================================
  */
 
@@ -505,16 +511,6 @@ open class SurveyViewModel(
 
     /* ───────────────────────────── Prompt Helpers ───────────────────────────── */
 
-    /**
-     * Returns true if the node has two-step prompts configured.
-     *
-     * Two-step requires BOTH:
-     * - resolveEvalPrompt(nodeId) non-null
-     * - resolveFollowupPrompt(nodeId) non-null
-     *
-     * Note:
-     * - SurveyConfig resolver already enforces "complete pair" semantics for split prompts.
-     */
     fun hasTwoStepPrompt(nodeId: String): Boolean {
         val k = nodeId.trim()
         if (k.isBlank()) return false
@@ -532,16 +528,9 @@ open class SurveyViewModel(
         return has
     }
 
-    /** Resolve prompt mode for the node. */
     fun getPromptMode(nodeId: String): PromptMode =
         if (hasTwoStepPrompt(nodeId)) PromptMode.TWO_STEP else PromptMode.ONE_STEP
 
-    /**
-     * Build a rendered ONE-STEP prompt string for the given node and answer.
-     *
-     * Backward compatibility:
-     * - If one-step prompt is missing but two-step eval exists, it falls back to eval prompt.
-     */
     fun getPrompt(nodeId: String, question: String, answer: String): String {
         val k = nodeId.trim()
         require(k.isNotBlank()) { "getPrompt: nodeId is blank" }
@@ -577,13 +566,6 @@ open class SurveyViewModel(
         return rendered
     }
 
-    /**
-     * Build a rendered STEP-1 (EVAL) prompt string.
-     *
-     * Works for:
-     * - legacy inline two-step (prompts[].eval_prompt)
-     * - split two-step (prompts_eval + prompts_followup pair)
-     */
     fun getEvalPrompt(nodeId: String, question: String, answer: String): String {
         val k = nodeId.trim()
         require(k.isNotBlank()) { "getEvalPrompt: nodeId is blank" }
@@ -607,15 +589,6 @@ open class SurveyViewModel(
         return rendered
     }
 
-    /**
-     * Build a rendered STEP-2 (FOLLOWUP) prompt string using step1 raw JSON.
-     *
-     * Placeholders supported:
-     * - {{QUESTION}}, {{ANSWER}}, {{NODE_ID}}, {{EVAL_JSON}}
-     *
-     * NOTE:
-     * - EVAL_JSON is injected last to avoid accidental template substitution inside eval JSON.
-     */
     fun getFollowupPrompt(
         nodeId: String,
         question: String,
@@ -645,14 +618,6 @@ open class SurveyViewModel(
         return rendered
     }
 
-    /**
-     * Replace placeholders in a template using the format `{{KEY}}`.
-     *
-     * This is intentionally simple and stable:
-     * - Replaces ALL occurrences of each placeholder.
-     * - Escapes KEY for regex safety.
-     * - Optional leftover placeholder detection in debug mode.
-     */
     private fun renderTemplate(template: String, vars: LinkedHashMap<String, String>): String {
         var out = template
         for ((key, value) in vars) {
@@ -675,14 +640,6 @@ open class SurveyViewModel(
         return out
     }
 
-    /**
-     * Build a detailed error message when prompt resolution fails.
-     *
-     * This is designed to immediately reveal config mismatch:
-     * - legacy prompts[] only vs split prompts_eval/prompts_followup only
-     * - incomplete split pairs
-     * - missing nodeId entirely
-     */
     private fun buildMissingPromptError(nodeId: String, phase: String): String {
         val legacyIds = config.prompts.map { it.nodeId.trim() }.filter { it.isNotBlank() }.distinct().sorted()
         val evalIds = config.promptsEval.map { it.nodeId.trim() }.filter { it.isNotBlank() }.distinct().sorted()
@@ -860,7 +817,8 @@ open class SurveyViewModel(
 
     /** Convert a config DTO node into a runtime node. */
     private fun NodeDTO.toVmNode(): Node {
-        val t = when (this.type.trim().uppercase()) {
+        val rawType = this.type.trim()
+        val t = when (rawType.uppercase()) {
             "START" -> NodeType.START
             "TEXT" -> NodeType.TEXT
             "SINGLE_CHOICE", "SINGLECHOICE", "RADIO" -> NodeType.SINGLE_CHOICE
@@ -868,7 +826,11 @@ open class SurveyViewModel(
             "AI", "LLM", "SLM" -> NodeType.AI
             "REVIEW" -> NodeType.REVIEW
             "DONE", "FINISH", "FINAL" -> NodeType.DONE
-            else -> NodeType.TEXT
+            else -> {
+                // Unknown types are treated as TEXT to keep the flow robust.
+                Log.w(TAG, "Unknown node type '$rawType' for id='${this.id}'. Defaulting to TEXT.")
+                NodeType.TEXT
+            }
         }
 
         return Node(
@@ -914,12 +876,30 @@ open class SurveyViewModel(
         }
     }
 
+    private fun validateGraphOrThrow(dtos: List<NodeDTO>) {
+        require(startId.isNotBlank()) { "graph.startId is blank" }
+
+        val ids = dtos.map { it.id.trim() }
+        val blank = ids.filter { it.isBlank() }.distinct()
+        require(blank.isEmpty()) { "Graph contains blank node IDs after trim." }
+
+        val dup = ids.groupingBy { it }.eachCount().filterValues { it > 1 }.keys
+        require(dup.isEmpty()) { "Duplicate node IDs after trim: ${dup.sorted()}" }
+    }
+
     /* ───────────────────────────── Initialization ───────────────────────────── */
 
     init {
-        graph = config.graph.nodes
+        val dtos = config.graph.nodes
+        validateGraphOrThrow(dtos)
+
+        graph = dtos
             .associateBy { it.id.trim() }
             .mapValues { (_, dto) -> dto.toVmNode() }
+
+        require(graph.containsKey(startId)) {
+            "startId '$startId' does not exist in graph. defined=${graph.keys.take(64)}"
+        }
 
         val start = nodeOf(startId)
         ensureQuestion(start.id)
@@ -928,8 +908,12 @@ open class SurveyViewModel(
         nodeStack.clear()
         nodeStack.addLast(start.id)
 
-        if (nav.size == 0) {
-            nav.add(navKeyFor(start))
+        // Normalize the nav root so Compose always renders the correct entry for start node.
+        // This prevents mismatch when AppNav creates backStack with FlowHome but config start node differs.
+        val startKey = navKeyFor(start)
+        val needsReset = (nav.size != 1) || (nav.getOrNull(0) != startKey)
+        if (needsReset) {
+            resetNavToStart(start)
         }
 
         updateCanGoBack()

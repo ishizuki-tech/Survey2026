@@ -17,33 +17,38 @@ import java.util.Locale
 /**
  * Convert a configuration-layer [NodeDTO] into a ViewModel-layer [Node].
  *
- * This mapper:
- * - Keeps the `config` package free from any dependency on the ViewModel layer.
- * - Centralizes mapping rules (default types, field transforms, null safety).
+ * Design goals:
+ * - Keep the `config` package free from any dependency on the ViewModel layer.
+ * - Centralize mapping rules (aliases, normalization, null safety).
  *
- * Fallback behavior:
- * - If [NodeDTO.type] is null/blank or cannot be mapped to [NodeType] via [NodeType.valueOf],
- *   the node defaults to [NodeType.TEXT].
+ * Normalization:
+ * - `id` is trimmed to prevent hidden-whitespace key mismatches.
+ * - `nextId` is trimmed and blank is converted to null.
+ * - `title` / `question` are trimmed (safe for accidental leading/trailing whitespace).
  *
- * Null-safety behavior:
- * - Optional string fields are normalized with safe defaults to avoid accidental NPEs
- *   in downstream UI code.
- * - Optional list fields are passed through as-is (or empty when appropriate),
- *   depending on the expected [Node] constructor types.
- *
- * @receiver [NodeDTO] loaded from JSON/YAML configuration.
- * @return A [Node] instance suitable for use in the ViewModel layer.
+ * Type mapping:
+ * - Supports aliases (e.g. "RADIO" -> SINGLE_CHOICE, "LLM" -> AI, "FINAL" -> DONE).
+ * - Falls back to [NodeType.TEXT] when unknown/blank.
  */
 fun NodeDTO.toVmNode(): Node {
     val vmType = resolveVmNodeType(type)
 
+    val safeId = id.trim()
+    val safeNextId = nextId?.trim()?.takeIf { it.isNotBlank() }
+
+    val safeOptions: List<String> = options
+        .asSequence()
+        .map { it.trim() }
+        .filter { it.isNotEmpty() }
+        .toList()
+
     return Node(
-        id = id,
+        id = safeId,
         type = vmType,
-        title = title.orEmpty(),
-        question = question.orEmpty(),
-        options = options,
-        nextId = nextId
+        title = title.orEmpty().trim(),
+        question = question.orEmpty().trim(),
+        options = safeOptions,
+        nextId = safeNextId
     )
 }
 
@@ -60,9 +65,21 @@ private fun resolveVmNodeType(rawType: String?): NodeType {
         ?.uppercase(Locale.ROOT)
         ?: return NodeType.TEXT
 
-    return runCatching {
-        NodeType.valueOf(normalized)
-    }.getOrElse {
-        NodeType.TEXT
+    // Keep backward compatibility with legacy config spellings / aliases.
+    return when (normalized) {
+        "START" -> NodeType.START
+        "TEXT" -> NodeType.TEXT
+
+        "SINGLE_CHOICE", "SINGLECHOICE", "RADIO" -> NodeType.SINGLE_CHOICE
+        "MULTI_CHOICE", "MULTICHOICE", "CHECKBOX" -> NodeType.MULTI_CHOICE
+
+        "AI", "LLM", "SLM" -> NodeType.AI
+
+        "REVIEW" -> NodeType.REVIEW
+
+        "DONE", "FINISH", "FINAL" -> NodeType.DONE
+
+        else -> runCatching { NodeType.valueOf(normalized) }
+            .getOrElse { NodeType.TEXT }
     }
 }

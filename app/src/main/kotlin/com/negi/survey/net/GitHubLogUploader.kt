@@ -38,12 +38,13 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
+import java.util.UUID
 import java.util.concurrent.TimeUnit
 import java.util.zip.GZIPOutputStream
 import kotlin.math.min
+import kotlin.system.measureTimeMillis
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import kotlin.system.measureTimeMillis
 
 private const val TAG = "GitHubLogUploader"
 
@@ -65,6 +66,9 @@ object GitHubLogUploader {
 
     /** Timeout for each logcat dump command. */
     private const val LOGCAT_CMD_TIMEOUT_MS = 1800L
+
+    /** Safety margin for request-size→raw-size conversion (base64 + JSON wrapper overhead). */
+    private const val REQUEST_OVERHEAD_BYTES = 16_384
 
     /**
      * Result payload for log upload.
@@ -105,14 +109,16 @@ object GitHubLogUploader {
         val pid = Process.myPid()
 
         // Use UTC for stable correlation across devices/timezones.
-        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).apply {
+        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).apply {
             timeZone = TimeZone.getTimeZone("UTC")
         }.format(Date())
         val dateDir = SimpleDateFormat("yyyy-MM-dd", Locale.US).apply {
             timeZone = TimeZone.getTimeZone("UTC")
         }.format(Date())
 
-        val remoteName = "logcat_${stamp}_pid${pid}.log.gz"
+        val nonce = UUID.randomUUID().toString().substring(0, 8)
+        val remoteName = "logcat_${stamp}_pid${pid}_$nonce.log.gz"
+
         val remotePath = buildRemotePath(
             remoteDir = remoteDir,
             addDateSubdir = addDateSubdir,
@@ -120,7 +126,7 @@ object GitHubLogUploader {
             fileName = remoteName,
         )
 
-        val header = if (includeDeviceHeader) buildHeader(context, pid) else ""
+        val header = if (includeDeviceHeader) buildHeader(context.applicationContext, pid) else ""
 
         onProgress(5)
 
@@ -165,8 +171,7 @@ object GitHubLogUploader {
 
         onProgress(20)
 
-        val cfgRawHint = cfg.maxRawBytesHint.takeIf { it > 0 } ?: LOG_GZ_MAX_BYTES_DEFAULT
-        val maxGzBytes = min(cfgRawHint, LOG_GZ_MAX_BYTES_DEFAULT).coerceAtLeast(50_000)
+        val maxGzBytes = computeMaxGzBytes(cfg)
         val gz = gzipAndFitToMaxBytesBestEffort(trimmed, maxGzBytes)
 
         onProgress(35)
@@ -196,6 +201,36 @@ object GitHubLogUploader {
             bytesRaw = trimmed.size,
             bytesGz = gz.size,
         )
+    }
+
+    /**
+     * Compute a practical gzip max bytes threshold.
+     *
+     * Preference order:
+     * - If maxRequestBytesHint is provided, convert request cap → raw cap (base64 ~= 4/3 expansion)
+     *   with a small overhead margin.
+     * - Else if maxRawBytesHint is provided, use it directly.
+     * - Else fall back to LOG_GZ_MAX_BYTES_DEFAULT.
+     */
+    private fun computeMaxGzBytes(cfg: GitHubUploader.GitHubConfig): Int {
+        val reqHint = cfg.maxRequestBytesHint
+        val rawHint = cfg.maxRawBytesHint
+
+        val rawFromReq = if (reqHint > 0) {
+            val usableReq = (reqHint - REQUEST_OVERHEAD_BYTES).coerceAtLeast(50_000)
+            // base64 expansion: raw ≈ req * 3/4
+            ((usableReq.toLong() * 3L) / 4L).toInt()
+        } else {
+            0
+        }
+
+        val base = when {
+            rawFromReq > 0 -> rawFromReq
+            rawHint > 0 -> rawHint
+            else -> LOG_GZ_MAX_BYTES_DEFAULT
+        }
+
+        return min(base, LOG_GZ_MAX_BYTES_DEFAULT).coerceAtLeast(50_000)
     }
 
     /**
@@ -276,7 +311,7 @@ object GitHubLogUploader {
             }
         }.apply {
             isDaemon = true
-            name = "SurveyFix-LogcatReader"
+            name = "SurveyNav-LogcatReader"
             start()
         }
 
@@ -294,7 +329,7 @@ object GitHubLogUploader {
         runCatching { proc.destroy() }
 
         val out = if (readError != null) {
-            "(logcat read failed: ${readError?.message})\n"
+            "(logcat read failed: ${readError.message})\n"
         } else {
             String(tail.toByteArray(), Charsets.UTF_8)
         }
@@ -490,6 +525,7 @@ object GitHubLogUploader {
         fun toByteArray(): ByteArray {
             if (size == 0) return ByteArray(0)
             if (size < capacity) {
+                // Not wrapped yet; bytes are contiguous from 0..size
                 return buf.copyOfRange(0, size)
             }
             val out = ByteArray(capacity)

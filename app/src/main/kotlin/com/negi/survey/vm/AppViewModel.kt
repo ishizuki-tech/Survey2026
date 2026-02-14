@@ -33,59 +33,29 @@ import androidx.lifecycle.viewModelScope
 import com.negi.survey.BuildConfig
 import com.negi.survey.utils.HeavyInitializer
 import java.io.File
-import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 /* ───────────────────────────── Download State ───────────────────────────── */
 
-/**
- * Represents the current model download lifecycle state.
- *
- * This sealed state is intentionally minimal and UI-friendly:
- * - It can be observed directly by Compose.
- * - It does not expose transport details (HTTP, resumable chunks, etc.).
- * - It is suitable for gating progression into SLM initialization.
- */
 sealed class DlState {
-
-    /**
-     * No download in progress and no confirmed model file.
-     *
-     * This state is also used as a "pre-flight" state when the ViewModel is
-     * initialized but has not yet been asked to ensure the model.
-     */
     data object Idle : DlState()
 
-    /**
-     * Model download is currently in progress.
-     *
-     * @property downloaded Number of bytes downloaded so far.
-     * @property total Total content length in bytes if known, or null when
-     * the server does not provide it.
-     */
     data class Downloading(
         val downloaded: Long,
         val total: Long?
     ) : DlState()
 
-    /**
-     * Download successfully completed.
-     *
-     * @property file Final model file location on disk.
-     */
     data class Done(
         val file: File
     ) : DlState()
 
-    /**
-     * Download failed or was cancelled.
-     *
-     * @property message Human-readable error message suitable for UI.
-     */
     data class Error(
         val message: String
     ) : DlState()
@@ -93,19 +63,6 @@ sealed class DlState {
 
 /* ───────────────────────────── ViewModel ───────────────────────────── */
 
-/**
- * ViewModel responsible for ensuring the on-device SLM model exists locally.
- *
- * Core responsibilities:
- * - Provide a single-flight, resume-capable download entry point via [HeavyInitializer].
- * - Expose a stable [StateFlow] of [DlState] for Compose UI gates.
- * - Apply progress throttling to prevent excessive recompositions.
- *
- * Architectural note:
- * This ViewModel is intentionally thin. It delegates:
- * - Network + resume + integrity checks to [HeavyInitializer].
- * - UI rendering to [DownloadGate].
- */
 class AppViewModel(
     val modelUrl: String = DEFAULT_MODEL_URL,
     private val fileName: String = DEFAULT_FILE_NAME,
@@ -116,37 +73,20 @@ class AppViewModel(
 
     private val _state = MutableStateFlow<DlState>(DlState.Idle)
 
-    /**
-     * Exposes the current download state for observers.
-     */
+    /** Exposes download state for Compose gating. */
     val state: StateFlow<DlState> = _state.asStateFlow()
 
-    /**
-     * Basic guard to avoid launching redundant orchestration coroutines.
-     *
-     * HeavyInitializer is assumed to be single-flight internally, but this
-     * ViewModel-level guard reduces noisy parallel attempts and state churn.
-     */
-    private val inFlight = AtomicBoolean(false)
+    @Volatile
+    private var downloadJob: Job? = null
 
     /**
-     * Ensures that the model file is available on disk.
+     * Ensures the target model exists locally, downloading if needed.
      *
-     * Behavior summary:
-     * - If [forceFresh] is false and any plausible existing model file is found,
-     *   this method immediately emits [DlState.Done] and returns.
-     * - Otherwise, [HeavyInitializer.ensureInitialized] is used to perform:
-     *   - single-flight download
-     *   - resume support
-     *   - optional integrity checks (implementation-dependent)
-     * - Progress is bridged into [DlState.Downloading] with throttling.
-     *
-     * Threading:
-     * - The orchestration runs on [Dispatchers.IO].
-     * - [MutableStateFlow] is thread-safe for background emissions.
-     *
-     * Idempotency:
-     * - Safe to call from multiple sites (e.g., LaunchedEffect + Retry button).
+     * Behavioral rules:
+     * - If already DONE and file exists, return (unless forceFresh=true).
+     * - If a plausible cached file exists, emit DONE and return (unless forceFresh=true).
+     * - Only one download job can run at a time.
+     * - forceFresh cancels the current job and starts a new attempt.
      */
     fun ensureModelDownloaded(
         appContext: Context,
@@ -154,13 +94,11 @@ class AppViewModel(
     ) {
         val app = appContext.applicationContext
 
-        // Fast-path: already done and not forcing refresh.
         val currentState = _state.value
         if (!forceFresh && currentState is DlState.Done && currentState.file.exists()) {
             return
         }
 
-        // Best-effort pre-check for an existing model file.
         if (!forceFresh) {
             val safeName = suggestFileName(modelUrl, fileName)
             findExistingModelFile(app, safeName)?.let { existing ->
@@ -169,16 +107,16 @@ class AppViewModel(
             }
         }
 
-        // Prevent redundant orchestration launches.
-        if (!forceFresh && !inFlight.compareAndSet(false, true)) {
-            return
-        }
-        if (forceFresh && !inFlight.compareAndSet(false, true)) {
-            // Even for force refresh, avoid parallel refresh attempts.
-            return
+        // Single job policy (Job-based, avoids AtomicBoolean races).
+        val running = downloadJob
+        if (running?.isActive == true) {
+            if (!forceFresh) return
+            running.cancel(CancellationException("forceFresh requested"))
+            HeavyInitializer.cancel()
         }
 
-        viewModelScope.launch(Dispatchers.IO) {
+        downloadJob = viewModelScope.launch(Dispatchers.IO) {
+            val job = coroutineContext[Job]
             try {
                 val nowState = _state.value
                 if (!forceFresh && (nowState is DlState.Downloading || nowState is DlState.Done)) {
@@ -190,20 +128,12 @@ class AppViewModel(
 
                 _state.value = DlState.Downloading(downloaded = 0L, total = null)
 
-                /**
-                 * Throttling state for progress-to-UI updates.
-                 *
-                 * The bridge emits when any of these are true:
-                 * - time since last commit >= [uiThrottleMs]
-                 * - bytes since last commit >= [uiMinDeltaBytes]
-                 * - the download reaches total size
-                 *
-                 * This keeps UI smooth and avoids saturating the main thread.
-                 */
                 var lastEmitNs = System.nanoTime()
                 var lastBytes = 0L
 
-                val progressBridge: (Long, Long?) -> Unit = { got, total ->
+                val progressBridge: (Long, Long?) -> Unit = progress@{ got, total ->
+                    if (job?.isActive == false) return@progress
+
                     val now = System.nanoTime()
                     val elapsedMs = (now - lastEmitNs) / 1_000_000L
                     val deltaBytes = got - lastBytes
@@ -220,12 +150,6 @@ class AppViewModel(
                     }
                 }
 
-                /**
-                 * Heavy initializer contract:
-                 * - Returns Result<File> representing the final local model.
-                 * - Collapses concurrent calls across the app process.
-                 * - May perform resume/integrity verification internally.
-                 */
                 val result = HeavyInitializer.ensureInitialized(
                     context = app,
                     modelUrl = modelUrl,
@@ -236,82 +160,65 @@ class AppViewModel(
                     onProgress = progressBridge
                 )
 
+                if (!isActive) return@launch
+
                 _state.value = result.fold(
                     onSuccess = { file -> DlState.Done(file) },
-                    onFailure = { error ->
-                        DlState.Error(error.message ?: "Download failed")
-                    }
+                    onFailure = { error -> DlState.Error(error.message ?: "Download failed") }
                 )
+            } catch (ce: CancellationException) {
+                if (_state.value !is DlState.Error) {
+                    _state.value = DlState.Error("Canceled by user")
+                }
+            } catch (t: Throwable) {
+                if (!isActive) return@launch
+                _state.value = DlState.Error(t.message ?: "Download failed")
             } finally {
-                inFlight.set(false)
+                if (downloadJob === this.coroutineContext[Job]) {
+                    downloadJob = null
+                }
             }
         }
     }
 
     /**
-     * Requests cancellation of any in-flight model initialization/download.
+     * Cancels the current download attempt.
      *
-     * This is a best-effort signal to [HeavyInitializer]. The underlying
-     * implementation may:
-     * - cancel active network work
-     * - keep partially downloaded files for future resume
+     * This cancels:
+     * - the ViewModel job
+     * - the HeavyInitializer owner job (best-effort)
      */
     fun cancelDownload() {
-        viewModelScope.launch {
-            HeavyInitializer.cancel()
-            _state.value = DlState.Error("Canceled by user")
-            inFlight.set(false)
-        }
+        downloadJob?.cancel(CancellationException("canceled by user"))
+        HeavyInitializer.cancel()
+        _state.value = DlState.Error("Canceled by user")
+        downloadJob = null
     }
 
-    /**
-     * Debug-only reset entry point.
-     *
-     * This clears both:
-     * - UI state in this ViewModel
-     * - any internal single-flight book-keeping in [HeavyInitializer]
-     *
-     * This should not be exposed in production UI.
-     */
     fun resetForDebug() {
+        downloadJob?.cancel(CancellationException("resetForDebug"))
         HeavyInitializer.resetForDebug()
         _state.value = DlState.Idle
-        inFlight.set(false)
+        downloadJob = null
+    }
+
+    override fun onCleared() {
+        downloadJob?.cancel(CancellationException("onCleared"))
+        runCatching { HeavyInitializer.cancel() }
+        downloadJob = null
+        super.onCleared()
     }
 
     companion object {
 
-        /**
-         * Default hosted model URL.
-         *
-         * This can be overridden by YAML `model_defaults.default_model_url`.
-         */
         const val DEFAULT_MODEL_URL: String =
             "https://huggingface.co/google/gemma-3n-E4B-it-litert-lm/resolve/main/gemma-3n-E4B-it-int4.litertlm"
 
-        /**
-         * Default local file name used when URL inference is unavailable.
-         */
         private const val DEFAULT_FILE_NAME: String = "model.litertlm"
-
-        /**
-         * Default hard timeout for model acquisition.
-         */
         private const val DEFAULT_TIMEOUT_MS: Long = 30L * 60L * 1000L
-
-        /**
-         * Minimum time interval between progress-to-UI emissions.
-         */
         private const val DEFAULT_UI_THROTTLE_MS: Long = 250L
-
-        /**
-         * Minimum byte delta required to trigger a UI emission.
-         */
         private const val DEFAULT_UI_MIN_DELTA_BYTES: Long = 1L * 1024L * 1024L
 
-        /**
-         * Compose-friendly factory using compiled defaults.
-         */
         fun factory(): ViewModelProvider.Factory =
             object : ViewModelProvider.Factory {
                 @Suppress("UNCHECKED_CAST")
@@ -320,14 +227,6 @@ class AppViewModel(
                 }
             }
 
-        /**
-         * Factory that accepts nullable overrides (e.g., from YAML model_defaults).
-         *
-         * This mirrors the usage in MainActivity:
-         * ```kotlin
-         * viewModel(factory = AppViewModel.factoryFromOverrides(...))
-         * ```
-         */
         fun factoryFromOverrides(
             modelUrlOverride: String? = null,
             fileNameOverride: String? = null,
@@ -339,8 +238,7 @@ class AppViewModel(
             val name = fileNameOverride?.takeIf { it.isNotBlank() } ?: DEFAULT_FILE_NAME
             val timeout = timeoutMsOverride?.takeIf { it > 0L } ?: DEFAULT_TIMEOUT_MS
             val throttle = uiThrottleMsOverride?.takeIf { it >= 0L } ?: DEFAULT_UI_THROTTLE_MS
-            val minDelta = uiMinDeltaBytesOverride?.takeIf { it >= 0L }
-                ?: DEFAULT_UI_MIN_DELTA_BYTES
+            val minDelta = uiMinDeltaBytesOverride?.takeIf { it >= 0L } ?: DEFAULT_UI_MIN_DELTA_BYTES
 
             return object : ViewModelProvider.Factory {
                 @Suppress("UNCHECKED_CAST")
@@ -356,26 +254,25 @@ class AppViewModel(
             }
         }
 
-        /**
-         * Suggest a stable file name for the model.
-         *
-         * Strategy:
-         * - Use the last path segment of the URL.
-         * - Strip query parameters.
-         * - Fall back to [fallback] when URL inference is empty.
-         */
         private fun suggestFileName(url: String, fallback: String): String {
             val raw = url.substringAfterLast('/').ifBlank { fallback }
             val stripped = raw.substringBefore('?').ifBlank { fallback }
-            return stripped
+            return sanitizeFileName(stripped.ifBlank { fallback })
         }
 
-        /**
-         * Best-effort search for an already-present model file.
-         *
-         * This does not guarantee correctness with future initializer revisions,
-         * but it provides a pragmatic speed-up for common storage patterns.
-         */
+        private fun sanitizeFileName(name: String): String {
+            if (name.isBlank()) return DEFAULT_FILE_NAME
+            val sb = StringBuilder(name.length)
+            for (c in name) {
+                val ok = (c in 'a'..'z') ||
+                        (c in 'A'..'Z') ||
+                        (c in '0'..'9') ||
+                        c == '.' || c == '_' || c == '-'
+                sb.append(if (ok) c else '_')
+            }
+            return sb.toString().take(160).ifBlank { DEFAULT_FILE_NAME }
+        }
+
         private fun findExistingModelFile(context: Context, name: String): File? {
             val privateModelsDir = runCatching { context.getDir("models", Context.MODE_PRIVATE) }
                 .getOrNull()
@@ -397,15 +294,6 @@ class AppViewModel(
 
 /* ───────────────────────────── UI Gate ───────────────────────────── */
 
-/**
- * UI gate that blocks entry into the SLM-dependent flow until
- * the model file is available locally.
- *
- * Design notes:
- * - [DlState.Idle] is rendered using a similar layout to downloading states
- *   to avoid UI flicker during short pre-flight checks.
- * - The UI deliberately avoids binding to transport details.
- */
 @Composable
 fun DownloadGate(
     state: DlState,

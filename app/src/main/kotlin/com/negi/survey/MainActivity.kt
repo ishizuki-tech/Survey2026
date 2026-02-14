@@ -49,6 +49,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.wrapContentWidth
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Settings
@@ -125,7 +127,10 @@ import com.negi.survey.vm.DownloadGate
 import com.negi.survey.vm.FlowAI
 import com.negi.survey.vm.FlowDone
 import com.negi.survey.vm.FlowHome
+import com.negi.survey.vm.FlowMulti
 import com.negi.survey.vm.FlowReview
+import com.negi.survey.vm.FlowSingle
+import com.negi.survey.vm.FlowText
 import com.negi.survey.vm.SurveyViewModel
 import com.negi.survey.vm.WhisperSpeechController
 import java.util.Locale
@@ -935,6 +940,9 @@ fun SurveyNavHost(
     val latestNode by vmSurvey.currentNode.collectAsState()
     val latestNodeId = latestNode.id
 
+    /** Keep SpeechController aligned with the real survey run id. */
+    val surveyUuid by vmSurvey.surveyUuid.collectAsState()
+
     // IMPORTANT:
     // - IME causes recompositions and size changes.
     // - imePadding() here prevents the whole nav content from being covered by the keyboard.
@@ -989,8 +997,6 @@ fun SurveyNavHost(
             )
         }
 
-        // IMPORTANT:
-        // viewModel<T>() must be parameterized with a ViewModel type.
         val whisperVm: WhisperSpeechController = viewModel(
             viewModelStoreOwner = owner,
             key = "WhisperSpeechController_${sessionId}_${assetPath}_$lang",
@@ -1004,9 +1010,9 @@ fun SurveyNavHost(
         }
     }
 
-    LaunchedEffect(sessionId, latestNode.id) {
-        // Keep SpeechController in sync with the current question/node.
-        runCatching { speechController.updateContext(sessionId, latestNode.id) }
+    LaunchedEffect(surveyUuid, latestNode.id) {
+        // Keep SpeechController in sync with the current survey run + question id.
+        runCatching { speechController.updateContext(surveyUuid, latestNode.id) }
     }
 
     DisposableEffect(speechController) {
@@ -1029,6 +1035,56 @@ fun SurveyNavHost(
                             vmAI.resetStates(keepError = false)
                             vmSurvey.advanceToNext()
                         }
+                    )
+                }
+
+                entry<FlowText> {
+                    val node by vmSurvey.currentNode.collectAsState()
+                    TextNodeScreen(
+                        title = node.title,
+                        question = node.question,
+                        onNext = { vmSurvey.advanceToNext() },
+                        onBack = { vmSurvey.backToPrevious() }
+                    )
+                }
+
+                entry<FlowSingle> {
+                    val node by vmSurvey.currentNode.collectAsState()
+                    SingleChoiceNodeScreen(
+                        title = node.title,
+                        question = node.question,
+                        options = node.options,
+                        selected = vmSurvey.single.collectAsState().value,
+                        onSelect = { vmSurvey.setSingleChoice(it) },
+                        onNext = {
+                            val sel = vmSurvey.single.value
+                            if (!sel.isNullOrBlank()) {
+                                vmSurvey.setAnswer(sel, node.id)
+                            } else {
+                                vmSurvey.setAnswer("", node.id)
+                            }
+                            vmSurvey.advanceToNext()
+                        },
+                        onBack = { vmSurvey.backToPrevious() }
+                    )
+                }
+
+                entry<FlowMulti> {
+                    val node by vmSurvey.currentNode.collectAsState()
+                    val selected by vmSurvey.multi.collectAsState()
+
+                    MultiChoiceNodeScreen(
+                        title = node.title,
+                        question = node.question,
+                        options = node.options,
+                        selected = selected,
+                        onToggle = { vmSurvey.toggleMultiChoice(it) },
+                        onNext = {
+                            val ans = selected.toList().sorted().joinToString(", ")
+                            vmSurvey.setAnswer(ans, node.id)
+                            vmSurvey.advanceToNext()
+                        },
+                        onBack = { vmSurvey.backToPrevious() }
                     )
                 }
 
@@ -1085,6 +1141,263 @@ fun SurveyNavHost(
         runCatching { speechController.stopRecording() }
         vmAI.resetStates()
         vmSurvey.backToPrevious()
+    }
+}
+
+/* ───────────────────────────── Minimal Node Screens ───────────────────────────── */
+
+/**
+ * Minimal TEXT node UI.
+ *
+ * This prevents runtime crashes when YAML contains TEXT nodes but the host has no entry.
+ */
+@Composable
+private fun TextNodeScreen(
+    title: String,
+    question: String,
+    onNext: () -> Unit,
+    onBack: () -> Unit
+) {
+    val backplate = appBackplate()
+    val scroll = rememberScrollState()
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .imePadding()
+            .background(backplate)
+            .padding(24.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Surface(
+            tonalElevation = 6.dp,
+            shadowElevation = 8.dp,
+            shape = MaterialTheme.shapes.large,
+            color = MaterialTheme.colorScheme.surface.copy(alpha = 0.97f),
+            modifier = Modifier
+                .fillMaxWidth()
+                .widthIn(max = 520.dp)
+                .wrapContentWidth()
+                .neonEdgeThin()
+        ) {
+            Column(
+                modifier = Modifier
+                    .padding(horizontal = 24.dp, vertical = 20.dp)
+                    .verticalScroll(scroll),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                if (title.isNotBlank()) {
+                    Text(text = title, style = MaterialTheme.typography.titleLarge)
+                }
+                Text(
+                    text = question.ifBlank { "(no question text)" },
+                    style = MaterialTheme.typography.bodyLarge
+                )
+
+                Spacer(Modifier.height(10.dp))
+
+                RowButtons(
+                    primaryLabel = "Next",
+                    onPrimary = onNext,
+                    secondaryLabel = "Back",
+                    onSecondary = onBack
+                )
+            }
+        }
+    }
+}
+
+/**
+ * Minimal SINGLE_CHOICE node UI.
+ *
+ * Stores selection in SurveyViewModel.single via callbacks supplied by the host.
+ */
+@Composable
+private fun SingleChoiceNodeScreen(
+    title: String,
+    question: String,
+    options: List<String>,
+    selected: String?,
+    onSelect: (String?) -> Unit,
+    onNext: () -> Unit,
+    onBack: () -> Unit
+) {
+    val backplate = appBackplate()
+    val scroll = rememberScrollState()
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .imePadding()
+            .background(backplate)
+            .padding(24.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Surface(
+            tonalElevation = 6.dp,
+            shadowElevation = 8.dp,
+            shape = MaterialTheme.shapes.large,
+            color = MaterialTheme.colorScheme.surface.copy(alpha = 0.97f),
+            modifier = Modifier
+                .fillMaxWidth()
+                .widthIn(max = 520.dp)
+                .wrapContentWidth()
+                .neonEdgeThin()
+        ) {
+            Column(
+                modifier = Modifier
+                    .padding(horizontal = 24.dp, vertical = 20.dp)
+                    .verticalScroll(scroll),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                if (title.isNotBlank()) {
+                    Text(text = title, style = MaterialTheme.typography.titleLarge)
+                }
+                Text(
+                    text = question.ifBlank { "(no question text)" },
+                    style = MaterialTheme.typography.bodyLarge
+                )
+
+                Spacer(Modifier.height(8.dp))
+
+                if (options.isEmpty()) {
+                    Text(
+                        text = "(no options)",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                } else {
+                    options.forEach { opt ->
+                        val isSel = (selected == opt)
+                        if (isSel) {
+                            Button(onClick = { onSelect(null) }, modifier = Modifier.fillMaxWidth()) {
+                                Text(opt)
+                            }
+                        } else {
+                            OutlinedButton(onClick = { onSelect(opt) }, modifier = Modifier.fillMaxWidth()) {
+                                Text(opt)
+                            }
+                        }
+                    }
+                }
+
+                Spacer(Modifier.height(10.dp))
+
+                RowButtons(
+                    primaryLabel = "Next",
+                    onPrimary = onNext,
+                    secondaryLabel = "Back",
+                    onSecondary = onBack
+                )
+            }
+        }
+    }
+}
+
+/**
+ * Minimal MULTI_CHOICE node UI.
+ *
+ * Stores selection set in SurveyViewModel.multi via callbacks supplied by the host.
+ */
+@Composable
+private fun MultiChoiceNodeScreen(
+    title: String,
+    question: String,
+    options: List<String>,
+    selected: Set<String>,
+    onToggle: (String) -> Unit,
+    onNext: () -> Unit,
+    onBack: () -> Unit
+) {
+    val backplate = appBackplate()
+    val scroll = rememberScrollState()
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .imePadding()
+            .background(backplate)
+            .padding(24.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Surface(
+            tonalElevation = 6.dp,
+            shadowElevation = 8.dp,
+            shape = MaterialTheme.shapes.large,
+            color = MaterialTheme.colorScheme.surface.copy(alpha = 0.97f),
+            modifier = Modifier
+                .fillMaxWidth()
+                .widthIn(max = 520.dp)
+                .wrapContentWidth()
+                .neonEdgeThin()
+        ) {
+            Column(
+                modifier = Modifier
+                    .padding(horizontal = 24.dp, vertical = 20.dp)
+                    .verticalScroll(scroll),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                if (title.isNotBlank()) {
+                    Text(text = title, style = MaterialTheme.typography.titleLarge)
+                }
+                Text(
+                    text = question.ifBlank { "(no question text)" },
+                    style = MaterialTheme.typography.bodyLarge
+                )
+
+                Spacer(Modifier.height(8.dp))
+
+                if (options.isEmpty()) {
+                    Text(
+                        text = "(no options)",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                } else {
+                    options.forEach { opt ->
+                        val isSel = opt in selected
+                        if (isSel) {
+                            Button(onClick = { onToggle(opt) }, modifier = Modifier.fillMaxWidth()) {
+                                Text(opt)
+                            }
+                        } else {
+                            OutlinedButton(onClick = { onToggle(opt) }, modifier = Modifier.fillMaxWidth()) {
+                                Text(opt)
+                            }
+                        }
+                    }
+                }
+
+                Spacer(Modifier.height(10.dp))
+
+                RowButtons(
+                    primaryLabel = "Next",
+                    onPrimary = onNext,
+                    secondaryLabel = "Back",
+                    onSecondary = onBack
+                )
+            }
+        }
+    }
+}
+
+/**
+ * Shared two-button row (kept simple: column-aligned for readability).
+ */
+@Composable
+private fun RowButtons(
+    primaryLabel: String,
+    onPrimary: () -> Unit,
+    secondaryLabel: String,
+    onSecondary: () -> Unit
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Button(onClick = onPrimary, modifier = Modifier.fillMaxWidth()) {
+            Text(primaryLabel)
+        }
+        OutlinedButton(onClick = onSecondary, modifier = Modifier.fillMaxWidth()) {
+            Text(secondaryLabel)
+        }
     }
 }
 
@@ -1231,13 +1544,6 @@ private fun listAssetYamlConfigs(assetManager: AssetManager): List<String> {
 
 /* ───────────────────────────── Config Details Resolver ───────────────────────────── */
 
-/**
- * Load config YAML text from assets and extract helpful meta (slm: section).
- *
- * Notes:
- * - No YAML library needed.
- * - Best-effort: meta parsing can fail safely; longText still shows the real YAML.
- */
 private suspend fun resolveConfigDetailsFromAssets(
     context: Context,
     configId: String
@@ -1321,13 +1627,6 @@ private fun readFirstAssetText(
     )
 }
 
-/**
- * Heuristically extract key/value pairs under the "slm:" section.
- *
- * This is intentionally lightweight:
- * - Not a full YAML parser.
- * - Handles common "key: value" lines in a nested block.
- */
 private fun extractSlmMeta(yamlText: String): Map<String, String> {
     val lines = yamlText.lines()
 

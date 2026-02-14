@@ -38,8 +38,8 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.negi.survey.screens.SpeechController
 import com.negi.survey.utils.ExportUtils
-import com.negi.survey.whisper.WhisperEngine
 import com.negi.survey.whisper.Recorder
+import com.negi.survey.whisper.WhisperEngine
 import java.io.File
 import java.io.FileInputStream
 import java.security.MessageDigest
@@ -177,10 +177,19 @@ class WhisperSpeechController(
      */
     private val recorder: Recorder = Recorder(appContext) { e ->
         Log.e(TAG, "Recorder error", e)
+
+        // Best-effort delete the temp wav if it exists.
+        val tmp = outputFile
+        outputFile = null
+        cleanupScope.launch {
+            withContext(NonCancellable) {
+                deleteTempFileQuietly(tmp, reason = "recorder_error")
+            }
+        }
+
         _error.value = e.message ?: "Recording error"
         _isRecording.value = false
         _isTranscribing.value = false
-        outputFile = null
     }
 
     /**
@@ -298,6 +307,11 @@ class WhisperSpeechController(
                 try {
                     ensureActive()
 
+                    // Clean leftover temp file if any (best-effort).
+                    val old = outputFile
+                    outputFile = null
+                    deleteTempFileQuietly(old, reason = "start_cleanup")
+
                     ensureModelInitializedFromAssetsOnce()
                     ensureActive()
 
@@ -319,12 +333,18 @@ class WhisperSpeechController(
                 } catch (ce: CancellationException) {
                     Log.d(TAG, "startRecording: cancelled")
                     _isRecording.value = false
+
+                    val tmp = outputFile
                     outputFile = null
+                    deleteTempFileQuietly(tmp, reason = "start_cancelled")
                 } catch (t: Throwable) {
                     Log.e(TAG, "startRecording: failed", t)
                     _error.value = t.message ?: "Speech recognition start failed"
                     _isRecording.value = false
+
+                    val tmp = outputFile
                     outputFile = null
+                    deleteTempFileQuietly(tmp, reason = "start_failed")
                 }
             }
         }
@@ -433,17 +453,7 @@ class WhisperSpeechController(
                     _error.value = t.message ?: "Speech recognition failed"
                 } finally {
                     _isTranscribing.value = false
-
-                    runCatching {
-                        localWav?.let { tmp ->
-                            if (tmp.exists()) {
-                                val ok = tmp.delete()
-                                Log.d(TAG, "stopRecording: temp delete=$ok -> ${tmp.path}")
-                            }
-                        }
-                    }.onFailure { e ->
-                        Log.w(TAG, "stopRecording: temp WAV delete failed", e)
-                    }
+                    deleteTempFileQuietly(localWav, reason = "stop_finally")
                 }
             }
         }
@@ -530,6 +540,9 @@ class WhisperSpeechController(
 
     /**
      * Compute SHA-256 checksum for the given file.
+     *
+     * IMPORTANT:
+     * - Use `byte.toInt() and 0xff` to avoid sign-extension issues in hex formatting.
      */
     private fun computeSha256(file: File): String {
         val digest = MessageDigest.getInstance("SHA-256")
@@ -541,7 +554,24 @@ class WhisperSpeechController(
                 digest.update(buffer, 0, read)
             }
         }
-        return digest.digest().joinToString("") { "%02x".format(it) }
+        return digest.digest().joinToString("") { b ->
+            "%02x".format(b.toInt() and 0xff)
+        }
+    }
+
+    /**
+     * Best-effort temp file deletion with logging.
+     */
+    private fun deleteTempFileQuietly(file: File?, reason: String) {
+        if (file == null) return
+        runCatching {
+            if (file.exists()) {
+                val ok = file.delete()
+                Log.d(TAG, "temp delete=$ok reason=$reason -> ${file.path}")
+            }
+        }.onFailure { e ->
+            Log.w(TAG, "temp delete failed reason=$reason -> ${file.path}", e)
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -552,27 +582,20 @@ class WhisperSpeechController(
         workerJob?.cancel()
         workerJob = null
 
-        cleanupScope.launch {
+        val job = cleanupScope.launch {
             withContext(NonCancellable) {
-                /**
-                 * Soft detach to keep the heavy model alive across navigation
-                 * and restart flows.
-                 */
+                // Soft detach to keep the heavy model alive across navigation/restart flows.
                 runCatching { WhisperEngine.detach() }
                     .onFailure { e -> Log.w(TAG, "WhisperEngine.detach failed", e) }
 
-                /**
-                 * Recorder resources should be released with the ViewModel.
-                 */
+                // Recorder resources should be released with the ViewModel.
                 runCatching { recorder.close() }
                     .onFailure { e -> Log.w(TAG, "Recorder.close failed", e) }
             }
-
-            /**
-             * Ensure the cleanup scope does not leak.
-             */
-            cleanupScope.cancel()
         }
+
+        // Ensure the cleanup scope does not leak.
+        job.invokeOnCompletion { cleanupScope.cancel() }
 
         super.onCleared()
     }

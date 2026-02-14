@@ -15,6 +15,7 @@ import java.io.FileOutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.TimeZone
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.zip.GZIPOutputStream
@@ -51,17 +52,25 @@ object CrashCapture {
     private val enqueueing = AtomicBoolean(false)
     private val lastEnqueueAt = AtomicLong(0L)
 
+    /** UTC timestamp used in filenames to keep ordering stable across devices/locales. */
+    private val FILE_TS_UTC = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).apply {
+        timeZone = TimeZone.getTimeZone("UTC")
+    }
+
+    /** Local timestamp for human-friendly header info. */
+    private val HEADER_TS_LOCAL = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US)
+
     /**
      * Install default uncaught exception handler that writes a gz crash report file.
      *
      * Note:
      * - Keep this method non-suspending and fast.
-     * - Avoid allocations that could crash again.
+     * - Avoid allocations that could crash again (best-effort).
      */
     fun install(context: Context) {
         if (!installed.compareAndSet(false, true)) return
 
-        val appContext = context.applicationContext ?: context
+        val appContext = context.applicationContext
         val prior = Thread.getDefaultUncaughtExceptionHandler()
         val pidAtInstall = Process.myPid()
 
@@ -110,16 +119,7 @@ object CrashCapture {
      * - Keep files locally if nothing is configured.
      */
     fun enqueuePendingCrashUploadsIfPossible(context: Context) {
-        val appContext = context.applicationContext ?: context
-
-        val now = SystemClock.elapsedRealtime()
-        val prev = lastEnqueueAt.get()
-        val dt = now - prev
-        if (prev != 0L && dt in 0 until ENQUEUE_COOLDOWN_MS) {
-            Log.d(TAG, "enqueuePendingCrashUploadsIfPossible skipped (cooldown). dt=${dt}ms")
-            return
-        }
-        lastEnqueueAt.set(now)
+        val appContext = context.applicationContext
 
         if (!enqueueing.compareAndSet(false, true)) {
             Log.d(TAG, "enqueuePendingCrashUploadsIfPossible skipped (already running).")
@@ -127,6 +127,15 @@ object CrashCapture {
         }
 
         try {
+            val now = SystemClock.elapsedRealtime()
+            val prev = lastEnqueueAt.get()
+            val dt = now - prev
+            if (prev != 0L && dt in 0 until ENQUEUE_COOLDOWN_MS) {
+                Log.d(TAG, "enqueuePendingCrashUploadsIfPossible skipped (cooldown). dt=${dt}ms")
+                return
+            }
+            lastEnqueueAt.set(now)
+
             val dir = crashDir(appContext).apply { mkdirs() }
             val ghMirrorDir = crashGitHubMirrorDir(appContext).apply { mkdirs() }
 
@@ -158,7 +167,7 @@ object CrashCapture {
             Log.d(
                 TAG,
                 "GitHub hints: owner=${BuildConfig.GH_OWNER} repo=${BuildConfig.GH_REPO} " +
-                        "branch=${BuildConfig.GH_BRANCH} pathPrefix=${buildCrashGitHubConfigOrNull()?.pathPrefix}"
+                        "branch=${BuildConfig.GH_BRANCH} pathPrefix=${ghCfg?.pathPrefix}"
             )
 
             val targets = files
@@ -218,15 +227,23 @@ object CrashCapture {
     private fun makeGitHubMirrorCopy(src: File, mirrorDir: File): File {
         mirrorDir.mkdirs()
 
-        // Keep the same filename but add a stable suffix to avoid collisions.
-        val dstName = src.name.removeSuffix(".gz") + ".ghcopy.gz"
-        val dst = File(mirrorDir, dstName)
+        // Prefer keeping the same file name to simplify server-side ingestion.
+        val dst = File(mirrorDir, src.name)
 
-        // If a previous copy exists and looks valid, reuse it.
-        if (dst.exists() && dst.length() == src.length()) return dst
+        // If a previous copy exists and looks identical, reuse it.
+        if (dst.exists() && dst.length() == src.length() && dst.lastModified() == src.lastModified()) {
+            return dst
+        }
+
+        // If a different file already exists at the same name, create a unique suffixed name.
+        val target = if (!dst.exists()) {
+            dst
+        } else {
+            makeUniqueGzFile(mirrorDir, baseName = src.name.removeSuffix(".gz"))
+        }
 
         FileInputStream(src).use { input ->
-            FileOutputStream(dst).use { output ->
+            FileOutputStream(target).use { output ->
                 val buf = ByteArray(64 * 1024)
                 while (true) {
                     val n = input.read(buf)
@@ -236,8 +253,21 @@ object CrashCapture {
                 output.flush()
             }
         }
-        dst.setLastModified(src.lastModified())
-        return dst
+
+        target.setLastModified(src.lastModified())
+        return target
+    }
+
+    private fun makeUniqueGzFile(dir: File, baseName: String): File {
+        var candidate = File(dir, "$baseName.gz")
+        if (!candidate.exists()) return candidate
+
+        var index = 2
+        while (true) {
+            candidate = File(dir, "$baseName-$index.gz")
+            if (!candidate.exists()) return candidate
+            index++
+        }
     }
 
     private fun captureCrashToFile(
@@ -248,17 +278,25 @@ object CrashCapture {
         val dir = crashDir(context).apply { mkdirs() }
         purgeOldFiles(dir, MAX_FILES_TO_KEEP)
 
-        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        val now = Date()
+        val stampUtc = FILE_TS_UTC.format(now)
+        val stampLocal = HEADER_TS_LOCAL.format(now)
+
         val pid = Process.myPid()
-        val name = "crash_${stamp}_pid${pid}.log.gz"
+        val tid = Process.myTid()
+        val uptimeTail = (SystemClock.elapsedRealtime() % 1_000_000L)
+
+        val name = "crash_${stampUtc}_pid${pid}_tid${tid}_u${uptimeTail}.log.gz"
         val outFile = File(dir, name)
 
         FileOutputStream(outFile).use { fos ->
             GZIPOutputStream(fos).use { gz ->
                 val header = buildString {
                     appendLine("=== Crash Report ===")
-                    appendLine("time_local=$stamp")
+                    appendLine("time_utc=$stampUtc")
+                    appendLine("time_local=$stampLocal")
                     appendLine("pid=$pid")
+                    appendLine("tid=$tid")
                     appendLine("thread=${thread.name}")
                     appendLine("sdk=${Build.VERSION.SDK_INT}")
                     appendLine("device=${Build.MANUFACTURER} ${Build.MODEL}")
@@ -294,7 +332,7 @@ object CrashCapture {
         File(context.filesDir, CRASH_GH_MIRROR_DIR_REL)
 
     private fun purgeOldFiles(dir: File, maxKeep: Int) {
-        val all = dir.listFiles { f -> f.isFile && f.length() > 0L }?.toList().orEmpty()
+        val all = dir.listFiles { f -> f.isFile && f.length() > 0L && !f.name.startsWith(".") }?.toList().orEmpty()
         if (all.size <= maxKeep) return
 
         val sorted = all.sortedBy { it.lastModified() }
@@ -357,14 +395,19 @@ object CrashCapture {
         if (BuildConfig.GH_TOKEN.isBlank()) return null
         if (BuildConfig.GH_OWNER.isBlank() || BuildConfig.GH_REPO.isBlank()) return null
 
+        // Accept either "repo" or "owner/repo" in GH_REPO, normalize to "repo".
+        val repoName = BuildConfig.GH_REPO.substringAfterLast('/').trim()
+        if (repoName.isBlank()) return null
+
         val basePrefix = BuildConfig.GH_PATH_PREFIX.trim('/')
+
         val crashPrefix = listOf(basePrefix, "diagnostics/crash")
             .filter { it.isNotBlank() }
             .joinToString("/")
 
         return GitHubUploader.GitHubConfig(
             owner = BuildConfig.GH_OWNER,
-            repo = BuildConfig.GH_REPO,
+            repo = repoName,
             branch = BuildConfig.GH_BRANCH.ifBlank { "main" },
             pathPrefix = crashPrefix,
             token = BuildConfig.GH_TOKEN

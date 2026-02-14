@@ -83,8 +83,8 @@ class UploadQueueViewModel(app: Application) : AndroidViewModel(app) {
         wm.getWorkInfosByTagLiveData(GitHubUploadWorker.TAG)
             .asFlow()
             .map { workList ->
-                workList
-                    .map { wi -> wi.toUploadItemUi() }
+                // LiveData is a platform type; be defensive to avoid rare null-ish emissions.
+                workList.map { wi -> wi.toUploadItemUi() }
                     .sortedWith(
                         compareBy<UploadItemUi> { it.priorityRank() }
                             .thenBy { it.fileName.lowercase(Locale.ROOT) }
@@ -116,11 +116,11 @@ class UploadQueueViewModel(app: Application) : AndroidViewModel(app) {
             ?.takeIf { it.isNotBlank() }
 
         val msg = when (state) {
-            WorkInfo.State.ENQUEUED  -> "Waiting for network…"
-            WorkInfo.State.RUNNING   -> "Uploading…"
+            WorkInfo.State.ENQUEUED -> "Waiting for network…"
+            WorkInfo.State.RUNNING -> "Uploading…"
             WorkInfo.State.SUCCEEDED -> "Uploaded"
-            WorkInfo.State.FAILED    -> "Failed"
-            WorkInfo.State.BLOCKED   -> "Blocked"
+            WorkInfo.State.FAILED -> "Failed"
+            WorkInfo.State.BLOCKED -> "Blocked"
             WorkInfo.State.CANCELLED -> "Cancelled"
         }
 
@@ -309,8 +309,12 @@ class UploadQueueViewModel(app: Application) : AndroidViewModel(app) {
          */
         fun factory(app: Application) = object : ViewModelProvider.Factory {
             @Suppress("UNCHECKED_CAST")
-            override fun <T : ViewModel> create(modelClass: Class<T>): T =
-                UploadQueueViewModel(app) as T
+            override fun <T : ViewModel> create(modelClass: Class<T>): T {
+                require(modelClass.isAssignableFrom(UploadQueueViewModel::class.java)) {
+                    "Unknown ViewModel class $modelClass"
+                }
+                return UploadQueueViewModel(app) as T
+            }
         }
     }
 }

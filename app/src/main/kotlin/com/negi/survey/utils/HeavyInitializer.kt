@@ -19,8 +19,7 @@
  *  - Single-flight:
  *      Concurrent callers share the same in-flight Deferred<Result<File>>.
  *  - Resume:
- *      A partial ".tmp" file is preserved across cancellations/timeouts
- *      when forceFresh=false, allowing a subsequent call to continue.
+ *      Partial files are preserved across cancellations/timeouts when forceFresh=false.
  *  - Integrity:
  *      If Content-Length is known, final size must match exactly.
  *  - Replacement:
@@ -37,6 +36,7 @@ import com.negi.survey.BuildConfig
 import com.negi.survey.net.HttpUrlFileDownloader
 import java.io.File
 import java.io.IOException
+import java.io.InterruptedIOException
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.atomic.AtomicReference
@@ -46,6 +46,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withTimeout
 
 /**
@@ -100,29 +101,20 @@ object HeavyInitializer {
         hfToken: String?,
         fileName: String
     ): Boolean {
-        val dst = File(context.filesDir, fileName)
+        val dst = resolveSafeFileUnder(context.filesDir, fileName)
         if (!dst.exists() || !dst.isFile || dst.length() <= 0L) return false
 
         val token = hfToken?.takeIf { it.isNotBlank() }
         val remoteLen = runCatching { headContentLengthForVerify(modelUrl, token) }.getOrNull()
 
-        // Strict match when Content-Length is known.
         return when {
             remoteLen != null -> remoteLen == dst.length()
-            else -> true // Len unknown: treat existing non-empty file as usable.
+            else -> true
         }
     }
 
     /**
      * Ensure that the model or asset is initialized, downloading it if needed.
-     *
-     * @param context App context used for storage resolution.
-     * @param modelUrl Remote model URL (supports Hugging Face gated assets).
-     * @param hfToken Optional Hugging Face token.
-     * @param fileName Local target file name under filesDir.
-     * @param timeoutMs Hard timeout for the download phase.
-     * @param forceFresh If true, ignore and delete cached final/tmp files.
-     * @param onProgress Callback bridging downloaded bytes and total size.
      */
     suspend fun ensureInitialized(
         context: Context,
@@ -150,12 +142,20 @@ object HeavyInitializer {
         val token = hfToken?.takeIf { it.isNotBlank() }
 
         val dir = app.filesDir
-        val finalFile = File(dir, fileName)
-        val tmpFile = File(dir, "$fileName.tmp") // persistent partial for resume
+        val finalFile = resolveSafeFileUnder(dir, fileName)
+        val tmpFile = resolveSafeFileUnder(dir, "$fileName.tmp")
+
+        // HttpUrlFileDownloader uses: dst.name + ".part" and ".part.meta"
+        val tmpPartFile = File(tmpFile.parentFile, tmpFile.name + ".part")
+        val tmpMetaFile = File(tmpFile.parentFile, tmpPartFile.name + ".meta")
 
         try {
+            currentCoroutineContext().ensureActive()
+
             if (forceFresh) {
                 runCatching { tmpFile.delete() }
+                runCatching { tmpPartFile.delete() }
+                runCatching { tmpMetaFile.delete() }
                 runCatching { finalFile.delete() }
             }
 
@@ -183,29 +183,24 @@ object HeavyInitializer {
                 }
             }
 
-            // Resume logic for tmp file.
-            if (!forceFresh && tmpFile.exists() && tmpFile.length() > 0L) {
-                if (remoteLen != null && tmpFile.length() > remoteLen) {
+            // Resume logic: validate partial if remoteLen is known.
+            if (!forceFresh && tmpPartFile.exists() && tmpPartFile.length() > 0L) {
+                if (remoteLen != null && tmpPartFile.length() > remoteLen) {
                     Log.w(
                         TAG,
-                        "tmp is larger than remoteLen -> discarding tmp " +
-                                "(tmp=${tmpFile.length()}, remote=$remoteLen)"
+                        "part is larger than remoteLen -> discarding part " +
+                                "(part=${tmpPartFile.length()}, remote=$remoteLen)"
                     )
-                    runCatching { tmpFile.delete() }
+                    runCatching { tmpPartFile.delete() }
+                    runCatching { tmpMetaFile.delete() }
                 }
             }
 
-            // Ensure tmp exists (do not delete when resuming).
-            if (!tmpFile.exists()) {
-                tmpFile.parentFile?.mkdirs()
-                tmpFile.createNewFile()
-            }
+            val existingPartial = tmpPartFile.takeIf { it.exists() }?.length() ?: 0L
 
-            val tmpExisting = tmpFile.takeIf { it.exists() }?.length() ?: 0L
-
-            // Free-space validation based on remaining bytes to write into tmp.
+            // Free-space validation based on remaining bytes (when remoteLen is known).
             if (remoteLen != null) {
-                val remaining = max(0L, remoteLen - tmpExisting)
+                val remaining = max(0L, remoteLen - existingPartial)
                 val needed = remaining + FREE_SPACE_MARGIN_BYTES
                 if (dir.usableSpace < needed) {
                     val msg =
@@ -217,31 +212,35 @@ object HeavyInitializer {
                 }
             }
 
-            // Download with timeout.
             withTimeout(timeoutMs) {
-                val progressBridge: (Long, Long?) -> Unit = { cur, total ->
-                    // Respect owner coroutine cancellation.
-                    if (ownerJob?.isActive == false) {
-                        throw CancellationException("canceled by caller")
+                currentCoroutineContext().ensureActive()
+
+                val safeProgressBridge: (Long, Long?) -> Unit = { cur, total ->
+                    // Never throw from callbacks. Just stop emitting when cancelled.
+                    if (ownerJob?.isActive != false) {
+                        onProgress(cur, total)
                     }
-                    onProgress(cur, total)
                 }
 
-                // Let downloader decide whether to resume based on tmp length.
-                downloader.downloadToFile(modelUrl, tmpFile, progressBridge)
+                // NOTE: downloadToFile is suspend -> do NOT wrap with runInterruptible here.
+                // Cancellation responsiveness is handled inside HttpUrlFileDownloader via runInterruptible(read/write).
+                downloader.downloadToFile(
+                    url = modelUrl,
+                    dst = tmpFile,
+                    onProgress = safeProgressBridge
+                )
+
+                currentCoroutineContext().ensureActive()
             }
 
-            // Integrity check when we know the expected size.
+            // Integrity check when we know expected size.
             if (remoteLen != null) {
                 val got = tmpFile.length()
                 if (got != remoteLen) {
-                    throw IOException(
-                        "Downloaded size mismatch. expected=$remoteLen, got=$got"
-                    )
+                    throw IOException("Downloaded size mismatch. expected=$remoteLen, got=$got")
                 }
             }
 
-            // Replace final file.
             replaceFinalAtomic(tmpFile, finalFile)
 
             val outLen = finalFile.length()
@@ -250,20 +249,29 @@ object HeavyInitializer {
             deferred.complete(Result.success(finalFile))
 
         } catch (ce: CancellationException) {
-            // Cancellation policy:
-            // - Preserve tmp for resume unless forceFresh was requested.
             Log.w(TAG, "ensureInitialized: cancelled", ce)
             if (forceFresh) {
                 runCatching { tmpFile.delete() }
+                runCatching { tmpPartFile.delete() }
+                runCatching { tmpMetaFile.delete() }
             }
             deferred.complete(Result.failure(IOException("Canceled", ce)))
 
+        } catch (ie: InterruptedIOException) {
+            Log.w(TAG, "ensureInitialized: interrupted", ie)
+            if (forceFresh) {
+                runCatching { tmpFile.delete() }
+                runCatching { tmpPartFile.delete() }
+                runCatching { tmpMetaFile.delete() }
+            }
+            deferred.complete(Result.failure(IOException("Canceled", ie)))
+
         } catch (te: TimeoutCancellationException) {
-            // Timeout policy:
-            // - Preserve tmp for resume unless forceFresh was requested.
             Log.w(TAG, "ensureInitialized: timeout after ${timeoutMs}ms", te)
             if (forceFresh) {
                 runCatching { tmpFile.delete() }
+                runCatching { tmpPartFile.delete() }
+                runCatching { tmpMetaFile.delete() }
             }
             deferred.complete(Result.failure(IOException("Timeout ($timeoutMs ms)", te)))
 
@@ -271,14 +279,14 @@ object HeavyInitializer {
             val msg = userFriendlyMessage(t)
             Log.w(TAG, "Initialization error: $msg", t)
 
-            // On unexpected errors, we usually discard tmp because it may be corrupted
-            // in ways the downloader cannot resume from safely.
+            // Discard partials on unexpected errors to avoid corrupted resume loops.
             runCatching { tmpFile.delete() }
+            runCatching { tmpPartFile.delete() }
+            runCatching { tmpMetaFile.delete() }
 
             deferred.complete(Result.failure(IOException(msg, t)))
 
         } finally {
-            // Clear in-flight owner state only when this deferred is the current one.
             if (inFlight.get() === deferred) {
                 inFlight.set(null)
             }
@@ -294,7 +302,7 @@ object HeavyInitializer {
      * This requests cancellation of the owner coroutine that is currently
      * performing the download. Awaiters will receive a failure Result.
      */
-    suspend fun cancel() {
+    fun cancel() {
         runningJob?.cancel(CancellationException("canceled by user"))
         Log.w(TAG, "Initialization cancel requested.")
     }
@@ -305,10 +313,42 @@ object HeavyInitializer {
      * This is intended for development/testing only.
      */
     fun resetForDebug() {
-        inFlight.getAndSet(null)?.cancel(CancellationException("resetForDebug"))
+        inFlight.get()?.complete(Result.failure(IOException("resetForDebug")))
         runningJob?.cancel(CancellationException("resetForDebug"))
         runningJob = null
         Log.w(TAG, "resetForDebug(): cleared in-flight state")
+    }
+
+    // ---------------------------------------------------------------------
+    // Safe file resolution
+    // ---------------------------------------------------------------------
+
+    /**
+     * Resolves a relative path under [baseDir] safely.
+     *
+     * Rules:
+     * - Allows subdirectories (e.g., "models/foo.bin")
+     * - Rejects absolute paths and any ".." traversal segments
+     * - Ensures canonical target stays under baseDir
+     */
+    private fun resolveSafeFileUnder(baseDir: File, relativePath: String): File {
+        val p = relativePath.trim()
+        require(p.isNotEmpty()) { "fileName must not be empty" }
+        require(!p.startsWith("/")) { "absolute paths are not allowed: $p" }
+
+        val segments = p.split('/', '\\')
+        require(segments.none { it == ".." }) { "path traversal is not allowed: $p" }
+
+        val base = baseDir.canonicalFile
+        val f = File(baseDir, p)
+        val canon = f.canonicalFile
+
+        val basePath = base.path
+        val canonPath = canon.path
+        val ok = canonPath == basePath || canonPath.startsWith(basePath + File.separator)
+        require(ok) { "resolved path escapes baseDir: $p" }
+
+        return canon
     }
 
     // ---------------------------------------------------------------------
@@ -320,11 +360,6 @@ object HeavyInitializer {
 
     /**
      * HEAD request with manual redirect handling.
-     *
-     * Notes:
-     * - We disable gzip by forcing Accept-Encoding=identity to preserve
-     *   a stable Content-Length when servers honor it.
-     * - For Hugging Face, we attach Bearer token when provided.
      */
     private fun headContentLengthForVerify(srcUrl: String, hfToken: String?): Long? {
         var current = srcUrl
@@ -395,31 +430,24 @@ object HeavyInitializer {
 
     /**
      * Approximates atomic replace within the same directory.
-     *
-     * Strategy:
-     * 1) Delete destination if it exists.
-     * 2) Try rename(tmp -> dst).
-     * 3) If rename fails, fall back to stream copy.
-     *
-     * We assume tmp and dst are under the same parent directory.
      */
     private fun replaceFinalAtomic(tmp: File, dst: File) {
         if (!tmp.exists() || tmp.length() <= 0L) {
             throw IOException("Temp file missing or empty: ${tmp.absolutePath}")
         }
 
+        dst.parentFile?.mkdirs()
+
         if (dst.exists() && !dst.delete()) {
             Log.w(TAG, "replaceFinalAtomic: failed to delete existing ${dst.absolutePath}")
         }
 
-        // Attempt fast path.
         if (tmp.renameTo(dst)) {
             return
         }
 
         Log.w(TAG, "replaceFinalAtomic: rename failed, falling back to copy")
 
-        // Fallback copy.
         try {
             tmp.inputStream().use { input ->
                 dst.outputStream().use { output ->
