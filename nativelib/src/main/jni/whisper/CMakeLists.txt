@@ -142,10 +142,31 @@ file(GLOB WHISPER_SRC
 list(FILTER WHISPER_SRC EXCLUDE REGEX ".*/main\\.c$")
 list(FILTER WHISPER_SRC EXCLUDE REGEX ".*/main\\.cpp$")
 
-set(JNI_SRC "${CMAKE_CURRENT_LIST_DIR}/whisperLib.c")
-if (NOT EXISTS "${JNI_SRC}")
-    message(FATAL_ERROR "Missing JNI source: ${JNI_SRC}")
+# ---------------------------------------------------------------------
+# JNI source (case-insensitive safe selection)
+# ---------------------------------------------------------------------
+set(JNI_SRC "")
+set(JNI_SRC_CANDIDATES
+        "${CMAKE_CURRENT_LIST_DIR}/WhisperLib.c"
+        "${CMAKE_CURRENT_LIST_DIR}/whisperLib.c"
+)
+
+foreach(candidate IN LISTS JNI_SRC_CANDIDATES)
+    if (EXISTS "${candidate}")
+        set(JNI_SRC "${candidate}")
+        break()
+    endif()
+endforeach()
+
+if (NOT JNI_SRC)
+    message(FATAL_ERROR
+            "Missing JNI source. Tried:\n"
+            " - ${CMAKE_CURRENT_LIST_DIR}/WhisperLib.c\n"
+            " - ${CMAKE_CURRENT_LIST_DIR}/whisperLib.c\n"
+    )
 endif()
+
+message(STATUS "Using JNI source: ${JNI_SRC}")
 
 # GGML core
 file(GLOB GGML_CORE_SRC

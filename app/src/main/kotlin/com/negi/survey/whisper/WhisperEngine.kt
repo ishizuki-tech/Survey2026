@@ -21,6 +21,7 @@ import com.whispercpp.whisper.WhisperContext
 import java.io.File
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicLong
+import kotlin.math.max
 import kotlin.math.sqrt
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
@@ -32,6 +33,16 @@ private const val DEFAULT_TARGET_SAMPLE_RATE = 16_000
 private const val ASSET_KEY_PREFIX = "asset:"
 private const val WAV_HEADER_BYTES_PCM16_MONO = 44L
 private const val PCM16_BYTES_PER_SAMPLE = 2L
+
+/**
+ * Silence gate thresholds.
+ *
+ * Note:
+ * - These values are conservative and meant to avoid wasting CPU on clearly silent clips.
+ * - If your microphones are very quiet, lower these slightly.
+ */
+private const val SILENCE_RMS_THRESHOLD = 0.0025
+private const val SILENCE_PEAK_THRESHOLD = 0.02
 
 /**
  * Timing breakdown for a single transcription run.
@@ -117,68 +128,32 @@ data class InitTiming(
  * Two-level cleanup:
  * - [detach] is a soft UI-level detach that keeps the native context alive.
  * - [release] is a hard cleanup that closes native resources.
- *
- * This split prevents unnecessary re-initialization when Compose screens
- * are disposed and recreated during navigation or "restart" flows.
  */
 object WhisperEngine {
 
-    /**
-     * Current active Whisper context.
-     *
-     * Access must be guarded by [engineMutex] for mutation.
-     */
     @Volatile
     private var whisperContext: WhisperContext? = null
 
-    /**
-     * Identifier of the model used to create [whisperContext].
-     *
-     * - For file-based models: absolute file path.
-     * - For asset-based models: synthetic key "asset:<path>".
-     */
     @Volatile
     private var modelKey: String? = null
 
-    /**
-     * Single mutex to serialize init / transcribe / release.
-     */
     private val engineMutex = Mutex()
 
-    /** Monotonic id for correlating per-call timing logs. */
     private val transcribeSeq = AtomicLong(0L)
-
-    /** Monotonic id for correlating init timing logs. */
     private val initSeq = AtomicLong(0L)
 
-    /**
-     * Returns the currently bound model key, if any.
-     */
     fun currentModelKey(): String? = modelKey
 
-    /**
-     * Returns true if a Whisper context is currently alive.
-     */
     fun isInitialized(): Boolean = whisperContext != null
 
-    /**
-     * Returns true if initialized with the given file path.
-     */
     fun isInitializedForFile(modelFile: File): Boolean =
         whisperContext != null && modelKey == modelFile.absolutePath
 
-    /**
-     * Returns true if initialized with the given asset path.
-     */
     fun isInitializedForAsset(assetPath: String): Boolean =
         whisperContext != null && modelKey == ASSET_KEY_PREFIX + assetPath
 
     /**
      * Estimate a PCM_16BIT MONO WAV file size in bytes.
-     *
-     * NOTE:
-     * - This is an approximation that assumes a standard 44-byte WAV header.
-     * - It does NOT account for extra chunks or non-PCM encodings.
      */
     fun estimatePcm16MonoWavBytes(seconds: Int, sampleRateHz: Int): Long {
         val s = seconds.coerceAtLeast(0).toLong()
@@ -188,10 +163,6 @@ object WhisperEngine {
 
     /**
      * Estimate audio duration (seconds) from a PCM_16BIT MONO WAV byte length.
-     *
-     * NOTE:
-     * - This is an approximation that assumes a standard 44-byte WAV header.
-     * - Returns 0.0 when bytes <= header size.
      */
     fun estimatePcm16MonoWavSeconds(bytes: Long, sampleRateHz: Int): Double {
         val sr = sampleRateHz.coerceAtLeast(1).toDouble()
@@ -199,22 +170,6 @@ object WhisperEngine {
         return payload / (sr * PCM16_BYTES_PER_SAMPLE.toDouble())
     }
 
-    /**
-     * Ensure that a Whisper model is loaded from [modelFile].
-     *
-     * Behavior:
-     * - If the engine is already initialized with the same file path,
-     *   returns immediately with [Result.success].
-     * - If a different model is active, the old context is released before
-     *   creating a new one.
-     *
-     * Extra debug:
-     * - Logs lock wait/hold time, release time, create time, and basic memory info.
-     *
-     * @param context Android [Context]. Currently unused but kept for API symmetry.
-     * @param modelFile Local Whisper model file (GGML/GGUF). Must exist.
-     * @param onTiming Optional callback receiving a timing breakdown for this init call.
-     */
     suspend fun ensureInitializedFromFile(
         context: Context,
         modelFile: File,
@@ -234,9 +189,7 @@ object WhisperEngine {
         val bytes = runCatching { modelFile.length() }.getOrDefault(-1L)
         val lastMod = runCatching { modelFile.lastModified() }.getOrDefault(0L)
 
-        /**
-         * Fast path without locking.
-         */
+        // Fast path without locking.
         if (whisperContext != null && modelKey == key) {
             val totalMs = SystemClock.elapsedRealtime() - totalStart
             Log.d(
@@ -272,9 +225,7 @@ object WhisperEngine {
             val previousKey = modelKey
             val current = whisperContext
 
-            /**
-             * Double-check inside the lock.
-             */
+            // Double-check inside the lock.
             if (current != null && modelKey == key) {
                 val totalMs = SystemClock.elapsedRealtime() - totalStart
                 val lockHoldMs = SystemClock.elapsedRealtime() - lockAcquiredAt
@@ -309,9 +260,6 @@ object WhisperEngine {
             )
             logMemory("[$requestId][init:file]")
 
-            /**
-             * Release any previous context before switching models.
-             */
             var releasePrevMs = 0L
             if (current != null) {
                 val r0 = SystemClock.elapsedRealtime()
@@ -328,9 +276,6 @@ object WhisperEngine {
             whisperContext = null
             modelKey = null
 
-            /**
-             * Create new context.
-             */
             val c0 = SystemClock.elapsedRealtime()
             val createdResult = runCatching {
                 Log.i(LOG_TAG, "[$requestId][init:file] Creating WhisperContext from file=$key")
@@ -401,22 +346,6 @@ object WhisperEngine {
         }
     }
 
-    /**
-     * Ensure that a Whisper model is loaded from app assets at [assetPath].
-     *
-     * Example:
-     * - assetPath = "models/ggml-small-q5_1.bin"
-     *
-     * Behavior mirrors [ensureInitializedFromFile] but uses
-     * [WhisperContext.createContextFromAsset].
-     *
-     * Extra debug:
-     * - Logs asset existence check time, lock wait/hold time, release time, create time, and memory info.
-     *
-     * @param context Android [Context] used for asset access.
-     * @param assetPath Relative asset path under the APK assets directory.
-     * @param onTiming Optional callback receiving a timing breakdown for this init call.
-     */
     suspend fun ensureInitializedFromAsset(
         context: Context,
         assetPath: String,
@@ -426,9 +355,6 @@ object WhisperEngine {
         val requestId = initSeq.incrementAndGet()
         val totalStart = SystemClock.elapsedRealtime()
 
-        /**
-         * Lightweight asset existence check (timed).
-         */
         val a0 = SystemClock.elapsedRealtime()
         val assetOk = runCatching {
             context.assets.open(assetPath).use { }
@@ -466,9 +392,7 @@ object WhisperEngine {
 
         val key = ASSET_KEY_PREFIX + assetPath
 
-        /**
-         * Fast path without locking.
-         */
+        // Fast path without locking.
         if (whisperContext != null && modelKey == key) {
             val totalMs = SystemClock.elapsedRealtime() - totalStart
             Log.d(
@@ -504,9 +428,7 @@ object WhisperEngine {
             val previousKey = modelKey
             val current = whisperContext
 
-            /**
-             * Double-check inside the lock.
-             */
+            // Double-check inside the lock.
             if (current != null && modelKey == key) {
                 val totalMs = SystemClock.elapsedRealtime() - totalStart
                 val lockHoldMs = SystemClock.elapsedRealtime() - lockAcquiredAt
@@ -541,9 +463,6 @@ object WhisperEngine {
             )
             logMemory("[$requestId][init:asset]")
 
-            /**
-             * Release any previous context before switching models.
-             */
             var releasePrevMs = 0L
             if (current != null) {
                 val r0 = SystemClock.elapsedRealtime()
@@ -560,9 +479,6 @@ object WhisperEngine {
             whisperContext = null
             modelKey = null
 
-            /**
-             * Create new context.
-             */
             val c0 = SystemClock.elapsedRealtime()
             val createdResult = runCatching {
                 Log.i(LOG_TAG, "[$requestId][init:asset] Creating WhisperContext from assets/$assetPath")
@@ -647,6 +563,7 @@ object WhisperEngine {
         translate: Boolean = false,
         printTimestamp: Boolean = false,
         targetSampleRate: Int = DEFAULT_TARGET_SAMPLE_RATE,
+        enableSilenceGate: Boolean = true,
         onTiming: (TranscribeTiming) -> Unit = {},
     ): Result<String> = withContext(Dispatchers.Default) {
 
@@ -659,24 +576,22 @@ object WhisperEngine {
             )
         }
 
+        val sr = targetSampleRate.coerceAtLeast(1)
         val fileBytes = runCatching { file.length() }.getOrDefault(-1L)
-        val approxSecFromBytes = if (fileBytes >= 0L) estimatePcm16MonoWavSeconds(fileBytes, targetSampleRate) else -1.0
+        val approxSecFromBytes = if (fileBytes >= 0L) estimatePcm16MonoWavSeconds(fileBytes, sr) else -1.0
 
         val activeKeyAtStart = modelKey
         Log.d(
             LOG_TAG,
             "[$requestId][asr] Start. file=${file.name} bytes=${formatBytes(fileBytes)} " +
-                    "approxSec(pcm16mono@${targetSampleRate}Hz)=${formatFixed2(approxSecFromBytes)} " +
-                    "lang=$lang translate=$translate printTimestamp=$printTimestamp sr=$targetSampleRate modelKey=$activeKeyAtStart thread=${Thread.currentThread().name}"
+                    "approxSec(pcm16mono@${sr}Hz)=${formatFixed2(approxSecFromBytes)} " +
+                    "lang=$lang translate=$translate printTimestamp=$printTimestamp sr=$sr modelKey=$activeKeyAtStart thread=${Thread.currentThread().name}"
         )
         logMemory("[$requestId][asr]")
 
         val decodeStart = SystemClock.elapsedRealtime()
-        val pcmResult = runCatching {
-            decodeWaveFile(
-                file = file,
-                targetSampleRate = targetSampleRate
-            )
+        val pcmResult = withContext(Dispatchers.IO) {
+            runCatching { decodeWaveFile(file = file, targetSampleRate = sr) }
         }.onFailure { e ->
             Log.e(LOG_TAG, "[$requestId][asr] Failed to decode WAV file=${file.path}", e)
         }
@@ -698,23 +613,43 @@ object WhisperEngine {
             )
         }
 
-        val audioSeconds = pcm.size.toDouble() / targetSampleRate.toDouble()
+        val audioSeconds = pcm.size.toDouble() / sr.toDouble()
         val audioSecondsStr = formatFixed2(audioSeconds)
 
-        val stats = computePcmStats(pcm)
+        val stats = computePcmStatsSampled(pcm)
         Log.d(
             LOG_TAG,
-            "[$requestId][asr] PCM stats: samples=${pcm.size} seconds=${audioSecondsStr} " +
-                    "min=${stats.min} max=${stats.max} rms=${stats.rms} decodeMs=$decodeMs"
+            "[$requestId][asr] PCM stats(sampled): samples=${pcm.size} seconds=${audioSecondsStr} " +
+                    "min=${stats.min} max=${stats.max} rms=${formatFixed2(stats.rms)} decodeMs=$decodeMs"
         )
 
-        val languageAttempts: List<String> =
-            if (lang.lowercase() == "auto") listOf("auto", "en", "ja", "sw") else listOf(lang)
-
-        fun safeEmitTiming(timing: TranscribeTiming) {
-            runCatching { onTiming(timing) }
-                .onFailure { t -> Log.w(LOG_TAG, "[$requestId][asr] onTiming callback failed: ${t.message}", t) }
+        if (enableSilenceGate && isProbablySilent(stats)) {
+            val totalMs = SystemClock.elapsedRealtime() - totalStart
+            Log.w(
+                LOG_TAG,
+                "[$requestId][asr] SilenceGate: returning empty transcript. totalMs=$totalMs decodeMs=$decodeMs " +
+                        "rms=${formatFixed2(stats.rms)} peak=${formatFixed2(max(kotlin.math.abs(stats.min.toDouble()), kotlin.math.abs(stats.max.toDouble())))}"
+            )
+            safeEmitTiming(
+                requestId = requestId,
+                onTiming = onTiming,
+                timing = TranscribeTiming(
+                    requestId = requestId,
+                    totalMs = totalMs,
+                    decodeMs = decodeMs,
+                    lockWaitMs = 0L,
+                    lockHoldMs = 0L,
+                    attempts = emptyList(),
+                    selectedLang = lang,
+                    audioSeconds = audioSeconds,
+                )
+            )
+            return@withContext Result.success("")
         }
+
+        val langNorm = lang.lowercase(Locale.US)
+        val languageAttempts: List<String> =
+            if (langNorm == "auto") listOf("auto", "en", "ja", "sw") else listOf(lang)
 
         val lockRequestAt = SystemClock.elapsedRealtime()
 
@@ -727,7 +662,9 @@ object WhisperEngine {
                     val totalMs = SystemClock.elapsedRealtime() - totalStart
                     val lockHoldMs = SystemClock.elapsedRealtime() - lockAcquiredAt
                     safeEmitTiming(
-                        TranscribeTiming(
+                        requestId = requestId,
+                        onTiming = onTiming,
+                        timing = TranscribeTiming(
                             requestId = requestId,
                             totalMs = totalMs,
                             decodeMs = decodeMs,
@@ -752,7 +689,6 @@ object WhisperEngine {
 
             val attemptTimings = mutableListOf<TranscribeTiming.AttemptTiming>()
 
-            var lastEmptySuccess: String? = null
             var lastFailure: Throwable? = null
             var selectedLang = languageAttempts.lastOrNull() ?: lang
 
@@ -785,6 +721,8 @@ object WhisperEngine {
                     )
                 }
                 val transcribeMs = SystemClock.elapsedRealtime() - tStart
+                val rtf = if (audioSeconds > 0.0) (transcribeMs / 1000.0) / audioSeconds else 0.0
+                val rtfStr = formatFixed2(rtf)
 
                 if (result.isFailure) {
                     lastFailure = result.exceptionOrNull()
@@ -793,14 +731,12 @@ object WhisperEngine {
                         transcribeMs = transcribeMs,
                         textLen = 0,
                         success = false,
-                        rtf = if (audioSeconds > 0.0) (transcribeMs / 1000.0) / audioSeconds else 0.0,
+                        rtf = rtf,
                     )
                     continue
                 }
 
                 val trimmed = result.getOrThrow().trim()
-                val rtf = if (audioSeconds > 0.0) (transcribeMs / 1000.0) / audioSeconds else 0.0
-                val rtfStr = formatFixed2(rtf)
 
                 attemptTimings += TranscribeTiming.AttemptTiming(
                     lang = code,
@@ -826,7 +762,9 @@ object WhisperEngine {
                     val lockHoldMs = SystemClock.elapsedRealtime() - lockAcquiredAt
 
                     safeEmitTiming(
-                        TranscribeTiming(
+                        requestId = requestId,
+                        onTiming = onTiming,
+                        timing = TranscribeTiming(
                             requestId = requestId,
                             totalMs = totalMs,
                             decodeMs = decodeMs,
@@ -847,10 +785,9 @@ object WhisperEngine {
                     return@withLock Result.success(trimmed)
                 }
 
-                lastEmptySuccess = trimmed
                 Log.w(
                     LOG_TAG,
-                    "[$requestId][asr] Empty transcript: lang=$code transcribeMs=$transcribeMs (continuing)"
+                    "[$requestId][asr] Empty transcript: lang=$code transcribeMs=$transcribeMs rtf=$rtfStr (continuing)"
                 )
             }
 
@@ -858,7 +795,9 @@ object WhisperEngine {
             val lockHoldMs = SystemClock.elapsedRealtime() - lockAcquiredAt
 
             safeEmitTiming(
-                TranscribeTiming(
+                requestId = requestId,
+                onTiming = onTiming,
+                timing = TranscribeTiming(
                     requestId = requestId,
                     totalMs = totalMs,
                     decodeMs = decodeMs,
@@ -876,26 +815,19 @@ object WhisperEngine {
             )
             logMemory("[$requestId][asr]")
 
-            when {
-                lastEmptySuccess != null -> Result.success(lastEmptySuccess)
+            return@withLock when {
                 lastFailure != null -> Result.failure(lastFailure)
                 else -> Result.failure(IllegalStateException("Transcription produced no usable result."))
             }
         }
     }
 
-    /**
-     * Softly detach the engine from UI lifecycle without releasing native resources.
-     */
     suspend fun detach() {
         engineMutex.withLock {
             Log.d(LOG_TAG, "Detach called. Keeping native context alive for key=$modelKey")
         }
     }
 
-    /**
-     * Release the active Whisper context, if any, and reset the engine.
-     */
     suspend fun release() {
         engineMutex.withLock {
             val ctx = whisperContext
@@ -917,16 +849,10 @@ object WhisperEngine {
         }
     }
 
-    /**
-     * Alias of [release] for clarity when a hard cleanup is explicitly desired.
-     */
     suspend fun cleanUp() {
         release()
     }
 
-    /**
-     * Simple statistics container for PCM buffers.
-     */
     private data class PcmStats(
         val min: Float,
         val max: Float,
@@ -934,39 +860,62 @@ object WhisperEngine {
     )
 
     /**
-     * Compute [PcmStats] for the given [pcm] buffer.
+     * Computes PCM stats using sampling to avoid O(N) cost on very large buffers.
+     *
+     * @param pcm PCM samples in [-1, 1]
+     * @param maxSamples Maximum samples to inspect (sampling stride computed automatically)
      */
-    private fun computePcmStats(pcm: FloatArray): PcmStats {
-        var min = Float.POSITIVE_INFINITY
-        var max = Float.NEGATIVE_INFINITY
-        var sumSq = 0.0
+    private fun computePcmStatsSampled(pcm: FloatArray, maxSamples: Int = 200_000): PcmStats {
+        if (pcm.isEmpty()) return PcmStats(0f, 0f, 0.0)
 
-        for (v in pcm) {
-            if (v < min) min = v
-            if (v > max) max = v
+        val n = pcm.size
+        val step = max(1, n / max(1, maxSamples))
+
+        var minV = Float.POSITIVE_INFINITY
+        var maxV = Float.NEGATIVE_INFINITY
+        var sumSq = 0.0
+        var count = 0
+
+        var i = 0
+        while (i < n) {
+            val v = pcm[i]
+            if (v < minV) minV = v
+            if (v > maxV) maxV = v
             sumSq += v.toDouble() * v.toDouble()
+            count++
+            i += step
         }
 
-        val rms = if (pcm.isNotEmpty()) sqrt(sumSq / pcm.size) else 0.0
+        val rms = if (count > 0) sqrt(sumSq / count.toDouble()) else 0.0
 
         return PcmStats(
-            min = if (min.isFinite()) min else 0f,
-            max = if (max.isFinite()) max else 0f,
+            min = if (minV.isFinite()) minV else 0f,
+            max = if (maxV.isFinite()) maxV else 0f,
             rms = rms
         )
     }
 
     /**
-     * Emit init timing safely (never throw).
+     * Returns true when the signal looks like silence.
+     *
+     * Note:
+     * - We use both RMS and peak to avoid misclassifying brief impulses.
      */
+    private fun isProbablySilent(stats: PcmStats): Boolean {
+        val peak = max(kotlin.math.abs(stats.min.toDouble()), kotlin.math.abs(stats.max.toDouble()))
+        return stats.rms < SILENCE_RMS_THRESHOLD && peak < SILENCE_PEAK_THRESHOLD
+    }
+
     private fun safeEmitInitTiming(onTiming: (InitTiming) -> Unit, timing: InitTiming) {
         runCatching { onTiming(timing) }
             .onFailure { t -> Log.w(LOG_TAG, "[init] onTiming callback failed: ${t.message}", t) }
     }
 
-    /**
-     * Log Java heap and native heap in a compact format.
-     */
+    private fun safeEmitTiming(requestId: Long, onTiming: (TranscribeTiming) -> Unit, timing: TranscribeTiming) {
+        runCatching { onTiming(timing) }
+            .onFailure { t -> Log.w(LOG_TAG, "[$requestId][asr] onTiming callback failed: ${t.message}", t) }
+    }
+
     private fun logMemory(prefix: String) {
         val rt = Runtime.getRuntime()
         val used = (rt.totalMemory() - rt.freeMemory())
@@ -980,9 +929,6 @@ object WhisperEngine {
         )
     }
 
-    /**
-     * Format bytes for logs.
-     */
     private fun formatBytes(bytes: Long): String {
         if (bytes < 0L) return "n/a"
         val kb = 1024.0
@@ -997,18 +943,10 @@ object WhisperEngine {
         }
     }
 
-    /**
-     * Format a double with 2 decimal places using a fixed locale.
-     *
-     * IMPORTANT: Only use this for numeric formatting; do not mix dynamic text into Formatter.
-     */
     private fun formatFixed2(value: Double): String {
         return String.format(Locale.US, "%.2f", value)
     }
 
-    /**
-     * Escape control chars to keep logs single-line and readable.
-     */
     private fun escapeForLog(text: String): String {
         if (text.isEmpty()) return text
         return buildString(text.length) {

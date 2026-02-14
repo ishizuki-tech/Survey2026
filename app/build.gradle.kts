@@ -1,6 +1,7 @@
 // file: app/build.gradle.kts
 import com.android.build.api.dsl.ApplicationExtension
 import java.io.ByteArrayOutputStream
+import java.io.File
 import java.util.Properties
 import org.gradle.api.GradleException
 import org.gradle.api.tasks.Exec
@@ -144,18 +145,53 @@ fun resolveVersionCode(): Int {
  * Setup tasks (Submodule / Model download)
  * ========================================================================== */
 
+/**
+ * Parse submodule paths from .gitmodules.
+ *
+ * Notes:
+ * - This avoids hard-coding submodule directories.
+ * - If .gitmodules is missing (rare), fallback paths are used.
+ */
+fun parseGitmodulesSubmodulePaths(gitmodules: File): List<String> {
+    if (!gitmodules.exists()) return emptyList()
+    val re = Regex("^path\\s*=\\s*(.+)$")
+    return gitmodules.readLines()
+        .mapNotNull { line -> re.find(line.trim())?.groupValues?.getOrNull(1)?.trim() }
+        .filter { it.isNotBlank() }
+        .distinct()
+}
+
+/** True if a directory exists and looks non-empty. */
+fun looksInitialized(dir: File): Boolean =
+    dir.exists() && dir.isDirectory && (dir.listFiles()?.isNotEmpty() == true)
+
 tasks.register<Exec>("checkSubmodule") {
-    description = "Recursively initialize the native submodule if not yet set up"
+    description = "Recursively initialize Git submodules if not yet set up"
     group = "setup"
 
-    val subDir = rootProject.layout.projectDirectory.dir("nativelib/whisper_core").asFile
+    val gitmodules = rootProject.file(".gitmodules")
+    val gitmodulePaths = parseGitmodulesSubmodulePaths(gitmodules)
+
+    // Fallbacks for common layouts (kept for safety).
+    val fallbackPaths = listOf(
+        "whisper.cpp",
+        "nativelib/whisper_core",
+    )
+
+    val candidatePaths = (gitmodulePaths + fallbackPaths).distinct()
+    val candidateDirs = candidatePaths.map { p -> rootProject.file(p) }
+
+    fun anySubmoduleInitialized(): Boolean = candidateDirs.any { d -> looksInitialized(d) }
 
     val out = ByteArrayOutputStream()
     val err = ByteArrayOutputStream()
 
     onlyIf {
-        val missing = !(subDir.exists() && subDir.listFiles()?.isNotEmpty() == true)
-        if (missing) logger.lifecycle("🔄 Submodule not initialized → running git submodule update --init --recursive")
+        val missing = !anySubmoduleInitialized()
+        if (missing) {
+            logger.lifecycle("🔄 Submodules not initialized → running git submodule update --init --recursive")
+            logger.lifecycle("   Candidates: ${candidatePaths.joinToString(", ")}")
+        }
         missing
     }
 
@@ -178,6 +214,16 @@ tasks.register<Exec>("checkSubmodule") {
             val msg = "Submodule init failed (exit=$exit)."
             if (isCi) throw GradleException("$msg See logs above.")
             logger.warn("⚠️ $msg Continuing locally.")
+            return@doLast
+        }
+
+        // Re-check after init to avoid a "false success" state.
+        if (!anySubmoduleInitialized()) {
+            val msg = "Submodule init finished, but no initialized submodule dir was found."
+            if (isCi) {
+                throw GradleException("$msg Candidates: ${candidatePaths.joinToString(", ")}")
+            }
+            logger.warn("⚠️ $msg Candidates: ${candidatePaths.joinToString(", ")}")
         } else {
             logger.lifecycle("✅ Submodule check completed.")
         }

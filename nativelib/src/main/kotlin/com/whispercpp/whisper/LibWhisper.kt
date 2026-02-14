@@ -1,4 +1,16 @@
-// file: com/whispercpp/whisper/WhisperContext.kt
+/*
+ * =====================================================================
+ *  IshizukiTech LLC — SLM Integration Framework
+ *  ---------------------------------------------------------------------
+ *  File: WhisperContext.kt
+ *  Author: Shu Ishizuki
+ *  License: MIT License
+ *  © 2026 IshizukiTech LLC. All rights reserved.
+ * =====================================================================
+ */
+
+@file:Suppress("KotlinJdkLibUsage")
+
 // ============================================================
 // ✅ WhisperContext — JNI-safe, Coroutine-isolated, Debug-stable
 // ------------------------------------------------------------
@@ -15,13 +27,17 @@ package com.whispercpp.whisper
 import android.content.res.AssetManager
 import android.os.Build
 import android.util.Log
-import kotlinx.coroutines.*
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.ExecutorCoroutineDispatcher
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.InputStream
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
-import kotlin.math.max
-import kotlin.math.min
 
 private const val LOG_TAG = "WhisperJNI"
 
@@ -101,7 +117,10 @@ class WhisperContext private constructor(
         }
         try {
             val numThreads = WhisperCpuConfig.preferredThreadCount
-            Log.i(LOG_TAG, "Transcribe start: threads=$numThreads lang=$lang translate=$translate, samples=${data.size}")
+            Log.i(
+                LOG_TAG,
+                "Transcribe start: threads=$numThreads lang=$lang translate=$translate, samples=${data.size}"
+            )
 
             // JNI → whisper_full()
             WhisperLib.fullTranscribe(ptr, lang, numThreads, translate, data)
@@ -173,7 +192,7 @@ class WhisperContext private constructor(
         // 2) Cancel coroutines and close dispatcher (outside of dispatcher context)
         scope.cancel()
         // Closing the dispatcher shuts down the Executor thread to avoid thread leaks.
-        (dispatcher).close()
+        dispatcher.close()
     }
 
     /**
@@ -203,10 +222,10 @@ class WhisperContext private constructor(
          */
         fun createContextFromFile(filePath: String): WhisperContext {
             require(filePath.isNotBlank()) { "filePath must not be blank" }
-            val ptr = WhisperLib.initContext(filePath)
-            require(ptr != 0L) { "Failed to create context from file: $filePath" }
+            val ctxPtr = WhisperLib.initContext(filePath)
+            require(ctxPtr != 0L) { "Failed to create context from file: $filePath" }
             Log.i(LOG_TAG, "WhisperContext created from file: $filePath")
-            return WhisperContext(ptr)
+            return WhisperContext(ctxPtr)
         }
 
         /**
@@ -214,10 +233,10 @@ class WhisperContext private constructor(
          * The stream may be network-backed or decrypted-on-the-fly.
          */
         fun createContextFromInputStream(stream: InputStream): WhisperContext {
-            val ptr = WhisperLib.initContextFromInputStream(stream)
-            require(ptr != 0L) { "Failed to create context from InputStream" }
+            val ctxPtr = WhisperLib.initContextFromInputStream(stream)
+            require(ctxPtr != 0L) { "Failed to create context from InputStream" }
             Log.i(LOG_TAG, "WhisperContext created from InputStream")
-            return WhisperContext(ptr)
+            return WhisperContext(ctxPtr)
         }
 
         /**
@@ -225,10 +244,10 @@ class WhisperContext private constructor(
          */
         fun createContextFromAsset(assetManager: AssetManager, assetPath: String): WhisperContext {
             require(assetPath.isNotBlank()) { "assetPath must not be blank" }
-            val ptr = WhisperLib.initContextFromAsset(assetManager, assetPath)
-            require(ptr != 0L) { "Failed to create context from asset: $assetPath" }
+            val ctxPtr = WhisperLib.initContextFromAsset(assetManager, assetPath)
+            require(ctxPtr != 0L) { "Failed to create context from asset: $assetPath" }
             Log.i(LOG_TAG, "WhisperContext created from asset: $assetPath")
-            return WhisperContext(ptr)
+            return WhisperContext(ctxPtr)
         }
 
         /** Returns GGML/whisper system info string from native. */
@@ -250,7 +269,8 @@ private class WhisperLib {
             val feats = cpuInfo().orEmpty()
 
             fun tryLoad(name: String): Boolean = try {
-                System.loadLibrary(name); true
+                System.loadLibrary(name)
+                true
             } catch (e: UnsatisfiedLinkError) {
                 Log.w(LOG_TAG, "Unable to load lib$name.so on $abi: ${e.message}")
                 false
@@ -265,7 +285,10 @@ private class WhisperLib {
                         tryLoad("whisper")
 
             if (loaded) {
-                Log.i(LOG_TAG, "Native whisper library loaded (ABI=$abi, fp16=${hasFp16(feats)}, vfpv4=${hasVfpv4(feats)})")
+                Log.i(
+                    LOG_TAG,
+                    "Native whisper library loaded (ABI=$abi, fp16=${hasFp16(feats)}, vfpv4=${hasVfpv4(feats)})"
+                )
             } else {
                 error("Failed to load any native whisper library")
             }
@@ -276,7 +299,14 @@ private class WhisperLib {
         @JvmStatic external fun initContextFromAsset(assetManager: AssetManager, assetPath: String): Long
         @JvmStatic external fun initContextFromInputStream(inputStream: InputStream): Long
         @JvmStatic external fun freeContext(contextPtr: Long)
-        @JvmStatic external fun fullTranscribe(contextPtr: Long, lang: String, numThreads: Int, translate: Boolean, audioData: FloatArray)
+        @JvmStatic external fun fullTranscribe(
+            contextPtr: Long,
+            lang: String,
+            numThreads: Int,
+            translate: Boolean,
+            audioData: FloatArray
+        )
+
         @JvmStatic external fun getTextSegmentCount(contextPtr: Long): Int
         @JvmStatic external fun getTextSegment(contextPtr: Long, index: Int): String
         @JvmStatic external fun getTextSegmentT0(contextPtr: Long, index: Int): Long
@@ -291,7 +321,8 @@ private class WhisperLib {
         private fun cpuInfo(): String? = try {
             File("/proc/cpuinfo").inputStream().bufferedReader().use { it.readText() }
         } catch (e: Exception) {
-            Log.w(LOG_TAG, "Could not read /proc/cpuinfo", e); null
+            Log.w(LOG_TAG, "Could not read /proc/cpuinfo", e)
+            null
         }
 
         /** True if ABI indicates 64-bit ARM. */
@@ -340,4 +371,3 @@ private fun toTimestamp(t: Long, comma: Boolean = false): String {
     val delim = if (comma) "," else "."
     return String.format("%02d:%02d:%02d%s%03d", hr, min, sec, delim, msec)
 }
-
