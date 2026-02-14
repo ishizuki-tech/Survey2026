@@ -139,6 +139,10 @@ object LiteRtLM {
      * Contract:
      * - Completes with "" on success
      * - Completes with non-empty string on failure
+     *
+     * NOTE:
+     * - We keep completed signals in the map (replaced on next init attempt) to avoid
+     *   "initInFlight=true but signal missing" race windows.
      */
     private val initSignals: ConcurrentHashMap<String, CompletableDeferred<String>> = ConcurrentHashMap()
 
@@ -190,6 +194,12 @@ object LiteRtLM {
         val logicalTerminator: AtomicReference<(() -> Unit)?> = AtomicReference(null),
         val hardCloseRunning: AtomicBoolean = AtomicBoolean(false),
         val cleanupToken: AtomicLong = AtomicLong(0L),
+
+        /**
+         * Hook invoked after native termination (onDone/onError), OR after hard-close watchdog.
+         * Must be set per active run, and cleared after firing.
+         */
+        val nativeDoneHook: AtomicReference<(() -> Unit)?> = AtomicReference(null),
     )
 
     private val runStates: ConcurrentHashMap<String, RunState> = ConcurrentHashMap()
@@ -265,10 +275,9 @@ object LiteRtLM {
         }
     }
 
-    /** Complete an init signal safely. */
-    private fun completeInitSignal(key: String, signal: CompletableDeferred<String>, error: String) {
+    /** Complete an init signal safely (kept in map; replaced on next init attempt). */
+    private fun completeInitSignal(signal: CompletableDeferred<String>, error: String) {
         if (!signal.isCompleted) signal.complete(error)
-        initSignals.remove(key, signal)
     }
 
     /** Normalize accelerator string for stable backend selection. */
@@ -552,28 +561,6 @@ object LiteRtLM {
         return out.toString()
     }
 
-    /** Best-effort extraction of visible text from a single Content.Text instance. */
-    private fun extractTextFromContentTextBestEffort(textObj: Content.Text): String {
-        val any = textObj as Any
-        val candidates = listOf("getText", "text", "getValue", "value", "getContent", "content", "getData", "data")
-        for (name in candidates) {
-            val m = runCatching {
-                any.javaClass.methods.firstOrNull {
-                    it.name == name && it.parameterCount == 0 && it.returnType == String::class.java
-                }
-            }.getOrNull() ?: continue
-
-            val v = runCatching { m.invoke(any) as? String }.getOrNull()
-            if (!v.isNullOrBlank()) return v
-        }
-
-        val s = runCatching { any.toString() }.getOrElse { "" }
-        val parsed = extractTextFromDebugString(s)
-        if (parsed.isNotBlank()) return parsed
-
-        return s
-    }
-
     /** Attempt to extract text from Message directly if such getter exists. */
     private fun extractTextFromMessageBestEffort(message: Message): String {
         val any = message as Any
@@ -617,18 +604,9 @@ object LiteRtLM {
 
         val fromContents = runCatching {
             val contentsObj: Any = message.contents
-
-            val iterable: Iterable<*>? = when (contentsObj) {
-                is Iterable<*> -> contentsObj
-                is Array<*> -> contentsObj.asIterable()
-                else -> null
-            }
-
-            run {
-                val s = contentsObj.toString()
-                val parsed = extractTextFromDebugString(s)
-                parsed.ifBlank { s }
-            }
+            val s = contentsObj.toString()
+            val parsed = extractTextFromDebugString(s)
+            parsed.ifBlank { s }
         }.getOrElse { "" }
 
         val fromToString = runCatching { message.toString() }.getOrElse { "" }
@@ -758,7 +736,12 @@ object LiteRtLM {
 
         val accepted = initInFlight.add(key)
         if (!accepted) {
-            postToMain { onDone("") }
+            // Another init is in-flight. Report the REAL result when it completes.
+            ioScope.launch {
+                val err = withTimeoutOrNull(INIT_AWAIT_TIMEOUT_MS) { signal.await() }
+                    ?: "Initialization timed out after ${INIT_AWAIT_TIMEOUT_MS}ms."
+                postToMain { onDone(err) }
+            }
             return
         }
 
@@ -865,7 +848,7 @@ object LiteRtLM {
 
                 Log.d(TAG, "LiteRT-LM initialization succeeded: model='${model.name}', key='$key'")
                 postToMain { onDone("") }
-                completeInitSignal(key, signal, "")
+                completeInitSignal(signal, "")
                 completed = true
             } catch (e: Exception) {
                 val err = cleanError(e.message)
@@ -874,12 +857,12 @@ object LiteRtLM {
                     .onFailure { Log.w(TAG, "Failed to close engine after init failure: ${it.message}", it) }
 
                 postToMain { onDone(err) }
-                completeInitSignal(key, signal, err)
+                completeInitSignal(signal, err)
                 completed = true
             } finally {
                 initInFlight.remove(key)
                 if (!completed) {
-                    completeInitSignal(key, signal, "Initialization aborted unexpectedly.")
+                    completeInitSignal(signal, "Initialization aborted unexpectedly.")
                 }
             }
         }
@@ -928,6 +911,14 @@ object LiteRtLM {
         }
     }
 
+    /** Fire native done hook once (safe no-op if already cleared). */
+    private fun fireNativeDoneHookOnce(key: String) {
+        val rs = getRunState(key)
+        val hook = rs.nativeDoneHook.getAndSet(null) ?: return
+        runCatching { hook.invoke() }
+            .onFailure { t -> Log.w(TAG, "nativeDoneHook failed: key='$key' err=${t.message}", t) }
+    }
+
     /** Close and remove an instance NOW (best-effort). */
     private suspend fun closeInstanceNowBestEffort(key: String, reason: String) {
         cancelScheduledCleanup(key, "closeNow:$reason")
@@ -935,19 +926,24 @@ object LiteRtLM {
         val instance: LiteRtLmInstance? = stateMutex.withLock {
             val rs = getRunState(key)
             if (rs.active.get()) return@withLock null
+            if (initInFlight.contains(key)) return@withLock null
 
             rs.cancelRequested.set(false)
             rs.pendingCancel.set(false)
             rs.logicalTerminator.set(null)
+            rs.nativeDoneHook.set(null)
             rs.terminated.set(true)
             rs.logicalDone.set(true)
 
             pendingAfterStream.remove(key)
-            instances.remove(key)
+            instances.remove(key).also {
+                // Safe prune (no waiters if not initInFlight).
+                initSignals.remove(key)
+            }
         }
 
         if (instance == null) {
-            Log.d(TAG, "closeInstanceNowBestEffort: nothing to close (or active): key='$key' reason='$reason'")
+            Log.d(TAG, "closeInstanceNowBestEffort: nothing to close (or active/initInFlight): key='$key' reason='$reason'")
             return
         }
 
@@ -1006,6 +1002,7 @@ object LiteRtLM {
             rs.cancelRequested.set(false)
             rs.pendingCancel.set(false)
             rs.logicalTerminator.set(null)
+            rs.nativeDoneHook.set(null)
             rs.terminated.set(true)
             rs.logicalDone.set(true)
 
@@ -1015,6 +1012,9 @@ object LiteRtLM {
                 Log.d(TAG, "Idle cleanup: nothing to close: key='$key'")
                 return@withLock null
             }
+
+            // Safe prune (no waiters if not initInFlight).
+            initSignals.remove(key)
 
             IdleClosePlan(
                 instance = inst,
@@ -1201,10 +1201,17 @@ object LiteRtLM {
                     if (sinceMsg in 0..2_000L && elapsed < HARD_CLOSE_TIMEOUT_MS) continue
 
                     if (elapsed >= HARD_CLOSE_TIMEOUT_MS) {
+                        // Ensure only one termination path wins.
+                        val didTerminate = rs.terminated.compareAndSet(false, true)
+                        if (!didTerminate) {
+                            Log.d(TAG, "Hard-close watchdog abort (already terminated): key='$key'")
+                            return@launch
+                        }
+
                         Log.e(TAG, "Hard-close watchdog firing: key='$key' elapsed=${elapsed}ms sinceMsg=${sinceMsg}ms")
 
                         val inst: LiteRtLmInstance? = stateMutex.withLock {
-                            if (!rs.active.get() || rs.terminated.get()) return@withLock null
+                            if (!rs.active.get()) return@withLock null
                             pendingAfterStream.remove(key)
                             instances.remove(key)
                         }
@@ -1216,13 +1223,16 @@ object LiteRtLM {
                                 .onFailure { Log.e(TAG, "Hard-close: engine.close failed: key='$key' err=${it.message}", it) }
                         }
 
+                        val tNow = SystemClock.elapsedRealtime()
+                        rs.lastTerminateAtMs.set(tNow)
+                        rs.cooldownUntilMs.set(tNow + POST_TERMINATE_COOLDOWN_MS)
+
                         rs.active.set(false)
-                        rs.terminated.set(true)
                         rs.logicalDone.set(true)
                         rs.logicalTerminator.set(null)
 
-                        val deferred = stateMutex.withLock { pendingAfterStream.remove(key)?.toList() ?: emptyList() }
-                        deferred.forEach { act -> runCatching { act.invoke() } }
+                        // IMPORTANT: Must invoke cleanup path even on hard-close.
+                        fireNativeDoneHookOnce(key)
 
                         Log.e(TAG, "Hard-close completed: key='$key'")
                         return@launch
@@ -1265,26 +1275,36 @@ object LiteRtLM {
             val needAutoInit = stateMutex.withLock { instances[key] == null }
             if (needAutoInit) {
                 val ctx = appContextRef.get()
-                if (ctx != null) {
-                    val reqImage = images.isNotEmpty()
-                    val reqAudio = audioClips.isNotEmpty()
-                    runCatching {
-                        awaitInitializedInternal(
-                            context = ctx,
-                            model = model,
-                            supportImage = reqImage,
-                            supportAudio = reqAudio,
-                        )
-                    }.onFailure { t ->
-                        val msg = "LiteRT-LM auto-init failed: ${cleanError(t.message)}"
-                        Log.e(TAG, msg, t)
-                        postToMain {
-                            onError(msg)
-                            resultListener("", true)
-                            runCatching { cleanUpListener.invoke() }
-                        }
-                        return@launch
+                if (ctx == null) {
+                    val msg = "LiteRT-LM model '${model.name}' is not initialized, and no application context is set. " +
+                            "Call setApplicationContext() or initializeIfNeeded() first."
+                    Log.e(TAG, msg)
+                    postToMain {
+                        onError(msg)
+                        resultListener("", true)
+                        runCatching { cleanUpListener.invoke() }
                     }
+                    return@launch
+                }
+
+                val reqImage = images.isNotEmpty()
+                val reqAudio = audioClips.isNotEmpty()
+                runCatching {
+                    awaitInitializedInternal(
+                        context = ctx,
+                        model = model,
+                        supportImage = reqImage,
+                        supportAudio = reqAudio,
+                    )
+                }.onFailure { t ->
+                    val msg = "LiteRT-LM auto-init failed: ${cleanError(t.message)}"
+                    Log.e(TAG, msg, t)
+                    postToMain {
+                        onError(msg)
+                        resultListener("", true)
+                        runCatching { cleanUpListener.invoke() }
+                    }
+                    return@launch
                 }
             }
 
@@ -1345,6 +1365,8 @@ object LiteRtLM {
                 return@launch
             }
 
+            val rsLocal = rs
+
             if (cooldownDelayMs > 0) {
                 Log.d(TAG, "Post-terminate cooldown: delaying start ${cooldownDelayMs}ms for key='$key'")
                 delay(cooldownDelayMs)
@@ -1358,10 +1380,11 @@ object LiteRtLM {
                 val msg = "LiteRT-LM input rejected: empty message (no text/images/audio)."
                 Log.w(TAG, msg)
                 stateMutex.withLock {
-                    rs.active.set(false)
-                    rs.terminated.set(true)
-                    rs.logicalDone.set(true)
-                    rs.logicalTerminator.set(null)
+                    rsLocal.active.set(false)
+                    rsLocal.terminated.set(true)
+                    rsLocal.logicalDone.set(true)
+                    rsLocal.logicalTerminator.set(null)
+                    rsLocal.nativeDoneHook.set(null)
                 }
                 postToMain {
                     onError(msg)
@@ -1384,11 +1407,28 @@ object LiteRtLM {
                 }
             }
 
+            fun scheduleDeferredActions() {
+                ioScope.launch { runDeferredActions() }
+            }
+
+            fun scheduleCleanUpListener() {
+                postToMain {
+                    runCatching { cleanUpListener.invoke() }
+                        .onFailure { t -> Log.w(TAG, "cleanUpListener failed: ${t.message}", t) }
+                }
+            }
+
+            // Hook for hard-close path (and normal termination path).
+            rsLocal.nativeDoneHook.set {
+                if (rsLocal.runId.get() != myRunId) return@set
+                scheduleCleanUpListener()
+                scheduleDeferredActions()
+            }
+
             var watchdog: Job? = null
             var nativeStarted = false
 
             fun deliverLogicalDoneOnce(errorMessage: String? = null, isCancel: Boolean = false) {
-                val rsLocal = rs
                 if (!rsLocal.logicalDone.compareAndSet(false, true)) return
 
                 postToMain {
@@ -1403,7 +1443,6 @@ object LiteRtLM {
             }
 
             fun markNativeDoneOnce(errorMessage: String? = null, isCancel: Boolean = false) {
-                val rsLocal = rs
                 if (!rsLocal.terminated.compareAndSet(false, true)) return
 
                 watchdog?.cancel()
@@ -1418,16 +1457,11 @@ object LiteRtLM {
 
                 deliverLogicalDoneOnce(errorMessage = errorMessage, isCancel = isCancel)
 
-                postToMain {
-                    runCatching { cleanUpListener.invoke() }
-                        .onFailure { t -> Log.w(TAG, "cleanUpListener failed: ${t.message}", t) }
-                }
-
-                ioScope.launch { runDeferredActions() }
+                // IMPORTANT: cleanup must run even if native termination was forced.
+                fireNativeDoneHookOnce(key)
             }
 
             fun requestLogicalCancel(reason: String) {
-                val rsLocal = rs
                 rsLocal.cancelRequested.set(true)
 
                 deliverLogicalDoneOnce(errorMessage = reason, isCancel = true)
@@ -1438,9 +1472,9 @@ object LiteRtLM {
                 if (HARD_CLOSE_ENABLE) startHardCloseWatchdog(key, reason = "logicalCancel")
             }
 
-            rs.logicalTerminator.set { requestLogicalCancel("Cancelled") }
+            rsLocal.logicalTerminator.set { requestLogicalCancel("Cancelled") }
 
-            if (rs.cancelRequested.get()) {
+            if (rsLocal.cancelRequested.get()) {
                 Log.i(TAG, "LiteRT-LM start cancelled before sendMessageAsync: key='$key'")
                 markNativeDoneOnce(errorMessage = "Cancelled", isCancel = true)
                 return@launch
@@ -1448,8 +1482,8 @@ object LiteRtLM {
 
             watchdog = ioScope.launch {
                 delay(STREAM_WATCHDOG_MS)
-                if (rs.runId.get() != myRunId) return@launch
-                if (rs.terminated.get()) return@launch
+                if (rsLocal.runId.get() != myRunId) return@launch
+                if (rsLocal.terminated.get()) return@launch
 
                 Log.e(TAG, "Stream watchdog fired: key='$key' runId=$myRunId timeout=${STREAM_WATCHDOG_MS}ms")
 
@@ -1466,11 +1500,11 @@ object LiteRtLM {
             val callback = object : MessageCallback {
 
                 override fun onMessage(message: Message) {
-                    if (rs.runId.get() != myRunId) return
-                    if (rs.terminated.get()) return
-                    if (rs.logicalDone.get() || rs.cancelRequested.get()) return
+                    if (rsLocal.runId.get() != myRunId) return
+                    if (rsLocal.terminated.get()) return
+                    if (rsLocal.logicalDone.get() || rsLocal.cancelRequested.get()) return
 
-                    rs.lastMessageAtMs.set(SystemClock.elapsedRealtime())
+                    rsLocal.lastMessageAtMs.set(SystemClock.elapsedRealtime())
                     msgCount++
 
                     val snapshotRaw = extractRenderedText(message)
@@ -1482,7 +1516,7 @@ object LiteRtLM {
 
                     val delta = normalizeDeltaText(deltaRaw)
 
-                    if (msgCount == 1 || msgCount % DEBUG_STREAM_EVERY_N == 0) {
+                    if (DEBUG_STREAM && (msgCount == 1 || msgCount % DEBUG_STREAM_EVERY_N == 0)) {
                         val lead = deltaRaw.firstOrNull()
                         val leadInfo =
                             if (lead == null) "null"
@@ -1503,12 +1537,12 @@ object LiteRtLM {
                 }
 
                 override fun onDone() {
-                    if (rs.runId.get() != myRunId) return
+                    if (rsLocal.runId.get() != myRunId) return
                     markNativeDoneOnce(null)
                 }
 
                 override fun onError(throwable: Throwable) {
-                    if (rs.runId.get() != myRunId) return
+                    if (rsLocal.runId.get() != myRunId) return
 
                     val rawMsg = throwable.message ?: throwable.toString()
                     val msg = cleanError(rawMsg)
@@ -1525,7 +1559,7 @@ object LiteRtLM {
                         )
                     }
 
-                    val cancelled = rs.cancelRequested.get() || isCancellationThrowable(throwable, msg)
+                    val cancelled = rsLocal.cancelRequested.get() || isCancellationThrowable(throwable, msg)
                     if (cancelled) {
                         Log.i(TAG, "LiteRT-LM inference cancelled: key='$key' runId=$myRunId")
                         markNativeDoneOnce(errorMessage = "Cancelled", isCancel = true)

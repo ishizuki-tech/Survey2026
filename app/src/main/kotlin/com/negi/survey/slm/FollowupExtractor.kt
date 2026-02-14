@@ -15,7 +15,7 @@
  *    - Multiple embedded JSON fragments (JSONObject / JSONArray).
  *    - Robust key normalization (separator-insensitive + camelCase-aware).
  *    - Question-field detection with lightweight heuristics.
- *    - Deduplication with stable encounter order.
+ *    - Deduplication with encounter order.
  *    - Lightweight score extraction with JSON-first semantics and
  *      plain-text fallback.
  * =====================================================================
@@ -25,6 +25,7 @@
 
 package com.negi.survey.slm
 
+import java.util.Locale
 import org.json.JSONArray
 import org.json.JSONObject
 import kotlin.math.max
@@ -38,6 +39,7 @@ import kotlin.math.min
  * - Traverses objects/arrays to find likely question-bearing fields (key-insensitive, separator-insensitive).
  * - Handles camelCase keys (e.g., followUpQuestion) by inserting separators before normalization.
  * - Deduplicates while preserving encounter order (LinkedHashSet semantics).
+ *   Note: JSONArray order is stable; JSONObject key iteration order may vary by implementation.
  * - Provides a light-weight 0..100 score extractor with robust JSON recursion + textual fallback.
  *
  * Typical usage:
@@ -67,7 +69,7 @@ object FollowupExtractor {
     /**
      * Normalize field keys for matching:
      * - Insert separators for camelCase and acronym boundaries.
-     * - Lowercase the entire string.
+     * - Lowercase the entire string (Locale.US).
      * - Convert any run of [space/_/unicode-dash/zero-width] to a single '-'.
      * - Trim leading/trailing dashes.
      *
@@ -80,7 +82,7 @@ object FollowupExtractor {
      */
     private fun normKey(k: String): String =
         decamel(k)
-            .lowercase()
+            .lowercase(Locale.US)
             .replace(KEY_SEP_REGEX, "-")
             .trim('-')
 
@@ -237,6 +239,7 @@ object FollowupExtractor {
             is List<*> -> for (elem in any) {
                 if (elem != null && out.size < max) collect(elem, out, max)
             }
+
             else -> collect(any, out, max)
         }
         return out.toList().take(max)
@@ -322,6 +325,7 @@ object FollowupExtractor {
                             extractQuestionField(v)?.let { addIfMeaningful(it, out, max) }
                             collect(v, out, max)
                         }
+
                         is JSONArray -> collect(v, out, max)
                     }
                 }
@@ -359,7 +363,8 @@ object FollowupExtractor {
                                         kn == "question" ||
                                         kn.endsWith("-question") ||
                                         kn.endsWith("-q") ||
-                                        kn.contains("follow-up")
+                                        kn.contains("follow-up") ||
+                                        (kn.contains("followup") && kn.contains("question"))
 
                             if (looksLikeQuestionField) {
                                 addIfMeaningful(v, out, max)
@@ -503,6 +508,7 @@ object FollowupExtractor {
                     sb.append(ch)
                     flush()
                 }
+
                 else -> sb.append(ch)
             }
         }
@@ -521,9 +527,11 @@ object FollowupExtractor {
      *   {...}
      *   ```
      *   More text
+     *
+     * Note: Accepts optional newline before closing fence to tolerate outputs without trailing newline.
      */
     private fun extractCodeFenceBodies(raw: String): List<String> {
-        val re = Regex("""```[A-Za-z0-9_-]*\s*\n([\s\S]*?)\n```""")
+        val re = Regex("""```[A-Za-z0-9_-]*\s*\n([\s\S]*?)\n?```""")
         return re.findAll(raw).map { it.groupValues[1].trim() }.toList()
     }
 
@@ -576,6 +584,7 @@ object FollowupExtractor {
                             '}' -> if (stack.isNotEmpty() && stack.last() == '{') {
                                 stack.removeLast()
                             }
+
                             ']' -> if (stack.isNotEmpty() && stack.last() == '[') {
                                 stack.removeLast()
                             }

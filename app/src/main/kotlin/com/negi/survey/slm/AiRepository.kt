@@ -19,7 +19,6 @@ import android.util.Log
 import com.google.ai.edge.litertlm.Message
 import com.negi.survey.BuildConfig
 import com.negi.survey.config.SurveyConfig
-import com.negi.survey.vm.AiViewModel
 import java.io.File
 import java.security.MessageDigest
 import java.text.SimpleDateFormat
@@ -59,6 +58,7 @@ enum class PromptPhase {
     EVAL,
     FOLLOWUP
 }
+
 /**
  * Repository that streams inference results from an on-device LLM backend.
  *
@@ -67,9 +67,6 @@ enum class PromptPhase {
  * - Implementations may enforce process-wide serialization (e.g., via a semaphore).
  * - Callers are expected to collect in a coroutine scope they control and cancel
  *   collection to abort/cleanup the underlying engine call (best-effort).
- */
-/**
- * Repository that streams inference results from an on-device LLM backend.
  */
 interface Repository {
 
@@ -82,12 +79,11 @@ interface Repository {
     /**
      * Build the full model-ready prompt string for a specific [phase].
      *
-     * NOTE:
+     * Note:
      * - Default implementation keeps backward compatibility by delegating to the legacy method.
      */
     fun buildPrompt(userPrompt: String, phase: PromptPhase): String = buildPrompt(userPrompt)
 }
-
 
 /* ====================================================================== */
 /*  Shared process-wide inference gate                                     */
@@ -352,40 +348,9 @@ private class StreamDeltaNormalizer(
 /* ====================================================================== */
 
 private object PromptDefaults {
-
     const val USER_TURN_PREFIX = "<start_of_turn>user"
     const val MODEL_TURN_PREFIX = "<start_of_turn>model"
     const val TURN_END = "<end_of_turn>"
-//    const val EMPTY_JSON_INSTRUCTION = "Respond with an empty JSON object: {}"
-//    const val PREAMBLE =
-//        "You are a well-known farmer survey expert. Read the Question and the Answer."
-//    const val KEY_CONTRACT =
-//        "OUTPUT FORMAT:\n" +
-//                "- In English.\n" +
-//                "- Keys:\n" +
-//                "  • \"analysis\": short string\n" +
-//                "  • \"expected answer\": short string\n" +
-//                "  • \"follow-up question\": a single short confirm/validate question\n" +
-//                "  • \"score\": integer 1–100\n" +
-//                "FOLLOW-UP INTENT:\n" +
-//                "- The follow-up must confirm or clarify the respondent's original answer to the SAME question.\n" +
-//                "- Target the biggest uncertainty (unit/scale, missing number, time window, baseline, method).\n" +
-//                "- Keep it single-scope and answerable immediately."
-//    const val LENGTH_BUDGET =
-//        "LENGTH LIMITS:\n" +
-//                "- analysis<=80 chars\n" +
-//                "- expected answer<=60 chars\n" +
-//                "- follow-up question<=90 chars"
-//    const val SCORING_RULE =
-//        "SCORING RULE:\n" +
-//                "- Judge ONLY content relevance/completeness/accuracy.\n" +
-//                "- Do NOT penalize style or formatting."
-//    const val STRICT_OUTPUT =
-//        "STRICT OUTPUT (NO MARKDOWN):\n" +
-//                "- RAW JSON only.\n" +
-//                "- No extra text.\n" +
-//                "- Prefer compact JSON.\n" +
-//                "- Entire output should be short and machine-parseable."
 }
 
 /* ====================================================================== */
@@ -482,71 +447,6 @@ class LiteRtRepository(
         return if (out.length <= maxChars) out else out.takeLast(maxChars)
     }
 
-//    override fun buildPrompt(userPrompt: String): String {
-//        fun normalize(s: String): String =
-//            s.replace("\r\n", "\n")
-//                .replace("\r", "\n")
-//                .trimEnd('\n')
-//
-//        fun joinNonBlank(vararg parts: String): String =
-//            parts.asSequence()
-//                .map { normalize(it) }
-//                .filter { it.isNotBlank() }
-//                .joinToString("\n")
-//
-//        val slm = config.slm
-//
-//        val userTurn = sanitizeTurnToken(slm.userTurnPrefix, PromptDefaults.USER_TURN_PREFIX)
-//        val modelTurn = sanitizeTurnToken(slm.modelTurnPrefix, PromptDefaults.MODEL_TURN_PREFIX)
-//        val turnEnd = sanitizeTurnToken(slm.turnEnd, PromptDefaults.TURN_END)
-//
-////        val emptyJson = normalize(slm.emptyJsonInstruction ?: PromptDefaults.EMPTY_JSON_INSTRUCTION)
-////        val preamble = normalize(slm.preamble ?: PromptDefaults.PREAMBLE)
-////        val keyContract = normalize(slm.keyContract ?: PromptDefaults.KEY_CONTRACT)
-////        val lengthBudget = normalize(slm.lengthBudget ?: PromptDefaults.LENGTH_BUDGET)
-////        val scoringRule = normalize(slm.scoringRule ?: PromptDefaults.SCORING_RULE)
-////        val strictOutput = normalize(slm.strictOutput ?: PromptDefaults.STRICT_OUTPUT)
-//
-//        val emptyJson = normalize(slm.emptyJsonInstruction ?: "")
-//        val preamble = normalize(slm.preamble ?: "")
-//        val keyContract = normalize(slm.keyContract ?: "")
-//        val lengthBudget = normalize(slm.lengthBudget ?: "")
-//        val scoringRule = normalize(slm.scoringRule ?: "")
-//        val strictOutput = normalize(slm.strictOutput ?: "")
-//        val effectiveInput = if (userPrompt.isBlank()) emptyJson else normalize(userPrompt.trimIndent())
-//        val labeledInput = joinNonBlank("INPUT:", effectiveInput)
-//        val userBlock = joinNonBlank(
-//            preamble,
-//            keyContract,
-//            lengthBudget,
-//            scoringRule,
-//            strictOutput,
-//            labeledInput
-//        )
-//        val fullPrompt = joinNonBlank(
-//            userTurn,
-//            userBlock,
-//            turnEnd,
-//            modelTurn
-//        )
-//
-//        val capped = capPromptIfNeeded(fullPrompt, PROMPT_CHAR_CAP, PROMPT_KEEP_TAIL_CHARS)
-//
-////        val sha = AiTrace.sha256Short(capped)
-////        Log.d(TAG, "buildPrompt: in.len=${userPrompt.length}, out.len=${capped.length}, sha=$sha (capped=${capped.length != fullPrompt.length})")
-////
-////        if (BuildConfig.DEBUG && AiTrace.enabled) {
-////            AiTrace.logLong(TAG, Log.DEBUG, "[buildPrompt] PROMPT (FULL) sha=$sha", capped)
-////        } else if (BuildConfig.DEBUG) {
-////            val head = capped.take(420).replace("\n", "\\n")
-////            val tail = capped.takeLast(260).replace("\n", "\\n")
-////            Log.d(TAG, "buildPrompt preview(head): '$head' ...")
-////            Log.d(TAG, "buildPrompt preview(tail): ... '$tail'")
-////        }
-//
-//        return capped
-//    }
-
     override fun buildPrompt(userPrompt: String): String =
         buildPrompt(userPrompt, PromptPhase.ONE_STEP)
 
@@ -576,7 +476,6 @@ class LiteRtRepository(
         }.let(::normalize)
 
         // Keep legacy behavior: if user prompt is blank, inject empty-json instruction.
-        // (Typically not used for FOLLOWUP because you always pass EVAL_JSON there.)
         val emptyJson = normalize(slm.emptyJsonInstruction ?: "")
         val effectiveInput = if (userPrompt.isBlank()) emptyJson else normalize(userPrompt.trimIndent())
 
@@ -592,7 +491,6 @@ class LiteRtRepository(
 
         return capPromptIfNeeded(fullPrompt, PROMPT_CHAR_CAP, PROMPT_KEEP_TAIL_CHARS)
     }
-
 
     @OptIn(DelicateCoroutinesApi::class)
     override suspend fun request(prompt: String): Flow<String> {

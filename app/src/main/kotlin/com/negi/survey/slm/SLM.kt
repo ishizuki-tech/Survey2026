@@ -48,9 +48,10 @@ import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.coroutines.Continuation
 import kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.suspendCancellableCoroutine
-import kotlin.coroutines.resume
 
 private const val TAG = "SLM"
 
@@ -230,51 +231,55 @@ fun buildModelConfig(slm: SurveyConfig.SlmMeta): MutableMap<ConfigKey, Any> {
 /* ───────────────────────────── Reflection Bridge ───────────────────────────── */
 
 /**
- * Cache methods by (name/arity) to reduce reflection scan cost.
+ * Cache methods by (class/name/arity) to reduce reflection scan cost.
  */
 private val methodBucketCache = ConcurrentHashMap<String, List<Method>>()
 
 /**
  * Build a cache key for method buckets.
  */
-private fun bucketKey(methodName: String, argc: Int): String = "$methodName/$argc"
+private fun bucketKey(cls: Class<*>, methodName: String, argc: Int): String =
+    "${cls.name}::$methodName/$argc"
 
 /**
  * Get all methods (public + declared) matching name+arity, cached.
  */
 private fun getMethodBucket(cls: Class<*>, methodName: String, argc: Int): List<Method> {
-    val key = bucketKey(methodName, argc)
+    val key = bucketKey(cls, methodName, argc)
     return methodBucketCache.getOrPut(key) {
         val all = ArrayList<Method>(64)
         all.addAll(cls.methods.filter { it.name == methodName && it.parameterTypes.size == argc })
         all.addAll(cls.declaredMethods.filter { it.name == methodName && it.parameterTypes.size == argc })
         all.distinctBy { m ->
-            val sb = StringBuilder()
-            sb.append(m.name).append("(")
-            m.parameterTypes.forEachIndexed { i, p ->
-                if (i > 0) sb.append(",")
-                sb.append(p.name)
+            buildString {
+                append(m.name).append("(")
+                m.parameterTypes.forEachIndexed { i, p ->
+                    if (i > 0) append(",")
+                    append(p.name)
+                }
+                append(")")
             }
-            sb.append(")")
-            sb.toString()
         }
     }
 }
 
 /**
  * Convert primitive parameter class to its boxed counterpart.
+ *
+ * NOTE:
+ * Avoid java.lang.* wrapper classes in Kotlin source to suppress warnings.
  */
 private fun boxedOfPrimitive(p: Class<*>): Class<*>? {
     if (!p.isPrimitive) return null
     return when (p) {
-        java.lang.Boolean.TYPE -> java.lang.Boolean::class.java
-        java.lang.Integer.TYPE -> java.lang.Integer::class.java
-        java.lang.Long.TYPE -> java.lang.Long::class.java
-        java.lang.Float.TYPE -> java.lang.Float::class.java
-        java.lang.Double.TYPE -> java.lang.Double::class.java
-        java.lang.Short.TYPE -> java.lang.Short::class.java
-        java.lang.Byte.TYPE -> java.lang.Byte::class.java
-        java.lang.Character.TYPE -> java.lang.Character::class.java
+        Boolean::class.javaPrimitiveType -> Boolean::class.javaObjectType
+        Int::class.javaPrimitiveType -> Int::class.javaObjectType
+        Long::class.javaPrimitiveType -> Long::class.javaObjectType
+        Float::class.javaPrimitiveType -> Float::class.javaObjectType
+        Double::class.javaPrimitiveType -> Double::class.javaObjectType
+        Short::class.javaPrimitiveType -> Short::class.javaObjectType
+        Byte::class.javaPrimitiveType -> Byte::class.javaObjectType
+        Char::class.javaPrimitiveType -> Char::class.javaObjectType
         else -> null
     }
 }
@@ -299,12 +304,26 @@ private fun coerceArgForParam(param: Class<*>, arg: Any?): Any? {
     if (boxed != null && boxed.isInstance(arg)) return arg
 
     /** Numeric coercions. */
-    val wantsInt = (param == java.lang.Integer.TYPE || param == java.lang.Integer::class.java)
-    val wantsLong = (param == java.lang.Long.TYPE || param == java.lang.Long::class.java)
-    val wantsFloat = (param == java.lang.Float.TYPE || param == java.lang.Float::class.java)
-    val wantsDouble = (param == java.lang.Double.TYPE || param == java.lang.Double::class.java)
-    val wantsShort = (param == java.lang.Short.TYPE || param == java.lang.Short::class.java)
-    val wantsByte = (param == java.lang.Byte.TYPE || param == java.lang.Byte::class.java)
+    val intP = Int::class.javaPrimitiveType
+    val longP = Long::class.javaPrimitiveType
+    val floatP = Float::class.javaPrimitiveType
+    val doubleP = Double::class.javaPrimitiveType
+    val shortP = Short::class.javaPrimitiveType
+    val byteP = Byte::class.javaPrimitiveType
+
+    val intO = Int::class.javaObjectType
+    val longO = Long::class.javaObjectType
+    val floatO = Float::class.javaObjectType
+    val doubleO = Double::class.javaObjectType
+    val shortO = Short::class.javaObjectType
+    val byteO = Byte::class.javaObjectType
+
+    val wantsInt = (param == intP || param == intO)
+    val wantsLong = (param == longP || param == longO)
+    val wantsFloat = (param == floatP || param == floatO)
+    val wantsDouble = (param == doubleP || param == doubleO)
+    val wantsShort = (param == shortP || param == shortO)
+    val wantsByte = (param == byteP || param == byteO)
 
     if (arg is Number) {
         return when {
@@ -319,43 +338,30 @@ private fun coerceArgForParam(param: Class<*>, arg: Any?): Any? {
     }
 
     /** Function0 -> Runnable. */
-    if (param == java.lang.Runnable::class.java && arg is Function0<*>) {
+    if (param == Runnable::class.java && arg is Function0<*>) {
         return Runnable { arg.invoke() }
     }
 
     /** Function1 -> Consumer (best-effort). */
     if (param.name == "java.util.function.Consumer" && arg is Function1<*, *>) {
-        val f = arg as Function1<Any?, Any?>
-        val consumerCls = Class.forName("java.util.function.Consumer")
-        /** Create a proxy via lambda adaptation (Consumer is SAM). */
-        return java.lang.reflect.Proxy.newProxyInstance(
-            consumerCls.classLoader,
-            arrayOf(consumerCls)
-        ) { _, method, args ->
-            if (method.name == "accept") {
-                f.invoke(args?.getOrNull(0))
-                null
-            } else {
-                null
+        return runCatching {
+            val f = arg as Function1<Any?, Any?>
+            val consumerCls = Class.forName("java.util.function.Consumer")
+            java.lang.reflect.Proxy.newProxyInstance(
+                consumerCls.classLoader,
+                arrayOf(consumerCls)
+            ) { _, method, args ->
+                if (method.name == "accept") {
+                    f.invoke(args?.getOrNull(0))
+                    null
+                } else {
+                    null
+                }
             }
-        }
+        }.getOrElse { arg }
     }
 
     return arg
-}
-
-/**
- * Check if parameter can accept an arg after coercion.
- */
-private fun isParamCompatible(param: Class<*>, arg: Any?): Boolean {
-    if (arg == null) return !param.isPrimitive
-    val coerced = coerceArgForParam(param, arg) ?: return !param.isPrimitive
-
-    if (param.isPrimitive) {
-        val boxed = boxedOfPrimitive(param) ?: return false
-        return boxed.isInstance(coerced)
-    }
-    return param.isAssignableFrom(coerced.javaClass)
 }
 
 /**
@@ -399,6 +405,7 @@ private fun findBestMethod(cls: Class<*>, methodName: String, args: Array<Any?>)
         val params = m.parameterTypes
         var score = 0
         var ok = true
+
         for (i in params.indices) {
             val s = scoreParamMatch(params[i], args[i])
             if (s < -1000) {
@@ -428,12 +435,12 @@ private fun findBestMethod(cls: Class<*>, methodName: String, args: Array<Any?>)
  * - Try full args
  * - If last is emptyList -> drop it
  * - If last is null -> drop it
- * - Also try dropping last 1 / last 2 always (best-effort)
+ * - Also try dropping last N (1..4) always (best-effort)
  */
 private fun buildArgCandidates(args: Array<Any?>): List<Array<Any?>> {
     if (args.isEmpty()) return listOf(args)
 
-    val out = ArrayList<Array<Any?>>(6)
+    val out = ArrayList<Array<Any?>>(8)
     out.add(args)
 
     fun dropLast(n: Int) {
@@ -444,18 +451,61 @@ private fun buildArgCandidates(args: Array<Any?>): List<Array<Any?>> {
     if (last is List<*> && last.isEmpty()) dropLast(1)
     if (last == null) dropLast(1)
 
-    /** Generic trims (works for optional tails like systemMessage/tools). */
-    dropLast(1)
-    dropLast(2)
+    /** Generic trims (works for optional tails like systemMessage/tools/onPartial). */
+    val maxDrop = minOf(4, args.size - 1)
+    for (n in 1..maxDrop) dropLast(n)
 
     /** De-dupe by arity. */
     return out.distinctBy { it.size }
 }
 
 /**
- * Call a LiteRtLM method by name using reflection (non-suspend).
+ * Call a LiteRtLM method by name using reflection (non-suspend), returning Any?.
  *
- * Returns true if invoked successfully.
+ * Returns null if no compatible method was found or invocation failed.
+ */
+private fun invokeLiteRtLmBestEffortReturn(
+    methodName: String,
+    args: Array<Any?>,
+    onFailLog: String,
+): Any? {
+    val cls = LiteRtLM::class.java
+    val candidates = buildArgCandidates(args)
+
+    for (cand in candidates) {
+        try {
+            val m = findBestMethod(cls, methodName, cand)
+            if (m == null) {
+                d { "$onFailLog (method not found): name='$methodName' argc=${cand.size}" }
+                continue
+            }
+
+            m.isAccessible = true
+            val receiver: Any? = if (Modifier.isStatic(m.modifiers)) null else LiteRtLM
+
+            /** Coerce args per param types. */
+            val coercedArgs = Array<Any?>(cand.size) { i ->
+                coerceArgForParam(m.parameterTypes[i], cand[i])
+            }
+
+            return m.invoke(receiver, *coercedArgs)
+        } catch (ite: InvocationTargetException) {
+            val root = ite.targetException ?: ite
+            w(root) { "$onFailLog (target threw): name='$methodName' err=${root.message}" }
+        } catch (t: Throwable) {
+            w(t) { "$onFailLog (invoke failed): name='$methodName' err=${t.message}" }
+        }
+    }
+
+    return null
+}
+
+/**
+ * Call a LiteRtLM method by name using reflection (non-suspend), returning success boolean.
+ *
+ * IMPORTANT:
+ * - Kotlin Unit/Java void methods return null from Method.invoke().
+ * - So success must be "invoked without throwing", not "return != null".
  */
 private fun invokeLiteRtLmBestEffortUnit(
     methodName: String,
@@ -511,7 +561,6 @@ private suspend fun invokeLiteRtLmBestEffortSuspend(
     val candidates = buildArgCandidates(argsNoCont)
 
     return suspendCancellableCoroutine { outer ->
-        /** Propagate cancellation to LiteRtLM if possible. */
         outer.invokeOnCancellation {
             d { "invokeSuspend cancelled: method='$methodName'" }
         }
@@ -520,9 +569,18 @@ private suspend fun invokeLiteRtLmBestEffortSuspend(
             override val context = outer.context
             override fun resumeWith(result: Result<Any?>) {
                 if (outer.isCompleted) return
-                outer.resumeWith(result)
+                result.fold(
+                    onSuccess = { v ->
+                        if (!outer.isCompleted) outer.resume(v)
+                    },
+                    onFailure = { e ->
+                        if (!outer.isCompleted) outer.resumeWithException(e)
+                    }
+                )
             }
         }
+
+        var invoked = false
 
         for (cand in candidates) {
             try {
@@ -545,23 +603,20 @@ private suspend fun invokeLiteRtLmBestEffortSuspend(
 
                 val ret = m.invoke(receiver, *coercedArgs)
 
+                invoked = true
                 if (ret !== COROUTINE_SUSPENDED) {
-                    /** Completed synchronously. */
                     if (!outer.isCompleted) outer.resume(ret)
                 }
-                return@suspendCancellableCoroutine
+                break
             } catch (ite: InvocationTargetException) {
                 val root = ite.targetException ?: ite
                 w(root) { "$onFailLog (suspend target threw): name='$methodName' err=${root.message}" }
-                if (!outer.isCompleted) outer.resume(null)
-                return@suspendCancellableCoroutine
             } catch (t: Throwable) {
                 w(t) { "$onFailLog (suspend invoke failed): name='$methodName' err=${t.message}" }
             }
         }
 
-        /** Method not found. */
-        if (!outer.isCompleted) outer.resume(null)
+        if (!invoked && !outer.isCompleted) outer.resume(null)
     }
 }
 
@@ -571,24 +626,14 @@ object SLM {
 
     /** True when a suspend generateText call is currently in progress. */
     fun isBusy(): Boolean {
-        val ok = invokeLiteRtLmBestEffortUnit(
-            methodName = "isBusy",
-            args = emptyArray(),
-            onFailLog = "LiteRtLM.isBusy unavailable",
-        )
-        if (!ok) return false
-
-        /** If invoked, prefer reading via reflection return is hard; fallback to safe default. */
-        return try {
-            /** Try direct reflection-return path (secondary). */
-            val cls = LiteRtLM::class.java
-            val m = findBestMethod(cls, "isBusy", emptyArray()) ?: return false
-            val receiver: Any? = if (Modifier.isStatic(m.modifiers)) null else LiteRtLM
-            val ret = m.invoke(receiver)
-            ret as? Boolean ?: false
-        } catch (t: Throwable) {
-            false
-        }
+        return runCatching {
+            val ret = invokeLiteRtLmBestEffortReturn(
+                methodName = "isBusy",
+                args = emptyArray(),
+                onFailLog = "LiteRtLM.isBusy unavailable",
+            )
+            (ret as? Boolean) ?: false
+        }.getOrDefault(false)
     }
 
     /** Allow host app to set context early (recommended). */
@@ -637,7 +682,7 @@ object SLM {
     /**
      * Suspend-style initializer.
      *
-     * Best-effort reflection call. If unavailable, falls back to initialize() and returns.
+     * Best-effort reflection call. If unavailable, falls back to initialize() and waits for onDone.
      */
     suspend fun initializeIfNeeded(
         context: Context,
@@ -664,15 +709,21 @@ object SLM {
             w(t) { "initializeIfNeeded: reflection failed err=${t.message}" }
         }
 
-        /** Fallback: call async initialize and return once onDone fires. */
+        /** Fallback: call async initialize and suspend until onDone fires (and honor errors). */
         suspendCancellableCoroutine<Unit> { cont ->
             initialize(
                 context = context,
                 model = model,
                 supportImage = supportImage,
                 supportAudio = supportAudio,
-                onDone = { _ ->
-                    if (!cont.isCompleted) cont.resume(Unit)
+                onDone = { err ->
+                    if (cont.isCompleted) {
+                        // ignore late callback
+                    } else if (err.isBlank()) {
+                        cont.resume(Unit)
+                    } else {
+                        cont.resumeWithException(IllegalStateException("LiteRtLM init failed: $err"))
+                    }
                 },
                 systemMessage = systemMessage,
                 tools = tools
@@ -815,31 +866,52 @@ object SLM {
             w(t) { "generateText: reflection failed err=${t.message}" }
         }
 
-        /** Fallback: aggregate via streaming. */
+        /** Fallback: aggregate via streaming (no labeled returns; guard by if). */
         return suspendCancellableCoroutine { cont ->
-            var lastText = ""
+            val buffer = StringBuilder()
             var doneOnce = false
 
-            runInference(
-                model = model,
-                input = input,
-                images = images,
-                audioClips = audioClips,
-                resultListener = { partial, done ->
-                    lastText = partial
-                    onPartial(partial)
-                    if (done && !doneOnce) {
-                        doneOnce = true
-                        if (!cont.isCompleted) cont.resume(partial)
+            val resultListener: ResultListener = { partial, done ->
+                if (!doneOnce) {
+                    if (partial.isNotEmpty()) {
+                        buffer.append(partial)
+                        runCatching { onPartial(partial) }
+                            .onFailure { t -> w(t) { "generateText fallback onPartial failed: ${t.message}" } }
                     }
-                },
-                cleanUpListener = {
-                    /** No-op; LiteRtLM owns native termination. */
-                },
-                onError = { msg ->
-                    if (!cont.isCompleted) cont.resume("error: $msg")
+
+                    if (done) {
+                        doneOnce = true
+                        if (!cont.isCompleted) cont.resume(buffer.toString())
+                    }
                 }
+            }
+
+            val onError: (String) -> Unit = { msg ->
+                if (!doneOnce) {
+                    doneOnce = true
+
+                    val lc = msg.lowercase(Locale.US)
+                    if (lc.contains("cancel")) {
+                        if (!cont.isCompleted) cont.resumeWithException(CancellationException("Cancelled"))
+                    } else {
+                        if (!cont.isCompleted) cont.resumeWithException(
+                            IllegalStateException("LiteRtLM generation error: $msg")
+                        )
+                    }
+                }
+            }
+
+            /** Prefer notifying cancel as error for suspend semantics. */
+            val ok = invokeLiteRtLmBestEffortUnit(
+                methodName = "runInference",
+                args = arrayOf(model, input, resultListener, { /* no-op */ }, onError, images, audioClips, true),
+                onFailLog = "LiteRtLM.runInference unavailable",
             )
+
+            if (!ok) {
+                doneOnce = true
+                if (!cont.isCompleted) cont.resumeWithException(IllegalStateException("runInference unavailable"))
+            }
 
             cont.invokeOnCancellation {
                 d { "generateText fallback cancelled: model='${model.name}'" }
@@ -877,7 +949,7 @@ object SLM {
  *
  * ───────────────────────────────────────────────────────────────────────────── */
 
-/* ────────────────────────── TestTag Sanitizer (unchanged) ────────────────────────── */
+/* ────────────────────────── TestTag Sanitizer ────────────────────────── */
 
 /**
  * Sanitize strings for use in test tags.
@@ -888,8 +960,10 @@ object SLM {
  * - Truncate to [maxLen].
  */
 private fun String.safeTestTagToken(maxLen: Int): String {
-    val cleaned = buildString(length) {
-        for (ch in this@safeTestTagToken) {
+    /** Avoid 'this' label usage to prevent accidental label drift compile errors. */
+    val src = this
+    val cleaned = buildString(src.length) {
+        for (ch in src) {
             val ok = ch.isLetterOrDigit() || ch == '_' || ch == '-' || ch == '.'
             append(if (ok) ch else '_')
         }
