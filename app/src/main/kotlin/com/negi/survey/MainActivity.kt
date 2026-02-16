@@ -161,9 +161,11 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        LiteRtLM.setApplicationContext(this)
-
+        // Install crash capture BEFORE any heavy init to catch early failures.
         bootstrapCrashCaptureOnce(applicationContext)
+
+        // Use application context to avoid accidentally retaining Activity.
+        LiteRtLM.setApplicationContext(applicationContext)
 
         configureEdgeToEdge()
 
@@ -1109,16 +1111,9 @@ fun SurveyNavHost(
                 }
 
                 entry<FlowDone> {
-                    val gh = if (BuildConfig.GH_TOKEN.isNotEmpty()) {
-                        GitHubUploader.GitHubConfig(
-                            owner = BuildConfig.GH_OWNER,
-                            repo = BuildConfig.GH_REPO,
-                            branch = BuildConfig.GH_BRANCH,
-                            pathPrefix = BuildConfig.GH_PATH_PREFIX,
-                            token = BuildConfig.GH_TOKEN
-                        )
-                    } else {
-                        null
+                    // Normalize GitHub config to avoid "owner/repo" vs "repo" mismatch bugs.
+                    val gh = remember {
+                        buildGitHubConfigOrNull()
                     }
 
                     DoneScreen(
@@ -1142,6 +1137,33 @@ fun SurveyNavHost(
         vmAI.resetStates()
         vmSurvey.backToPrevious()
     }
+}
+
+/**
+ * Build GitHub uploader config if configured.
+ *
+ * Note:
+ * - Accept either "repo" or "owner/repo" in GH_REPO and normalize to "repo".
+ * - Trim pathPrefix slashes for consistent remote paths.
+ */
+private fun buildGitHubConfigOrNull(): GitHubUploader.GitHubConfig? {
+    if (BuildConfig.GH_TOKEN.isBlank()) return null
+    val owner = BuildConfig.GH_OWNER.trim()
+    if (owner.isBlank()) return null
+
+    val repoName = BuildConfig.GH_REPO.substringAfterLast('/').trim()
+    if (repoName.isBlank()) return null
+
+    val branch = BuildConfig.GH_BRANCH.ifBlank { "main" }
+    val prefix = BuildConfig.GH_PATH_PREFIX.trim().trim('/')
+
+    return GitHubUploader.GitHubConfig(
+        owner = owner,
+        repo = repoName,
+        branch = branch,
+        pathPrefix = prefix,
+        token = BuildConfig.GH_TOKEN
+    )
 }
 
 /* ───────────────────────────── Minimal Node Screens ───────────────────────────── */

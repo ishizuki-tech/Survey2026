@@ -1,7 +1,21 @@
+/*
+ * =====================================================================
+ *  IshizukiTech LLC — Android Diagnostics
+ *  ---------------------------------------------------------------------
+ *  File: CrashCapture.kt
+ *  Author: Shu Ishizuki
+ *  License: MIT License
+ *  © 2026 IshizukiTech LLC. All rights reserved.
+ * =====================================================================
+ */
+
 package com.negi.survey
 
+import android.app.Activity
+import android.app.Application
 import android.content.Context
 import android.os.Build
+import android.os.Bundle
 import android.os.Process
 import android.os.SystemClock
 import android.util.Log
@@ -16,6 +30,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.zip.GZIPOutputStream
@@ -47,10 +62,26 @@ object CrashCapture {
     /** Prevent re-enqueue storms on rapid app restarts / multiple entry points. */
     private const val ENQUEUE_COOLDOWN_MS = 1200L
 
-    private val installed = AtomicBoolean(false)
+    /** Try to force logcat process shutdown quickly (best-effort). */
+    private const val LOGCAT_WAITFOR_MS = 80L
+
+    /** Prevent ensure storms (handler re-wrap). */
+    private const val ENSURE_COOLDOWN_MS = 800L
+
     private val capturing = AtomicBoolean(false)
     private val enqueueing = AtomicBoolean(false)
+    private val selfHealingRegistered = AtomicBoolean(false)
+
     private val lastEnqueueAt = AtomicLong(0L)
+    private val lastEnsureAt = AtomicLong(0L)
+
+    /** Root filesDir cached at install time to avoid keeping applicationContext references. */
+    @Volatile
+    private var filesDirRoot: File? = null
+
+    /** Our installed handler instance (stable per-process). */
+    @Volatile
+    private var handler: CrashHandler? = null
 
     /** UTC timestamp used in filenames to keep ordering stable across devices/locales. */
     private val FILE_TS_UTC = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).apply {
@@ -61,53 +92,80 @@ object CrashCapture {
     private val HEADER_TS_LOCAL = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US)
 
     /**
-     * Install default uncaught exception handler that writes a gz crash report file.
+     * Install (or re-wrap) the default uncaught exception handler.
      *
-     * Note:
-     * - Keep this method non-suspending and fast.
-     * - Avoid allocations that could crash again (best-effort).
+     * Key behavior:
+     * - Safe to call multiple times.
+     * - If another SDK replaces the default handler after we installed, calling install() again
+     *   will wrap the new handler and restore CrashCapture to the chain.
      */
     fun install(context: Context) {
-        if (!installed.compareAndSet(false, true)) return
-
-        val appContext = context.applicationContext
-        val prior = Thread.getDefaultUncaughtExceptionHandler()
-        val pidAtInstall = Process.myPid()
-
-        Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
-            if (!capturing.compareAndSet(false, true)) {
-                try {
-                    prior?.uncaughtException(thread, throwable)
-                } catch (_: Throwable) {
-                    hardKill()
-                }
-                return@setDefaultUncaughtExceptionHandler
-            }
-
-            try {
-                val file = runCatching { captureCrashToFile(appContext, thread, throwable) }
-                    .onFailure { e -> Log.e(TAG, "Crash capture failed: ${e.message}", e) }
-                    .getOrNull()
-
-                if (file != null) {
-                    Log.e(TAG, "Crash captured: ${file.absolutePath} bytes=${file.length()}")
-                }
-            } catch (t: Throwable) {
-                Log.e(TAG, "Crash capture unexpected failure: ${t.message}", t)
-            } finally {
-                try {
-                    if (prior != null) {
-                        prior.uncaughtException(thread, throwable)
-                    } else {
-                        hardKill()
-                    }
-                } catch (_: Throwable) {
-                    hardKill()
-                }
-            }
+        val root = runCatching { context.filesDir }.getOrNull()
+        if (root == null) {
+            Log.w(TAG, "install: context.filesDir unavailable; skipping install.")
+            return
         }
 
-        Log.d(TAG, "Installed default uncaught exception handler. pid=$pidAtInstall")
+        filesDirRoot = root
+
+        val currentDefault = Thread.getDefaultUncaughtExceptionHandler()
+
+        // Create the handler once, then keep re-wrapping the delegate as needed.
+        val h = handler ?: synchronized(this) {
+            handler ?: CrashHandler(
+                filesDir = root,
+                capturing = capturing,
+                onHardKill = { hardKill() }
+            ).also { handler = it }
+        }
+
+        ensureDefaultHandlerInstalled(h, currentDefault)
+        Log.d(TAG, "install: ensured default handler. pid=${Process.myPid()} default=${describeHandler(Thread.getDefaultUncaughtExceptionHandler())}")
+    }
+
+    /**
+     * Optional hardening: register lifecycle callbacks to periodically re-ensure the handler chain.
+     *
+     * Useful when:
+     * - Some SDK replaces the default handler later (e.g., after Application.onCreate()).
+     */
+    fun registerSelfHealing(application: Application) {
+        if (!selfHealingRegistered.compareAndSet(false, true)) return
+
+        application.registerActivityLifecycleCallbacks(object : Application.ActivityLifecycleCallbacks {
+            override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) {
+                ensureInstalled(activity)
+            }
+
+            override fun onActivityStarted(activity: Activity) {
+                ensureInstalled(activity)
+            }
+
+            override fun onActivityResumed(activity: Activity) {
+                ensureInstalled(activity)
+            }
+
+            override fun onActivityPaused(activity: Activity) = Unit
+            override fun onActivityStopped(activity: Activity) = Unit
+            override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) = Unit
+            override fun onActivityDestroyed(activity: Activity) = Unit
+        })
+
+        Log.d(TAG, "registerSelfHealing: ActivityLifecycleCallbacks registered.")
+    }
+
+    /**
+     * Ensure we are the default handler (best-effort) with a small cooldown.
+     *
+     * Safe to call often.
+     */
+    fun ensureInstalled(context: Context) {
+        val now = SystemClock.elapsedRealtime()
+        val prev = lastEnsureAt.get()
+        if (prev != 0L && (now - prev) in 0 until ENSURE_COOLDOWN_MS) return
+        lastEnsureAt.set(now)
+
+        install(context)
     }
 
     /**
@@ -119,7 +177,11 @@ object CrashCapture {
      * - Keep files locally if nothing is configured.
      */
     fun enqueuePendingCrashUploadsIfPossible(context: Context) {
-        val appContext = context.applicationContext
+        val root = filesDirRoot ?: runCatching { context.filesDir }.getOrNull()
+        if (root == null) {
+            Log.w(TAG, "enqueuePendingCrashUploadsIfPossible: filesDir unavailable; skipping.")
+            return
+        }
 
         if (!enqueueing.compareAndSet(false, true)) {
             Log.d(TAG, "enqueuePendingCrashUploadsIfPossible skipped (already running).")
@@ -136,8 +198,8 @@ object CrashCapture {
             }
             lastEnqueueAt.set(now)
 
-            val dir = crashDir(appContext).apply { mkdirs() }
-            val ghMirrorDir = crashGitHubMirrorDir(appContext).apply { mkdirs() }
+            val dir = crashDir(root).apply { mkdirs() }
+            val ghMirrorDir = crashGitHubMirrorDir(root).apply { mkdirs() }
 
             purgeOldFiles(dir, MAX_FILES_TO_KEEP)
             purgeOldFiles(ghMirrorDir, MAX_FILES_TO_KEEP)
@@ -157,7 +219,6 @@ object CrashCapture {
                         "supabaseConfigured=$supabaseConfigured githubConfigured=${ghCfg != null}"
             )
 
-            // Helpful hints for debugging config mismatches.
             Log.d(
                 TAG,
                 "Supabase hints: urlSet=${BuildConfig.SUPABASE_URL.isNotBlank()} urlLen=${BuildConfig.SUPABASE_URL.length} " +
@@ -188,7 +249,7 @@ object CrashCapture {
                         "Supabase enqueue: name=${file.name} bytes=${file.length()} mtime=${file.lastModified()}"
                     )
                     SupabaseCrashUploadWorker.enqueueExistingCrash(
-                        context = appContext,
+                        context = context.applicationContext,
                         file = file,
                         objectPrefix = SUPABASE_CRASH_PREFIX,
                         addDateSubdir = true
@@ -212,7 +273,7 @@ object CrashCapture {
                             "GitHub enqueue: name=${mirror.name} bytes=${mirror.length()} mtime=${mirror.lastModified()}"
                         )
                         GitHubUploadWorker.enqueueExistingPayload(
-                            context = appContext,
+                            context = context.applicationContext,
                             cfg = ghCfg,
                             file = mirror
                         )
@@ -224,10 +285,20 @@ object CrashCapture {
         }
     }
 
+    private fun ensureDefaultHandlerInstalled(h: CrashHandler, currentDefault: Thread.UncaughtExceptionHandler?) {
+        val current = Thread.getDefaultUncaughtExceptionHandler()
+        if (current === h) return
+
+        // Update delegate to whatever is currently installed (unless it is already us).
+        h.updateDelegate(currentDefault ?: current)
+
+        // Install ourselves as the default.
+        Thread.setDefaultUncaughtExceptionHandler(h)
+    }
+
     private fun makeGitHubMirrorCopy(src: File, mirrorDir: File): File {
         mirrorDir.mkdirs()
 
-        // Prefer keeping the same file name to simplify server-side ingestion.
         val dst = File(mirrorDir, src.name)
 
         // If a previous copy exists and looks identical, reuse it.
@@ -239,7 +310,7 @@ object CrashCapture {
         val target = if (!dst.exists()) {
             dst
         } else {
-            makeUniqueGzFile(mirrorDir, baseName = src.name.removeSuffix(".gz"))
+            makeUniqueLike(srcName = src.name, dir = mirrorDir)
         }
 
         FileInputStream(src).use { input ->
@@ -258,24 +329,38 @@ object CrashCapture {
         return target
     }
 
-    private fun makeUniqueGzFile(dir: File, baseName: String): File {
-        var candidate = File(dir, "$baseName.gz")
-        if (!candidate.exists()) return candidate
+    /**
+     * Preserve ".log.gz" naming when generating unique copies.
+     * Examples:
+     * - crash_x.log.gz -> crash_x-2.log.gz
+     * - foo.gz -> foo-2.gz
+     */
+    private fun makeUniqueLike(srcName: String, dir: File): File {
+        if (srcName.endsWith(".log.gz")) {
+            val base = srcName.removeSuffix(".log.gz")
+            var index = 2
+            while (true) {
+                val candidate = File(dir, "$base-$index.log.gz")
+                if (!candidate.exists()) return candidate
+                index++
+            }
+        }
 
+        val base = srcName.removeSuffix(".gz")
         var index = 2
         while (true) {
-            candidate = File(dir, "$baseName-$index.gz")
+            val candidate = File(dir, "$base-$index.gz")
             if (!candidate.exists()) return candidate
             index++
         }
     }
 
     private fun captureCrashToFile(
-        context: Context,
+        filesDir: File,
         thread: Thread,
         throwable: Throwable
     ): File {
-        val dir = crashDir(context).apply { mkdirs() }
+        val dir = crashDir(filesDir).apply { mkdirs() }
         purgeOldFiles(dir, MAX_FILES_TO_KEEP)
 
         val now = Date()
@@ -320,16 +405,19 @@ object CrashCapture {
                 gz.write(logBytes)
                 gz.flush()
             }
+
+            // Best-effort durability (avoid secondary crash if it fails).
+            runCatching { fos.fd.sync() }
         }
 
         return outFile
     }
 
-    private fun crashDir(context: Context): File =
-        File(context.filesDir, CRASH_DIR_REL)
+    private fun crashDir(filesDir: File): File =
+        File(filesDir, CRASH_DIR_REL)
 
-    private fun crashGitHubMirrorDir(context: Context): File =
-        File(context.filesDir, CRASH_GH_MIRROR_DIR_REL)
+    private fun crashGitHubMirrorDir(filesDir: File): File =
+        File(filesDir, CRASH_GH_MIRROR_DIR_REL)
 
     private fun purgeOldFiles(dir: File, maxKeep: Int) {
         val all = dir.listFiles { f -> f.isFile && f.length() > 0L && !f.name.startsWith(".") }?.toList().orEmpty()
@@ -387,7 +475,16 @@ object CrashCapture {
                 out.toByteArray()
             }
         } finally {
-            runCatching { proc.destroy() }
+            runCatching {
+                proc.waitFor(LOGCAT_WAITFOR_MS, TimeUnit.MILLISECONDS)
+            }
+            runCatching {
+                proc.destroy()
+                proc.waitFor(LOGCAT_WAITFOR_MS, TimeUnit.MILLISECONDS)
+            }
+            runCatching {
+                if (proc.isAlive) proc.destroyForcibly()
+            }
         }
     }
 
@@ -412,6 +509,61 @@ object CrashCapture {
             pathPrefix = crashPrefix,
             token = BuildConfig.GH_TOKEN
         )
+    }
+
+    private fun describeHandler(h: Thread.UncaughtExceptionHandler?): String {
+        if (h == null) return "null"
+        return "${h.javaClass.name}@${Integer.toHexString(System.identityHashCode(h))}"
+    }
+
+    private class CrashHandler(
+        private val filesDir: File,
+        private val capturing: AtomicBoolean,
+        private val onHardKill: () -> Unit
+    ) : Thread.UncaughtExceptionHandler {
+
+        @Volatile
+        private var delegate: Thread.UncaughtExceptionHandler? = null
+
+        fun updateDelegate(newDelegate: Thread.UncaughtExceptionHandler?) {
+            // Avoid self-loop.
+            if (newDelegate === this) return
+            delegate = newDelegate
+        }
+
+        override fun uncaughtException(thread: Thread, throwable: Throwable) {
+            if (!capturing.compareAndSet(false, true)) {
+                try {
+                    delegate?.uncaughtException(thread, throwable)
+                } catch (_: Throwable) {
+                    onHardKill()
+                }
+                return
+            }
+
+            try {
+                val file = runCatching { captureCrashToFile(filesDir, thread, throwable) }
+                    .onFailure { e -> Log.e(TAG, "Crash capture failed: ${e.message}", e) }
+                    .getOrNull()
+
+                if (file != null) {
+                    Log.e(TAG, "Crash captured: ${file.absolutePath} bytes=${file.length()}")
+                }
+            } catch (t: Throwable) {
+                Log.e(TAG, "Crash capture unexpected failure: ${t.message}", t)
+            } finally {
+                try {
+                    val d = delegate
+                    if (d != null) {
+                        d.uncaughtException(thread, throwable)
+                    } else {
+                        onHardKill()
+                    }
+                } catch (_: Throwable) {
+                    onHardKill()
+                }
+            }
+        }
     }
 
     private fun hardKill() {

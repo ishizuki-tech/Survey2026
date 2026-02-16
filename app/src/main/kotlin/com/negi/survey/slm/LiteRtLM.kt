@@ -29,6 +29,7 @@ import com.google.ai.edge.litertlm.EngineConfig
 import com.google.ai.edge.litertlm.Message
 import com.google.ai.edge.litertlm.MessageCallback
 import com.google.ai.edge.litertlm.SamplerConfig
+import com.negi.survey.BuildConfig
 import java.io.ByteArrayOutputStream
 import java.lang.reflect.Modifier
 import java.util.Locale
@@ -84,16 +85,16 @@ private const val HARD_CLOSE_POLL_MS = 750L
 private const val HARD_CLOSE_ENABLE = true
 
 /** Streaming debug toggles. */
-private const val DEBUG_STREAM = true
+private val DEBUG_STREAM: Boolean = BuildConfig.DEBUG
 private const val DEBUG_STREAM_EVERY_N = 16
 private const val DEBUG_PREFIX_CHARS = 24
 
 /** Text extraction debug toggles. */
-private const val DEBUG_EXTRACT = true
+private val DEBUG_EXTRACT: Boolean = BuildConfig.DEBUG
 private const val DEBUG_EXTRACT_EVERY_N = 64
 
 /** Throwable debug toggles. */
-private const val DEBUG_ERROR_THROWABLE = true
+private val DEBUG_ERROR_THROWABLE: Boolean = BuildConfig.DEBUG
 private const val DEBUG_ERROR_STACK_LINES = 18
 
 /**
@@ -715,6 +716,81 @@ object LiteRtLM {
     }
 
     /**
+     * Delay when a post-terminate cooldown is active for this key.
+     *
+     * English comment:
+     * - Hard-close and native teardown can overlap with re-init on some devices.
+     * - This delay reduces the chance of "close vs init" races.
+     */
+    private suspend fun awaitCooldownIfNeeded(key: String, reason: String) {
+        val rs = getRunState(key)
+        val now = SystemClock.elapsedRealtime()
+        val until = rs.cooldownUntilMs.get()
+        val delayMs = max(0L, until - now)
+        if (delayMs > 0) {
+            Log.d(TAG, "Cooldown delay: key='$key' delay=${delayMs}ms reason='$reason'")
+            delay(delayMs)
+        }
+    }
+
+    /**
+     * Upgrade (reinitialize) runtime capabilities if needed.
+     *
+     * English comment:
+     * - If an instance was initialized with supportImage=false and a later request includes images,
+     *   we re-init with supportImage=true (same for audio).
+     * - This avoids "capability fixed at first call" failures in production flows.
+     */
+    private suspend fun upgradeCapabilitiesIfNeeded(
+        context: Context,
+        model: Model,
+        wantImage: Boolean,
+        wantAudio: Boolean,
+        systemMessage: Message? = null,
+        tools: List<Any> = emptyList(),
+    ) {
+        if (!wantImage && !wantAudio) return
+
+        val key = runtimeKey(model)
+
+        val plan = stateMutex.withLock {
+            val inst = instances[key] ?: return@withLock null
+            val needImage = wantImage && !inst.supportImage
+            val needAudio = wantAudio && !inst.supportAudio
+            if (!needImage && !needAudio) return@withLock null
+
+            // English comment: Only upgrade to true; never downgrade existing capabilities.
+            val nextImage = inst.supportImage || wantImage
+            val nextAudio = inst.supportAudio || wantAudio
+            Triple(nextImage, nextAudio, "needImage=$needImage needAudio=$needAudio have(image=${inst.supportImage},audio=${inst.supportAudio})")
+        }
+
+        if (plan == null) return
+
+        val (nextImage, nextAudio, detail) = plan
+        Log.w(TAG, "Capability upgrade requested: key='$key' -> image=$nextImage audio=$nextAudio ($detail)")
+
+        awaitCooldownIfNeeded(key, reason = "capability-upgrade")
+
+        val signal = getOrCreateInitSignal(key)
+
+        initialize(
+            context = context,
+            model = model,
+            supportImage = nextImage,
+            supportAudio = nextAudio,
+            onDone = { /* ignored */ },
+            systemMessage = systemMessage,
+            tools = tools,
+        )
+
+        val err = withTimeoutOrNull(INIT_AWAIT_TIMEOUT_MS) { signal.await() }
+            ?: "Initialization timed out after ${INIT_AWAIT_TIMEOUT_MS}ms."
+
+        if (err.isNotEmpty()) throw IllegalStateException("LiteRT-LM capability upgrade failed: $err")
+    }
+
+    /**
      * Initialize LiteRT-LM Engine + Conversation (async).
      */
     fun initialize(
@@ -736,7 +812,6 @@ object LiteRtLM {
 
         val accepted = initInFlight.add(key)
         if (!accepted) {
-            // Another init is in-flight. Report the REAL result when it completes.
             ioScope.launch {
                 val err = withTimeoutOrNull(INIT_AWAIT_TIMEOUT_MS) { signal.await() }
                     ?: "Initialization timed out after ${INIT_AWAIT_TIMEOUT_MS}ms."
@@ -750,6 +825,8 @@ object LiteRtLM {
             var completed = false
 
             try {
+                awaitCooldownIfNeeded(key, reason = "initialize")
+
                 stateMutex.withLock {
                     val rs = getRunState(key)
                     if (rs.active.get()) {
@@ -888,6 +965,8 @@ object LiteRtLM {
         val already = stateMutex.withLock { instances.containsKey(key) }
         if (already) return
 
+        awaitCooldownIfNeeded(key, reason = "initializeIfNeeded")
+
         apiMutex.withLock {
             val stillAlready = stateMutex.withLock { instances.containsKey(key) }
             if (stillAlready) return@withLock
@@ -937,7 +1016,6 @@ object LiteRtLM {
 
             pendingAfterStream.remove(key)
             instances.remove(key).also {
-                // Safe prune (no waiters if not initInFlight).
                 initSignals.remove(key)
             }
         }
@@ -1013,7 +1091,6 @@ object LiteRtLM {
                 return@withLock null
             }
 
-            // Safe prune (no waiters if not initInFlight).
             initSignals.remove(key)
 
             IdleClosePlan(
@@ -1201,7 +1278,6 @@ object LiteRtLM {
                     if (sinceMsg in 0..2_000L && elapsed < HARD_CLOSE_TIMEOUT_MS) continue
 
                     if (elapsed >= HARD_CLOSE_TIMEOUT_MS) {
-                        // Ensure only one termination path wins.
                         val didTerminate = rs.terminated.compareAndSet(false, true)
                         if (!didTerminate) {
                             Log.d(TAG, "Hard-close watchdog abort (already terminated): key='$key'")
@@ -1212,7 +1288,10 @@ object LiteRtLM {
 
                         val inst: LiteRtLmInstance? = stateMutex.withLock {
                             if (!rs.active.get()) return@withLock null
-                            pendingAfterStream.remove(key)
+
+                            // IMPORTANT:
+                            // Do NOT clear pendingAfterStream here.
+                            // It will be drained by nativeDoneHook via scheduleDeferredActions().
                             instances.remove(key)
                         }
 
@@ -1231,7 +1310,6 @@ object LiteRtLM {
                         rs.logicalDone.set(true)
                         rs.logicalTerminator.set(null)
 
-                        // IMPORTANT: Must invoke cleanup path even on hard-close.
                         fireNativeDoneHookOnce(key)
 
                         Log.e(TAG, "Hard-close completed: key='$key'")
@@ -1308,30 +1386,56 @@ object LiteRtLM {
                 }
             }
 
-            var instance: LiteRtLmInstance? = null
-            var rs: RunState? = null
+            // Capability upgrade path (text-only first, multimodal later).
+            val wantImage = images.isNotEmpty()
+            val wantAudio = audioClips.isNotEmpty()
+            if (wantImage || wantAudio) {
+                val ctx = appContextRef.get()
+                if (ctx != null) {
+                    runCatching {
+                        upgradeCapabilitiesIfNeeded(
+                            context = ctx,
+                            model = model,
+                            wantImage = wantImage,
+                            wantAudio = wantAudio,
+                        )
+                    }.onFailure { t ->
+                        val msg = "LiteRT-LM capability upgrade failed: ${cleanError(t.message)}"
+                        Log.e(TAG, msg, t)
+                        postToMain {
+                            onError(msg)
+                            resultListener("", true)
+                            runCatching { cleanUpListener.invoke() }
+                        }
+                        return@launch
+                    }
+                }
+            }
+
+            var instNullable: LiteRtLmInstance? = null
+            var rsNullable: RunState? = null
             var myRunId = 0L
-            var conversation: Conversation? = null
+            var convNullable: Conversation? = null
             var rejectMsg: String? = null
             var cooldownDelayMs = 0L
 
             stateMutex.withLock {
-                instance = instances[key]
-                if (instance == null) {
+                val inst = instances[key]
+                if (inst == null) {
                     rejectMsg = "LiteRT-LM model '${model.name}' is not initialized. Call initializeIfNeeded() first."
                     return@withLock
                 }
 
-                if (images.isNotEmpty() && !instance.supportImage) {
+                if (images.isNotEmpty() && !inst.supportImage) {
                     rejectMsg = "Vision input rejected: supportImage=false for key='$key'. Reinitialize with supportImage=true."
                     return@withLock
                 }
-                if (audioClips.isNotEmpty() && !instance.supportAudio) {
+                if (audioClips.isNotEmpty() && !inst.supportAudio) {
                     rejectMsg = "Audio input rejected: supportAudio=false for key='$key'. Reinitialize with supportAudio=true."
                     return@withLock
                 }
 
-                rs = getRunState(key)
+                val rs = getRunState(key)
 
                 val now = SystemClock.elapsedRealtime()
                 val until = rs.cooldownUntilMs.get()
@@ -1351,11 +1455,18 @@ object LiteRtLM {
                 val preCancelled = rs.pendingCancel.getAndSet(false)
                 rs.cancelRequested.set(preCancelled)
 
-                conversation = instance.conversation
+                instNullable = inst
+                rsNullable = rs
+                convNullable = inst.conversation
             }
 
-            if (rejectMsg != null || rs == null || conversation == null) {
-                val msg = rejectMsg ?: "LiteRT-LM start rejected: unknown reason."
+            val inst = instNullable
+            val rsLocal = rsNullable
+            val conversation = convNullable
+            val reject = rejectMsg
+
+            if (reject != null || inst == null || rsLocal == null || conversation == null) {
+                val msg = reject ?: "LiteRT-LM start rejected: unknown reason."
                 Log.w(TAG, msg)
                 postToMain {
                     onError(msg)
@@ -1364,8 +1475,6 @@ object LiteRtLM {
                 }
                 return@launch
             }
-
-            val rsLocal = rs
 
             if (cooldownDelayMs > 0) {
                 Log.d(TAG, "Post-terminate cooldown: delaying start ${cooldownDelayMs}ms for key='$key'")
@@ -1418,7 +1527,6 @@ object LiteRtLM {
                 }
             }
 
-            // Hook for hard-close path (and normal termination path).
             rsLocal.nativeDoneHook.set {
                 if (rsLocal.runId.get() != myRunId) return@set
                 scheduleCleanUpListener()
@@ -1437,7 +1545,9 @@ object LiteRtLM {
                         if (notifyCancelToOnError && !errorMessage.isNullOrBlank()) {
                             onError(errorMessage)
                         }
-                    } else if (!errorMessage.isNullOrBlank()) onError(errorMessage)
+                    } else if (!errorMessage.isNullOrBlank()) {
+                        onError(errorMessage)
+                    }
                     resultListener("", true)
                 }
             }

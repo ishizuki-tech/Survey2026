@@ -46,15 +46,6 @@ private const val SILENCE_PEAK_THRESHOLD = 0.02
 
 /**
  * Timing breakdown for a single transcription run.
- *
- * @property requestId Monotonic id for correlating logs.
- * @property totalMs End-to-end time for transcribeWaveFile().
- * @property decodeMs Time spent in decodeWaveFile().
- * @property lockWaitMs Time waiting to acquire engineMutex.
- * @property lockHoldMs Time spent inside engineMutex critical section.
- * @property attempts Per-language attempt timings (transcribeData only).
- * @property selectedLang Language code that produced the returned transcript (or last tried).
- * @property audioSeconds Approx audio length in seconds based on PCM and sample rate.
  */
 data class TranscribeTiming(
     val requestId: Long,
@@ -66,15 +57,6 @@ data class TranscribeTiming(
     val selectedLang: String,
     val audioSeconds: Double,
 ) {
-    /**
-     * Single attempt timing for one language code.
-     *
-     * @property lang Language code used for transcribeData().
-     * @property transcribeMs Time spent in ctx.transcribeData().
-     * @property textLen Length of trimmed transcript.
-     * @property success True when transcript was non-empty.
-     * @property rtf Real-time factor ~= transcribeSeconds / audioSeconds (lower is faster).
-     */
     data class AttemptTiming(
         val lang: String,
         val transcribeMs: Long,
@@ -86,18 +68,6 @@ data class TranscribeTiming(
 
 /**
  * Timing breakdown for a single initialization call.
- *
- * @property requestId Monotonic id for correlating logs.
- * @property totalMs End-to-end time for ensureInitializedFromFile/Asset().
- * @property lockWaitMs Time waiting to acquire engineMutex.
- * @property lockHoldMs Time spent inside engineMutex critical section.
- * @property assetCheckMs Time spent checking asset existence (asset init only).
- * @property releasePrevMs Time spent releasing a previous WhisperContext (if any).
- * @property createMs Time spent creating a new WhisperContext.
- * @property key Selected model key after init attempt.
- * @property previousKey Previous model key before init attempt.
- * @property source "file" or "asset".
- * @property modelBytes Model file size (file init) or extracted asset size if available (usually -1).
  */
 data class InitTiming(
     val requestId: Long,
@@ -116,41 +86,40 @@ data class InitTiming(
 /**
  * Thin facade for integrating Whisper.cpp into the SurveyNav app.
  *
- * This object wraps [WhisperContext] and [decodeWaveFile] to provide a small,
- * suspend-friendly API.
- *
  * Key design:
  * - The engine is a process-wide singleton.
  * - Initialization is idempotent per model key.
  * - All operations touching the underlying [WhisperContext] are serialized
  *   through a single [engineMutex].
- *
- * Two-level cleanup:
- * - [detach] is a soft UI-level detach that keeps the native context alive.
- * - [release] is a hard cleanup that closes native resources.
  */
 object WhisperEngine {
 
-    @Volatile
-    private var whisperContext: WhisperContext? = null
+    /**
+     * Keep context + key in a single volatile snapshot to avoid transient inconsistency
+     * (ctx != null but key == null, etc.).
+     */
+    private data class EngineState(
+        val ctx: WhisperContext,
+        val key: String
+    )
 
     @Volatile
-    private var modelKey: String? = null
+    private var engineState: EngineState? = null
 
     private val engineMutex = Mutex()
 
     private val transcribeSeq = AtomicLong(0L)
     private val initSeq = AtomicLong(0L)
 
-    fun currentModelKey(): String? = modelKey
+    fun currentModelKey(): String? = engineState?.key
 
-    fun isInitialized(): Boolean = whisperContext != null
+    fun isInitialized(): Boolean = engineState != null
 
     fun isInitializedForFile(modelFile: File): Boolean =
-        whisperContext != null && modelKey == modelFile.absolutePath
+        engineState?.key == modelFile.absolutePath
 
     fun isInitializedForAsset(assetPath: String): Boolean =
-        whisperContext != null && modelKey == ASSET_KEY_PREFIX + assetPath
+        engineState?.key == ASSET_KEY_PREFIX + assetPath
 
     /**
      * Estimate a PCM_16BIT MONO WAV file size in bytes.
@@ -170,11 +139,37 @@ object WhisperEngine {
         return payload / (sr * PCM16_BYTES_PER_SAMPLE.toDouble())
     }
 
+    /**
+     * Check asset existence with a fast path (openFd) and fallback (open).
+     *
+     * Returns:
+     * - ok: true if asset is accessible
+     * - bytes: asset length if known (openFd), otherwise -1
+     */
+    private fun checkAssetExistsAndLength(context: Context, assetPath: String): Pair<Boolean, Long> {
+        val fdRes = runCatching {
+            context.assets.openFd(assetPath).use { afd ->
+                // afd.length can be UNKNOWN_LENGTH (-1) for some cases
+                afd.length
+            }
+        }
+        if (fdRes.isSuccess) {
+            return true to fdRes.getOrDefault(-1L)
+        }
+
+        val ok = runCatching {
+            context.assets.open(assetPath).use { }
+            true
+        }.getOrElse { false }
+
+        return ok to -1L
+    }
+
     suspend fun ensureInitializedFromFile(
         context: Context,
         modelFile: File,
         onTiming: (InitTiming) -> Unit = {},
-    ): Result<Unit> = withContext(Dispatchers.Default) {
+    ): Result<Unit> = withContext(Dispatchers.IO) {
 
         val requestId = initSeq.incrementAndGet()
         val totalStart = SystemClock.elapsedRealtime()
@@ -190,7 +185,8 @@ object WhisperEngine {
         val lastMod = runCatching { modelFile.lastModified() }.getOrDefault(0L)
 
         // Fast path without locking.
-        if (whisperContext != null && modelKey == key) {
+        val st0 = engineState
+        if (st0 != null && st0.key == key) {
             val totalMs = SystemClock.elapsedRealtime() - totalStart
             Log.d(
                 LOG_TAG,
@@ -222,11 +218,13 @@ object WhisperEngine {
             val lockAcquiredAt = SystemClock.elapsedRealtime()
             val lockWaitMs = lockAcquiredAt - lockRequestAt
 
-            val previousKey = modelKey
-            val current = whisperContext
+            val previous = engineState
+            val previousKey = previous?.key
+            val current = previous?.ctx
 
             // Double-check inside the lock.
-            if (current != null && modelKey == key) {
+            val st1 = engineState
+            if (st1 != null && st1.key == key) {
                 val totalMs = SystemClock.elapsedRealtime() - totalStart
                 val lockHoldMs = SystemClock.elapsedRealtime() - lockAcquiredAt
                 Log.d(
@@ -273,8 +271,7 @@ object WhisperEngine {
                 Log.i(LOG_TAG, "[$requestId][init:file] Released previous context. releasePrevMs=$releasePrevMs")
             }
 
-            whisperContext = null
-            modelKey = null
+            engineState = null
 
             val c0 = SystemClock.elapsedRealtime()
             val createdResult = runCatching {
@@ -312,8 +309,8 @@ object WhisperEngine {
                 return@withLock Result.failure(createdResult.exceptionOrNull()!!)
             }
 
-            whisperContext = createdResult.getOrThrow()
-            modelKey = key
+            val ctx = createdResult.getOrThrow()
+            engineState = EngineState(ctx = ctx, key = key)
 
             val totalMs = SystemClock.elapsedRealtime() - totalStart
             val lockHoldMs = SystemClock.elapsedRealtime() - lockAcquiredAt
@@ -350,17 +347,16 @@ object WhisperEngine {
         context: Context,
         assetPath: String,
         onTiming: (InitTiming) -> Unit = {},
-    ): Result<Unit> = withContext(Dispatchers.Default) {
+    ): Result<Unit> = withContext(Dispatchers.IO) {
 
         val requestId = initSeq.incrementAndGet()
         val totalStart = SystemClock.elapsedRealtime()
 
         val a0 = SystemClock.elapsedRealtime()
-        val assetOk = runCatching {
-            context.assets.open(assetPath).use { }
-            true
-        }.getOrElse { false }
+        val (assetOk, assetBytes) = checkAssetExistsAndLength(context, assetPath)
         val assetCheckMs = SystemClock.elapsedRealtime() - a0
+
+        val key = ASSET_KEY_PREFIX + assetPath
 
         if (!assetOk) {
             val totalMs = SystemClock.elapsedRealtime() - totalStart
@@ -379,10 +375,10 @@ object WhisperEngine {
                     assetCheckMs = assetCheckMs,
                     releasePrevMs = 0L,
                     createMs = 0L,
-                    key = ASSET_KEY_PREFIX + assetPath,
-                    previousKey = modelKey,
+                    key = key,
+                    previousKey = engineState?.key,
                     source = "asset",
-                    modelBytes = -1L,
+                    modelBytes = assetBytes,
                 )
             )
             return@withContext Result.failure(
@@ -390,15 +386,14 @@ object WhisperEngine {
             )
         }
 
-        val key = ASSET_KEY_PREFIX + assetPath
-
         // Fast path without locking.
-        if (whisperContext != null && modelKey == key) {
+        val st0 = engineState
+        if (st0 != null && st0.key == key) {
             val totalMs = SystemClock.elapsedRealtime() - totalStart
             Log.d(
                 LOG_TAG,
                 "[$requestId][init:asset] Fast path (already initialized). totalMs=$totalMs assetCheckMs=$assetCheckMs " +
-                        "key=$key thread=${Thread.currentThread().name}"
+                        "key=$key bytes=${formatBytes(assetBytes)} thread=${Thread.currentThread().name}"
             )
             safeEmitInitTiming(
                 onTiming = onTiming,
@@ -413,7 +408,7 @@ object WhisperEngine {
                     key = key,
                     previousKey = key,
                     source = "asset",
-                    modelBytes = -1L,
+                    modelBytes = assetBytes,
                 )
             )
             return@withContext Result.success(Unit)
@@ -425,11 +420,13 @@ object WhisperEngine {
             val lockAcquiredAt = SystemClock.elapsedRealtime()
             val lockWaitMs = lockAcquiredAt - lockRequestAt
 
-            val previousKey = modelKey
-            val current = whisperContext
+            val previous = engineState
+            val previousKey = previous?.key
+            val current = previous?.ctx
 
             // Double-check inside the lock.
-            if (current != null && modelKey == key) {
+            val st1 = engineState
+            if (st1 != null && st1.key == key) {
                 val totalMs = SystemClock.elapsedRealtime() - totalStart
                 val lockHoldMs = SystemClock.elapsedRealtime() - lockAcquiredAt
                 Log.d(
@@ -450,7 +447,7 @@ object WhisperEngine {
                         key = key,
                         previousKey = previousKey,
                         source = "asset",
-                        modelBytes = -1L,
+                        modelBytes = assetBytes,
                     )
                 )
                 return@withLock Result.success(Unit)
@@ -459,7 +456,7 @@ object WhisperEngine {
             Log.i(
                 LOG_TAG,
                 "[$requestId][init:asset] Init start. assetCheckMs=$assetCheckMs lockWaitMs=$lockWaitMs prevKey=$previousKey newKey=$key " +
-                        "thread=${Thread.currentThread().name}"
+                        "bytes=${formatBytes(assetBytes)} thread=${Thread.currentThread().name}"
             )
             logMemory("[$requestId][init:asset]")
 
@@ -476,8 +473,7 @@ object WhisperEngine {
                 Log.i(LOG_TAG, "[$requestId][init:asset] Released previous context. releasePrevMs=$releasePrevMs")
             }
 
-            whisperContext = null
-            modelKey = null
+            engineState = null
 
             val c0 = SystemClock.elapsedRealtime()
             val createdResult = runCatching {
@@ -509,14 +505,14 @@ object WhisperEngine {
                         key = key,
                         previousKey = previousKey,
                         source = "asset",
-                        modelBytes = -1L,
+                        modelBytes = assetBytes,
                     )
                 )
                 return@withLock Result.failure(createdResult.exceptionOrNull()!!)
             }
 
-            whisperContext = createdResult.getOrThrow()
-            modelKey = key
+            val ctx = createdResult.getOrThrow()
+            engineState = EngineState(ctx = ctx, key = key)
 
             val totalMs = SystemClock.elapsedRealtime() - totalStart
             val lockHoldMs = SystemClock.elapsedRealtime() - lockAcquiredAt
@@ -524,7 +520,7 @@ object WhisperEngine {
             Log.i(
                 LOG_TAG,
                 "[$requestId][init:asset] Init OK. totalMs=$totalMs assetCheckMs=$assetCheckMs lockWaitMs=$lockWaitMs lockHoldMs=$lockHoldMs " +
-                        "releasePrevMs=$releasePrevMs createMs=$createMs key=$key"
+                        "releasePrevMs=$releasePrevMs createMs=$createMs key=$key bytes=${formatBytes(assetBytes)}"
             )
             logMemory("[$requestId][init:asset]")
 
@@ -541,7 +537,7 @@ object WhisperEngine {
                     key = key,
                     previousKey = previousKey,
                     source = "asset",
-                    modelBytes = -1L,
+                    modelBytes = assetBytes,
                 )
             )
 
@@ -580,7 +576,7 @@ object WhisperEngine {
         val fileBytes = runCatching { file.length() }.getOrDefault(-1L)
         val approxSecFromBytes = if (fileBytes >= 0L) estimatePcm16MonoWavSeconds(fileBytes, sr) else -1.0
 
-        val activeKeyAtStart = modelKey
+        val activeKeyAtStart = engineState?.key
         Log.d(
             LOG_TAG,
             "[$requestId][asr] Start. file=${file.name} bytes=${formatBytes(fileBytes)} " +
@@ -625,10 +621,11 @@ object WhisperEngine {
 
         if (enableSilenceGate && isProbablySilent(stats)) {
             val totalMs = SystemClock.elapsedRealtime() - totalStart
+            val peak = max(kotlin.math.abs(stats.min.toDouble()), kotlin.math.abs(stats.max.toDouble()))
             Log.w(
                 LOG_TAG,
                 "[$requestId][asr] SilenceGate: returning empty transcript. totalMs=$totalMs decodeMs=$decodeMs " +
-                        "rms=${formatFixed2(stats.rms)} peak=${formatFixed2(max(kotlin.math.abs(stats.min.toDouble()), kotlin.math.abs(stats.max.toDouble())))}"
+                        "rms=${formatFixed2(stats.rms)} peak=${formatFixed2(peak)}"
             )
             safeEmitTiming(
                 requestId = requestId,
@@ -657,7 +654,8 @@ object WhisperEngine {
             val lockAcquiredAt = SystemClock.elapsedRealtime()
             val lockWaitMs = lockAcquiredAt - lockRequestAt
 
-            val ctx = whisperContext
+            val st = engineState
+            val ctx = st?.ctx
                 ?: run {
                     val totalMs = SystemClock.elapsedRealtime() - totalStart
                     val lockHoldMs = SystemClock.elapsedRealtime() - lockAcquiredAt
@@ -677,7 +675,7 @@ object WhisperEngine {
                     )
                     Log.e(
                         LOG_TAG,
-                        "[$requestId][asr] FAILED (not initialized). totalMs=$totalMs decodeMs=$decodeMs lockWaitMs=$lockWaitMs lockHoldMs=$lockHoldMs modelKey=$modelKey"
+                        "[$requestId][asr] FAILED (not initialized). totalMs=$totalMs decodeMs=$decodeMs lockWaitMs=$lockWaitMs lockHoldMs=$lockHoldMs modelKey=${engineState?.key}"
                     )
                     return@withLock Result.failure(
                         IllegalStateException(
@@ -695,7 +693,7 @@ object WhisperEngine {
             Log.i(
                 LOG_TAG,
                 "[$requestId][asr] Mutex acquired. lockWaitMs=$lockWaitMs attempts=${languageAttempts.joinToString(",")} " +
-                        "audio=${audioSecondsStr}s modelKey=$modelKey"
+                        "audio=${audioSecondsStr}s modelKey=${st.key}"
             )
 
             for (code in languageAttempts) {
@@ -778,7 +776,7 @@ object WhisperEngine {
 
                     Log.i(
                         LOG_TAG,
-                        "[$requestId][asr] OK. totalMs=$totalMs decodeMs=$decodeMs lockWaitMs=$lockWaitMs lockHoldMs=$lockHoldMs selectedLang=$code modelKey=$modelKey"
+                        "[$requestId][asr] OK. totalMs=$totalMs decodeMs=$decodeMs lockWaitMs=$lockWaitMs lockHoldMs=$lockHoldMs selectedLang=$code modelKey=${engineState?.key}"
                     )
                     logMemory("[$requestId][asr]")
 
@@ -811,7 +809,7 @@ object WhisperEngine {
 
             Log.i(
                 LOG_TAG,
-                "[$requestId][asr] END. totalMs=$totalMs decodeMs=$decodeMs lockWaitMs=$lockWaitMs lockHoldMs=$lockHoldMs selectedLang=$selectedLang modelKey=$modelKey"
+                "[$requestId][asr] END. totalMs=$totalMs decodeMs=$decodeMs lockWaitMs=$lockWaitMs lockHoldMs=$lockHoldMs selectedLang=$selectedLang modelKey=${engineState?.key}"
             )
             logMemory("[$requestId][asr]")
 
@@ -824,25 +822,20 @@ object WhisperEngine {
 
     suspend fun detach() {
         engineMutex.withLock {
-            Log.d(LOG_TAG, "Detach called. Keeping native context alive for key=$modelKey")
+            Log.d(LOG_TAG, "Detach called. Keeping native context alive for key=${engineState?.key}")
         }
     }
 
     suspend fun release() {
         engineMutex.withLock {
-            val ctx = whisperContext
-            if (ctx == null) {
-                modelKey = null
-                return
-            }
+            val st = engineState
+            if (st == null) return
 
-            whisperContext = null
-            val oldKey = modelKey
-            modelKey = null
+            engineState = null
 
             runCatching {
-                Log.i(LOG_TAG, "Releasing WhisperContext for $oldKey")
-                ctx.release()
+                Log.i(LOG_TAG, "Releasing WhisperContext for ${st.key}")
+                st.ctx.release()
             }.onFailure { e ->
                 Log.w(LOG_TAG, "Error while releasing WhisperContext", e)
             }
@@ -861,9 +854,6 @@ object WhisperEngine {
 
     /**
      * Computes PCM stats using sampling to avoid O(N) cost on very large buffers.
-     *
-     * @param pcm PCM samples in [-1, 1]
-     * @param maxSamples Maximum samples to inspect (sampling stride computed automatically)
      */
     private fun computePcmStatsSampled(pcm: FloatArray, maxSamples: Int = 200_000): PcmStats {
         if (pcm.isEmpty()) return PcmStats(0f, 0f, 0.0)
@@ -897,9 +887,6 @@ object WhisperEngine {
 
     /**
      * Returns true when the signal looks like silence.
-     *
-     * Note:
-     * - We use both RMS and peak to avoid misclassifying brief impulses.
      */
     private fun isProbablySilent(stats: PcmStats): Boolean {
         val peak = max(kotlin.math.abs(stats.min.toDouble()), kotlin.math.abs(stats.max.toDouble()))
@@ -920,12 +907,12 @@ object WhisperEngine {
         val rt = Runtime.getRuntime()
         val used = (rt.totalMemory() - rt.freeMemory())
         val total = rt.totalMemory()
-        val max = rt.maxMemory()
+        val maxMem = rt.maxMemory()
         val native = runCatching { Debug.getNativeHeapAllocatedSize() }.getOrDefault(-1L)
 
         Log.d(
             LOG_TAG,
-            "$prefix mem: javaUsed=${formatBytes(used)} javaTotal=${formatBytes(total)} javaMax=${formatBytes(max)} nativeAllocated=${formatBytes(native)}"
+            "$prefix mem: javaUsed=${formatBytes(used)} javaTotal=${formatBytes(total)} javaMax=${formatBytes(maxMem)} nativeAllocated=${formatBytes(native)}"
         )
     }
 

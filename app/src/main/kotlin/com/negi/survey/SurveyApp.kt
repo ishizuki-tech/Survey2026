@@ -23,9 +23,15 @@ import java.io.File
 
 /**
  * Application bootstrap:
- * - Install CrashCapture early (attachBaseContext) WITHOUT touching applicationContext.
+ * - Install CrashCapture early (attachBaseContext) to catch crashes during Application startup.
+ * - Re-install (re-wrap) CrashCapture in onCreate to recover if another SDK overwrote the handler.
+ * - Optionally register a lightweight self-healing hook to keep CrashCapture in the chain.
  * - Enqueue pending crash uploads on next start (onCreate).
  * - Run only in the main process.
+ *
+ * Note:
+ * - This class avoids explicitly touching base.applicationContext in attachBaseContext.
+ * - CrashCapture.install() may internally touch filesDir; that is intentional for early bootstrap.
  */
 class SurveyApp : Application() {
 
@@ -39,13 +45,12 @@ class SurveyApp : Application() {
         Log.d(TAG, "attachBaseContext: pid=$pid process=$pn isMain=$isMain")
 
         if (!isMain) {
-            Log.d(TAG, "Non-main process; CrashCapture install skipped.")
+            Log.d(TAG, "Non-main process; bootstrap skipped.")
             return
         }
 
-        // Install as early as possible to catch crashes during Application.onCreate().
+        // Install as early as possible to catch crashes during Application startup.
         runCatching {
-            // IMPORTANT: Do not use base.applicationContext here.
             CrashCapture.install(base)
             Log.d(TAG, "CrashCapture installed in attachBaseContext.")
         }.onFailure { t ->
@@ -72,6 +77,22 @@ class SurveyApp : Application() {
             .onFailure { t ->
                 Log.w(TAG, "LiteRtLM.setApplicationContext failed: ${t.message}", t)
             }
+
+        // Re-wrap default handler in case any SDK replaced it after attachBaseContext().
+        runCatching {
+            CrashCapture.install(this)
+            Log.d(TAG, "CrashCapture re-installed in onCreate (re-wrap).")
+        }.onFailure { t ->
+            Log.w(TAG, "CrashCapture.install failed in onCreate: ${t.message}", t)
+        }
+
+        // Optional: self-heal if another SDK overwrites the handler later in runtime.
+        runCatching {
+            CrashCapture.registerSelfHealing(this)
+            Log.d(TAG, "CrashCapture self-healing registered.")
+        }.onFailure { t ->
+            Log.w(TAG, "CrashCapture.registerSelfHealing failed: ${t.message}", t)
+        }
 
         // Enqueue pending crash uploads from previous run (best-effort).
         runCatching {
@@ -111,13 +132,16 @@ class SurveyApp : Application() {
 
         // 3) /proc/self/cmdline
         runCatching {
-            val cmd = File("/proc/self/cmdline")
+            val bytes = File("/proc/self/cmdline")
                 .inputStream()
                 .use { it.readBytes() }
+
+            val cmd = bytes
                 .takeWhile { it.toInt() != 0 }
                 .toByteArray()
                 .toString(Charsets.UTF_8)
                 .trim()
+
             cmd
         }.getOrNull()
             ?.takeIf { it.isNotBlank() }

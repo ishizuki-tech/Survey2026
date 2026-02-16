@@ -26,10 +26,10 @@
 package com.negi.survey.slm
 
 import java.util.Locale
-import org.json.JSONArray
-import org.json.JSONObject
 import kotlin.math.max
 import kotlin.math.min
+import org.json.JSONArray
+import org.json.JSONObject
 
 /**
  * Utility for extracting follow-up questions (and simple scores) from raw text or JSON.
@@ -66,19 +66,15 @@ object FollowupExtractor {
     /** Avoid accidentally capturing gigantic prompt blobs as a "question". */
     private const val MAX_QUESTION_CHARS: Int = 220
 
+    /** Soft guard: reject extremely long strings even if found under question-ish keys. */
+    private const val HARD_REJECT_QUESTION_CHARS: Int = 2000
+
     /**
      * Normalize field keys for matching:
      * - Insert separators for camelCase and acronym boundaries.
      * - Lowercase the entire string (Locale.US).
      * - Convert any run of [space/_/unicode-dash/zero-width] to a single '-'.
      * - Trim leading/trailing dashes.
-     *
-     * Examples:
-     * - "followup question"      -> "followup-question"
-     * - "follow_up_question"     -> "follow-up-question"
-     * - "Follow-Up–Question"     -> "follow-up-question"
-     * - "followUpQuestion"       -> "follow-up-question"
-     * - "overallScore"           -> "overall-score"
      */
     private fun normKey(k: String): String =
         decamel(k)
@@ -91,7 +87,8 @@ object FollowupExtractor {
      *
      * Rules (simple and robust):
      * - lower/digit -> Upper inserts '-'
-     * - Upper + Upper + lower: split before the last Upper to keep acronyms together (e.g. "JSONScore" -> "JSON-Score")
+     * - Upper + Upper + lower: split before the last Upper to keep acronyms together
+     *   (e.g. "JSONScore" -> "JSON-Score")
      */
     private fun decamel(s: String): String {
         if (s.isEmpty()) return s
@@ -125,10 +122,10 @@ object FollowupExtractor {
         "follow_up_question",
         "followUpQuestion",
         "followupQuestion",
+        "follow_up",
+        "followup",
 
         // Plural / list containers
-        "followup",
-        "follow-up",
         "followups",
         "follow-ups",
         "followup-questions",
@@ -139,7 +136,11 @@ object FollowupExtractor {
         "follow-up-q",
         "next-questions",
         "suggested-questions",
-        "suggestedQuestions"
+        "suggestedQuestions",
+        "follow_up_candidates",
+        "followup_candidates",
+        "followUpCandidates",
+        "followupCandidates"
         // NOTE: We intentionally do NOT include a broad "questions" key here
         // to avoid accidentally treating original question lists as follow-ups.
     )
@@ -168,6 +169,20 @@ object FollowupExtractor {
     /** Normalized set for strict key equality checks. */
     private val QUESTION_FIELDS_NORM: Set<String> =
         QUESTION_FIELD_CANDIDATES.map(::normKey).toSet()
+
+    /** Score keys we accept (normalized). */
+    private val SCORE_KEYS_NORM: Set<String> = listOf(
+        "overall_score",
+        "overallScore",
+        "overall-score",
+        "evaluation_score",
+        "evaluationScore",
+        "eval_score",
+        "evalScore",
+        "rating",
+        "confidence",
+        "score"
+    ).map(::normKey).toSet()
 
     /* --------------------------------------------------------------------- */
     /* Public API                                                            */
@@ -245,19 +260,26 @@ object FollowupExtractor {
         return out.toList().take(max)
     }
 
-    /** Convenience: return the first follow-up question found in [rawText], or null if none. */
+    /**
+     * Convenience: return a likely follow-up question from [rawText], or null if none.
+     *
+     * Preference:
+     * - Prefer entries that contain '?' or '？' (question-like).
+     * - Otherwise return the first extracted candidate.
+     */
     @JvmStatic
-    fun extractFollowupQuestion(rawText: String): String? =
-        runCatching { fromRaw(rawText, max = 3).firstOrNull() }
-            .getOrNull()
-            ?.takeIf { it.isNotBlank() }
+    fun extractFollowupQuestion(rawText: String): String? {
+        val list = runCatching { fromRaw(rawText, max = 6) }.getOrNull().orEmpty()
+        val q = list.firstOrNull { it.contains('?') || it.contains('？') } ?: list.firstOrNull()
+        return q?.takeIf { it.isNotBlank() }
+    }
 
     /**
      * Extract an integer score in the range 0..100 from [text].
      *
      * Strategy:
-     *  (1) Parse JSON fragments and recursively look for "overall_score"/"overallScore"/"score"
-     *      keys (numeric or numeric-string). The first valid key in document order wins.
+     *  (1) Parse JSON fragments and recursively look for common score keys
+     *      (numeric or numeric-string). The first valid key in traversal order wins.
      *  (2) If not found, fall back to the last integer 0..100 in the raw text.
      */
     @JvmStatic
@@ -412,17 +434,24 @@ object FollowupExtractor {
      *
      * Light heuristics:
      * - Trim and reject empty.
+     * - Reject extremely long strings (likely prompt/essay blobs).
      * - Cap length to avoid huge blobs (keeps UX stable).
      * - Coalesce trailing question marks to exactly one (? or ？).
      */
     private fun addIfMeaningful(s: String, out: MutableSet<String>, max: Int) {
         if (out.size >= max) return
 
-        val t0 = s.trim()
+        val t0 = stripWrappingQuotes(s.trim())
         if (t0.isEmpty()) return
+        if (t0.length >= HARD_REJECT_QUESTION_CHARS) return
 
         // Prevent prompt-size strings from being treated as questions.
         val t = if (t0.length > MAX_QUESTION_CHARS) t0.take(MAX_QUESTION_CHARS).trimEnd() else t0
+
+        // If it looks totally non-question and too short/too generic, keep it anyway only if it carries a '?/？'.
+        // This keeps extraction stable across models that sometimes omit '?'.
+        val keep = looksLikeQuestionString(t) || t.contains('?') || t.contains('？')
+        if (!keep && t.length < 8) return
 
         val normalized = TRAILING_QUESTION_REGEX.replace(t) { m ->
             // Preserve the type of question mark the model used
@@ -432,14 +461,44 @@ object FollowupExtractor {
         out.add(normalized)
     }
 
-    /* ----------------------- Score (recursive JSON) ----------------------- */
+    private fun stripWrappingQuotes(s: String): String {
+        val t = s.trim()
+        if (t.length >= 2) {
+            val a = t.first()
+            val b = t.last()
+            if ((a == '"' && b == '"') || (a == '“' && b == '”') || (a == '『' && b == '』')) {
+                return t.substring(1, t.length - 1).trim()
+            }
+        }
+        return t
+    }
 
-    /** Allowed score keys (normalized). */
-    private val SCORE_KEYS = setOf(
-        "overall-score",
-        "overallscore", // extra tolerance (in case separators were lost upstream)
-        "score"
-    )
+    /**
+     * Extremely lightweight question-likeness heuristic.
+     * This avoids capturing random "message/body" blobs as follow-ups.
+     */
+    private fun looksLikeQuestionString(s: String): Boolean {
+        val t = s.trim()
+        if (t.isEmpty()) return false
+        if (t.contains('?') || t.contains('？')) return true
+
+        // English interrogatives / auxiliaries (very small set)
+        val lower = t.lowercase(Locale.US)
+        val starters = listOf(
+            "what", "why", "how", "when", "where", "which", "who",
+            "is", "are", "do", "did", "does", "can", "could", "would", "should", "may", "might"
+        )
+        if (starters.any { lower.startsWith("$it ") }) return true
+
+        // Japanese common question endings / starters (tiny set)
+        val jpStarters = listOf("なぜ", "どう", "いつ", "どこ", "どれ", "どの", "だれ", "何", "どんな")
+        if (jpStarters.any { t.startsWith(it) }) return true
+        if (t.endsWith("ですか") || t.endsWith("ますか") || t.endsWith("でしょうか") || t.endsWith("か")) return true
+
+        return false
+    }
+
+    /* ----------------------- Score (recursive JSON) ----------------------- */
 
     private fun findScoreRecursive(obj: JSONObject): Int? {
         // 1) Direct keys on this object (normalized).
@@ -449,7 +508,23 @@ object FollowupExtractor {
             val k = it.next()
             norm[normKey(k)] = obj.opt(k)
         }
-        for (k in SCORE_KEYS) {
+
+        // Prefer known score keys in a deterministic order.
+        val ordered = listOf(
+            "overall_score",
+            "overallScore",
+            "overall-score",
+            "evaluation_score",
+            "evaluationScore",
+            "eval_score",
+            "evalScore",
+            "rating",
+            "confidence",
+            "score"
+        ).map(::normKey)
+
+        for (k in ordered) {
+            if (!SCORE_KEYS_NORM.contains(k)) continue
             norm[k]?.let { v ->
                 parseNumberOrNull(v)?.let { n -> return clamp0to100(n) }
             }
@@ -521,13 +596,6 @@ object FollowupExtractor {
     /**
      * Extract all code-fence bodies (```...```) anywhere in the raw text.
      *
-     * This catches common model outputs like:
-     *   Some text
-     *   ```json
-     *   {...}
-     *   ```
-     *   More text
-     *
      * Note: Accepts optional newline before closing fence to tolerate outputs without trailing newline.
      */
     private fun extractCodeFenceBodies(raw: String): List<String> {
@@ -543,6 +611,7 @@ object FollowupExtractor {
      * - Otherwise scans for balanced '{...}' / '[...]' regions while:
      *   - Respecting string literals.
      *   - Skipping escaped quotes.
+     * - If a mismatched closing bracket is found, the fragment is treated as invalid and discarded.
      */
     private fun extractJsonFragments(raw: String): List<Any> {
         val s0 = raw.trim()
@@ -563,9 +632,11 @@ object FollowupExtractor {
                 val start = i
                 val stack = ArrayDeque<Char>()
                 stack.addLast(ch)
-                var inString = false
-                i++ // move past opener
 
+                var inString = false
+                var invalid = false
+
+                i++ // move past opener
                 while (i < n && stack.isNotEmpty()) {
                     val c = s0[i]
                     if (inString) {
@@ -581,30 +652,44 @@ object FollowupExtractor {
                             '"' -> inString = true
                             '{' -> stack.addLast('{')
                             '[' -> stack.addLast('[')
-                            '}' -> if (stack.isNotEmpty() && stack.last() == '{') {
-                                stack.removeLast()
+                            '}' -> {
+                                val top = stack.lastOrNull()
+                                if (top == '{') {
+                                    stack.removeLast()
+                                } else {
+                                    invalid = true
+                                    break
+                                }
                             }
 
-                            ']' -> if (stack.isNotEmpty() && stack.last() == '[') {
-                                stack.removeLast()
+                            ']' -> {
+                                val top = stack.lastOrNull()
+                                if (top == '[') {
+                                    stack.removeLast()
+                                } else {
+                                    invalid = true
+                                    break
+                                }
                             }
                         }
                     }
                     i++
                 }
 
+                // If invalid or unbalanced, discard and continue scanning from next char after start.
+                if (invalid || stack.isNotEmpty()) {
+                    i = start + 1
+                    continue
+                }
+
                 val endIdx = i
-                if (stack.isEmpty() && endIdx <= n) {
+                if (endIdx <= n) {
                     val frag = s0.substring(start, endIdx)
                     parseAny(frag)?.let { fragments.add(it) }
                     continue
-                } else {
-                    // Unbalanced; skip this opener and move on.
-                    i = start + 1
                 }
-            } else {
-                i++
             }
+            i++
         }
         return fragments
     }

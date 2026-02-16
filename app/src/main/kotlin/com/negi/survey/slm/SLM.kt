@@ -46,6 +46,7 @@ import java.lang.reflect.Method
 import java.lang.reflect.Modifier
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.Continuation
 import kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED
 import kotlin.coroutines.resume
@@ -228,6 +229,122 @@ fun buildModelConfig(slm: SurveyConfig.SlmMeta): MutableMap<ConfigKey, Any> {
     return out
 }
 
+/* ───────────────────────────── Stream delta normalizer ───────────────────────────── */
+
+/**
+ * Normalize streaming partials into delta chunks.
+ *
+ * Some backends may return:
+ * - DELTA (new tokens only), or
+ * - ACCUMULATED (full text so far)
+ *
+ * This helper detects accumulated behavior and converts to delta.
+ *
+ * IMPORTANT:
+ * - This is `internal` because other files (e.g., AiRepository.kt) may use it.
+ * - Keep the constructor compatible with existing call sites:
+ *     StreamDeltaNormalizer(StreamDeltaNormalizer.PartialMode.AUTO)
+ */
+internal class StreamDeltaNormalizer(
+    modeHint: PartialMode = PartialMode.AUTO,
+    private val prefixSampleChars: Int = 128,
+    private val boundarySampleChars: Int = 64,
+) {
+    enum class PartialMode { AUTO, DELTA, ACCUMULATED }
+
+    private var decided: PartialMode = modeHint
+
+    private var lastLen: Int = 0
+    private var prefixSample: String = ""
+    private var boundarySample: String = ""
+
+    /** Used only during AUTO decision; avoid keeping huge strings. */
+    private var firstChunk: String? = null
+    private var firstChunkLen: Int = 0
+
+    fun toDelta(incoming: String): String {
+        if (incoming.isEmpty()) return ""
+
+        return when (decided) {
+            PartialMode.DELTA -> incoming
+            PartialMode.ACCUMULATED -> accumulatedDelta(incoming)
+            PartialMode.AUTO -> autoDelta(incoming)
+        }
+    }
+
+    private fun autoDelta(incoming: String): String {
+        if (lastLen == 0) {
+            seed(incoming, allowFirstChunk = true)
+            return incoming
+        }
+
+        val looksAccumulated = looksLikeAccumulated(incoming)
+        decided = if (looksAccumulated) PartialMode.ACCUMULATED else PartialMode.DELTA
+
+        firstChunk = null
+        firstChunkLen = 0
+
+        return if (decided == PartialMode.ACCUMULATED) {
+            accumulatedDelta(incoming)
+        } else {
+            seed(incoming, allowFirstChunk = false)
+            incoming
+        }
+    }
+
+    private fun accumulatedDelta(incoming: String): String {
+        if (lastLen == 0) {
+            seed(incoming, allowFirstChunk = false)
+            return incoming
+        }
+
+        if (!looksLikeAccumulated(incoming)) {
+            seed(incoming, allowFirstChunk = false)
+            return incoming
+        }
+
+        val delta = if (incoming.length >= lastLen) incoming.substring(lastLen) else incoming
+        seed(incoming, allowFirstChunk = false)
+        return delta
+    }
+
+    private fun seed(text: String, allowFirstChunk: Boolean) {
+        lastLen = text.length
+        prefixSample = text.take(prefixSampleChars)
+        boundarySample = text.takeLast(boundarySampleChars)
+
+        if (allowFirstChunk) {
+            val cap = 4_096
+            firstChunk = if (text.length <= cap) text else null
+            firstChunkLen = text.length
+        }
+    }
+
+    private fun looksLikeAccumulated(incoming: String): Boolean {
+        val fc = firstChunk
+        if (fc != null && incoming.length >= firstChunkLen && incoming.startsWith(fc)) {
+            return true
+        }
+
+        if (incoming.length < lastLen) return false
+        if (prefixSample.isNotEmpty() && !incoming.startsWith(prefixSample)) return false
+
+        if (boundarySample.isNotEmpty()) {
+            val start = (lastLen - boundarySample.length).coerceAtLeast(0)
+            val ok = incoming.regionMatches(
+                thisOffset = start,
+                other = boundarySample,
+                otherOffset = 0,
+                length = boundarySample.length,
+                ignoreCase = false
+            )
+            if (!ok) return false
+        }
+
+        return true
+    }
+}
+
 /* ───────────────────────────── Reflection Bridge ───────────────────────────── */
 
 /**
@@ -250,16 +367,20 @@ private fun getMethodBucket(cls: Class<*>, methodName: String, argc: Int): List<
         val all = ArrayList<Method>(64)
         all.addAll(cls.methods.filter { it.name == methodName && it.parameterTypes.size == argc })
         all.addAll(cls.declaredMethods.filter { it.name == methodName && it.parameterTypes.size == argc })
-        all.distinctBy { m ->
-            buildString {
-                append(m.name).append("(")
-                m.parameterTypes.forEachIndexed { i, p ->
-                    if (i > 0) append(",")
-                    append(p.name)
+
+        all.asSequence()
+            .filterNot { it.isBridge || it.isSynthetic }
+            .distinctBy { m ->
+                buildString {
+                    append(m.name).append("(")
+                    m.parameterTypes.forEachIndexed { i, p ->
+                        if (i > 0) append(",")
+                        append(p.name)
+                    }
+                    append(")")
                 }
-                append(")")
             }
-        }
+            .toList()
     }
 }
 
@@ -866,38 +987,52 @@ object SLM {
             w(t) { "generateText: reflection failed err=${t.message}" }
         }
 
-        /** Fallback: aggregate via streaming (no labeled returns; guard by if). */
+        /** Fallback: aggregate via streaming with delta normalization. */
         return suspendCancellableCoroutine { cont ->
             val buffer = StringBuilder()
-            var doneOnce = false
+            val normalizer = StreamDeltaNormalizer(StreamDeltaNormalizer.PartialMode.AUTO)
 
-            val resultListener: ResultListener = { partial, done ->
-                if (!doneOnce) {
-                    if (partial.isNotEmpty()) {
-                        buffer.append(partial)
-                        runCatching { onPartial(partial) }
-                            .onFailure { t -> w(t) { "generateText fallback onPartial failed: ${t.message}" } }
-                    }
+            /**
+             * Terminal guard for done/error/invoke-failure races.
+             * This avoids double-resume crashes under callback concurrency.
+             */
+            val terminal = AtomicBoolean(false)
 
-                    if (done) {
-                        doneOnce = true
-                        if (!cont.isCompleted) cont.resume(buffer.toString())
+            val resultListener: ResultListener = result@{ partial, done ->
+                if (terminal.get()) return@result
+
+                val delta = normalizer.toDelta(partial)
+                if (delta.isNotEmpty()) {
+                    buffer.append(delta)
+                    runCatching { onPartial(delta) }
+                        .onFailure { t -> w(t) { "generateText fallback onPartial failed: ${t.message}" } }
+                }
+
+                if (done) {
+                    if (terminal.compareAndSet(false, true)) {
+                        runCatching {
+                            if (!cont.isCompleted) cont.resume(buffer.toString())
+                        }.onFailure { t ->
+                            w(t) { "generateText fallback resume failed (likely double-finish): ${t.message}" }
+                        }
                     }
                 }
             }
 
-            val onError: (String) -> Unit = { msg ->
-                if (!doneOnce) {
-                    doneOnce = true
+            val onError: (String) -> Unit = onError@{ msg ->
+                if (!terminal.compareAndSet(false, true)) return@onError
 
-                    val lc = msg.lowercase(Locale.US)
-                    if (lc.contains("cancel")) {
-                        if (!cont.isCompleted) cont.resumeWithException(CancellationException("Cancelled"))
-                    } else {
-                        if (!cont.isCompleted) cont.resumeWithException(
-                            IllegalStateException("LiteRtLM generation error: $msg")
-                        )
-                    }
+                val lc = msg.lowercase(Locale.US)
+                val ex = if (lc.contains("cancel")) {
+                    CancellationException("Cancelled")
+                } else {
+                    IllegalStateException("LiteRtLM generation error: $msg")
+                }
+
+                runCatching {
+                    if (!cont.isCompleted) cont.resumeWithException(ex)
+                }.onFailure { t ->
+                    w(t) { "generateText fallback resumeWithException failed (likely double-finish): ${t.message}" }
                 }
             }
 
@@ -909,8 +1044,13 @@ object SLM {
             )
 
             if (!ok) {
-                doneOnce = true
-                if (!cont.isCompleted) cont.resumeWithException(IllegalStateException("runInference unavailable"))
+                if (terminal.compareAndSet(false, true)) {
+                    runCatching {
+                        if (!cont.isCompleted) cont.resumeWithException(IllegalStateException("runInference unavailable"))
+                    }.onFailure { t ->
+                        w(t) { "generateText fallback immediate failure resumeWithException failed: ${t.message}" }
+                    }
+                }
             }
 
             cont.invokeOnCancellation {
@@ -959,9 +1099,7 @@ object SLM {
  * - Replace other characters with underscore.
  * - Truncate to [maxLen].
  */
-private fun String.safeTestTagToken(maxLen: Int): String {
-    /** Avoid 'this' label usage to prevent accidental label drift compile errors. */
-    val src = this
+private fun safeTestTagTokenInternal(src: String, maxLen: Int): String {
     val cleaned = buildString(src.length) {
         for (ch in src) {
             val ok = ch.isLetterOrDigit() || ch == '_' || ch == '-' || ch == '.'
@@ -969,4 +1107,15 @@ private fun String.safeTestTagToken(maxLen: Int): String {
         }
     }
     return if (cleaned.length <= maxLen) cleaned else cleaned.take(maxLen)
+}
+
+/**
+ * Sanitize strings for use in test tags.
+ *
+ * NOTE:
+ * - This wrapper preserves the original extension-style call sites.
+ * - The internal implementation does not reference `this` at all.
+ */
+private fun String.safeTestTagToken(maxLen: Int): String {
+    return safeTestTagTokenInternal(src = this, maxLen = maxLen)
 }

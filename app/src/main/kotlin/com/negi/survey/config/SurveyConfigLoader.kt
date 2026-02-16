@@ -235,11 +235,6 @@ data class SurveyConfig(
         @SerialName("ui_min_delta_bytes") val uiMinDeltaBytes: Long? = null
     )
 
-    /**
-     * Resolve a legacy one-step prompt (prompt) for the given nodeId.
-     *
-     * This intentionally ignores two-step prompts.
-     */
     fun resolveOneStepPrompt(nodeId: String): String? {
         val id = nodeId.trim()
         if (id.isBlank()) return null
@@ -247,15 +242,6 @@ data class SurveyConfig(
         return p.prompt?.takeIf { it.isNotBlank() }
     }
 
-    /**
-     * Resolve an eval prompt for the given nodeId (two-step).
-     *
-     * Priority:
-     *  1) Inline two-step (eval_prompt) when complete
-     *  2) Split two-step (prompts_eval) when complete pair exists
-     *
-     * Note: Ambiguous cases should be rejected by validation.
-     */
     fun resolveEvalPrompt(nodeId: String): String? {
         val id = nodeId.trim()
         if (id.isBlank()) return null
@@ -272,15 +258,6 @@ data class SurveyConfig(
         return null
     }
 
-    /**
-     * Resolve a follow-up prompt for the given nodeId (two-step).
-     *
-     * Priority:
-     *  1) Inline two-step (followup_prompt) when complete
-     *  2) Split two-step (prompts_followup) when complete pair exists
-     *
-     * Note: Ambiguous cases should be rejected by validation.
-     */
     fun resolveFollowupPrompt(nodeId: String): String? {
         val id = nodeId.trim()
         if (id.isBlank()) return null
@@ -297,11 +274,6 @@ data class SurveyConfig(
         return null
     }
 
-    /**
-     * Compose the system prompt for one-step mode.
-     *
-     * Backward-compatible alias: composeSystemPrompt() uses this.
-     */
     fun composeSystemPromptOneStep(): String {
         val parts = listOf(
             slm.preamble,
@@ -315,14 +287,6 @@ data class SurveyConfig(
         return parts.joinToString("\n")
     }
 
-    /**
-     * Compose the system prompt for two-step EVAL phase.
-     *
-     * Uses key_contract_eval/length_budget_eval/strict_output_eval when present,
-     * otherwise falls back to key_contract/length_budget/strict_output.
-     *
-     * Note: EVAL should remain JSON-only for reliable parsing.
-     */
     fun composeSystemPromptEval(): String {
         val contract = slm.keyContractEval?.takeIf { it.isNotBlank() } ?: slm.keyContract
         val budget = slm.lengthBudgetEval?.takeIf { it.isNotBlank() } ?: slm.lengthBudget
@@ -340,27 +304,12 @@ data class SurveyConfig(
         return parts.joinToString("\n")
     }
 
-    /**
-     * Default strict instructions for follow-up TEXT-only mode.
-     *
-     * This is used when followup_output_mode=TEXT but strict_output_followup is empty.
-     */
     private fun defaultFollowupStrictText(): String = """
         STRICT OUTPUT (NO MARKDOWN):
         - Output ONLY the follow-up question as plain text on ONE LINE, or EMPTY output if none.
         - No JSON, no quotes, no extra text.
     """.trimIndent()
 
-    /**
-     * Compose the system prompt for two-step FOLLOWUP phase.
-     *
-     * Uses key_contract_followup/length_budget_followup/strict_output_followup when present,
-     * otherwise falls back to key_contract/length_budget/strict_output.
-     *
-     * If followup_output_mode=TEXT:
-     * - Do NOT include empty_json_instruction (it tends to bias output toward JSON).
-     * - Prefer strict_output_followup or a built-in text-only strict.
-     */
     fun composeSystemPromptFollowup(): String {
         val contract = slm.keyContractFollowup?.takeIf { it.isNotBlank() } ?: slm.keyContract
         val budget = slm.lengthBudgetFollowup?.takeIf { it.isNotBlank() } ?: slm.lengthBudget
@@ -380,7 +329,6 @@ data class SurveyConfig(
         slm.scoringRule?.takeIf { it.isNotBlank() }?.let { parts += it.trim() }
         strict?.takeIf { it.isNotBlank() }?.let { parts += it.trim() }
 
-        // Important: exclude empty_json_instruction for TEXT follow-up.
         if (mode == FollowupOutputMode.JSON) {
             slm.emptyJsonInstruction?.takeIf { it.isNotBlank() }?.let { parts += it.trim() }
         }
@@ -388,18 +336,8 @@ data class SurveyConfig(
         return parts.joinToString("\n")
     }
 
-    /**
-     * Compose the system prompt from SLM meta fields (one-step default).
-     */
     fun composeSystemPrompt(): String = composeSystemPromptOneStep()
 
-    /**
-     * Produce a normalized prompt list:
-     * - Start with legacy prompts as-is.
-     * - Add split two-step entries that are not present in legacy prompts.
-     *
-     * This is useful for JSONL export and debugging.
-     */
     fun normalizedPrompts(): List<Prompt> {
         val legacyById = LinkedHashMap<String, Prompt>()
         prompts.forEach { p ->
@@ -423,10 +361,8 @@ data class SurveyConfig(
 
         val out = ArrayList<Prompt>(legacyById.size + evalById.size)
 
-        // Keep legacy prompts.
         out.addAll(legacyById.values)
 
-        // Add split prompts (only when the pair is complete AND the nodeId is not already defined in legacy).
         val splitIds = (evalById.keys + followById.keys).toSet()
         splitIds.asSequence()
             .sorted()
@@ -442,32 +378,24 @@ data class SurveyConfig(
         return out
     }
 
-    /**
-     * Encode prompts as JSON lines (one object per line).
-     *
-     * This exports the normalized prompt list, so split two-step prompts are included as inline two-step entries.
-     */
     fun toJsonl(): List<String> =
         SurveyConfigLoader.jsonCompact.let { json ->
             normalizedPrompts().map { json.encodeToString(Prompt.serializer(), it) }
         }
 
-    /**
-     * Encode the whole config into JSON.
-     */
     fun toJson(pretty: Boolean = true): String =
         (if (pretty) SurveyConfigLoader.jsonPretty else SurveyConfigLoader.jsonCompact)
             .encodeToString(serializer(), this)
 
     /**
      * Encode the whole config into YAML.
+     *
+     * Note:
+     * - Uses cached Yaml instances to avoid repeated allocations.
      */
     fun toYaml(strict: Boolean = false): String =
-        SurveyConfigLoader.yaml(strict).encodeToString(serializer(), this)
+        SurveyConfigLoader.yamlCached(strict).encodeToString(serializer(), this)
 
-    /**
-     * Debug summary string for logcat.
-     */
     fun debugSummary(maxIds: Int = 8): String {
         fun takeIds(xs: List<String>, n: Int): String {
             val t = xs.asSequence().map { it.trim() }.filter { it.isNotBlank() }.distinct().take(n).toList()
@@ -491,9 +419,6 @@ data class SurveyConfig(
                 "followIds=[${takeIds(followIds, maxIds)}]"
     }
 
-    /**
-     * Debug dump: system prompt previews + prompt coverage for AI nodes.
-     */
     fun debugDump(maxPreviewChars: Int = 320): String {
         fun preview(s: String): String {
             val t = s.replace("\r", "\\r").replace("\n", "\\n")
@@ -526,12 +451,6 @@ data class SurveyConfig(
         }
     }
 
-    /**
-     * Validate the config and return a list of issues (empty if valid).
-     *
-     * Note:
-     * - Validation assumes a single-successor graph via nextId.
-     */
     fun validate(): List<String> {
         val issues = mutableListOf<String>()
 
@@ -615,7 +534,6 @@ data class SurveyConfig(
             issues += "no DONE node detected (expected at least one terminal node)"
         }
 
-        // --- prompts sanity (legacy prompts[]) ---
         val legacyBlankTargets = prompts.map { it.nodeId }.filter { it.isBlank() }.distinct()
         if (legacyBlankTargets.isNotEmpty()) {
             issues += "prompts contain blank nodeId entries"
@@ -641,7 +559,6 @@ data class SurveyConfig(
             issues += "multiple prompts defined for nodeIds: ${legacyDuplicateTargets.joinToString(",")}"
         }
 
-        // --- prompts sanity (split prompts_eval/prompts_followup) ---
         fun duplicateNodeIds(list: List<NodePrompt>, label: String) {
             val dup = list
                 .map { it.nodeId.trim() }
@@ -720,7 +637,6 @@ data class SurveyConfig(
                 }
             }
 
-            // Disallow mixed representations for the same nodeId to avoid ambiguous runtime selection.
             if (legacy != null && splitHasAny) {
                 issues += "nodeId='$id' uses both legacy prompts[] and split prompts_eval/prompts_followup (ambiguous)"
             }
@@ -729,7 +645,6 @@ data class SurveyConfig(
             if (isTwoStepForId) hasAnyTwoStep = true
         }
 
-        // If two-step prompts exist, ensure we have at least some contract to run.
         if (hasAnyTwoStep) {
             val hasEvalContract = !(slm.keyContractEval.isNullOrBlank() && slm.keyContract.isNullOrBlank())
             val hasFollowContract = !(slm.keyContractFollowup.isNullOrBlank() && slm.keyContract.isNullOrBlank())
@@ -737,7 +652,6 @@ data class SurveyConfig(
             if (!hasEvalContract) issues += "two-step prompts present but missing slm.key_contract_eval (and slm.key_contract fallback is also empty)"
             if (!hasFollowContract) issues += "two-step prompts present but missing slm.key_contract_followup (and slm.key_contract fallback is also empty)"
 
-            // Text-only follow-up sanity (best-effort heuristic).
             val mode = slm.resolvedFollowupOutputMode()
             if (mode == FollowupOutputMode.TEXT) {
                 val followContract = (slm.keyContractFollowup ?: slm.keyContract).orEmpty()
@@ -760,7 +674,6 @@ data class SurveyConfig(
             }
         }
 
-        // Ensure every AI node has at least one usable prompt definition.
         graph.nodes
             .asSequence()
             .filter { it.nodeType() == NodeType.AI }
@@ -774,7 +687,6 @@ data class SurveyConfig(
                 }
             }
 
-        // --- nextId reference existence check ---
         graph.nodes.forEach { node ->
             node.nextId
                 ?.trim()
@@ -826,7 +738,6 @@ data class SurveyConfig(
                 }
             }
 
-        // --- Reachability / cycle detection (single-successor graph) ---
         run {
             if (startIdNorm.isBlank() || startIdNorm !in idSet) return@run
 
@@ -880,7 +791,6 @@ data class SurveyConfig(
             }
         }
 
-        // --- SLM param sanity ---
         slm.accelerator?.let { acc ->
             val a = acc.trim().uppercase()
             if (a != "CPU" && a != "GPU") issues += "slm.accelerator should be 'CPU' or 'GPU' (got '$acc')"
@@ -890,7 +800,6 @@ data class SurveyConfig(
         slm.topP?.let { if (it !in 0.0..1.0) issues += "slm.top_p must be in [0.0,1.0] (got $it)" }
         slm.temperature?.let { if (it !in 0.0..2.0) issues += "slm.temperature must be in [0.0,2.0] (got $it)" }
 
-        // --- Whisper sanity ---
         whisper.assetModelPath?.let { if (it.isBlank()) issues += "whisper.asset_model_path is blank" }
         whisper.language?.let { lang ->
             val norm = lang.trim().lowercase()
@@ -908,7 +817,6 @@ data class SurveyConfig(
             }
         }
 
-        // --- Model defaults sanity ---
         modelDefaults.modelName?.let { if (it.isBlank()) issues += "model_defaults.model_name is blank" }
         modelDefaults.defaultModelUrl?.let { if (it.isBlank()) issues += "model_defaults.default_model_url is blank" }
         modelDefaults.defaultFileName?.let { if (it.isBlank()) issues += "model_defaults.default_file_name is blank" }
@@ -919,9 +827,6 @@ data class SurveyConfig(
         return issues
     }
 
-    /**
-     * Throw when validation fails.
-     */
     fun requireValid() {
         val issues = validate()
         require(issues.isEmpty()) {
@@ -941,9 +846,6 @@ typealias PromptEntry = SurveyConfig.Prompt
 typealias GraphConfig = SurveyConfig.Graph
 typealias NodePromptEntry = SurveyConfig.NodePrompt
 
-/**
- * Node DTO as loaded from config.
- */
 @Serializable
 data class NodeDTO(
     val id: String = "",
@@ -956,9 +858,6 @@ data class NodeDTO(
     fun nodeType(): NodeType = NodeType.from(type)
 }
 
-/**
- * Node types used by configuration layer.
- */
 enum class NodeType {
     START,
     TEXT,
@@ -993,20 +892,13 @@ enum class NodeType {
 
 enum class ConfigFormat { JSON, YAML, AUTO }
 
-/**
- * Loader/encoder for SurveyConfig.
- */
 object SurveyConfigLoader {
 
-    // Runtime-togglable debug flags (do not use const to allow switching without rebuild).
     @Volatile private var debugFormat: Boolean = false
     @Volatile private var debugValidate: Boolean = false
     @Volatile private var debugPrompts: Boolean = false
     @Volatile private var debugDumpSystemPrompts: Boolean = false
 
-    /**
-     * Enable or disable loader debug flags at runtime.
-     */
     fun setDebug(
         format: Boolean? = null,
         validate: Boolean? = null,
@@ -1050,16 +942,25 @@ object SurveyConfigLoader {
         explicitNulls = false
     }
 
-    private val yamlLenient: Yaml by lazy { yaml(strict = false) }
-    private val yamlStrict: Yaml by lazy { yaml(strict = true) }
-
-    internal fun yaml(strict: Boolean = false): Yaml =
+    private fun createYaml(strict: Boolean): Yaml =
         Yaml(
             configuration = YamlConfiguration(
                 encodeDefaults = false,
                 strictMode = strict
             )
         )
+
+    // Cached instances (avoid repeated allocations during frequent export).
+    private val yamlLenient: Yaml by lazy { createYaml(strict = false) }
+    private val yamlStrict: Yaml by lazy { createYaml(strict = true) }
+
+    /**
+     * Return cached YAML instance.
+     *
+     * Note:
+     * - strictMode primarily affects parsing behavior, but we keep it consistent here.
+     */
+    internal fun yamlCached(strict: Boolean = false): Yaml = if (strict) yamlStrict else yamlLenient
 
     fun fromAssets(
         context: Context,

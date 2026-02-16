@@ -230,120 +230,6 @@ private fun compactJoin(vararg parts: String): String {
 }
 
 /* ====================================================================== */
-/*  Stream chunk normalization                                             */
-/* ====================================================================== */
-
-/**
- * Some streaming APIs return either:
- * - DELTA chunks (new tokens)
- * - ACCUMULATED text (full text so far)
- *
- * This helper normalizes to DELTA output for Flow emission and capture.
- *
- * Notes:
- * - Avoids keeping the entire lastFull string to reduce memory pressure.
- * - Uses length + small samples to detect monotonic accumulated behavior.
- */
-private class StreamDeltaNormalizer(
-    private val modeHint: PartialMode = PartialMode.AUTO,
-    private val prefixSampleChars: Int = 128,
-    private val boundarySampleChars: Int = 64,
-) {
-    enum class PartialMode { AUTO, DELTA, ACCUMULATED }
-
-    private var decided: PartialMode = modeHint
-
-    private var lastLen: Int = 0
-    private var prefixSample: String = ""
-    private var boundarySample: String = ""
-
-    // Used only in AUTO for the first decision; cap to avoid storing huge content.
-    private var firstChunk: String? = null
-    private var firstChunkLen: Int = 0
-
-    fun toDelta(incoming: String): String {
-        if (incoming.isEmpty()) return ""
-
-        return when (decided) {
-            PartialMode.DELTA -> incoming
-            PartialMode.ACCUMULATED -> accumulatedDelta(incoming)
-            PartialMode.AUTO -> autoDelta(incoming)
-        }
-    }
-
-    private fun autoDelta(incoming: String): String {
-        if (lastLen == 0) {
-            seed(incoming, allowFirstChunk = true)
-            return incoming
-        }
-
-        // Decide on second+ chunk.
-        val looksAccumulated = looksLikeAccumulated(incoming)
-        decided = if (looksAccumulated) PartialMode.ACCUMULATED else PartialMode.DELTA
-
-        // Release AUTO helpers.
-        firstChunk = null
-        firstChunkLen = 0
-
-        return if (decided == PartialMode.ACCUMULATED) {
-            accumulatedDelta(incoming)
-        } else {
-            // DELTA: treat as raw delta.
-            seed(incoming, allowFirstChunk = false)
-            incoming
-        }
-    }
-
-    private fun accumulatedDelta(incoming: String): String {
-        if (lastLen == 0) {
-            seed(incoming, allowFirstChunk = false)
-            return incoming
-        }
-
-        // Basic monotonic assumption; verify with light samples.
-        if (!looksLikeAccumulated(incoming)) {
-            // Treat as reset.
-            seed(incoming, allowFirstChunk = false)
-            return incoming
-        }
-
-        val delta = if (incoming.length >= lastLen) incoming.substring(lastLen) else incoming
-        seed(incoming, allowFirstChunk = false)
-        return delta
-    }
-
-    private fun seed(text: String, allowFirstChunk: Boolean) {
-        lastLen = text.length
-        prefixSample = text.take(prefixSampleChars)
-        boundarySample = text.takeLast(boundarySampleChars)
-
-        if (allowFirstChunk) {
-            val cap = 4_096
-            firstChunk = if (text.length <= cap) text else null
-            firstChunkLen = text.length
-        }
-    }
-
-    private fun looksLikeAccumulated(incoming: String): Boolean {
-        val fc = firstChunk
-        if (fc != null && incoming.length >= firstChunkLen && incoming.startsWith(fc)) {
-            return true
-        }
-
-        if (incoming.length < lastLen) return false
-        if (prefixSample.isNotEmpty() && !incoming.startsWith(prefixSample)) return false
-
-        if (boundarySample.isNotEmpty()) {
-            val start = (lastLen - boundarySample.length).coerceAtLeast(0)
-            val ok = incoming.regionMatches(start, boundarySample, 0, boundarySample.length, ignoreCase = false)
-            if (!ok) return false
-        }
-
-        return true
-    }
-}
-
-/* ====================================================================== */
 /*  Shared defaults for prompt building                                    */
 /* ====================================================================== */
 
@@ -565,6 +451,25 @@ class LiteRtRepository(
                     return synchronized(outLock) { fullOut.toString() }
                 }
 
+                /**
+                 * Debug snapshot helper that avoids fullOut.toString() allocation.
+                 *
+                 * NOTE:
+                 * - Use this ONLY for debug preview/length.
+                 * - For final dumps, snapshotOutput() is still used.
+                 */
+                fun snapshotForDebug(prefixChars: Int): Pair<Int, String> {
+                    return synchronized(outLock) {
+                        val len = fullOut.length
+                        if (len <= 0) return@synchronized (0 to "")
+                        val end = minOf(len, prefixChars.coerceAtLeast(0))
+                        val preview =
+                            if (end == len && len <= prefixChars) fullOut.toString()
+                            else fullOut.substring(0, end)
+                        len to preview
+                    }
+                }
+
                 fun finalizeOnce(reason: String, cause: Throwable? = null) {
                     if (!finalized.compareAndSet(false, true)) return
 
@@ -767,11 +672,14 @@ class LiteRtRepository(
 
                             if (DEBUG_STREAM && (msgCount == 1 || msgCount % DEBUG_STREAM_EVERY_N == 0)) {
                                 val dPreview = delta.take(DEBUG_PREFIX_CHARS).replace("\n", "\\n")
-                                val sPreview = snapshotOutput().take(DEBUG_PREFIX_CHARS).replace("\n", "\\n")
+
+                                val (outLen, outPreviewRaw) = snapshotForDebug(DEBUG_PREFIX_CHARS)
+                                val sPreview = outPreviewRaw.replace("\n", "\\n")
+
                                 Log.d(
                                     TAG,
                                     "stream[rid=$requestId msg#$msgCount] done=$done " +
-                                            "deltaLen=${delta.length} outLen=${snapshotOutput().length} " +
+                                            "deltaLen=${delta.length} outLen=$outLen " +
                                             "outPreview='$sPreview' deltaPreview='$dPreview'"
                                 )
                             }

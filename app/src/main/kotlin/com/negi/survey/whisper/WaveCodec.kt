@@ -7,25 +7,6 @@
  *  License: MIT License
  *  © 2025 IshizukiTech LLC. All rights reserved.
  * ================================================================
- *
- *  Permission is hereby granted, free of charge, to any person obtaining a copy
- *  of this software and associated documentation files (the “Software”), to deal
- *  in the Software without restriction, including without limitation the rights
- *  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- *  copies of the Software, and to permit persons to whom the Software is
- *  furnished to do so, subject to the following conditions:
- *
- *  The above copyright notice and this permission notice shall be included in
- *  all copies or substantial portions of the Software.
- *
- *  THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- *  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- *  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- *  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- *  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- *  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- *  THE SOFTWARE.
- * ================================================================
  */
 
 package com.negi.survey.whisper
@@ -51,21 +32,10 @@ private const val LOG_TAG = "WaveCodec"
  * - **PCM 16-bit** (`audioFormat = 1`)
  * - **IEEE Float 32-bit** (`audioFormat = 3`)
  *
- * ## Features
- * - Tolerant RIFF parser with padding and unknown chunk skipping
- * - Automatic downmix to mono
- * - Optional resampling via linear interpolation
- * - Safe bounds checking and error messages
- * - Streaming decode (does NOT load the whole file into memory)
- *
- * ## Output
- * Returns a normalized `FloatArray` of mono samples suitable for direct
- * Whisper model ingestion.
- *
- * Typical usage:
- * ```kotlin
- * val samples = decodeWaveFile(File("/path/audio.wav"), targetSampleRate = 16000)
- * ```
+ * ## Robustness notes
+ * - Chunk sizes in broken WAVs can exceed the actual file length. This decoder
+ *   clamps chunk skips to EOF instead of throwing immediately, allowing partial
+ *   salvage of truncated recordings.
  *
  * @throws IOException If the file is malformed or contains invalid chunk data
  * @throws IllegalArgumentException If the file does not exist or is unreadable
@@ -75,6 +45,7 @@ fun decodeWaveFile(
     file: File,
     targetSampleRate: Int = 16_000
 ): FloatArray {
+    require(targetSampleRate > 0) { "Invalid targetSampleRate=$targetSampleRate" }
     require(file.exists()) { "File not found: ${file.path}" }
     require(file.isFile) { "Not a file: ${file.path}" }
     require(file.canRead()) { "File not readable: ${file.path}" }
@@ -86,7 +57,7 @@ fun decodeWaveFile(
 
         // --- Validate RIFF/WAVE headers ---
         val riff = raf.readAscii4()
-        raf.skipFully(4) // riffSize (u32)
+        raf.skipFullyOrThrow(4) // riffSize (u32)
         val wave = raf.readAscii4()
         if (riff != "RIFF" || wave != "WAVE") {
             throw IOException("Invalid RIFF/WAVE header in ${file.name}: riff='$riff' wave='$wave'")
@@ -112,7 +83,6 @@ fun decodeWaveFile(
 
             when (id) {
                 "fmt " -> {
-                    // Parse format chunk (must be >= 16 bytes)
                     if (size < 16L) {
                         throw IOException("Invalid 'fmt ' chunk in ${file.name} (size=$size)")
                     }
@@ -120,14 +90,13 @@ fun decodeWaveFile(
                     audioFormat = raf.readLE16u()
                     channels = raf.readLE16u()
                     sampleRate = raf.readLE32u().toInt()
-                    raf.skipFully(4) // byteRate
-                    raf.skipFully(2) // blockAlign
+                    raf.skipFullyOrThrow(4) // byteRate
+                    raf.skipFullyOrThrow(2) // blockAlign
                     bitsPerSample = raf.readLE16u()
 
-                    // Skip any remaining fmt bytes (extended format)
                     val remaining = size - 16L
                     if (remaining > 0L) {
-                        raf.skipFully(remaining)
+                        raf.skipFullyClamped(remaining, reason = "fmt-extra")
                         Log.v(LOG_TAG, "fmt: extra fmt bytes=$remaining")
                     }
 
@@ -136,25 +105,23 @@ fun decodeWaveFile(
                 }
 
                 "data" -> {
-                    // Record data chunk start and declared size
                     dataStart = chunkDataStart
                     dataSizeHeader = size
                     dataFound = true
 
-                    // Move file pointer past data chunk for continued scan (if fmt not found yet)
-                    raf.skipFully(size)
+                    // IMPORTANT: Do not throw if the WAV is truncated. Clamp to EOF.
+                    raf.skipFullyClamped(size, reason = "data-scan")
                 }
 
                 else -> {
-                    // Skip unknown chunk
                     Log.v(LOG_TAG, "Skip chunk: '$id' ($size bytes)")
-                    raf.skipFully(size)
+                    raf.skipFullyClamped(size, reason = "unknown:$id")
                 }
             }
 
-            // RIFF chunks are padded to even size
+            // RIFF chunks are padded to even size.
             if ((size and 1L) == 1L) {
-                raf.skipFully(1)
+                raf.skipFullyClamped(1, reason = "pad")
             }
 
             if (fmtFound && dataFound) break
@@ -166,6 +133,7 @@ fun decodeWaveFile(
             throw IOException("Missing or empty 'data' chunk in ${file.name}")
         }
         if (channels <= 0) throw IOException("Invalid channel count ($channels) in ${file.name}")
+        if (sampleRate <= 0) throw IOException("Invalid sampleRate ($sampleRate) in ${file.name}")
         if (audioFormat !in listOf(1, 3)) {
             throw IOException("Unsupported format=$audioFormat in ${file.name} (only 1=PCM, 3=FLOAT supported)")
         }
@@ -234,7 +202,6 @@ private fun decodePcm16ToMono(
     val frameCount = frameCountLong.toInt()
     val out = FloatArray(frameCount)
 
-    // Read in chunks of frames for efficiency
     val framesPerChunk = 4096
     val buf = ByteArray((framesPerChunk.toLong() * bytesPerFrame).toInt())
 
@@ -268,15 +235,11 @@ private fun decodePcm16ToMono(
         remainingFrames -= usableFrames
     }
 
-    // If truncated read occurred, return only decoded portion
     return if (outIndex == out.size) out else out.copyOf(outIndex)
 }
 
 /**
  * Decodes IEEE 32-bit float PCM (LE) samples from a RandomAccessFile and mixes channels into mono.
- *
- * Note:
- * - Float samples can exceed [-1, 1] depending on writer; we clamp to [-1, 1].
  */
 private fun decodeFloat32ToMono(
     raf: RandomAccessFile,
@@ -335,11 +298,6 @@ private fun decodeFloat32ToMono(
 
 /**
  * Endpoint-aligned linear resampler.
- *
- * Guarantees that the first and last samples align between
- * source and target buffers, ensuring no phase drift.
- * This is sufficient for Whisper inference which is insensitive
- * to slight resampling artifacts.
  */
 private fun resampleLinearEndpointAligned(
     src: FloatArray,
@@ -408,14 +366,33 @@ private fun RandomAccessFile.readLE32u(): Long {
 
 /**
  * Skips exactly n bytes, throwing on unexpected EOF.
+ *
+ * This is used only when the spec guarantees presence (e.g., fixed RIFF header fields).
  */
-private fun RandomAccessFile.skipFully(n: Long) {
+private fun RandomAccessFile.skipFullyOrThrow(n: Long) {
     if (n <= 0L) return
     val target = filePointer + n
     if (target > length()) {
-        // Seek to end and fail fast for consistent error reporting
         seek(length())
         throw IOException("Unexpected EOF while skipping $n bytes")
     }
     seek(target)
+}
+
+/**
+ * Skips up to n bytes, clamped to EOF. Never throws due to chunk-size overrun.
+ *
+ * @return The actual number of bytes skipped.
+ */
+private fun RandomAccessFile.skipFullyClamped(n: Long, reason: String): Long {
+    if (n <= 0L) return 0L
+    val cur = filePointer
+    val max = length()
+    val target = (cur + n).coerceAtMost(max)
+    seek(target)
+    val skipped = target - cur
+    if (skipped < n) {
+        Log.w(LOG_TAG, "Clamped skip ($reason): wanted=$n actual=$skipped fp=$cur len=$max")
+    }
+    return skipped
 }

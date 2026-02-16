@@ -12,18 +12,15 @@
  *  ---------------------------------------------------------------------
  *  ViewModel-based SpeechController implementation backed by Whisper.cpp.
  *
- *  Responsibilities:
- *   • Manage recording lifecycle using Recorder.
- *   • Ensure Whisper model initialization via WhisperEngine.
- *   • Run transcription and publish the final text to partialText.
- *   • Export recorded WAV files to a persistent "exports" folder.
- *   • Emit an optional export callback so callers can register
- *     a logical audio manifest in SurveyViewModel.
+ *  Diagnostics upgrades:
+ *   • Parse WAV header to log sampleRate/channels/bits/dataBytes/duration.
+ *   • Compute lightweight PCM16 amplitude stats (RMS/Peak/non-silence ratio).
+ *   • Wait briefly for the WAV file size to stabilize after stopRecording.
+ *   • Set a user-visible error when transcription returns empty text.
  *
- *  Notes:
- *   • Uses a Mutex to serialize start/stop operations.
- *   • Uses a second Mutex to avoid repeated model initialization.
- *   • Computes optional SHA-256 checksum for exported WAV.
+ *  Robustness upgrades:
+ *   • Guard recorder.stopRecording() with a timeout.
+ *   • On stop timeout, attempt to close + recreate Recorder instance.
  * =====================================================================
  */
 
@@ -32,6 +29,7 @@
 package com.negi.survey.vm
 
 import android.content.Context
+import android.os.SystemClock
 import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
@@ -42,8 +40,12 @@ import com.negi.survey.whisper.Recorder
 import com.negi.survey.whisper.WhisperEngine
 import java.io.File
 import java.io.FileInputStream
+import java.io.RandomAccessFile
 import java.security.MessageDigest
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicReference
+import kotlin.math.abs
+import kotlin.math.sqrt
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -51,6 +53,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -58,21 +61,10 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * ViewModel-based [SpeechController] implementation backed by Whisper.cpp.
- *
- * UI contract:
- * - [isRecording] is true while audio capture is active.
- * - [isTranscribing] is true while transcription is running.
- * - When recording stops and transcription succeeds, [partialText] is updated
- *   with the final recognized text.
- *
- * Lifecycle policy:
- * - This controller does NOT hard-release Whisper native resources on
- *   ViewModel clearance to avoid expensive re-initialization during
- *   navigation/restart flows.
- * - Instead it calls [WhisperEngine.detach].
  */
 class WhisperSpeechController(
     private val appContext: Context,
@@ -84,42 +76,25 @@ class WhisperSpeechController(
     companion object {
         private const val TAG = "WhisperSpeechController"
 
-        /**
-         * Default language for Whisper.
-         *
-         * Valid values:
-         * - "auto" : auto-detect language
-         * - "en"   : English
-         * - "ja"   : Japanese
-         * - "sw"   : Swahili
-         */
         private const val DEFAULT_LANGUAGE = "auto"
-
-        /**
-         * Default model path inside assets.
-         *
-         * Place your model at:
-         *   app/src/main/assets/models/ggml-model-q4_0.bin
-         * and keep this as "models/ggml-model-q4_0.bin".
-         */
         private const val DEFAULT_ASSET_MODEL = "models/ggml-model-q4_0.bin"
 
-        /**
-         * Preferred sample rates to attempt for the recorder backend.
-         */
         private val RECORDER_RATE_CANDIDATES = intArrayOf(16_000, 48_000, 44_100)
 
-        /**
-         * Minimum WAV byte length heuristic.
-         *
-         * 44 bytes is the typical PCM header size.
-         * Anything at or below this is effectively empty audio.
-         */
         private const val MIN_WAV_BYTES = 44L
+        private const val MIN_DURATION_SEC_HEURISTIC = 0.25
 
-        /**
-         * Factory for use with Compose `viewModel(factory = ...)`.
-         */
+        private const val WAV_STABILIZE_MAX_MS = 900L
+        private const val WAV_STABILIZE_STEP_MS = 60L
+
+        private const val PCM16_SILENCE_ABS_THRESHOLD = 400
+
+        /** Timeout for recorder.stopRecording() (must be > Recorder STOP_JOIN_TIMEOUT_MS). */
+        private const val RECORDER_STOP_TIMEOUT_MS = 6_000L
+
+        /** Best-effort timeout for recorder.close() during recovery. */
+        private const val RECORDER_CLOSE_TIMEOUT_MS = 2_500L
+
         fun provideFactory(
             appContext: Context,
             assetModelPath: String = DEFAULT_ASSET_MODEL,
@@ -142,21 +117,8 @@ class WhisperSpeechController(
             }
     }
 
-    // ---------------------------------------------------------------------
-    // Models
-    // ---------------------------------------------------------------------
-
     /**
      * Minimal export event payload.
-     *
-     * This is intentionally file-system neutral so callers can decide
-     * how to record the logical manifest.
-     *
-     * @property surveyId Optional survey UUID used in exported naming.
-     * @property questionId Optional node ID used in exported naming.
-     * @property fileName Exported WAV file name (no path).
-     * @property byteSize Byte size at export time.
-     * @property checksum Optional SHA-256 checksum for idempotent ingestion.
      */
     data class ExportedVoice(
         val surveyId: String?,
@@ -171,31 +133,12 @@ class WhisperSpeechController(
     // ---------------------------------------------------------------------
 
     /**
-     * Dedicated WAV recorder implementation.
-     *
-     * Errors are forwarded into [errorMessage].
+     * Recorder instance (re-creatable on failure/hang).
      */
-    private val recorder: Recorder = Recorder(appContext) { e ->
-        Log.e(TAG, "Recorder error", e)
-
-        // Best-effort delete the temp wav if it exists.
-        val tmp = outputFile
-        outputFile = null
-        cleanupScope.launch {
-            withContext(NonCancellable) {
-                deleteTempFileQuietly(tmp, reason = "recorder_error")
-            }
-        }
-
-        _error.value = e.message ?: "Recording error"
-        _isRecording.value = false
-        _isTranscribing.value = false
-    }
+    private var recorder: Recorder = newRecorder()
 
     /**
      * Last output WAV file produced by [recorder].
-     *
-     * This file lives under cache/whisper_rec and is treated as temporary.
      */
     private var outputFile: File? = null
 
@@ -204,36 +147,16 @@ class WhisperSpeechController(
      */
     private var workerJob: Job? = null
 
-    /**
-     * Optional context for naming exported voice files.
-     */
     private var currentSurveyId: String? = null
     private var currentQuestionId: String? = null
 
-    /**
-     * Serialize start/stop to avoid state races on rapid taps.
-     */
     private val recordingMutex = Mutex()
-
-    /**
-     * Prevent repeated model initialization across multiple recordings.
-     *
-     * Note:
-     * This mutex gates init attempts, while the actual truth of initialization
-     * is derived from [WhisperEngine.isInitializedForAsset].
-     */
     private val modelInitMutex = Mutex()
 
-    /**
-     * Cleanup scope not tied to [viewModelScope].
-     *
-     * This avoids the common pitfall where [viewModelScope] is already cancelled
-     * when [onCleared] executes.
-     */
     private val cleanupScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     // ---------------------------------------------------------------------
-    // State exposed to the UI
+    // State
     // ---------------------------------------------------------------------
 
     private val _isRecording = MutableStateFlow(false)
@@ -246,36 +169,14 @@ class WhisperSpeechController(
     override val partialText: StateFlow<String> = _partialText
     override val errorMessage: StateFlow<String?> = _error
 
-    // ---------------------------------------------------------------------
-    // Config
-    // ---------------------------------------------------------------------
-
-    /**
-     * Raw language code passed from callers.
-     */
     private val languageCodeRaw: String = languageCode
 
-    /**
-     * Normalized language code for Whisper calls.
-     */
     private val normalizedLanguage: String =
         languageCodeRaw.trim()
             .lowercase(Locale.ROOT)
             .ifBlank { DEFAULT_LANGUAGE }
 
-    // ---------------------------------------------------------------------
-    // Optional context setter
-    // ---------------------------------------------------------------------
-
-    /**
-     * Update the survey/question context used when exporting voice.
-     *
-     * This is used only for file naming; can be null.
-     */
-    override fun updateContext(
-        surveyId: String?,
-        questionId: String?
-    ) {
+    override fun updateContext(surveyId: String?, questionId: String?) {
         currentSurveyId = surveyId
         currentQuestionId = questionId
         Log.d(TAG, "updateContext: surveyId=$surveyId, questionId=$questionId")
@@ -285,9 +186,6 @@ class WhisperSpeechController(
     // Recording control
     // ---------------------------------------------------------------------
 
-    /**
-     * Start capturing audio and begin recognition.
-     */
     override fun startRecording() {
         if (_isRecording.value || _isTranscribing.value) {
             Log.d(TAG, "startRecording: busy, ignoring")
@@ -307,7 +205,6 @@ class WhisperSpeechController(
                 try {
                     ensureActive()
 
-                    // Clean leftover temp file if any (best-effort).
                     val old = outputFile
                     outputFile = null
                     deleteTempFileQuietly(old, reason = "start_cleanup")
@@ -324,16 +221,11 @@ class WhisperSpeechController(
                     outputFile = wav
 
                     Log.d(TAG, "startRecording: recorder.startRecording -> ${wav.path}")
-                    recorder.startRecording(
-                        output = wav,
-                        rates = RECORDER_RATE_CANDIDATES
-                    )
-
+                    recorder.startRecording(output = wav, rates = RECORDER_RATE_CANDIDATES)
                     Log.d(TAG, "startRecording: started")
                 } catch (ce: CancellationException) {
                     Log.d(TAG, "startRecording: cancelled")
                     _isRecording.value = false
-
                     val tmp = outputFile
                     outputFile = null
                     deleteTempFileQuietly(tmp, reason = "start_cancelled")
@@ -350,9 +242,6 @@ class WhisperSpeechController(
         }
     }
 
-    /**
-     * Stop capturing audio and finalize the current utterance.
-     */
     override fun stopRecording() {
         if (!_isRecording.value) {
             Log.d(TAG, "stopRecording: not recording, ignoring")
@@ -368,13 +257,28 @@ class WhisperSpeechController(
         workerJob = viewModelScope.launch(Dispatchers.IO) {
             recordingMutex.withLock {
                 var localWav: File? = null
-
                 try {
+                    val t0 = SystemClock.elapsedRealtime()
                     Log.d(TAG, "stopRecording: awaiting recorder.stopRecording()")
-                    runCatching { recorder.stopRecording() }
-                        .onFailure { e ->
-                            Log.w(TAG, "recorder.stopRecording failed", e)
-                        }
+
+                    val ok = withTimeoutOrNull(RECORDER_STOP_TIMEOUT_MS) {
+                        recorder.stopRecording()
+                        true
+                    } ?: false
+
+                    val dt = SystemClock.elapsedRealtime() - t0
+                    if (!ok) {
+                        Log.e(TAG, "recorder.stopRecording TIMEOUT after ${dt}ms (qid=$currentQuestionId)")
+                        _error.value = "Recorder stop timeout (AudioRecord thread stuck)"
+                        recoverRecorderAfterHang(reason = "stop_timeout")
+
+                        val wav = outputFile
+                        outputFile = null
+                        localWav = wav
+                        return@withLock
+                    } else {
+                        Log.d(TAG, "recorder.stopRecording OK in ${dt}ms")
+                    }
 
                     val wav = outputFile
                     outputFile = null
@@ -388,10 +292,45 @@ class WhisperSpeechController(
                         Log.d(TAG, "stopRecording: WAV missing (likely quick cancel) -> ${wav.path}")
                         return@withLock
                     }
+
+                    val stableBytes = awaitFileSizeStabilized(wav)
+                    Log.d(TAG, "stopRecording: wav.size(stable)=$stableBytes path=${wav.path}")
+
                     if (wav.length() <= MIN_WAV_BYTES) {
                         Log.d(TAG, "stopRecording: WAV too short (likely no speech) (${wav.length()} bytes)")
                         _error.value = "Recording too short or empty"
                         return@withLock
+                    }
+
+                    val info = readWavInfo(wav)
+                    if (info == null) {
+                        Log.w(TAG, "stopRecording: WAV header parse failed; proceeding anyway")
+                    } else {
+                        Log.d(
+                            TAG,
+                            "stopRecording: wav.info fmt=${info.audioFormat} ch=${info.channels} " +
+                                    "sr=${info.sampleRate} bits=${info.bitsPerSample} " +
+                                    "dataBytes=${info.dataBytes} durationSec=${"%.3f".format(info.durationSec())}"
+                        )
+
+                        if (info.durationSec() in 0.0..MIN_DURATION_SEC_HEURISTIC) {
+                            Log.w(TAG, "stopRecording: WAV duration looks too short (${info.durationSec()} sec)")
+                        }
+
+                        val stats = computePcm16Stats(
+                            file = wav,
+                            info = info,
+                            silenceAbsThreshold = PCM16_SILENCE_ABS_THRESHOLD
+                        )
+                        if (stats != null) {
+                            Log.d(
+                                TAG,
+                                "stopRecording: wav.stats rms=${"%.5f".format(stats.rms)} " +
+                                        "peak=${"%.5f".format(stats.peak)} " +
+                                        "nonSilent=${"%.3f".format(stats.nonSilentRatio)} " +
+                                        "samples=${stats.samples}"
+                            )
+                        }
                     }
 
                     val exported = exportRecordedVoiceSafely(wav)
@@ -436,7 +375,8 @@ class WhisperSpeechController(
                         .onSuccess { text ->
                             val trimmed = text.trim()
                             if (trimmed.isEmpty()) {
-                                Log.w(TAG, "Transcription produced empty text")
+                                Log.w(TAG, "Transcription produced empty text (qid=$currentQuestionId)")
+                                _error.value = buildEmptyTranscriptionReason(wav)
                             } else {
                                 Log.d(TAG, "Transcription success: ${trimmed.take(80)}")
                             }
@@ -459,44 +399,29 @@ class WhisperSpeechController(
         }
     }
 
-    /**
-     * Convenience toggle used by the UI microphone button.
-     */
     override fun toggleRecording() {
         if (_isRecording.value) stopRecording() else startRecording()
     }
 
     // ---------------------------------------------------------------------
-    // Helpers
+    // Public helpers
     // ---------------------------------------------------------------------
 
-    /**
-     * Update the current partial or final transcript text.
-     */
     fun updatePartialText(text: String) {
         _partialText.value = text
         Log.d(TAG, "updatePartialText: len=${text.length}")
     }
 
-    /**
-     * Clear any previously reported error.
-     */
     fun clearError() {
         _error.value = null
     }
 
-    /**
-     * Ensure Whisper model is initialized via [WhisperEngine] using assets.
-     *
-     * This function is safe to call repeatedly.
-     * It avoids repeated heavy initialization by:
-     * - Checking [WhisperEngine.isInitializedForAsset] first.
-     * - Using [modelInitMutex] to serialize init attempts.
-     */
+    // ---------------------------------------------------------------------
+    // Model init
+    // ---------------------------------------------------------------------
+
     private suspend fun ensureModelInitializedFromAssetsOnce() {
-        if (WhisperEngine.isInitializedForAsset(assetModelPath)) {
-            return
-        }
+        if (WhisperEngine.isInitializedForAsset(assetModelPath)) return
 
         modelInitMutex.withLock {
             if (WhisperEngine.isInitializedForAsset(assetModelPath)) {
@@ -521,9 +446,10 @@ class WhisperSpeechController(
         }
     }
 
-    /**
-     * Export the recorded WAV to persistent storage.
-     */
+    // ---------------------------------------------------------------------
+    // Export / checksum
+    // ---------------------------------------------------------------------
+
     private suspend fun exportRecordedVoiceSafely(wav: File): File? =
         withContext(Dispatchers.IO) {
             runCatching {
@@ -538,12 +464,6 @@ class WhisperSpeechController(
             }.getOrNull()
         }
 
-    /**
-     * Compute SHA-256 checksum for the given file.
-     *
-     * IMPORTANT:
-     * - Use `byte.toInt() and 0xff` to avoid sign-extension issues in hex formatting.
-     */
     private fun computeSha256(file: File): String {
         val digest = MessageDigest.getInstance("SHA-256")
         FileInputStream(file).use { fis ->
@@ -559,9 +479,6 @@ class WhisperSpeechController(
         }
     }
 
-    /**
-     * Best-effort temp file deletion with logging.
-     */
     private fun deleteTempFileQuietly(file: File?, reason: String) {
         if (file == null) return
         runCatching {
@@ -575,6 +492,300 @@ class WhisperSpeechController(
     }
 
     // ---------------------------------------------------------------------
+    // Recorder lifecycle / recovery
+    // ---------------------------------------------------------------------
+
+    /**
+     * Create a new Recorder instance with the standard error callback.
+     */
+    private fun newRecorder(): Recorder {
+        return Recorder(appContext) { e ->
+            Log.e(TAG, "Recorder error", e)
+
+            val tmp = outputFile
+            outputFile = null
+            cleanupScope.launch {
+                withContext(NonCancellable) {
+                    deleteTempFileQuietly(tmp, reason = "recorder_error")
+                }
+            }
+
+            _error.value = e.message ?: "Recording error"
+            _isRecording.value = false
+            _isTranscribing.value = false
+
+            cleanupScope.launch {
+                withContext(NonCancellable) {
+                    recoverRecorderAfterHang(reason = "recorder_error")
+                }
+            }
+        }
+    }
+
+    /**
+     * Best-effort recovery path when stopRecording times out or recorder errors out.
+     */
+    private fun recoverRecorderAfterHang(reason: String) {
+        Log.w(TAG, "Recovering Recorder (reason=$reason)")
+
+        val old = recorder
+        val closeRes = runBlockingWithThreadTimeout(
+            name = "WSC-recorderClose",
+            timeoutMs = RECORDER_CLOSE_TIMEOUT_MS
+        ) {
+            old.close()
+        }
+
+        when {
+            closeRes == null -> Log.e(TAG, "recorder.close TIMEOUT (reason=$reason)")
+            closeRes.isFailure -> Log.w(TAG, "recorder.close failed (reason=$reason)", closeRes.exceptionOrNull())
+            else -> Log.d(TAG, "recorder.close OK (reason=$reason)")
+        }
+
+        recorder = newRecorder()
+        Log.w(TAG, "Recorder recreated (reason=$reason)")
+    }
+
+    /**
+     * Run a potentially blocking operation on a dedicated Thread and wait up to timeoutMs.
+     *
+     * Returns:
+     * - null if timeout
+     * - Result.success(Unit) if completed without exception
+     * - Result.failure(e) if exception was thrown
+     */
+    private fun runBlockingWithThreadTimeout(
+        name: String,
+        timeoutMs: Long,
+        block: () -> Unit
+    ): Result<Unit>? {
+        val err = AtomicReference<Throwable?>(null)
+        val t = Thread(
+            {
+                try {
+                    block()
+                } catch (e: Throwable) {
+                    err.set(e)
+                }
+            },
+            name
+        )
+        t.start()
+        runCatching { t.join(timeoutMs) }
+        return if (t.isAlive) {
+            null
+        } else {
+            val e = err.get()
+            if (e != null) Result.failure(e) else Result.success(Unit)
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // WAV diagnostics
+    // ---------------------------------------------------------------------
+
+    private data class WavInfo(
+        val audioFormat: Int,
+        val channels: Int,
+        val sampleRate: Int,
+        val bitsPerSample: Int,
+        val dataOffset: Long,
+        val dataBytes: Long,
+        val headerBytes: Long
+    ) {
+        fun durationSec(): Double {
+            if (sampleRate <= 0 || channels <= 0 || bitsPerSample <= 0) return 0.0
+            val bytesPerSample = bitsPerSample / 8.0
+            if (bytesPerSample <= 0.0) return 0.0
+            val bytesPerFrame = channels * bytesPerSample
+            if (bytesPerFrame <= 0.0) return 0.0
+            return dataBytes / (sampleRate * bytesPerFrame)
+        }
+    }
+
+    private data class Pcm16Stats(
+        val rms: Double,
+        val peak: Double,
+        val nonSilentRatio: Double,
+        val samples: Long
+    )
+
+    private suspend fun awaitFileSizeStabilized(file: File): Long {
+        var last = file.length()
+        var waited = 0L
+        while (waited < WAV_STABILIZE_MAX_MS) {
+            delay(WAV_STABILIZE_STEP_MS)
+            val cur = file.length()
+            if (cur == last) return cur
+            last = cur
+            waited += WAV_STABILIZE_STEP_MS
+        }
+        return last
+    }
+
+    private fun readWavInfo(file: File): WavInfo? {
+        return runCatching {
+            RandomAccessFile(file, "r").use { raf ->
+                fun readU8(): Int = raf.readUnsignedByte()
+                fun readLE16(): Int {
+                    val lo = readU8()
+                    val hi = readU8()
+                    return (hi shl 8) or lo
+                }
+                fun readLE32(): Long {
+                    val b0 = readU8().toLong()
+                    val b1 = readU8().toLong()
+                    val b2 = readU8().toLong()
+                    val b3 = readU8().toLong()
+                    return (b3 shl 24) or (b2 shl 16) or (b1 shl 8) or b0
+                }
+                fun readFourCC(): String {
+                    val buf = ByteArray(4)
+                    raf.readFully(buf)
+                    return String(buf, Charsets.US_ASCII)
+                }
+
+                val riff = readFourCC()
+                if (riff != "RIFF") return@use null
+                readLE32()
+                val wave = readFourCC()
+                if (wave != "WAVE") return@use null
+
+                var audioFormat = -1
+                var channels = -1
+                var sampleRate = -1
+                var bitsPerSample = -1
+                var dataOffset = -1L
+                var dataBytes = -1L
+
+                while (raf.filePointer + 8 <= raf.length()) {
+                    val chunkId = readFourCC()
+                    val chunkSize = readLE32()
+                    val chunkDataStart = raf.filePointer
+
+                    when (chunkId) {
+                        "fmt " -> {
+                            if (chunkSize >= 16) {
+                                audioFormat = readLE16()
+                                channels = readLE16()
+                                sampleRate = readLE32().toInt()
+                                readLE32()
+                                readLE16()
+                                bitsPerSample = readLE16()
+                            }
+                        }
+                        "data" -> {
+                            dataOffset = raf.filePointer
+                            dataBytes = chunkSize
+                        }
+                    }
+
+                    raf.seek(chunkDataStart + chunkSize)
+                    if (chunkSize % 2L == 1L) {
+                        if (raf.filePointer < raf.length()) raf.seek(raf.filePointer + 1)
+                    }
+
+                    if (audioFormat != -1 && dataOffset >= 0 && dataBytes >= 0) break
+                }
+
+                if (audioFormat == -1 || dataOffset < 0 || dataBytes < 0) return@use null
+
+                val headerBytes = dataOffset.coerceAtLeast(0L)
+                WavInfo(
+                    audioFormat = audioFormat,
+                    channels = channels.coerceAtLeast(1),
+                    sampleRate = sampleRate.coerceAtLeast(1),
+                    bitsPerSample = bitsPerSample.coerceAtLeast(1),
+                    dataOffset = dataOffset,
+                    dataBytes = dataBytes,
+                    headerBytes = headerBytes
+                )
+            }
+        }.getOrNull()
+    }
+
+    private fun computePcm16Stats(
+        file: File,
+        info: WavInfo,
+        silenceAbsThreshold: Int
+    ): Pcm16Stats? {
+        if (info.audioFormat != 1) return null
+        if (info.bitsPerSample != 16) return null
+        if (info.dataOffset < 0 || info.dataBytes <= 0) return null
+
+        return runCatching {
+            FileInputStream(file).use { fis ->
+                val skipped = fis.skip(info.dataOffset)
+                if (skipped < info.dataOffset) return@use null
+
+                val buf = ByteArray(1024 * 16)
+                var remaining = info.dataBytes
+                var samples = 0L
+                var nonSilent = 0L
+                var peakAbs = 0
+                var sumSq = 0.0
+
+                while (remaining > 0) {
+                    val toRead = minOf(buf.size.toLong(), remaining).toInt()
+                    val read = fis.read(buf, 0, toRead)
+                    if (read <= 0) break
+                    remaining -= read.toLong()
+
+                    var i = 0
+                    while (i + 1 < read) {
+                        val lo = buf[i].toInt() and 0xff
+                        val hi = buf[i + 1].toInt()
+                        val s = (hi shl 8) or lo
+                        val v = s.toShort().toInt()
+                        val a = abs(v)
+
+                        if (a > peakAbs) peakAbs = a
+                        if (a >= silenceAbsThreshold) nonSilent++
+
+                        sumSq += (v.toLong() * v.toLong()).toDouble()
+                        samples++
+
+                        i += 2
+                    }
+                }
+
+                if (samples <= 0) return@use null
+                val rms = sqrt(sumSq / samples) / 32768.0
+                val peak = peakAbs / 32768.0
+                val nonSilentRatio = nonSilent.toDouble() / samples.toDouble()
+
+                Pcm16Stats(
+                    rms = rms,
+                    peak = peak,
+                    nonSilentRatio = nonSilentRatio,
+                    samples = samples
+                )
+            }
+        }.getOrNull()
+    }
+
+    private fun buildEmptyTranscriptionReason(wav: File): String {
+        val info = readWavInfo(wav)
+        val dur = info?.durationSec() ?: -1.0
+        val stats = if (info != null) {
+            computePcm16Stats(wav, info, silenceAbsThreshold = PCM16_SILENCE_ABS_THRESHOLD)
+        } else null
+
+        val silentHeuristic = stats?.let { it.nonSilentRatio < 0.005 && it.peak < 0.02 } ?: false
+
+        return when {
+            info == null ->
+                "Transcription empty (WAV header parse failed)"
+            dur in 0.0..MIN_DURATION_SEC_HEURISTIC ->
+                "Transcription empty (audio too short: ${"%.2f".format(dur)}s)"
+            silentHeuristic ->
+                "Transcription empty (audio seems silent/very low volume)"
+            else ->
+                "Transcription empty (check Recorder format/sample rate)"
+        }
+    }
+
+    // ---------------------------------------------------------------------
     // Lifecycle
     // ---------------------------------------------------------------------
 
@@ -584,19 +795,15 @@ class WhisperSpeechController(
 
         val job = cleanupScope.launch {
             withContext(NonCancellable) {
-                // Soft detach to keep the heavy model alive across navigation/restart flows.
                 runCatching { WhisperEngine.detach() }
                     .onFailure { e -> Log.w(TAG, "WhisperEngine.detach failed", e) }
 
-                // Recorder resources should be released with the ViewModel.
                 runCatching { recorder.close() }
                     .onFailure { e -> Log.w(TAG, "Recorder.close failed", e) }
             }
         }
 
-        // Ensure the cleanup scope does not leak.
         job.invokeOnCompletion { cleanupScope.cancel() }
-
         super.onCleared()
     }
 }

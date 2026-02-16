@@ -22,7 +22,16 @@ import android.media.MediaRecorder
 import android.util.Log
 import androidx.annotation.RequiresPermission
 import androidx.core.content.ContextCompat
+import java.io.BufferedOutputStream
+import java.io.Closeable
+import java.io.DataOutputStream
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExecutorCoroutineDispatcher
 import kotlinx.coroutines.Job
@@ -34,46 +43,14 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
-import java.io.BufferedOutputStream
-import java.io.Closeable
-import java.io.DataOutputStream
-import java.io.File
-import java.io.FileInputStream
-import java.io.FileOutputStream
-import java.util.concurrent.Executors
-import java.util.concurrent.atomic.AtomicReference
 
 /**
- * Recorder — High-reliability single-threaded WAV recorder.
+ * Recorder — High-reliability WAV recorder.
  *
- * ## Overview
- * Provides deterministic, coroutine-based control over the Android `AudioRecord`
- * pipeline. It records raw PCM into a temporary file and safely finalizes a
- * valid RIFF/WAV file upon stopping.
- *
- * ## State Machine
- * ```
- *   Idle → Starting → Recording → Stopping → Idle
- * ```
- *
- * ## Technical Highlights
- * - Dedicated single thread + coroutine scope ensures sequential audio operations.
- * - Writes temporary PCM and rewrites valid RIFF/WAVE header on stop().
- * - Handles rapid Record→Stop taps without race conditions.
- * - Uses atomic state and safe AudioRecord release.
- * - Fully deterministic even under cancellation or early stop.
- *
- * ## Typical Lifecycle
- * ```kotlin
- * val recorder = Recorder(context) { e -> Log.e("Recorder", "Error", e) }
- * recorder.startRecording(File(...))
- * recorder.stopRecording()
- * recorder.close()
- * ```
- *
- * @constructor
- * @param context Application context used for cache directory
- * @param onError Callback invoked on any recoverable or fatal exception
+ * Key rule:
+ * - Control operations (start/stop state machine) run on a dedicated single thread.
+ * - The blocking AudioRecord.read() loop MUST NOT run on the same single thread,
+ *   otherwise stopRecording() cannot execute and you will deadlock.
  */
 class Recorder(
     private val context: Context,
@@ -81,13 +58,13 @@ class Recorder(
 ) : Closeable {
 
     // -------------------------------------------------------------------------
-    // Dedicated single-thread execution context
+    // Control dispatcher (single thread)
     // -------------------------------------------------------------------------
-    private val executor = Executors.newSingleThreadExecutor { r ->
+    private val controlExecutor = Executors.newSingleThreadExecutor { r ->
         Thread(r, "RecorderThread").apply { priority = Thread.NORM_PRIORITY }
     }
-    private val dispatcher: ExecutorCoroutineDispatcher = executor.asCoroutineDispatcher()
-    private val scope = CoroutineScope(dispatcher + SupervisorJob())
+    private val controlDispatcher: ExecutorCoroutineDispatcher = controlExecutor.asCoroutineDispatcher()
+    private val scope = CoroutineScope(controlDispatcher + SupervisorJob())
 
     // -------------------------------------------------------------------------
     // Internal state
@@ -108,13 +85,12 @@ class Recorder(
     }
 
     // -------------------------------------------------------------------------
-    // Start Recording
+    // Start
     // -------------------------------------------------------------------------
     /**
-     * Starts recording in a deterministic, race-free manner.
-     * Idempotent — calling during active/starting state is ignored.
+     * Starts recording asynchronously.
      *
-     * @param output Target WAV file (will be overwritten)
+     * @param output Target WAV file (will be overwritten on stop)
      * @param rates Prioritized sample rate candidates
      */
     fun startRecording(
@@ -140,9 +116,9 @@ class Recorder(
                     error("AudioRecord init failed")
                 }
 
-                // Abort early if user stopped before init finished
+                // If stop was requested while initializing, abort safely.
                 if (state.get() != State.Starting) {
-                    Log.w(TAG, "startRecording aborted: premature stop, state=${state.get()}")
+                    Log.w(TAG, "startRecording aborted: state=${state.get()}")
                     runCatching { rec.release() }
                     cleanup()
                     state.set(State.Idle)
@@ -153,74 +129,93 @@ class Recorder(
                 tempPcm = File.createTempFile("rec_", ".pcm", context.cacheDir)
                 val tmp = tempPcm ?: error("Temp PCM file creation failed")
 
-                state.set(State.Recording)
-
-                // Writer coroutine: blocking read() loop → PCM write → stop/release in finally
-                writerJob = scope.launch {
+                // Create writer job first (LAZY) to avoid race where stop happens before writerJob is visible.
+                val job = scope.launch(Dispatchers.IO, start = CoroutineStart.LAZY) {
                     FileOutputStream(tmp).use { fos ->
-                        val bos = BufferedOutputStream(fos, conf.bufferSize)
-                        val shortBuf = ShortArray(conf.bufferSize / 2)
-                        val byteBuf = ByteArray(shortBuf.size * 2)
+                        BufferedOutputStream(fos, conf.bufferSize).use { bos ->
+                            val shortBuf = ShortArray(conf.bufferSize / 2)
+                            val byteBuf = ByteArray(shortBuf.size * 2)
+                            var started = false
 
-                        try {
-                            rec.startRecording()
-                            Log.i(TAG, "🎙 start ${conf.sampleRate}Hz buf=${conf.bufferSize}")
-
-                            while (isActive) {
-                                val n = rec.read(shortBuf, 0, shortBuf.size)
-                                if (n <= 0) {
-                                    if (n < 0) Log.w(TAG, "read() error=$n → break")
-                                    break
+                            try {
+                                // If we are no longer in Recording, do not start AudioRecord.
+                                if (this@Recorder.state.get() != State.Recording) {
+                                    Log.w(TAG, "writer: not in Recording state, skipping start (state=${this@Recorder.state.get()})")
+                                    return@use
                                 }
 
-                                var j = 0
-                                for (i in 0 until n) {
-                                    val v = shortBuf[i].toInt()
-                                    byteBuf[j++] = (v and 0xFF).toByte()
-                                    byteBuf[j++] = ((v ushr 8) and 0xFF).toByte()
+                                rec.startRecording()
+                                started = true
+                                Log.i(TAG, "🎙 start ${conf.sampleRate}Hz buf=${conf.bufferSize}")
+
+                                // Use both state AND coroutine cancellation to control the loop.
+                                while (isActive && this@Recorder.state.get() == State.Recording) {
+                                    val n = rec.read(shortBuf, 0, shortBuf.size)
+                                    if (n <= 0) {
+                                        if (n < 0) Log.w(TAG, "read() error=$n → break")
+                                        break
+                                    }
+
+                                    var j = 0
+                                    for (i in 0 until n) {
+                                        val v = shortBuf[i].toInt()
+                                        byteBuf[j++] = (v and 0xFF).toByte()
+                                        byteBuf[j++] = ((v ushr 8) and 0xFF).toByte()
+                                    }
+                                    bos.write(byteBuf, 0, n * 2)
                                 }
-                                bos.write(byteBuf, 0, n * 2)
+
+                                bos.flush()
+                            } finally {
+                                // Best-effort stop/release (may already be stopped by stopRecording()).
+                                if (started) runCatching { rec.stop() }
+                                runCatching { rec.release() }
+                                activeRecorder.compareAndSet(rec, null)
+                                Log.i(TAG, "🎙 stopped & released (writer exit)")
                             }
-
-                            bos.flush()
-                        } finally {
-                            runCatching { rec.stop() }
-                            runCatching { rec.release() }
-                            activeRecorder.compareAndSet(rec, null)
-                            Log.i(TAG, "🎙 stopped & released (writer exit)")
                         }
                     }
                 }
+
+                writerJob = job
+
+                // Commit Starting -> Recording atomically. If it fails, stop was requested.
+                if (!state.compareAndSet(State.Starting, State.Recording)) {
+                    Log.w(TAG, "startRecording: state changed before Recording (state=${state.get()}), aborting")
+                    runCatching { job.cancel() }
+                    runCatching { rec.release() }
+                    activeRecorder.compareAndSet(rec, null)
+                    cleanup()
+                    state.set(State.Idle)
+                    return@launch
+                }
+
+                job.start()
             } catch (e: Exception) {
                 Log.e(TAG, "startRecording failed", e)
                 onError(e)
                 state.set(State.Idle)
 
-                // Best-effort release if any recorder exists
                 activeRecorder.getAndSet(null)?.let {
                     runCatching { it.stop() }
                     runCatching { it.release() }
                 }
 
+                runCatching { writerJob?.cancel() }
                 cleanup()
             }
         }
     }
 
     // -------------------------------------------------------------------------
-    // Stop Recording
+    // Stop
     // -------------------------------------------------------------------------
     /**
      * Stops recording and finalizes the WAV file.
      *
-     * ### Steps
-     * 1. Transition state → Stopping
-     * 2. Unblock `AudioRecord.read()` via `stop()` (release is done by writer finally)
-     * 3. Cancel & join writer coroutine (with timeout)
-     * 4. Write valid RIFF/WAVE header to target file (IO)
-     * 5. Cleanup temp PCM and reset state
+     * Runs on RecorderThread (control dispatcher) so state transitions are serialized.
      */
-    suspend fun stopRecording() = withContext(scope.coroutineContext) {
+    suspend fun stopRecording(): Unit = withContext(controlDispatcher) {
         Log.d(TAG, "stopRecording() invoked (state=${state.get()})")
 
         val s = state.get()
@@ -231,14 +226,13 @@ class Recorder(
 
         state.set(State.Stopping)
 
-        // 1) Unblock AudioRecord.read() by stopping the active recorder (do NOT release here)
-        val rec = activeRecorder.get()
-        if (rec != null) {
+        // 1) Unblock AudioRecord.read() by stopping the active recorder (do NOT release here).
+        activeRecorder.get()?.let { rec ->
             Log.d(TAG, "Calling AudioRecord.stop() to unblock read() ...")
             runCatching { rec.stop() }.onFailure { Log.w(TAG, "stop() failed: $it") }
         }
 
-        // 2) Cancel + join writer job (bounded)
+        // 2) Cancel + join writer job (bounded).
         val job = writerJob
         runCatching { job?.cancel() }
 
@@ -250,14 +244,14 @@ class Recorder(
 
         if (!joined) {
             Log.w(TAG, "Writer job join timed out (${STOP_JOIN_TIMEOUT_MS}ms). Forcing release.")
-            activeRecorder.getAndSet(null)?.let {
-                runCatching { it.release() }
+            activeRecorder.getAndSet(null)?.let { rec ->
+                runCatching { rec.release() }
             }
         } else {
             Log.d(TAG, "Writer job joined successfully")
         }
 
-        // 3) Snapshot pieces before cleanup
+        // 3) Snapshot pieces before cleanup.
         val pcm = tempPcm
         val wav = targetWav
         val c = cfg
@@ -271,10 +265,9 @@ class Recorder(
         }
 
         try {
-            // 4) Merge PCM payload with valid WAV header (IO)
-            withContext(Dispatchers.IO) {
-                writeWavFromPcm(pcm, wav, c.sampleRate, 1, 16)
-            }
+            // 4) Merge PCM payload with valid WAV header.
+            // Small files are OK here; if you ever record long audio, move this to Dispatchers.IO.
+            writeWavFromPcm(pcm, wav, c.sampleRate, 1, 16)
             Log.d(TAG, "WAV header written")
 
             if (wav.length() <= 44L) {
@@ -294,7 +287,7 @@ class Recorder(
     }
 
     // -------------------------------------------------------------------------
-    // Internal Helpers
+    // Internal helpers
     // -------------------------------------------------------------------------
     /** Writes RIFF/WAVE header + PCM data → valid WAV file. */
     private fun writeWavFromPcm(pcm: File, wav: File, rate: Int, ch: Int, bits: Int) {
@@ -356,7 +349,6 @@ class Recorder(
 
     /**
      * Iterates candidate sample rates, returns first working AudioRecord config.
-     * Uses minimal buffer to reduce latency for short clips.
      */
     @RequiresPermission(Manifest.permission.RECORD_AUDIO)
     private fun findConfig(rates: IntArray): Config? {
@@ -367,7 +359,6 @@ class Recorder(
             val minBuf = AudioRecord.getMinBufferSize(r, ch, fmt)
             if (minBuf <= 0) continue
 
-            // Ensure bufferSize is even and >= 2 bytes to avoid edge cases in shortBuf sizing.
             val buf = (minBuf.coerceAtLeast(2048) / 2) * 2
 
             val test = AudioRecord(MediaRecorder.AudioSource.MIC, r, ch, fmt, buf)
@@ -388,21 +379,20 @@ class Recorder(
     // -------------------------------------------------------------------------
     // Lifecycle
     // -------------------------------------------------------------------------
-    /**
-     * Safely stops recording and releases resources.
-     * Blocks until cleanup is complete.
-     */
     override fun close() {
         runBlocking {
-            if (isActive()) stopRecording()
+            withTimeoutOrNull(CLOSE_TIMEOUT_MS) {
+                if (isActive()) stopRecording()
+            }
         }
         runCatching { scope.cancel() }
-        runCatching { dispatcher.close() }
-        runCatching { executor.shutdownNow() }
+        runCatching { controlDispatcher.close() }
+        runCatching { controlExecutor.shutdownNow() }
     }
 
     companion object {
         private const val TAG = "Recorder"
         private const val STOP_JOIN_TIMEOUT_MS = 3_000L
+        private const val CLOSE_TIMEOUT_MS = 4_500L
     }
 }

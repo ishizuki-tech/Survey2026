@@ -17,6 +17,7 @@ import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.negi.survey.slm.FollowupExtractor
+import com.negi.survey.slm.PromptPhase
 import com.negi.survey.slm.Repository
 import java.security.MessageDigest
 import java.util.concurrent.atomic.AtomicBoolean
@@ -38,8 +39,6 @@ import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeout
-import org.json.JSONArray
-import org.json.JSONObject
 
 /**
  * ViewModel dedicated to AI-related operations and chat persistence.
@@ -78,11 +77,6 @@ class AiViewModel(
          * Stream is emitted in chunks of at least this many newly appended chars.
          */
         private const val STREAM_EMIT_MIN_DELTA_CHARS = 96
-
-        /**
-         * Boxed Int class name (avoid referencing java.lang.Integer directly to prevent Kotlin warning).
-         */
-        private const val JAVA_LANG_INTEGER = "java.lang.Integer"
     }
 
     // ───────────────────────── UI state ─────────────────────────
@@ -132,7 +126,7 @@ class AiViewModel(
     /**
      * Evaluation output mode.
      *
-     * - EVAL_JSON: expects JSON with score + follow-up candidates.
+     * - EVAL_JSON: expects JSON-like output with score + follow-up candidates.
      * - FOLLOWUP_JSON_OR_TEXT: expects either JSON (preferred) OR raw text as follow-up question.
      */
     enum class EvalMode {
@@ -141,39 +135,10 @@ class AiViewModel(
     }
 
     /**
-     * Prompt building phase.
-     *
-     * ONE_STEP: single-call evaluation prompt.
-     * EVAL: two-step phase 1 (returns EVAL JSON).
-     * FOLLOWUP: two-step phase 2 (returns follow-up question; may be text-only).
-     */
-    enum class PromptPhase {
-        ONE_STEP,
-        EVAL,
-        FOLLOWUP
-    }
-
-    /**
-     * Optional capability interface: repositories can implement this to avoid reflection.
-     */
-    interface PhasePromptRepository {
-        /** Build a full prompt string from input + prompt phase. */
-        fun buildPrompt(input: String, phase: PromptPhase): String
-    }
-
-    /**
-     * Optional capability interface: repositories can implement this to avoid reflection.
-     */
-    interface OneArgPromptRepository {
-        /** Build a full prompt string from input only. */
-        fun buildPrompt(input: String): String
-    }
-
-    /**
      * Immutable record for a completed step to render both Step1 and Step2 in UI.
      *
      * @param runId Internal run id.
-     * @param phase Phase of this step.
+     * @param phase Prompt phase for this step (Repo-level PromptPhase).
      * @param mode Parse mode used.
      * @param raw Final raw output for this step (may be partial on timeout).
      * @param score Parsed score (only meaningful for EVAL_JSON).
@@ -328,8 +293,8 @@ class AiViewModel(
 
     /**
      * Two-step chaining:
-     * 1) Evaluate [firstPrompt].
-     * 2) Build prompt2 from step1 result via [buildSecondPrompt], then evaluate it.
+     * 1) Evaluate [firstPrompt] using phase=EVAL.
+     * 2) Build prompt2 from step1 result via [buildSecondPrompt], then evaluate it using phase=FOLLOWUP.
      *
      * This keeps both steps in [stepHistory].
      */
@@ -410,8 +375,8 @@ class AiViewModel(
 
     /**
      * Conditional two-step:
-     * 1) Run a short EVAL prompt (step1).
-     * 2) Only if [shouldRunSecond] returns true, build prompt2 from step1 result and run step2.
+     * 1) Run step1 with phase=EVAL.
+     * 2) Only if [shouldRunSecond] returns true, build prompt2 from step1 result and run step2 with phase=FOLLOWUP.
      *
      * UI goal:
      * - Keep Step1 pinned in primary UI state (score/raw/followups).
@@ -648,199 +613,20 @@ class AiViewModel(
 
             val unquoted = t.removePrefix("\"").removeSuffix("\"").trim()
             val lines = unquoted.lineSequence().map { it.trim() }.filter { it.isNotBlank() }.toList()
-            val qLine = lines.firstOrNull { it.contains("?") }
+
+            val qLine = lines.firstOrNull { it.contains("?") || it.contains("？") }
             return qLine ?: lines.firstOrNull()
-        }
-
-        /**
-         * Best-effort JSON object slicing from possibly noisy text.
-         *
-         * Strategy:
-         * - Slice from first '{' to last '}'.
-         * - Reject trivial "{}".
-         */
-        fun sliceLikelyJsonObject(text: String): String? {
-            val a = text.indexOf('{')
-            val b = text.lastIndexOf('}')
-            if (a < 0 || b <= a) return null
-            val s = text.substring(a, b + 1)
-            if (isEmptyJsonObject(s)) return null
-            return s
-        }
-
-        /**
-         * Extract score from JSON with common key spellings.
-         *
-         * Accepts:
-         * - int, float, stringified int/float
-         */
-        fun extractScoreFromJsonObject(jsonText: String): Int? {
-            return runCatching {
-                val obj = JSONObject(jsonText)
-
-                fun readNumber(key: String): Double? {
-                    if (!obj.has(key)) return null
-                    val v = obj.opt(key)
-                    return when (v) {
-                        is Number -> v.toDouble()
-                        is String -> v.trim().toDoubleOrNull()
-                        else -> null
-                    }
-                }
-
-                val d = readNumber("score")
-                    ?: readNumber("evaluation_score")
-                    ?: readNumber("eval_score")
-                    ?: readNumber("rating")
-                    ?: readNumber("confidence")
-
-                d?.toInt()?.coerceIn(0, 100)
-            }.getOrNull()
-        }
-
-        /**
-         * Extract follow-up candidates from JSON with common key spellings.
-         */
-        fun extractFollowupsFromJsonObject(jsonText: String, max: Int = 3): List<String> {
-            return runCatching {
-                val obj = JSONObject(jsonText)
-
-                fun asStringList(arr: JSONArray?): List<String> {
-                    if (arr == null) return emptyList()
-                    val out = ArrayList<String>(arr.length())
-                    for (i in 0 until arr.length()) {
-                        val s = arr.optString(i, "").trim()
-                        if (s.isNotBlank()) out.add(s)
-                    }
-                    return out
-                }
-
-                fun pickArray(vararg keys: String): JSONArray? {
-                    for (k in keys) {
-                        if (!obj.has(k)) continue
-                        val v = obj.opt(k)
-                        if (v is JSONArray) return v
-                    }
-                    return null
-                }
-
-                val arr = pickArray(
-                    "followups",
-                    "follow_ups",
-                    "follow_up_questions",
-                    "followup_questions",
-                    "follow_up_candidates",
-                    "followup_candidates",
-                    "questions"
-                )
-
-                val list = asStringList(arr)
-
-                // Single-field fallback (some models output only one question).
-                val single = obj.optString("follow_up_question", "").trim()
-                    .ifBlank { obj.optString("followup_question", "").trim() }
-                    .ifBlank { obj.optString("question", "").trim() }
-
-                val combined = buildList {
-                    addAll(list)
-                    if (single.isNotBlank()) add(single)
-                }
-
-                sanitizeFollowups(combined).take(max)
-            }.getOrElse { emptyList() }
-        }
-
-        /**
-         * Extract follow-up question from JSON using multiple key spellings.
-         */
-        fun extractFollowupFromJsonObject(jsonText: String): String? {
-            return runCatching {
-                val obj = JSONObject(jsonText)
-
-                fun pick(vararg keys: String): String? {
-                    for (k in keys) {
-                        if (!obj.has(k)) continue
-                        val v = obj.optString(k, "").trim()
-                        if (v.isNotBlank()) return v
-                    }
-                    return null
-                }
-
-                pick(
-                    "follow_up_question",
-                    "followup_question",
-                    "follow-up question",
-                    "follow-up_question",
-                    "followUpQuestion",
-                    "question",
-                    "followup",
-                    "follow_up",
-                )
-            }.getOrNull()
-        }
-
-        /**
-         * Build prompt using best-effort compatibility.
-         *
-         * Priority:
-         * 1) Capability interfaces (no reflection).
-         * 2) Public reflection (methods only).
-         * 3) Fallback to raw input.
-         */
-        fun buildPromptCompat(input: String, p: PromptPhase): String {
-            // 1) Non-reflection fast path
-            (repo as? PhasePromptRepository)?.let { return it.buildPrompt(input, p) }
-            (repo as? OneArgPromptRepository)?.let { return it.buildPrompt(input) }
-
-            // 2) Public reflection only (avoid isAccessible / declaredMethods pitfalls)
-            return runCatching {
-                val cls = repo.javaClass
-                val methods = cls.methods
-                    .filter { it.name == "buildPrompt" }
-                    .distinctBy { m -> "${m.name}/${m.parameterTypes.joinToString(",") { it.name }}" }
-
-                // Prefer 2-arg overload first.
-                val twoArg = methods.filter {
-                    it.parameterTypes.size == 2 && it.parameterTypes[0] == String::class.java
-                }
-                for (m in twoArg) {
-                    runCatching {
-                        val p1 = m.parameterTypes[1]
-
-                        val out: String? = when {
-                            p1 == PromptPhase::class.java -> m.invoke(repo, input, p) as? String
-                            p1 == String::class.java -> m.invoke(repo, input, p.name) as? String
-
-                            // Avoid referencing java.lang.Integer directly (Kotlin warns).
-                            p1 == Int::class.javaPrimitiveType || p1.name == JAVA_LANG_INTEGER ->
-                                m.invoke(repo, input, p.ordinal) as? String
-
-                            else -> null
-                        }
-
-                        if (!out.isNullOrBlank()) return out
-                    }
-                }
-
-                // Fallback to 1-arg overload.
-                val oneArg = methods.firstOrNull {
-                    it.parameterTypes.size == 1 && it.parameterTypes[0] == String::class.java
-                }
-                if (oneArg != null) {
-                    val out = oneArg.invoke(repo, input) as? String
-                    if (!out.isNullOrBlank()) return out
-                }
-
-                input
-            }.getOrElse { input }
         }
 
         var stepError: String? = null
 
         try {
-            val fullPrompt = runCatching { buildPromptCompat(userPrompt, phase) }
+            // IMPORTANT: Use repo's PromptPhase directly (no ViewModel-local enum).
+            // Repository has a default buildPrompt(userPrompt, phase) that falls back to buildPrompt(userPrompt),
+            // so single-step remains compatible even if a repo does not override phase-specific behavior.
+            val fullPrompt = runCatching { repo.buildPrompt(userPrompt, phase) }
                 .onFailure { t ->
-                    Log.e(TAG, "run[$runId]: buildPromptCompat failed; falling back to userPrompt", t)
+                    Log.e(TAG, "run[$runId]: repo.buildPrompt failed; falling back to userPrompt", t)
                 }
                 .getOrElse { userPrompt }
 
@@ -853,7 +639,8 @@ class AiViewModel(
                 Log.d(TAG, "run[$runId]: sha(prompt)=${sha256Hex(userPrompt)} sha(full)=${sha256Hex(fullPrompt)}")
             }
 
-            Log.i(FULL_PROMPT_TAG, "run[$runId]: FullPrompt=\n$fullPrompt")
+            // Make phase visible in a dedicated log tag for quick grep.
+            Log.i(FULL_PROMPT_TAG, "run[$runId]: phase=$phase FullPrompt=\n$fullPrompt")
 
             try {
                 withTimeout(timeoutMs) {
@@ -929,45 +716,27 @@ class AiViewModel(
                             )
                         }
                     } else {
-                        val jsonSlice = sliceLikelyJsonObject(rawText)
+                        val s1 = clampScore(FollowupExtractor.extractScore(rawText))
+                        val f1 = sanitizeFollowups(FollowupExtractor.fromRaw(rawText, max = 6))
 
-                        // Try extractor first (existing behavior), then fallback to JSON parsing.
-                        val extracted = runCatching {
-                            val s1 = clampScore(FollowupExtractor.extractScore(rawText))
-                            val f1 = sanitizeFollowups(FollowupExtractor.fromRaw(rawText, max = 3))
-                            Pair(s1, f1)
-                        }.onFailure { t ->
-                            Log.e(TAG, "run[$runId]: parsing failed (FollowupExtractor)", t)
-                        }.getOrNull()
-
-                        val sFromExtractor = extracted?.first
-                        val fFromExtractor = extracted?.second ?: emptyList()
-
-                        val sFromJson = jsonSlice?.let { extractScoreFromJsonObject(it) }
-                        val fFromJson = jsonSlice?.let { extractFollowupsFromJsonObject(it, max = 3) } ?: emptyList()
-
-                        val sFinal = sFromExtractor ?: sFromJson
-                        val fFinal = if (fFromExtractor.isNotEmpty()) fFromExtractor else fFromJson
-
-                        parsedScore = sFinal
-                        top3 = fFinal.take(3)
+                        parsedScore = s1
+                        top3 = f1.take(3)
                         q0 = top3.firstOrNull()
 
                         if (DEBUG_LOGS) {
                             Log.d(
                                 TAG,
-                                "run[$runId]: EVAL_JSON parsed score=$parsedScore followups=${top3.size} fu0='${debugVisible(preview(q0.orEmpty()))}' jsonSlice=${jsonSlice != null}"
+                                "run[$runId]: EVAL_JSON parsed score=$parsedScore followups=${top3.size} fu0='${debugVisible(preview(q0.orEmpty()))}'"
                             )
                         }
                     }
                 }
 
                 EvalMode.FOLLOWUP_JSON_OR_TEXT -> {
-                    val jsonSlice = sliceLikelyJsonObject(rawText)
-                    val jsonQ = jsonSlice?.let { extractFollowupFromJsonObject(it) }
-                    val textQ = extractFollowupFromPlainText(rawText)
+                    val fromExtractor = FollowupExtractor.extractFollowupQuestion(rawText)
+                    val fromText = extractFollowupFromPlainText(rawText)
 
-                    val best = (jsonQ ?: textQ)
+                    val best = (fromExtractor ?: fromText)
                         ?.trim()
                         ?.takeIf { it.isNotBlank() }
                         ?.takeIf { !isEmptyJsonObject(it) }
@@ -980,9 +749,9 @@ class AiViewModel(
                     if (DEBUG_LOGS) {
                         Log.d(
                             TAG,
-                            "run[$runId]: FOLLOWUP parse jsonSlice=${jsonSlice != null} " +
-                                    "jsonQ='${debugVisible(preview(jsonQ.orEmpty()))}' " +
-                                    "textQ='${debugVisible(preview(textQ.orEmpty()))}' " +
+                            "run[$runId]: FOLLOWUP parse " +
+                                    "extractorQ='${debugVisible(preview(fromExtractor.orEmpty()))}' " +
+                                    "textQ='${debugVisible(preview(fromText.orEmpty()))}' " +
                                     "best='${debugVisible(preview(best.orEmpty()))}'"
                         )
                     }
