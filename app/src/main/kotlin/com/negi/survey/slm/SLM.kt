@@ -29,6 +29,11 @@
  *   • Supports signature drift by trying trimmed argument tails.
  *   • Caches method candidates to reduce reflection overhead.
  *   • Adds a suspend fallback for generateText via streaming when reflection suspend path fails.
+ *
+ *  Fix (2026-02):
+ *   • StreamDeltaNormalizer: reduce false ACCUMULATED decisions on very short prefixes.
+ *   • DEBUG_SLM follows BuildConfig.DEBUG (avoid noisy release logs).
+ *   • Add isBusy(model) overload for compatibility with older call sites.
  * =====================================================================
  */
 
@@ -40,6 +45,7 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.util.Log
 import com.google.ai.edge.litertlm.Message
+import com.negi.survey.BuildConfig
 import com.negi.survey.config.SurveyConfig
 import java.lang.reflect.InvocationTargetException
 import java.lang.reflect.Method
@@ -57,7 +63,7 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 private const val TAG = "SLM"
 
 /** Toggle facade logs (safe to keep enabled in dev builds). */
-private const val DEBUG_SLM = true
+private const val DEBUG_SLM: Boolean = BuildConfig.DEBUG
 
 /**
  * Hardware accelerator options for inference (CPU or GPU).
@@ -252,15 +258,46 @@ internal class StreamDeltaNormalizer(
 ) {
     enum class PartialMode { AUTO, DELTA, ACCUMULATED }
 
+    companion object {
+        /**
+         * Minimum prefix/tail sample size to be considered "strong evidence".
+         * Short samples (e.g., "I", " ") are highly collision-prone.
+         */
+        private const val MIN_STRONG_SAMPLE_CHARS = 16
+
+        /**
+         * When the previous length is tiny, require a larger growth to reduce false positives.
+         */
+        private const val SMALL_PREV_FORCE_GROWTH_CHARS = 8
+
+        /**
+         * General minimum growth required to consider ACCUMULATED.
+         */
+        private const val MIN_GROWTH_CHARS = 1
+
+        /**
+         * If ACCUMULATED mode repeatedly mismatches, downgrade to DELTA mode.
+         */
+        private const val ACCUM_MISMATCH_TO_DELTA_THRESHOLD = 2
+    }
+
     private var decided: PartialMode = modeHint
 
+    /** Last observed length of the incoming string (when treating as accumulated). */
     private var lastLen: Int = 0
+
+    /** Prefix sample of last observed text. */
     private var prefixSample: String = ""
+
+    /** Tail/boundary sample of last observed text. */
     private var boundarySample: String = ""
 
     /** Used only during AUTO decision; avoid keeping huge strings. */
     private var firstChunk: String? = null
     private var firstChunkLen: Int = 0
+
+    /** Consecutive mismatch counter when in ACCUMULATED mode. */
+    private var accumMismatchCount: Int = 0
 
     fun toDelta(incoming: String): String {
         if (incoming.isEmpty()) return ""
@@ -295,14 +332,25 @@ internal class StreamDeltaNormalizer(
     private fun accumulatedDelta(incoming: String): String {
         if (lastLen == 0) {
             seed(incoming, allowFirstChunk = false)
+            accumMismatchCount = 0
             return incoming
         }
 
         if (!looksLikeAccumulated(incoming)) {
+            accumMismatchCount++
+            if (accumMismatchCount >= ACCUM_MISMATCH_TO_DELTA_THRESHOLD) {
+                /**
+                 * If the backend behavior changed (or our decision was wrong),
+                 * downgrade to DELTA mode to avoid persistent substring damage.
+                 */
+                decided = PartialMode.DELTA
+                d { "StreamDeltaNormalizer: downgrade to DELTA after $accumMismatchCount mismatches" }
+            }
             seed(incoming, allowFirstChunk = false)
             return incoming
         }
 
+        accumMismatchCount = 0
         val delta = if (incoming.length >= lastLen) incoming.substring(lastLen) else incoming
         seed(incoming, allowFirstChunk = false)
         return delta
@@ -315,21 +363,52 @@ internal class StreamDeltaNormalizer(
 
         if (allowFirstChunk) {
             val cap = 4_096
-            firstChunk = if (text.length <= cap) text else null
+            val canKeep = text.length in MIN_STRONG_SAMPLE_CHARS..cap
+            firstChunk = if (canKeep) text else null
             firstChunkLen = text.length
         }
     }
 
     private fun looksLikeAccumulated(incoming: String): Boolean {
-        val fc = firstChunk
-        if (fc != null && incoming.length >= firstChunkLen && incoming.startsWith(fc)) {
-            return true
-        }
-
+        /**
+         * ACCUMULATED must grow (or at least not shrink). If no growth, treat as not-accumulated
+         * to avoid deleting text on ambiguous repeats.
+         */
         if (incoming.length < lastLen) return false
+        val growth = incoming.length - lastLen
+        if (growth < MIN_GROWTH_CHARS) return false
+
+        /**
+         * Fast reject: accumulated output must start with previous prefix (even if short).
+         */
         if (prefixSample.isNotEmpty() && !incoming.startsWith(prefixSample)) return false
 
-        if (boundarySample.isNotEmpty()) {
+        /**
+         * Strong evidence using first-chunk full prefix (only when long enough).
+         */
+        val fc = firstChunk
+        if (fc != null && firstChunkLen >= MIN_STRONG_SAMPLE_CHARS) {
+            if (incoming.length >= firstChunkLen && incoming.startsWith(fc)) return true
+        }
+
+        /**
+         * When previous length is tiny, require a larger growth to reduce collisions on short prefixes.
+         */
+        if (lastLen < MIN_STRONG_SAMPLE_CHARS && growth < SMALL_PREV_FORCE_GROWTH_CHARS) {
+            return false
+        }
+
+        /**
+         * Strong prefix sample check (only when sample is long enough).
+         */
+        if (prefixSample.length >= MIN_STRONG_SAMPLE_CHARS && !incoming.startsWith(prefixSample)) {
+            return false
+        }
+
+        /**
+         * Strong boundary sample alignment check (only when sample is long enough).
+         */
+        if (boundarySample.length >= MIN_STRONG_SAMPLE_CHARS) {
             val start = (lastLen - boundarySample.length).coerceAtLeast(0)
             val ok = incoming.regionMatches(
                 thisOffset = start,
@@ -386,9 +465,6 @@ private fun getMethodBucket(cls: Class<*>, methodName: String, argc: Int): List<
 
 /**
  * Convert primitive parameter class to its boxed counterpart.
- *
- * NOTE:
- * Avoid java.lang.* wrapper classes in Kotlin source to suppress warnings.
  */
 private fun boxedOfPrimitive(p: Class<*>): Class<*>? {
     if (!p.isPrimitive) return null
@@ -581,6 +657,20 @@ private fun buildArgCandidates(args: Array<Any?>): List<Array<Any?>> {
 }
 
 /**
+ * Format method signature for debugging.
+ */
+private fun Method.signatureString(): String {
+    return buildString {
+        append(name).append("(")
+        parameterTypes.forEachIndexed { i, p ->
+            if (i > 0) append(", ")
+            append(p.simpleName)
+        }
+        append(")")
+    }
+}
+
+/**
  * Call a LiteRtLM method by name using reflection (non-suspend), returning Any?.
  *
  * Returns null if no compatible method was found or invocation failed.
@@ -609,6 +699,7 @@ private fun invokeLiteRtLmBestEffortReturn(
                 coerceArgForParam(m.parameterTypes[i], cand[i])
             }
 
+            d { "invokeReturn: picked ${m.signatureString()} (argc=${cand.size})" }
             return m.invoke(receiver, *coercedArgs)
         } catch (ite: InvocationTargetException) {
             val root = ite.targetException ?: ite
@@ -652,6 +743,7 @@ private fun invokeLiteRtLmBestEffortUnit(
                 coerceArgForParam(m.parameterTypes[i], cand[i])
             }
 
+            d { "invokeUnit: picked ${m.signatureString()} (argc=${cand.size})" }
             m.invoke(receiver, *coercedArgs)
             return true
         } catch (ite: InvocationTargetException) {
@@ -722,6 +814,7 @@ private suspend fun invokeLiteRtLmBestEffortSuspend(
                     coerceArgForParam(m.parameterTypes[i], args[i])
                 }
 
+                d { "invokeSuspend: picked ${m.signatureString()} (argc=${args.size})" }
                 val ret = m.invoke(receiver, *coercedArgs)
 
                 invoked = true
@@ -745,7 +838,12 @@ private suspend fun invokeLiteRtLmBestEffortSuspend(
 
 object SLM {
 
-    /** True when a suspend generateText call is currently in progress. */
+    /**
+     * True when a suspend generateText call is currently in progress.
+     *
+     * NOTE:
+     * - Some older call sites may use isBusy(model). Keep both.
+     */
     fun isBusy(): Boolean {
         return runCatching {
             val ret = invokeLiteRtLmBestEffortReturn(
@@ -754,6 +852,24 @@ object SLM {
                 onFailLog = "LiteRtLM.isBusy unavailable",
             )
             (ret as? Boolean) ?: false
+        }.getOrDefault(false)
+    }
+
+    /**
+     * Compatibility overload: isBusy(model).
+     *
+     * Strategy:
+     * 1) Try isBusy(model) if present.
+     * 2) Fallback to isBusy() if not present.
+     */
+    fun isBusy(model: Model): Boolean {
+        return runCatching {
+            val ret = invokeLiteRtLmBestEffortReturn(
+                methodName = "isBusy",
+                args = arrayOf(model),
+                onFailLog = "LiteRtLM.isBusy(model) unavailable",
+            )
+            (ret as? Boolean) ?: isBusy()
         }.getOrDefault(false)
     }
 

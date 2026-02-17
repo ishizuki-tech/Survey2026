@@ -281,6 +281,22 @@ object LiteRtLM {
         if (!signal.isCompleted) signal.complete(error)
     }
 
+    /**
+     * Await completion of an in-flight initialization for the same key.
+     *
+     * Why:
+     * - Without this, runInference() could start on a soon-to-be-retired instance while initialize() is running.
+     * - That can lead to close() being called on an engine/conversation that is still streaming.
+     */
+    private suspend fun awaitInitIfInFlight(key: String, reason: String) {
+        if (!initInFlight.contains(key)) return
+        val signal = getOrCreateInitSignal(key)
+        Log.d(TAG, "Awaiting init in flight: key='$key' reason='$reason'")
+        val err = withTimeoutOrNull(INIT_AWAIT_TIMEOUT_MS) { signal.await() }
+            ?: "Initialization timed out after ${INIT_AWAIT_TIMEOUT_MS}ms."
+        if (err.isNotEmpty()) throw IllegalStateException("LiteRT-LM init-in-flight failed: $err")
+    }
+
     /** Normalize accelerator string for stable backend selection. */
     private fun normalizedAccelerator(model: Model): String {
         return model.getStringConfigValue(ConfigKey.ACCELERATOR, Accelerator.GPU.label)
@@ -718,7 +734,7 @@ object LiteRtLM {
     /**
      * Delay when a post-terminate cooldown is active for this key.
      *
-     * English comment:
+     * Rationale:
      * - Hard-close and native teardown can overlap with re-init on some devices.
      * - This delay reduces the chance of "close vs init" races.
      */
@@ -736,7 +752,7 @@ object LiteRtLM {
     /**
      * Upgrade (reinitialize) runtime capabilities if needed.
      *
-     * English comment:
+     * Behavior:
      * - If an instance was initialized with supportImage=false and a later request includes images,
      *   we re-init with supportImage=true (same for audio).
      * - This avoids "capability fixed at first call" failures in production flows.
@@ -759,7 +775,7 @@ object LiteRtLM {
             val needAudio = wantAudio && !inst.supportAudio
             if (!needImage && !needAudio) return@withLock null
 
-            // English comment: Only upgrade to true; never downgrade existing capabilities.
+            // Only upgrade to true; never downgrade existing capabilities.
             val nextImage = inst.supportImage || wantImage
             val nextAudio = inst.supportAudio || wantAudio
             Triple(nextImage, nextAudio, "needImage=$needImage needAudio=$needAudio have(image=${inst.supportImage},audio=${inst.supportAudio})")
@@ -858,18 +874,25 @@ object LiteRtLM {
                     }
                 }.getOrNull()
 
-                fun buildConfig(forBackend: Backend): EngineConfig {
+                fun buildConfig(forBackend: Backend, visionBackend: Backend?, audioBackend: Backend?): EngineConfig {
                     return EngineConfig(
                         modelPath = modelPath,
                         backend = forBackend,
-                        visionBackend = if (supportImage) Backend.GPU else null,
-                        audioBackend = if (supportAudio) Backend.CPU else null,
+                        visionBackend = visionBackend,
+                        audioBackend = audioBackend,
                         maxNumTokens = maxTokens,
                         cacheDir = cacheDirPath,
                     )
                 }
 
-                var engineConfig = buildConfig(backend)
+                val visionPreferred = if (supportImage) Backend.GPU else null
+                val audioPreferred = if (supportAudio) Backend.CPU else null
+
+                var engineConfig = buildConfig(
+                    forBackend = backend,
+                    visionBackend = visionPreferred,
+                    audioBackend = audioPreferred,
+                )
 
                 val engine = runCatching {
                     Engine(engineConfig).also {
@@ -877,9 +900,16 @@ object LiteRtLM {
                         it.initialize()
                     }
                 }.getOrElse { first ->
-                    if (backend == Backend.GPU && !supportImage && !supportAudio) {
-                        Log.w(TAG, "GPU init failed; falling back to CPU: ${first.message}")
-                        engineConfig = buildConfig(Backend.CPU)
+                    // Best-effort fallback: if GPU init fails, try CPU.
+                    if (backend == Backend.GPU) {
+                        Log.w(TAG, "GPU init failed; trying CPU fallback: ${first.message}")
+                        val v = if (supportImage) Backend.CPU else null
+                        val a = if (supportAudio) Backend.CPU else null
+                        engineConfig = buildConfig(
+                            forBackend = Backend.CPU,
+                            visionBackend = v,
+                            audioBackend = a,
+                        )
                         Engine(engineConfig).also {
                             engineToCloseOnFailure = it
                             it.initialize()
@@ -1002,6 +1032,13 @@ object LiteRtLM {
     private suspend fun closeInstanceNowBestEffort(key: String, reason: String) {
         cancelScheduledCleanup(key, "closeNow:$reason")
 
+        // Avoid racing with init; wait if needed.
+        runCatching { awaitInitIfInFlight(key, reason = "closeNow:$reason") }
+            .onFailure {
+                Log.w(TAG, "closeInstanceNowBestEffort: init wait failed: key='$key' reason='$reason' err=${it.message}")
+                return
+            }
+
         val instance: LiteRtLmInstance? = stateMutex.withLock {
             val rs = getRunState(key)
             if (rs.active.get()) return@withLock null
@@ -1054,6 +1091,12 @@ object LiteRtLM {
         requiredToken: Long,
         reason: String,
     ) {
+        // Avoid racing with init; if init is in flight, skip this idle close.
+        if (initInFlight.contains(key)) {
+            Log.d(TAG, "Idle cleanup skipped (init in flight): key='$key'")
+            return
+        }
+
         val plan: IdleClosePlan? = stateMutex.withLock {
             val rs = getRunState(key)
             val nowInner = SystemClock.elapsedRealtime()
@@ -1122,6 +1165,10 @@ object LiteRtLM {
         val key = runtimeKey(model)
 
         ioScope.launch {
+            // If init is in flight, wait briefly so we don't schedule cleanup on a transient state.
+            runCatching { awaitInitIfInFlight(key, reason = "cleanUp") }
+                .onFailure { Log.w(TAG, "cleanUp: init wait failed: key='$key' err=${it.message}") }
+
             val action: () -> Unit = {
                 scheduleIdleCleanup(key, IDLE_CLEANUP_MS, "explicit-cleanUp")
                 postToMain { onDone() }
@@ -1157,6 +1204,13 @@ object LiteRtLM {
         ioScope.launch {
             markUsed(key)
             cancelScheduledCleanup(key, "resetConversation")
+
+            // Avoid resetting while init is building a new engine.
+            runCatching { awaitInitIfInFlight(key, reason = "resetConversation") }
+                .onFailure {
+                    Log.w(TAG, "resetConversation skipped (init wait failed): key='$key' err=${it.message}")
+                    return@launch
+                }
 
             val action: suspend () -> Unit = action@{
                 val inst = stateMutex.withLock { instances[key] }
@@ -1229,6 +1283,10 @@ object LiteRtLM {
             markUsed(key)
             cancelScheduledCleanup(key, "forceCleanUp")
 
+            // If init is in flight, wait to avoid tearing down right after creating.
+            runCatching { awaitInitIfInFlight(key, reason = "forceCleanUp") }
+                .onFailure { Log.w(TAG, "forceCleanUp: init wait failed: key='$key' err=${it.message}") }
+
             val action: suspend () -> Unit = {
                 closeInstanceNowBestEffort(key, reason = "forceCleanUp")
                 postToMain { onDone() }
@@ -1288,7 +1346,6 @@ object LiteRtLM {
 
                         val inst: LiteRtLmInstance? = stateMutex.withLock {
                             if (!rs.active.get()) return@withLock null
-
                             // IMPORTANT:
                             // Do NOT clear pendingAfterStream here.
                             // It will be drained by nativeDoneHook via scheduleDeferredActions().
@@ -1350,12 +1407,26 @@ object LiteRtLM {
             markUsed(key)
             cancelScheduledCleanup(key, "runInference")
 
+            // Critical guard: never start inference while init is building a new instance.
+            runCatching { awaitInitIfInFlight(key, reason = "runInference") }
+                .onFailure { t ->
+                    val msg = "LiteRT-LM cannot start inference while initialization is in progress: ${cleanError(t.message)}"
+                    Log.e(TAG, msg, t)
+                    postToMain {
+                        onError(msg)
+                        resultListener("", true)
+                        runCatching { cleanUpListener.invoke() }
+                    }
+                    return@launch
+                }
+
             val needAutoInit = stateMutex.withLock { instances[key] == null }
             if (needAutoInit) {
                 val ctx = appContextRef.get()
                 if (ctx == null) {
-                    val msg = "LiteRT-LM model '${model.name}' is not initialized, and no application context is set. " +
-                            "Call setApplicationContext() or initializeIfNeeded() first."
+                    val msg =
+                        "LiteRT-LM model '${model.name}' is not initialized, and no application context is set. " +
+                                "Call setApplicationContext() or initializeIfNeeded() first."
                     Log.e(TAG, msg)
                     postToMain {
                         onError(msg)
@@ -1503,6 +1574,12 @@ object LiteRtLM {
                 return@launch
             }
 
+            Log.d(
+                TAG,
+                "runInference start: key='$key' runId=$myRunId " +
+                        "hasText=$hasText textLen=${trimmed.length} images=${images.size} audioClips=${audioClips.size}"
+            )
+
             var emittedSoFar = ""
             var msgCount = 0
 
@@ -1527,8 +1604,8 @@ object LiteRtLM {
                 }
             }
 
-            rsLocal.nativeDoneHook.set {
-                if (rsLocal.runId.get() != myRunId) return@set
+            rsLocal.nativeDoneHook.set hook@{
+                if (rsLocal.runId.get() != myRunId) return@hook
                 scheduleCleanUpListener()
                 scheduleDeferredActions()
             }
