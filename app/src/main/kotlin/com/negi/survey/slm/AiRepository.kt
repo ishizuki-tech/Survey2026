@@ -29,6 +29,7 @@ import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.DelicateCoroutinesApi
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
@@ -233,16 +234,78 @@ private object PromptDefaults {
 }
 
 /* ====================================================================== */
-/*  LiteRtLM backend                                                      */
+/*  Stream normalization (NO Delicate API)                                 */
 /* ====================================================================== */
 
 /**
- * Primary repository implementation for LiteRtLM via [SLM] facade.
+ * Normalizes a stream where callbacks may return:
+ * - True deltas (only newly generated text)
+ * - Snapshots (accumulated prefix, i.e., full text so far)
  *
- * This repository assumes:
- * - [SLM.setApplicationContext] is called early OR [appContext] is provided here.
- * - [SLM.initializeIfNeeded] is safe to call repeatedly (no-op when ready).
+ * AUTO strategy:
+ * - If incoming starts with lastSnapshot => treat as snapshot and emit suffix delta.
+ * - Else treat as delta and append.
+ *
+ * Safety:
+ * - If snapshot "rewinds" (incoming shorter or unrelated), reset snapshot to incoming
+ *   and emit incoming as delta (best-effort recovery).
  */
+private class LocalDeltaNormalizer(
+    private val mode: Mode = Mode.AUTO
+) {
+
+    enum class Mode {
+        /** Always treat incoming as delta. */
+        DELTA,
+        /** Always treat incoming as snapshot (accumulated) and compute suffix. */
+        SNAPSHOT,
+        /** Detect snapshot vs delta at runtime. */
+        AUTO
+    }
+
+    private val lock = Any()
+    private var lastSnapshot: String = ""
+
+    fun toDelta(incomingRaw: String): String {
+        val incoming = incomingRaw
+        if (incoming.isEmpty()) return ""
+
+        return synchronized(lock) {
+            when (mode) {
+                Mode.DELTA -> {
+                    lastSnapshot += incoming
+                    incoming
+                }
+
+                Mode.SNAPSHOT -> {
+                    val delta = if (incoming.startsWith(lastSnapshot)) {
+                        incoming.substring(lastSnapshot.length)
+                    } else {
+                        incoming
+                    }
+                    lastSnapshot = incoming
+                    delta
+                }
+
+                Mode.AUTO -> {
+                    if (incoming.startsWith(lastSnapshot) && incoming.length >= lastSnapshot.length) {
+                        val delta = incoming.substring(lastSnapshot.length)
+                        lastSnapshot = incoming
+                        delta
+                    } else {
+                        lastSnapshot += incoming
+                        incoming
+                    }
+                }
+            }
+        }
+    }
+}
+
+/* ====================================================================== */
+/*  LiteRtLM backend                                                      */
+/* ====================================================================== */
+
 class LiteRtRepository(
     private val model: Model,
     private val config: SurveyConfig,
@@ -259,26 +322,16 @@ class LiteRtRepository(
         private val REQ_SEQ = AtomicLong(0L)
 
         private const val INIT_TIMEOUT_MS = 90_000L
-
-        /** Overall safety cap for a single request (GPU cold start can be slow). */
         private const val HARD_WATCHDOG_MS = 120_000L
-
-        /** Before first token arrives, tolerate a long warmup period. */
         private const val FIRST_TOKEN_TIMEOUT_MS = 45_000L
-
-        /** After streaming begins, tolerate silence between callback events. */
         private const val EVENT_STALL_TIMEOUT_MS = 12_000L
-
-        /** After logical done=true, wait for native termination callback. */
         private const val POST_DONE_TIMEOUT_MS = 30_000L
-
         private const val PROGRESS_POLL_MS = 250L
 
         private val DEBUG_STREAM: Boolean = BuildConfig.DEBUG
         private const val DEBUG_STREAM_EVERY_N = 8
         private const val DEBUG_PREFIX_CHARS = 180
 
-        /** Prompt size safety caps. */
         private const val PROMPT_CHAR_CAP: Int = 120_000
         private const val PROMPT_KEEP_TAIL_CHARS: Int = 24_000
     }
@@ -287,12 +340,6 @@ class LiteRtRepository(
         appContext?.let { AiTrace.install(it) }
     }
 
-    /**
-     * Sanitize turn tokens: keep them single-line and non-empty.
-     *
-     * - Prevents accidental "\n" inside tokens breaking the prompt format.
-     * - Trims whitespace and collapses internal whitespace.
-     */
     private fun sanitizeTurnToken(value: String?, fallback: String): String {
         val raw = (value ?: fallback)
         val cleaned = raw
@@ -305,13 +352,6 @@ class LiteRtRepository(
         return if (cleaned.isBlank()) fallback else cleaned
     }
 
-    /**
-     * Cap prompt size defensively.
-     *
-     * Strategy:
-     * - Keep the tail (most recent/user content typically lives near the end).
-     * - Prefix a short truncation marker so logs/debugging are honest.
-     */
     private fun capPromptIfNeeded(prompt: String, maxChars: Int, keepTailChars: Int): String {
         if (prompt.length <= maxChars) return prompt
 
@@ -387,32 +427,22 @@ class LiteRtRepository(
                 val finalized = AtomicBoolean(false)
 
                 val startAt = AtomicLong(SystemClock.elapsedRealtime())
-
-                /** First real emitted delta timestamp. -1 means "no token yet". */
                 val firstTokenAt = AtomicLong(-1L)
-
-                /** Updated when any callback event arrives (including empty deltas). */
                 val lastEventAt = AtomicLong(startAt.get())
-
-                /** Updated only when a non-empty delta is produced. */
                 val lastDeltaAt = AtomicLong(startAt.get())
 
-                /** Logical completion flag (done=true). Still wait for native termination if possible. */
                 val logicalDone = AtomicBoolean(false)
                 val logicalDoneAt = AtomicLong(-1L)
 
-                /** Set when cancellation/recovery is initiated by us. */
                 val cancelTag = AtomicReference<String?>(null)
 
                 val chunks = AtomicLong(0L)
                 val capturedAll = AtomicBoolean(true)
 
-                /** StringBuilder is not thread-safe; guard with a lock. */
                 val outLock = Any()
                 val fullOut = StringBuilder(8 * 1024)
 
-                /** Normalizes partials when an upstream might emit snapshots or deltas. */
-                val normalizer = StreamDeltaNormalizer(StreamDeltaNormalizer.PartialMode.AUTO)
+                val normalizer = LocalDeltaNormalizer(LocalDeltaNormalizer.Mode.AUTO)
 
                 fun markEvent() {
                     lastEventAt.set(SystemClock.elapsedRealtime())
@@ -456,8 +486,9 @@ class LiteRtRepository(
                 /**
                  * Run recovery actions at most once per request.
                  *
-                 * This is intentionally non-suspending; underlying SLM calls should schedule work
-                 * on their internal scopes if needed.
+                 * IMPORTANT:
+                 * - Avoid calling forceCleanUp() if it is marked as a delicate API.
+                 * - Use a double cleanUp() strategy in "aggressive" mode to approximate a stronger teardown.
                  */
                 fun bestEffortRecover(tag: String, aggressive: Boolean) {
                     if (!cancelTag.compareAndSet(null, tag)) return
@@ -475,24 +506,31 @@ class LiteRtRepository(
                         )
                     }.onFailure { Log.w(TAG, "[$requestId] resetConversation failed ($tag): ${it.message}", it) }
 
-                    if (aggressive) {
-                        runCatching {
-                            SLM.forceCleanUp(model) {
-                                Log.d(TAG, "[$requestId] forceCleanUp done ($tag)")
-                            }
-                        }.onFailure { Log.w(TAG, "[$requestId] forceCleanUp failed ($tag): ${it.message}", it) }
-                    } else {
+                    /**
+                     * NOTE:
+                     * Some cleanup helpers may be annotated with @DelicateCoroutinesApi upstream.
+                     * We opt-in locally to avoid turning warnings into errors, while keeping the call sites explicit.
+                     */
+                    @OptIn(DelicateCoroutinesApi::class)
+                    fun scheduleCleanup(pass: String) {
                         runCatching {
                             SLM.cleanUp(model) {
-                                Log.d(TAG, "[$requestId] cleanUp scheduled ($tag)")
+                                Log.d(TAG, "[$requestId] cleanUp done ($tag/$pass)")
                             }
-                        }.onFailure { Log.w(TAG, "[$requestId] cleanUp failed ($tag): ${it.message}", it) }
+                        }.onFailure { Log.w(TAG, "[$requestId] cleanUp failed ($tag/$pass): ${it.message}", it) }
+                    }
+
+                    scheduleCleanup("pass1")
+
+                    if (aggressive) {
+                        // Second pass after a short delay to catch late callbacks / native lag.
+                        anchorScope.launch {
+                            delay(350)
+                            scheduleCleanup("pass2")
+                        }
                     }
                 }
 
-                /**
-                 * Finalize trace on IO thread to avoid blocking main-thread callbacks.
-                 */
                 fun finalizeOnce(reason: String, cause: Throwable? = null) {
                     if (!finalized.compareAndSet(false, true)) return
 
@@ -528,9 +566,6 @@ class LiteRtRepository(
                     }
                 }
 
-                /**
-                 * Close the flow exactly once.
-                 */
                 fun closeOnce(reason: String, cause: Throwable? = null) {
                     if (!closed.compareAndSet(false, true)) return
 
@@ -555,9 +590,6 @@ class LiteRtRepository(
                 )
                 AiTrace.logLong(TAG, Log.DEBUG, "[$requestId] PROMPT (FULL) sha=$promptSha", cappedPrompt)
 
-                /**
-                 * Watchdog: warmup timeout / event stall / missing termination callback.
-                 */
                 anchorScope.launch {
                     while (isActive && !closed.get()) {
                         val now = SystemClock.elapsedRealtime()
@@ -609,12 +641,6 @@ class LiteRtRepository(
                     }
                 }
 
-                /**
-                 * Initialize (optional) before running inference.
-                 *
-                 * We do not early-return; failures are handled by closeOnce() and then we still
-                 * proceed to awaitClose to satisfy callbackFlow contract.
-                 */
                 val ctx = appContext
                 if (ctx != null) {
                     val initAttempt: Result<Unit>? = withTimeoutOrNull(INIT_TIMEOUT_MS) {
@@ -653,9 +679,6 @@ class LiteRtRepository(
                     Log.d(TAG, "[$requestId] appContext=null → skip initializeIfNeeded (assume already initialized)")
                 }
 
-                /**
-                 * Start streaming only if we are not already closed by init failure.
-                 */
                 if (!closed.get()) {
                     var msgCount = 0
 
@@ -737,11 +760,6 @@ class LiteRtRepository(
                     }
                 }
 
-                /**
-                 * awaitClose must always be reached to satisfy callbackFlow contract.
-                 *
-                 * If the collector cancels early, recover and close aggressively.
-                 */
                 awaitClose {
                     if (!closed.get()) {
                         val r = "collector-cancel"

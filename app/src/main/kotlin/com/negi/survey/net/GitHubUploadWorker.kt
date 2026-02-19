@@ -39,6 +39,7 @@ import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequest
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.OutOfQuotaPolicy
+import androidx.work.WorkInfo
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
 import androidx.work.workDataOf
@@ -104,13 +105,19 @@ class GitHubUploadWorker(
         val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
         val notifId = stableNotificationId(mode, stamp)
 
-        setForegroundAsync(
-            foregroundInfo(
-                notificationId = notifId,
-                pct = 0,
-                title = "$notifTitleBase…"
+        // Best-effort foreground. If the app lacks required FGS permissions/types,
+        // we still try to continue as a normal background worker.
+        runCatching {
+            setForeground(
+                foregroundInfo(
+                    notificationId = notifId,
+                    pct = 0,
+                    title = "$notifTitleBase…"
+                )
             )
-        )
+        }.onFailure { e ->
+            Log.w(TAG, "doWork: setForeground failed (continuing). err=${e.message}", e)
+        }
 
         val lastPctRef = intArrayOf(-1)
         val progressCallback: (Int) -> Unit = progressCallback@{ pct ->
@@ -125,13 +132,16 @@ class GitHubUploadWorker(
                 )
             )
 
-            setForegroundAsync(
-                foregroundInfo(
-                    notificationId = notifId,
-                    pct = clamped,
-                    title = "$notifTitleBase…"
+            // Do not block progress callback; best-effort notification update.
+            runCatching {
+                setForegroundAsync(
+                    foregroundInfo(
+                        notificationId = notifId,
+                        pct = clamped,
+                        title = "$notifTitleBase…"
+                    )
                 )
-            )
+            }
         }
 
         val currentPct: () -> Int = { lastPctRef[0].coerceAtLeast(0) }
@@ -225,14 +235,16 @@ class GitHubUploadWorker(
                 )
             }
 
-            setForegroundAsync(
-                foregroundInfo(
-                    notificationId = notifId,
-                    pct = 100,
-                    title = "Uploaded $fileName",
-                    finished = true
+            runCatching {
+                setForegroundAsync(
+                    foregroundInfo(
+                        notificationId = notifId,
+                        pct = 100,
+                        title = "Uploaded $fileName",
+                        finished = true
+                    )
                 )
-            )
+            }
 
             runCatching { pendingFile.delete() }
 
@@ -248,14 +260,16 @@ class GitHubUploadWorker(
         } catch (t: Throwable) {
             Log.w(TAG, "doFileUpload: upload failed for $filePath", t)
 
-            setForegroundAsync(
-                foregroundInfo(
-                    notificationId = notifId,
-                    pct = currentPct(),
-                    title = "Upload failed: $fileName",
-                    error = true
+            runCatching {
+                setForegroundAsync(
+                    foregroundInfo(
+                        notificationId = notifId,
+                        pct = currentPct(),
+                        title = "Upload failed: $fileName",
+                        error = true
+                    )
                 )
-            )
+            }
 
             val failData = workDataOf(ERROR_MESSAGE to (t.message ?: "Unknown error"))
 
@@ -292,14 +306,16 @@ class GitHubUploadWorker(
                 onProgress = onProgress,
             )
 
-            setForegroundAsync(
-                foregroundInfo(
-                    notificationId = notifId,
-                    pct = 100,
-                    title = "Uploaded logcat",
-                    finished = true
+            runCatching {
+                setForegroundAsync(
+                    foregroundInfo(
+                        notificationId = notifId,
+                        pct = 100,
+                        title = "Uploaded logcat",
+                        finished = true
+                    )
                 )
-            )
+            }
 
             Result.success(
                 workDataOf(
@@ -314,14 +330,16 @@ class GitHubUploadWorker(
         } catch (t: Throwable) {
             Log.w(TAG, "doLogcatUpload: upload failed", t)
 
-            setForegroundAsync(
-                foregroundInfo(
-                    notificationId = notifId,
-                    pct = currentPct(),
-                    title = "Log upload failed",
-                    error = true
+            runCatching {
+                setForegroundAsync(
+                    foregroundInfo(
+                        notificationId = notifId,
+                        pct = currentPct(),
+                        title = "Log upload failed",
+                        error = true
+                    )
                 )
-            )
+            }
 
             val failData = workDataOf(ERROR_MESSAGE to (t.message ?: "Unknown error"))
 
@@ -541,6 +559,32 @@ class GitHubUploadWorker(
         }
 
         /**
+         * Choose ExistingWorkPolicy based on current unique work state.
+         *
+         * Rationale:
+         * - KEEP prevents duplicates while a work is in-flight.
+         * - REPLACE allows re-enqueue after FAILED/SUCCEEDED/CANCELLED chains,
+         *   which is critical when config (token) was fixed later.
+         */
+        private fun choosePolicyForUniqueName(context: Context, uniqueName: String): ExistingWorkPolicy {
+            return try {
+                val infos = WorkManager.getInstance(context)
+                    .getWorkInfosForUniqueWork(uniqueName)
+                    .get(350, TimeUnit.MILLISECONDS)
+
+                val states = infos.joinToString(",") { it.state.name }
+                val inFlight = infos.any { it.state == WorkInfo.State.RUNNING || it.state == WorkInfo.State.ENQUEUED || it.state == WorkInfo.State.BLOCKED }
+
+                val policy = if (inFlight) ExistingWorkPolicy.KEEP else ExistingWorkPolicy.REPLACE
+                Log.d(TAG, "choosePolicy: uniqueName=$uniqueName policy=$policy states=[$states]")
+                policy
+            } catch (t: Throwable) {
+                Log.w(TAG, "choosePolicy: fallback KEEP (query failed). uniqueName=$uniqueName err=${t.message}")
+                ExistingWorkPolicy.KEEP
+            }
+        }
+
+        /**
          * Enqueue a work request to upload an existing file.
          */
         fun enqueueExistingPayload(
@@ -584,8 +628,16 @@ class GitHubUploadWorker(
                     .addTag("$TAG:file:$name")
                     .build()
 
-            WorkManager.getInstance(context)
-                .enqueueUniqueWork(uniqueName, ExistingWorkPolicy.KEEP, req)
+            val appCtx = context.applicationContext
+            val policy = choosePolicyForUniqueName(appCtx, uniqueName)
+
+            Log.d(
+                TAG,
+                "enqueueExistingPayload: uniqueName=$uniqueName policy=$policy file=${file.absolutePath} bytes=${file.length()} mtime=${file.lastModified()}"
+            )
+
+            WorkManager.getInstance(appCtx)
+                .enqueueUniqueWork(uniqueName, policy, req)
         }
 
         /**
@@ -634,7 +686,7 @@ class GitHubUploadWorker(
                     .addTag("$TAG:logcat")
                     .build()
 
-            WorkManager.getInstance(context)
+            WorkManager.getInstance(context.applicationContext)
                 .enqueueUniqueWork(uniqueName, ExistingWorkPolicy.KEEP, req)
         }
     }

@@ -12,8 +12,13 @@
  *  ---------------------------------------------------------------------
  *  Captures crash reports (stacktrace + logcat tail) into local files.
  *  Intended flow:
- *   - On crash: write a gzipped crash bundle to internal storage.
+ *   - On crash (Java/Kotlin): write a gzipped crash bundle to internal storage.
  *   - On next launch: scan pending bundles and schedule WorkManager uploads.
+ *
+ *  Important:
+ *   - Native crashes (SIGSEGV) do NOT invoke UncaughtExceptionHandler.
+ *     We must capture native tombstone/trace on the NEXT launch using
+ *     ApplicationExitInfo (Android 11+).
  * =====================================================================
  */
 
@@ -21,12 +26,17 @@
 
 package com.negi.survey.net
 
+import android.app.ActivityManager
+import android.app.ApplicationExitInfo
 import android.content.Context
+import android.content.SharedPreferences
 import android.content.pm.PackageInfo
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Process
 import android.util.Log
+import androidx.annotation.RequiresApi
+import com.negi.survey.BuildConfig
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.InputStream
@@ -50,7 +60,11 @@ private const val TAG = "CrashLogStore"
  * Design goals:
  * - Crash-time code must be fast and never throw.
  * - Upload happens later via WorkManager (GitHubUploadWorker).
- * - Stored artifacts are small (tail + gzip) to fit GitHub Contents API guards.
+ * - Stored artifacts are small (tail + gzip) to fit repository guards.
+ *
+ * Native crash note:
+ * - SIGSEGV/native crashes skip UncaughtExceptionHandler.
+ * - We capture native trace on the next start via ApplicationExitInfo (API 30+).
  */
 object CrashLogStore {
 
@@ -79,8 +93,28 @@ object CrashLogStore {
      */
     private const val COMMAND_STDOUT_MAX_BYTES = 260_000
 
+    /** Max bytes we read from ApplicationExitInfo.traceInputStream. */
+    private const val EXITINFO_TRACE_MAX_BYTES = 650_000
+
     /** Prevent handler being installed multiple times in the same process. */
     private val installed = AtomicBoolean(false)
+
+    /** Prevent startup tasks (capture + schedule) from running multiple times per process. */
+    private val startupTasksRan = AtomicBoolean(false)
+
+    /** Upper bound for how many pending files we schedule per app start. */
+    private const val MAX_FILES_TO_SCHEDULE_PER_START = 20
+
+    /** Prune guard: keep only newest N files to prevent unbounded growth. */
+    private const val MAX_PENDING_FILES_TO_KEEP = 120
+
+    /** Prune guard: delete files older than this (days). */
+    private const val MAX_PENDING_AGE_DAYS = 21L
+
+    private const val PREFS_NAME = "crash_log_store"
+    private const val PREF_KEY_LAST_EXIT_TS = "last_exit_timestamp"
+    private const val PREF_KEY_LAST_EXIT_PID = "last_exit_pid"
+    private const val PREF_KEY_LAST_EXIT_REASON = "last_exit_reason"
 
     /**
      * Install an UncaughtExceptionHandler that writes a crash bundle to disk.
@@ -89,18 +123,32 @@ object CrashLogStore {
      * - This does NOT prevent the crash.
      * - It chains to the previous default handler after writing.
      *
-     * Also:
-     * - On every normal app start, it schedules pending crash bundle uploads using saved config.
-     *   This prevents "we forgot to call schedule()" incidents.
+     * Startup tasks:
+     * - On every normal app start (first install call per process),
+     *   we capture native crash traces (Android 11+) and schedule pending uploads.
      */
     fun install(context: Context) {
         val appContext = context.applicationContext
 
-        // On each start, try to schedule any pending crash bundles.
-        runCatching {
-            schedulePendingUploadsFromSavedConfig(appContext)
-        }.onFailure { e ->
-            Log.w(TAG, "Failed to schedule pending crash uploads: ${e.message}", e)
+        // Run startup tasks exactly once per process (avoid cooldown spam / duplicate scheduling).
+        if (startupTasksRan.compareAndSet(false, true)) {
+            runCatching {
+                captureLastExitInfoBundleIfPossible(appContext)
+            }.onFailure { e ->
+                Log.w(TAG, "captureLastExitInfoBundleIfPossible failed: ${e.message}", e)
+            }
+
+            runCatching {
+                prunePendingFiles(appContext)
+            }.onFailure { e ->
+                Log.w(TAG, "prunePendingFiles failed: ${e.message}", e)
+            }
+
+            runCatching {
+                schedulePendingUploadsFromBestAvailableConfig(appContext)
+            }.onFailure { e ->
+                Log.w(TAG, "Failed to schedule pending crash uploads: ${e.message}", e)
+            }
         }
 
         // Avoid double-install within the same process.
@@ -132,19 +180,75 @@ object CrashLogStore {
     }
 
     /**
-     * Schedule uploads for any pending crash bundles using the saved GitHub config.
+     * Schedule uploads using the best available configuration source.
      *
-     * If no config is available (token not set), this is a no-op.
+     * Priority:
+     * 1) GitHubDiagnosticsConfigStore (persisted runtime config)
+     * 2) BuildConfig (compile-time config)
      */
-    fun schedulePendingUploadsFromSavedConfig(context: Context) {
-        val baseCfg = GitHubDiagnosticsConfigStore.buildGitHubConfigOrNull(context)
-        if (baseCfg == null) {
-            Log.w(TAG, "No usable GitHub diagnostics config; skip crashlog upload scheduling.")
+    fun schedulePendingUploadsFromBestAvailableConfig(context: Context) {
+        val fromStore = buildGitHubConfigFromConfigStoreOrNull(context)
+        val cfg = fromStore ?: buildGitHubConfigFromBuildConfigOrNull()
+
+        if (cfg == null) {
+            Log.w(
+                TAG,
+                "No usable GitHub config for crashlog uploads. " +
+                        "ConfigStoreReady=${fromStore != null} " +
+                        "BuildConfigHints(ownerSet=${BuildConfig.GH_OWNER.isNotBlank()} repoSet=${BuildConfig.GH_REPO.isNotBlank()} tokenSet=${BuildConfig.GH_TOKEN.isNotBlank()})"
+            )
             return
         }
 
+        schedulePendingUploads(context, cfg)
+    }
+
+    private fun buildGitHubConfigFromConfigStoreOrNull(context: Context): GitHubUploader.GitHubConfig? {
+        val baseCfg = GitHubDiagnosticsConfigStore.buildGitHubConfigOrNull(context)
+        if (baseCfg == null) {
+            Log.d(TAG, "GitHub config store not ready; will try BuildConfig fallback.")
+            return null
+        }
+
         val uploadCfg = baseCfg.copy(pathPrefix = "diagnostics/crashlogs")
-        schedulePendingUploads(context, uploadCfg)
+        Log.d(
+            TAG,
+            "Using GitHub config from ConfigStore. owner=${uploadCfg.owner} repo=${uploadCfg.repo} branch=${uploadCfg.branch} prefix=${uploadCfg.pathPrefix}"
+        )
+        return uploadCfg
+    }
+
+    private fun buildGitHubConfigFromBuildConfigOrNull(): GitHubUploader.GitHubConfig? {
+        val token = BuildConfig.GH_TOKEN.trim()
+        if (token.isBlank()) return null
+
+        // GH_OWNER is preferred, but allow extracting from GH_REPO when GH_OWNER is blank.
+        val rawRepo = BuildConfig.GH_REPO.trim()
+        if (rawRepo.isBlank()) return null
+
+        val owner = BuildConfig.GH_OWNER.trim().ifBlank {
+            rawRepo.substringBefore('/', missingDelimiterValue = "").trim()
+        }
+        val repo = rawRepo.substringAfterLast('/').trim()
+
+        if (owner.isBlank() || repo.isBlank()) return null
+
+        val basePrefix = BuildConfig.GH_PATH_PREFIX.trim('/')
+        val crashPrefix = listOf(basePrefix, "diagnostics/crashlogs")
+            .filter { it.isNotBlank() }
+            .joinToString("/")
+
+        val branch = BuildConfig.GH_BRANCH.ifBlank { "main" }
+
+        Log.d(TAG, "Using GitHub config from BuildConfig. owner=$owner repo=$repo branch=$branch prefix=$crashPrefix")
+
+        return GitHubUploader.GitHubConfig(
+            owner = owner,
+            repo = repo,
+            branch = branch,
+            pathPrefix = crashPrefix,
+            token = token
+        )
     }
 
     /**
@@ -167,8 +271,11 @@ object CrashLogStore {
             return
         }
 
-        // Oldest first (stable behavior).
-        files.sortedBy { it.lastModified() }.forEach { f ->
+        val targets = files
+            .sortedBy { it.lastModified() } // oldest first
+            .take(MAX_FILES_TO_SCHEDULE_PER_START)
+
+        targets.forEach { f ->
             GitHubUploadWorker.enqueueExistingPayload(
                 context = context,
                 cfg = cfg,
@@ -178,11 +285,115 @@ object CrashLogStore {
             )
         }
 
-        Log.i(TAG, "Scheduled ${files.size} crash bundle upload(s).")
+        Log.i(
+            TAG,
+            "Scheduled ${targets.size} crash bundle upload(s). " +
+                    "pendingTotal=${files.size} dir=${dir.absolutePath}"
+        )
     }
 
     /**
-     * Write a gzipped crash bundle to internal storage.
+     * Capture the last process exit trace (native crash / ANR / etc.) on Android 11+.
+     *
+     * Why:
+     * - SIGSEGV/native crashes do NOT invoke UncaughtExceptionHandler.
+     * - ApplicationExitInfo can provide a tombstone-like trace stream on the next start.
+     *
+     * Output:
+     * - Writes a gz bundle into the same pending dir, so existing upload pipeline works.
+     */
+    fun captureLastExitInfoBundleIfPossible(context: Context) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
+
+        val am = context.getSystemService(ActivityManager::class.java) ?: return
+        val prefs = prefs(context)
+
+        val lastTs = prefs.getLong(PREF_KEY_LAST_EXIT_TS, -1L)
+        val lastPid = prefs.getInt(PREF_KEY_LAST_EXIT_PID, -1)
+        val lastReason = prefs.getInt(PREF_KEY_LAST_EXIT_REASON, -1)
+
+        val list = runCatching {
+            am.getHistoricalProcessExitReasons(context.packageName, 0, 12)
+        }.getOrElse {
+            Log.w(TAG, "getHistoricalProcessExitReasons failed: ${it.message}", it)
+            return
+        }
+
+        if (list.isEmpty()) return
+
+        // Prefer the newest record that either has a trace stream or indicates a crash-like reason.
+        val candidate = list
+            .sortedByDescending { it.timestamp }
+            .firstOrNull { info ->
+                val hasTrace = runCatching { info.traceInputStream != null }.getOrDefault(false)
+                val crashLike = isCrashLikeReason(info.reason)
+                hasTrace || crashLike
+            } ?: return
+
+        // De-dup across launches.
+        val ts = candidate.timestamp
+        val pid = candidate.pid
+        val reason = candidate.reason
+
+        if (ts == lastTs && pid == lastPid && reason == lastReason) {
+            Log.d(TAG, "Last exit info already captured. ts=$ts pid=$pid reason=$reason")
+            return
+        }
+
+        val header = buildExitInfoHeader(context, candidate)
+
+        val traceBytes = runCatching {
+            candidate.traceInputStream?.use { readBytesLimited(it, EXITINFO_TRACE_MAX_BYTES) }
+        }.getOrNull()
+
+        val traceText = when {
+            traceBytes == null -> "(traceInputStream is null or unreadable)\n"
+            traceBytes.isEmpty() -> "(traceInputStream empty)\n"
+            else -> runCatching { traceBytes.toString(Charsets.UTF_8) }
+                .getOrElse { "(trace decode failed: ${it.message})\n" }
+        }
+
+        // Optionally include crash buffer tail (best-effort).
+        val crashBuf = runCatching { collectLogcatCrashTail(LOGCAT_CRASH_TAIL_LINES) }
+            .getOrElse { "(logcat crash buffer read failed: ${it.message})\n" }
+
+        val combined = buildString {
+            appendLine("=== Last Exit Bundle (ApplicationExitInfo) ===")
+            appendLine()
+            append(header)
+            appendLine()
+            appendLine("=== Trace (ApplicationExitInfo.traceInputStream) ===")
+            appendLine(traceText)
+            appendLine()
+            appendLine("=== Logcat crash buffer (tail) ===")
+            appendLine(crashBuf)
+            appendLine()
+        }.toByteArray(Charsets.UTF_8)
+
+        val trimmed = trimToTail(combined, MAX_UNCOMPRESSED_BYTES)
+        val gz = gzipAndFitToMaxBytesBestEffort(trimmed, CRASH_GZ_MAX_BYTES_DEFAULT)
+
+        val outFile = writePendingGzFile(
+            context = context,
+            prefix = "exitinfo",
+            stampUtcMillis = ts,
+            pid = pid,
+            suffix = "reason${reason}"
+        ) { gz }
+
+        if (outFile != null) {
+            prefs.edit()
+                .putLong(PREF_KEY_LAST_EXIT_TS, ts)
+                .putInt(PREF_KEY_LAST_EXIT_PID, pid)
+                .putInt(PREF_KEY_LAST_EXIT_REASON, reason)
+                .apply()
+
+            Log.i(TAG, "Last exit bundle written: ${outFile.absolutePath} (${gz.size} bytes gz)")
+        }
+    }
+
+    /**
+     * Write a gzipped crash bundle to internal storage (Java/Kotlin exceptions only).
      *
      * The bundle contains:
      * - Device/app header
@@ -198,15 +409,10 @@ object CrashLogStore {
         val pid = Process.myPid()
 
         // Use millis + short UUID suffix to avoid filename collisions on rapid repeated crashes.
-        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).apply {
+        val stampUtc = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).apply {
             timeZone = TimeZone.getTimeZone("UTC")
         }.format(Date())
         val nonce = UUID.randomUUID().toString().substring(0, 8)
-        val name = "crash_${stamp}_pid${pid}_$nonce.log.gz"
-
-        val dir = pendingDir(context)
-        val outFile = File(dir, name)
-        val tmpFile = File(dir, "$name.tmp")
 
         val header = buildHeader(context, pid, thread)
         val stack = buildStacktrace(throwable)
@@ -233,6 +439,11 @@ object CrashLogStore {
 
         val trimmed = trimToTail(combined, MAX_UNCOMPRESSED_BYTES)
         val gz = gzipAndFitToMaxBytesBestEffort(trimmed, CRASH_GZ_MAX_BYTES_DEFAULT)
+
+        val namePrefix = "crash_${stampUtc}_pid${pid}_$nonce"
+        val dir = pendingDir(context)
+        val outFile = File(dir, "$namePrefix.log.gz")
+        val tmpFile = File(dir, "$namePrefix.log.gz.tmp")
 
         runCatching {
             tmpFile.writeBytes(gz)
@@ -280,6 +491,39 @@ object CrashLogStore {
     }
 
     /**
+     * Build an ApplicationExitInfo header.
+     */
+    @RequiresApi(Build.VERSION_CODES.R)
+    private fun buildExitInfoHeader(context: Context, info: ApplicationExitInfo): String {
+        val pkg = context.packageName
+        val sdf = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US).apply {
+            timeZone = TimeZone.getTimeZone("UTC")
+        }
+        val utc = sdf.format(Date(info.timestamp))
+
+        return buildString {
+            appendLine("time_utc=$utc")
+            appendLine("package=$pkg")
+            appendLine("processName=${info.processName}")
+            appendLine("pid=${info.pid}")
+            appendLine("reason=${info.reason}")
+            appendLine("status=${info.status}")
+            appendLine("description=${info.description}")
+            appendLine("sdk=${Build.VERSION.SDK_INT}")
+        }
+    }
+
+    /**
+     * Determine whether a reason is crash-like.
+     */
+    private fun isCrashLikeReason(reason: Int): Boolean {
+        return reason == ApplicationExitInfo.REASON_CRASH ||
+                reason == ApplicationExitInfo.REASON_CRASH_NATIVE ||
+                reason == ApplicationExitInfo.REASON_ANR ||
+                reason == ApplicationExitInfo.REASON_INITIALIZATION_FAILURE
+    }
+
+    /**
      * Get PackageInfo safely on all API levels.
      */
     private fun getPackageInfoCompat(pm: PackageManager, pkg: String): PackageInfo? {
@@ -317,10 +561,6 @@ object CrashLogStore {
 
     /**
      * Collect logcat tail for the current app process.
-     *
-     * Notes:
-     * - Uses `--pid` so it should mainly capture your app logs.
-     * - Some devices may still restrict access; returns a short error string then.
      */
     private fun collectLogcatTail(pid: Int, tailLines: Int): String {
         val cmd = listOf(
@@ -352,10 +592,6 @@ object CrashLogStore {
 
     /**
      * Collect logcat crash buffer tail.
-     *
-     * Notes:
-     * - `-b crash` usually includes AndroidRuntime fatal exceptions.
-     * - Access may vary by device.
      */
     private fun collectLogcatCrashTail(tailLines: Int): String {
         val cmd = listOf(
@@ -370,12 +606,6 @@ object CrashLogStore {
 
     /**
      * Run a shell command and return stdout as text (best-effort).
-     *
-     * Crash handler safety rules:
-     * - If the process does not finish within [timeoutMs], we do NOT read the stream
-     *   to avoid blocking. We return a short timeout message.
-     * - Even if the command returns a lot of output, we cap reads to [maxStdoutBytes]
-     *   to avoid memory blowups on crash-time paths.
      */
     private fun runCommand(cmd: List<String>, timeoutMs: Long, maxStdoutBytes: Int): String {
         return try {
@@ -393,7 +623,7 @@ object CrashLogStore {
             val out = proc.inputStream.use { readTextLimited(it, maxStdoutBytes) }
             runCatching { proc.destroy() }
 
-            if (out.isBlank()) "(logcat empty or restricted)\n" else out
+            out.ifBlank { "(logcat empty or restricted)\n" }
         } catch (t: Throwable) {
             "(command failed: ${t.message})\n"
         }
@@ -424,6 +654,26 @@ object CrashLogStore {
     }
 
     /**
+     * Read at most [maxBytes] raw bytes from [input].
+     */
+    private fun readBytesLimited(input: InputStream, maxBytes: Int): ByteArray {
+        val buf = ByteArray(8_192)
+        val bos = ByteArrayOutputStream()
+        var total = 0
+        while (true) {
+            val n = input.read(buf)
+            if (n <= 0) break
+            val remain = maxBytes - total
+            if (remain <= 0) break
+            val toWrite = minOf(n, remain)
+            bos.write(buf, 0, toWrite)
+            total += toWrite
+            if (total >= maxBytes) break
+        }
+        return bos.toByteArray()
+    }
+
+    /**
      * Heuristic: detect PID option unsupported patterns.
      */
     private fun looksLikePidUnsupported(output: String): Boolean {
@@ -451,8 +701,6 @@ object CrashLogStore {
 
     /**
      * Gzip compress and best-effort fit under [maxGzBytes].
-     *
-     * This function must never throw (crash-time path).
      */
     private fun gzipAndFitToMaxBytesBestEffort(input: ByteArray, maxGzBytes: Int): ByteArray {
         return runCatching {
@@ -473,7 +721,6 @@ object CrashLogStore {
             safeGzip(current)
         }.getOrElse { t ->
             Log.w(TAG, "gzipAndFitToMaxBytesBestEffort failed: ${t.message}", t)
-            // Last resort: try to gzip a tiny message. Never throw.
             safeGzip("(gzip failed: ${t.message})\n".toByteArray(Charsets.UTF_8))
         }
     }
@@ -485,7 +732,7 @@ object CrashLogStore {
         return runCatching { gzip(input) }
             .getOrElse { t ->
                 runCatching { gzip("(gzip failed: ${t.message})\n".toByteArray(Charsets.UTF_8)) }
-                    .getOrElse { ByteArray(1) } // non-empty sentinel to avoid "length=0" filters
+                    .getOrElse { ByteArray(1) } // non-empty sentinel
             }
     }
 
@@ -496,6 +743,88 @@ object CrashLogStore {
         val bos = ByteArrayOutputStream()
         GZIPOutputStream(bos).use { it.write(input) }
         return bos.toByteArray()
+    }
+
+    /**
+     * Write a pending gz file via temp+rename to avoid partial writes.
+     */
+    private fun writePendingGzFile(
+        context: Context,
+        prefix: String,
+        stampUtcMillis: Long,
+        pid: Int,
+        suffix: String,
+        bytesProvider: () -> ByteArray
+    ): File? {
+        val dir = pendingDir(context)
+
+        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).apply {
+            timeZone = TimeZone.getTimeZone("UTC")
+        }.format(Date(stampUtcMillis))
+
+        val nonce = UUID.randomUUID().toString().substring(0, 8)
+        val base = "${prefix}_${stamp}_pid${pid}_${suffix}_$nonce.log.gz"
+
+        val outFile = File(dir, base)
+        val tmpFile = File(dir, "$base.tmp")
+
+        return runCatching {
+            val gz = bytesProvider()
+            tmpFile.writeBytes(gz)
+            if (outFile.exists()) runCatching { outFile.delete() }
+            val renamed = tmpFile.renameTo(outFile)
+            if (!renamed) {
+                outFile.writeBytes(gz)
+                runCatching { tmpFile.delete() }
+            }
+            outFile
+        }.onFailure {
+            runCatching { tmpFile.delete() }
+        }.getOrNull()
+    }
+
+    /**
+     * Prune old / excessive pending files to prevent unbounded storage growth.
+     */
+    private fun prunePendingFiles(context: Context) {
+        val dir = pendingDir(context)
+        val files = dir.listFiles()
+            ?.filter { it.isFile }
+            ?.filter { !it.name.endsWith(".tmp", ignoreCase = true) }
+            ?: return
+
+        if (files.isEmpty()) return
+
+        val now = System.currentTimeMillis()
+        val maxAgeMs = TimeUnit.DAYS.toMillis(MAX_PENDING_AGE_DAYS)
+
+        // 1) Delete very old files.
+        val old = files.filter { now - it.lastModified() > maxAgeMs }
+        old.forEach { f -> runCatching { f.delete() } }
+        if (old.isNotEmpty()) {
+            Log.w(TAG, "Pruned old pending files: deleted=${old.size} ageDays>$MAX_PENDING_AGE_DAYS")
+        }
+
+        // 2) Keep only newest N.
+        val remain = dir.listFiles()
+            ?.filter { it.isFile && !it.name.endsWith(".tmp", ignoreCase = true) }
+            ?: return
+
+        if (remain.size <= MAX_PENDING_FILES_TO_KEEP) return
+
+        val toDelete = remain
+            .sortedByDescending { it.lastModified() }
+            .drop(MAX_PENDING_FILES_TO_KEEP)
+
+        toDelete.forEach { f -> runCatching { f.delete() } }
+        Log.w(
+            TAG,
+            "Pruned pending files by count: deleted=${toDelete.size} keep=$MAX_PENDING_FILES_TO_KEEP totalBefore=${remain.size}"
+        )
+    }
+
+    private fun prefs(context: Context): SharedPreferences {
+        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     }
 
     /**

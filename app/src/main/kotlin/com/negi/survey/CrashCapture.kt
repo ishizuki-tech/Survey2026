@@ -19,6 +19,8 @@ import android.os.Bundle
 import android.os.Process
 import android.os.SystemClock
 import android.util.Log
+import androidx.work.WorkManager
+import com.negi.survey.net.GitHubDiagnosticsConfigStore
 import com.negi.survey.net.GitHubUploadWorker
 import com.negi.survey.net.GitHubUploader
 import com.negi.survey.net.SupabaseCrashUploadWorker
@@ -98,6 +100,10 @@ object CrashCapture {
      * - Safe to call multiple times.
      * - If another SDK replaces the default handler after we installed, calling install() again
      *   will wrap the new handler and restore CrashCapture to the chain.
+     *
+     * Also:
+     * - Best-effort: enqueue pending crash uploads on each install call (lightweight + cooldown).
+     *   This makes "crash happened -> next launch uploads" reliable even if the caller forgets.
      */
     fun install(context: Context) {
         val root = runCatching { context.filesDir }.getOrNull()
@@ -107,6 +113,13 @@ object CrashCapture {
         }
 
         filesDirRoot = root
+
+        // Best-effort: schedule pending uploads on startup.
+        runCatching {
+            enqueuePendingCrashUploadsIfPossible(context.applicationContext)
+        }.onFailure { e ->
+            Log.w(TAG, "install: enqueuePendingCrashUploadsIfPossible failed: ${e.message}", e)
+        }
 
         val currentDefault = Thread.getDefaultUncaughtExceptionHandler()
 
@@ -120,7 +133,10 @@ object CrashCapture {
         }
 
         ensureDefaultHandlerInstalled(h, currentDefault)
-        Log.d(TAG, "install: ensured default handler. pid=${Process.myPid()} default=${describeHandler(Thread.getDefaultUncaughtExceptionHandler())}")
+        Log.d(
+            TAG,
+            "install: ensured default handler. pid=${Process.myPid()} default=${describeHandler(Thread.getDefaultUncaughtExceptionHandler())}"
+        )
     }
 
     /**
@@ -175,6 +191,10 @@ object CrashCapture {
      * - If Supabase is configured, enqueue Supabase uploads.
      * - If GitHub is configured, ALSO enqueue GitHub mirror uploads (optional but useful).
      * - Keep files locally if nothing is configured.
+     *
+     * Important ordering:
+     * - If both targets are enabled, create GitHub mirror copies FIRST to avoid a race where
+     *   Supabase worker deletes originals before mirror-copy happens.
      */
     fun enqueuePendingCrashUploadsIfPossible(context: Context) {
         val root = filesDirRoot ?: runCatching { context.filesDir }.getOrNull()
@@ -198,6 +218,14 @@ object CrashCapture {
             }
             lastEnqueueAt.set(now)
 
+            // Fail-fast: if WorkManager isn't initialized, enqueuing will never work.
+            val wmOk = runCatching { WorkManager.getInstance(context.applicationContext) }
+                .onFailure { e ->
+                    Log.e(TAG, "WorkManager not available/initialized: ${e.message}", e)
+                }
+                .isSuccess
+            if (!wmOk) return
+
             val dir = crashDir(root).apply { mkdirs() }
             val ghMirrorDir = crashGitHubMirrorDir(root).apply { mkdirs() }
 
@@ -211,7 +239,7 @@ object CrashCapture {
             if (files.isEmpty()) return
 
             val supabaseConfigured = SupabaseCrashUploadWorker.isConfigured()
-            val ghCfg = buildCrashGitHubConfigOrNull()
+            val ghCfg = buildCrashGitHubConfigOrNull(context.applicationContext)
 
             Log.d(
                 TAG,
@@ -240,24 +268,7 @@ object CrashCapture {
                 return
             }
 
-            // 1) Supabase upload for originals (preferred)
-            if (supabaseConfigured) {
-                Log.d(TAG, "Enqueuing Supabase crash uploads… prefix=$SUPABASE_CRASH_PREFIX")
-                targets.forEach { file ->
-                    Log.d(
-                        TAG,
-                        "Supabase enqueue: name=${file.name} bytes=${file.length()} mtime=${file.lastModified()}"
-                    )
-                    SupabaseCrashUploadWorker.enqueueExistingCrash(
-                        context = context.applicationContext,
-                        file = file,
-                        objectPrefix = SUPABASE_CRASH_PREFIX,
-                        addDateSubdir = true
-                    )
-                }
-            }
-
-            // 2) GitHub mirror upload (copy files so Supabase worker can delete originals safely)
+            // 1) GitHub mirror upload (copy files first to avoid Supabase delete race)
             if (ghCfg != null) {
                 Log.d(TAG, "Enqueuing GitHub crash uploads… (mirror)")
                 targets.forEach { file ->
@@ -278,6 +289,23 @@ object CrashCapture {
                             file = mirror
                         )
                     }
+                }
+            }
+
+            // 2) Supabase upload for originals (preferred for cloud storage)
+            if (supabaseConfigured) {
+                Log.d(TAG, "Enqueuing Supabase crash uploads… prefix=$SUPABASE_CRASH_PREFIX")
+                targets.forEach { file ->
+                    Log.d(
+                        TAG,
+                        "Supabase enqueue: name=${file.name} bytes=${file.length()} mtime=${file.lastModified()}"
+                    )
+                    SupabaseCrashUploadWorker.enqueueExistingCrash(
+                        context = context.applicationContext,
+                        file = file,
+                        objectPrefix = SUPABASE_CRASH_PREFIX,
+                        addDateSubdir = true
+                    )
                 }
             }
         } finally {
@@ -488,7 +516,48 @@ object CrashCapture {
         }
     }
 
-    private fun buildCrashGitHubConfigOrNull(): GitHubUploader.GitHubConfig? {
+    /**
+     * Build GitHub config for crash uploads.
+     *
+     * Priority:
+     *  1) GitHubDiagnosticsConfigStore (user-configured token/prefs)
+     *  2) BuildConfig (gradle-injected secrets/config)
+     *
+     * Path prefix:
+     *  - Uses base prefix from config, then appends diagnostics/crash (avoids duplication when base already includes diagnostics).
+     */
+    private fun buildCrashGitHubConfigOrNull(context: Context): GitHubUploader.GitHubConfig? {
+        val fromStore = runCatching { GitHubDiagnosticsConfigStore.buildGitHubConfigOrNull(context) }
+            .getOrNull()
+
+        val base = fromStore ?: runCatching { buildCrashGitHubConfigFromBuildConfig() }.getOrNull()
+        if (base == null) return null
+
+        val crashPrefix = computeCrashPrefix(base.pathPrefix)
+
+        return base.copy(
+            repo = base.repo.substringAfterLast('/').trim(),
+            branch = base.branch.ifBlank { "main" },
+            pathPrefix = crashPrefix
+        )
+    }
+
+    private fun computeCrashPrefix(basePrefix: String): String {
+        val p = basePrefix.trim('/')
+
+        // Already a crash prefix
+        if (p.endsWith("diagnostics/crash")) return p
+
+        // If base already ends with diagnostics, append crash
+        if (p.endsWith("diagnostics")) {
+            return listOf(p, "crash").filter { it.isNotBlank() }.joinToString("/")
+        }
+
+        // Default: base + diagnostics/crash
+        return listOf(p, "diagnostics/crash").filter { it.isNotBlank() }.joinToString("/")
+    }
+
+    private fun buildCrashGitHubConfigFromBuildConfig(): GitHubUploader.GitHubConfig? {
         if (BuildConfig.GH_TOKEN.isBlank()) return null
         if (BuildConfig.GH_OWNER.isBlank() || BuildConfig.GH_REPO.isBlank()) return null
 
@@ -496,17 +565,11 @@ object CrashCapture {
         val repoName = BuildConfig.GH_REPO.substringAfterLast('/').trim()
         if (repoName.isBlank()) return null
 
-        val basePrefix = BuildConfig.GH_PATH_PREFIX.trim('/')
-
-        val crashPrefix = listOf(basePrefix, "diagnostics/crash")
-            .filter { it.isNotBlank() }
-            .joinToString("/")
-
         return GitHubUploader.GitHubConfig(
             owner = BuildConfig.GH_OWNER,
             repo = repoName,
             branch = BuildConfig.GH_BRANCH.ifBlank { "main" },
-            pathPrefix = crashPrefix,
+            pathPrefix = BuildConfig.GH_PATH_PREFIX.trim().trim('/'),
             token = BuildConfig.GH_TOKEN
         )
     }

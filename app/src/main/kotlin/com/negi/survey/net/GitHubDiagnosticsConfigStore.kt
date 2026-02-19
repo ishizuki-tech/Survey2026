@@ -59,8 +59,11 @@ object GitHubDiagnosticsConfigStore {
 
     private const val KEYSTORE_PROVIDER = "AndroidKeyStore"
 
-    /** Keep alias unique per applicationId to avoid collisions across flavors/apps. */
+    /** Current alias (stable per applicationId). */
     private val KEY_ALIAS: String = "${BuildConfig.APPLICATION_ID}.GitHubDiagnostics.Token"
+
+    /** Legacy alias fallback (safe to try; no-op if not present). */
+    private const val LEGACY_KEY_ALIAS: String = "GitHubDiagnostics.Token"
 
     private const val ENC_PREFIX_V1 = "v1:"
     private const val GCM_TAG_BITS = 128
@@ -70,8 +73,8 @@ object GitHubDiagnosticsConfigStore {
      * Immutable store snapshot.
      *
      * @property enabled Whether GitHub diagnostics upload is enabled.
-     * @property owner GitHub owner (e.g., "ishizuki-tech").
-     * @property repo GitHub repo (e.g., "SurveyExports" or "ishizuki-tech/SurveyExports" depending on your uploader).
+     * @property owner GitHub owner (e.g., "ishizuki-tech"). Can be blank if repo is "owner/repo".
+     * @property repo GitHub repo (e.g., "SurveyExports" or "ishizuki-tech/SurveyExports").
      * @property branch Git branch (default "main").
      * @property pathPrefix Repo path prefix for uploads (e.g., "diagnostics/crash").
      * @property token GitHub token (plaintext in memory; persisted encrypted when possible).
@@ -84,9 +87,28 @@ object GitHubDiagnosticsConfigStore {
         val pathPrefix: String,
         val token: String
     ) {
-        fun isUsable(): Boolean =
-            enabled && owner.isNotBlank() && repo.isNotBlank() && token.isNotBlank()
+        fun isUsable(): Boolean {
+            if (!enabled) return false
+            if (token.isBlank()) return false
+            if (repo.isBlank()) return false
+
+            // Accept either:
+            // - owner + repo, OR
+            // - repo in "owner/repo" form (owner can be derived).
+            if (owner.isNotBlank()) return true
+
+            val hasOwnerInRepo = repo.contains("/") &&
+                    repo.substringBefore("/").isNotBlank() &&
+                    repo.substringAfterLast("/").isNotBlank()
+
+            return hasOwnerInRepo
+        }
     }
+
+    private data class TokenLoadResult(
+        val token: String,
+        val migratedStored: String? = null
+    )
 
     // ───────────────────────── Public API ─────────────────────────
 
@@ -98,6 +120,7 @@ object GitHubDiagnosticsConfigStore {
      *
      * Behavior:
      * - If a plaintext token is found, it will be best-effort migrated into encrypted form.
+     * - If token is missing from prefs, falls back to BuildConfig.GH_TOKEN (in-memory only).
      */
     fun load(context: Context): StoreConfig {
         val p = prefs(context)
@@ -125,15 +148,19 @@ object GitHubDiagnosticsConfigStore {
             ?.ifBlank { null }
             ?: BuildConfig.GH_PATH_PREFIX.trim().trim('/')
 
-        val tokenStored = p.getString(KEY_TOKEN, "") ?: ""
-        val token = decryptTokenBestEffort(tokenStored).trim()
+        val tokenStored = (p.getString(KEY_TOKEN, "") ?: "").trim()
 
-        // Best-effort migration: plaintext -> encrypted (no behavior change for callers).
-        if (token.isNotBlank() && tokenStored.isNotBlank() && !tokenStored.startsWith(ENC_PREFIX_V1)) {
-            val migrated = encryptTokenBestEffort(token)
-            if (migrated != tokenStored) {
-                runCatching { p.edit().putString(KEY_TOKEN, migrated).apply() }
-            }
+        val tokenRes = decodeTokenBestEffort(tokenStored)
+
+        // Fallback token from BuildConfig if prefs token is missing/unreadable.
+        val token = tokenRes.token
+            .ifBlank { BuildConfig.GH_TOKEN.trim() }
+
+        // Best-effort migration: plaintext -> encrypted OR legacy-alias -> current-alias.
+        if (!tokenStored.startsWith(ENC_PREFIX_V1) && tokenRes.migratedStored != null) {
+            runCatching { p.edit().putString(KEY_TOKEN, tokenRes.migratedStored).apply() }
+        } else if (tokenStored.startsWith(ENC_PREFIX_V1) && tokenRes.migratedStored != null && tokenRes.migratedStored != tokenStored) {
+            runCatching { p.edit().putString(KEY_TOKEN, tokenRes.migratedStored).apply() }
         }
 
         return StoreConfig(
@@ -185,14 +212,24 @@ object GitHubDiagnosticsConfigStore {
 
     /**
      * Convenience: build a GitHubConfig for uploaders (or return null if not usable).
+     *
+     * Normalization:
+     * - Accept repo="owner/repo" and extract owner when needed.
+     * - Always pass repoName (last segment) to the uploader config.
      */
     fun buildGitHubConfigOrNull(context: Context): GitHubUploader.GitHubConfig? {
         val cfg = load(context)
         if (!cfg.isUsable()) return null
 
+        val normalized = normalizeOwnerRepo(cfg.owner, cfg.repo)
+        val owner = normalized.owner
+        val repoName = normalized.repoName
+
+        if (owner.isBlank() || repoName.isBlank() || cfg.token.isBlank()) return null
+
         return GitHubUploader.GitHubConfig(
-            owner = cfg.owner,
-            repo = cfg.repo,
+            owner = owner,
+            repo = repoName,
             branch = cfg.branch.ifBlank { "main" },
             pathPrefix = cfg.pathPrefix.trim().trim('/'),
             token = cfg.token
@@ -200,7 +237,6 @@ object GitHubDiagnosticsConfigStore {
     }
 
     // ───────────────────────── Backward-compat aliases ─────────────────────────
-    // Keep these to reduce churn if older call sites exist.
 
     /** @deprecated Use load(context). */
     @Deprecated("Use load(context) instead.", ReplaceWith("load(context)"))
@@ -216,6 +252,30 @@ object GitHubDiagnosticsConfigStore {
 
     // ───────────────────────── Internals ─────────────────────────
 
+    private data class OwnerRepoNormalized(
+        val owner: String,
+        val repoName: String
+    )
+
+    private fun normalizeOwnerRepo(ownerRaw: String, repoRaw: String): OwnerRepoNormalized {
+        val owner = ownerRaw.trim()
+        val repo = repoRaw.trim()
+
+        if (repo.contains("/")) {
+            val derivedOwner = repo.substringBefore("/").trim()
+            val derivedRepoName = repo.substringAfterLast("/").trim()
+            return OwnerRepoNormalized(
+                owner = owner.ifBlank { derivedOwner },
+                repoName = derivedRepoName
+            )
+        }
+
+        return OwnerRepoNormalized(
+            owner = owner,
+            repoName = repo
+        )
+    }
+
     private fun prefs(context: Context): SharedPreferences =
         context.applicationContext.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
 
@@ -223,7 +283,7 @@ object GitHubDiagnosticsConfigStore {
         val t = tokenPlain.trim()
         if (t.isBlank()) return ""
 
-        val encrypted = runCatching { encryptTokenKeystore(t) }
+        val encrypted = runCatching { encryptTokenKeystore(t, KEY_ALIAS) }
             .onFailure { e ->
                 Log.w(TAG, "encryptTokenBestEffort: keystore encrypt failed -> plaintext fallback", e)
             }
@@ -232,31 +292,56 @@ object GitHubDiagnosticsConfigStore {
         return encrypted ?: t
     }
 
-    private fun decryptTokenBestEffort(stored: String): String {
+    private fun decodeTokenBestEffort(stored: String): TokenLoadResult {
         val s = stored.trim()
-        if (s.isBlank()) return ""
+        if (s.isBlank()) return TokenLoadResult(token = "")
 
+        // Plaintext token (legacy) -> migrate to encrypted when possible.
         if (!s.startsWith(ENC_PREFIX_V1)) {
-            // Legacy/plaintext path.
-            return s
+            val token = s
+            val migrated = runCatching { encryptTokenKeystore(token, KEY_ALIAS) }
+                .onFailure { e ->
+                    Log.w(TAG, "decodeTokenBestEffort: plaintext token encrypt failed -> keep plaintext", e)
+                }
+                .getOrNull()
+
+            return TokenLoadResult(
+                token = token,
+                migratedStored = migrated ?: token
+            )
         }
 
-        val decrypted = runCatching { decryptTokenKeystore(s) }
+        // Encrypted token: try current alias first, then legacy alias.
+        val aliases = listOf(KEY_ALIAS, LEGACY_KEY_ALIAS)
+
+        val decrypted = runCatching { decryptTokenKeystoreWithAliases(s, aliases) }
             .onFailure { e ->
                 // If decrypt fails, safest behavior is to treat token as missing.
-                Log.w(TAG, "decryptTokenBestEffort: keystore decrypt failed -> treat as blank", e)
+                Log.w(TAG, "decodeTokenBestEffort: keystore decrypt failed -> treat as blank", e)
             }
             .getOrNull()
 
-        return decrypted ?: ""
+        if (decrypted.isNullOrBlank()) return TokenLoadResult(token = "")
+
+        // If we decrypted using legacy alias, re-encrypt with current alias (migration).
+        val migratedStored = runCatching { encryptTokenKeystore(decrypted, KEY_ALIAS) }
+            .onFailure { e ->
+                Log.w(TAG, "decodeTokenBestEffort: migration encrypt failed -> keep current stored", e)
+            }
+            .getOrNull()
+
+        return TokenLoadResult(
+            token = decrypted,
+            migratedStored = migratedStored ?: s
+        )
     }
 
-    private fun encryptTokenKeystore(tokenPlain: String): String {
+    private fun encryptTokenKeystore(tokenPlain: String, alias: String): String {
         if (Build.VERSION.SDK_INT < 23) {
             throw IllegalStateException("Android Keystore AES/GCM requires API 23+")
         }
 
-        val key = getOrCreateAesKey()
+        val key = getOrCreateAesKey(alias)
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
 
         val iv = ByteArray(GCM_IV_BYTES)
@@ -273,7 +358,7 @@ object GitHubDiagnosticsConfigStore {
         return "$ENC_PREFIX_V1$ivB64:$ctB64"
     }
 
-    private fun decryptTokenKeystore(stored: String): String {
+    private fun decryptTokenKeystoreWithAliases(stored: String, aliases: List<String>): String {
         if (Build.VERSION.SDK_INT < 23) {
             throw IllegalStateException("Android Keystore AES/GCM requires API 23+")
         }
@@ -286,24 +371,39 @@ object GitHubDiagnosticsConfigStore {
         val iv = b64d(parts[0])
         val ct = b64d(parts[1])
 
-        val key = getOrCreateAesKey()
-        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-        val spec = GCMParameterSpec(GCM_TAG_BITS, iv)
+        for (alias in aliases) {
+            val key = getExistingAesKeyOrNull(alias) ?: continue
 
-        cipher.init(Cipher.DECRYPT_MODE, key, spec)
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            val spec = GCMParameterSpec(GCM_TAG_BITS, iv)
 
-        val pt = cipher.doFinal(ct)
-        return pt.toString(Charsets.UTF_8)
+            val ok = runCatching {
+                cipher.init(Cipher.DECRYPT_MODE, key, spec)
+                val pt = cipher.doFinal(ct)
+                pt.toString(Charsets.UTF_8)
+            }.getOrNull()
+
+            if (!ok.isNullOrBlank()) return ok
+        }
+
+        throw IllegalStateException("No usable keystore key found for token decrypt.")
     }
 
-    private fun getOrCreateAesKey(): SecretKey {
+    private fun getExistingAesKeyOrNull(alias: String): SecretKey? {
+        val ks = KeyStore.getInstance(KEYSTORE_PROVIDER).apply { load(null) }
+        return runCatching {
+            (ks.getEntry(alias, null) as? KeyStore.SecretKeyEntry)?.secretKey
+        }.getOrNull()
+    }
+
+    private fun getOrCreateAesKey(alias: String): SecretKey {
         val ks = KeyStore.getInstance(KEYSTORE_PROVIDER).apply { load(null) }
 
-        val existing = (ks.getEntry(KEY_ALIAS, null) as? KeyStore.SecretKeyEntry)?.secretKey
+        val existing = (ks.getEntry(alias, null) as? KeyStore.SecretKeyEntry)?.secretKey
         if (existing != null) return existing
 
         val kg = KeyGenerator.getInstance("AES", KEYSTORE_PROVIDER)
-        val spec = buildKeyGenSpecReflective(KEY_ALIAS)
+        val spec = buildKeyGenSpecReflective(alias)
         kg.init(spec)
         return kg.generateKey()
     }

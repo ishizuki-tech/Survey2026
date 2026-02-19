@@ -17,9 +17,10 @@
  *  Features:
  *   • HEAD probe with manual redirects and ETag/Last-Modified validators
  *   • Safe resume using Range/If-Range with `.part` and `.meta` files
- *   • Exponential backoff retry with Retry-After compliance
+ *   • Resume overlap (truncate + re-download tail) to reduce silent corruption risk
+ *   • Content-Range validation for 206 responses
+ *   • Exponential backoff retry with Retry-After compliance (cap + jitter)
  *   • SHA-256 integrity verification and free-space check
- *   • Progress callback suitable for Android foreground workers
  * =====================================================================
  */
 
@@ -34,6 +35,7 @@ import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.IOException
+import java.io.RandomAccessFile
 import java.net.HttpURLConnection
 import java.net.SocketTimeoutException
 import java.net.URL
@@ -42,7 +44,9 @@ import java.time.Instant
 import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
 import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.pow
+import kotlin.random.Random
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
@@ -79,6 +83,7 @@ class HttpUrlFileDownloader(
      * @param stallTimeoutMs Timeout for read stalls during transfer.
      * @param ioBufferBytes Buffer size in bytes (default: 1 MiB).
      * @param maxRetries Maximum number of retry attempts.
+     * @param resumeOverlapBytes When resuming, truncate this many bytes from the tail and re-download.
      * @throws IOException When the operation fails permanently.
      */
     suspend fun downloadToFile(
@@ -90,7 +95,8 @@ class HttpUrlFileDownloader(
         firstByteTimeoutMs: Int = 30_000,
         stallTimeoutMs: Int = 90_000,
         ioBufferBytes: Int = 1 * 1024 * 1024,
-        maxRetries: Int = 3
+        maxRetries: Int = 3,
+        resumeOverlapBytes: Int = 64 * 1024
     ) = withContext(Dispatchers.IO) {
 
         val parent = dst.absoluteFile.parentFile
@@ -101,7 +107,7 @@ class HttpUrlFileDownloader(
         val meta = MetaFile(part)
 
         // Fast path: skip if already complete and valid (when server gives Content-Length).
-        runCatching { headProbe(url, connectTimeoutMs, firstByteTimeoutMs).total }.getOrNull()
+        runCatching { headProbeSmart(url, connectTimeoutMs, firstByteTimeoutMs).total }.getOrNull()
             ?.let { headLen ->
                 val okSize = dst.exists() && dst.length() == headLen
                 val okHash = expectedSha256 == null || sha256(dst).equals(expectedSha256, true)
@@ -119,42 +125,70 @@ class HttpUrlFileDownloader(
             try {
                 coroutineContext.ensureActive()
 
-                val probe = headProbe(url, connectTimeoutMs, firstByteTimeoutMs)
-                val total = probe.total ?: throw IOException("Missing Content-Length (probe).")
-                var finalUrl = probe.finalUrl
+                val probe = headProbeSmart(url, connectTimeoutMs, firstByteTimeoutMs)
 
-                // Reconcile partial state against stored validators.
+                // Prefer known total. If still unknown, we can download but cannot do strict size checks.
+                val total = probe.total
+                val finalUrl = probe.finalUrl
+
+                // If server does not support ranges, avoid attempting resume.
+                if (!probe.acceptRanges && part.exists()) {
+                    logw("Server does not advertise Accept-Ranges; restarting cleanly.")
+                    safeDelete(part)
+                    meta.delete()
+                }
+
+                // Reconcile partial state against stored validators when possible.
                 val reconciled = reconcilePartial(
                     part = part,
                     meta = meta,
                     probe = probe,
                     total = total
                 )
+
                 var resumeFrom = reconciled.resumeFrom
 
-                // If we are starting a new partial, write meta ONCE (do not overwrite for existing partial).
-                if (resumeFrom == 0L && !part.exists()) {
-                    meta.write(Meta(probe.etag, probe.lastModified, total))
-                }
-
-                checkFreeSpaceOrThrow(
-                    parent,
-                    max(0L, (total - resumeFrom)) + 50L * 1024 * 1024
+                // Ensure meta exists whenever we are starting a new partial stream.
+                ensureMetaIfStartingFresh(
+                    part = part,
+                    meta = meta,
+                    probe = probe,
+                    total = total
                 )
+
+                // Free space check (best-effort when total unknown).
+                val required = if (total != null) {
+                    max(0L, (total - resumeFrom)) + FREE_SPACE_MARGIN_BYTES
+                } else {
+                    // Unknown total: require a conservative margin.
+                    FREE_SPACE_MARGIN_BYTES
+                }
+                checkFreeSpaceOrThrow(parent, required)
 
                 var triesOnThisStream = 0
                 var unauthorizedCount = 0
 
                 STREAM@ while (true) {
-                    if (triesOnThisStream > 0) {
-                        val refreshed = headProbe(url, connectTimeoutMs, firstByteTimeoutMs)
-                        if (refreshed.total != null && refreshed.total != total) {
-                            throw IOException("Remote size changed (old=$total new=${refreshed.total})")
-                        }
-                        finalUrl = refreshed.finalUrl
-                    }
+                    coroutineContext.ensureActive()
+
+                    // If we restart the stream loop (e.g., after deleting part), ensure meta again.
+                    ensureMetaIfStartingFresh(
+                        part = part,
+                        meta = meta,
+                        probe = probe,
+                        total = total
+                    )
+
+                    // Apply resume overlap (truncate tail and re-download).
+                    resumeFrom = applyResumeOverlap(
+                        part = part,
+                        resumeFrom = resumeFrom,
+                        overlapBytes = resumeOverlapBytes,
+                        total = total
+                    )
 
                     val ifRange = meta.read()?.let { m ->
+                        // Prefer ETag for If-Range; fallback to Last-Modified.
                         etagForIfRange(m.etag) ?: m.lastModified
                     }
 
@@ -162,7 +196,7 @@ class HttpUrlFileDownloader(
                         srcUrl = finalUrl,
                         connectTimeoutMs = connectTimeoutMs,
                         readTimeoutMs = stallTimeoutMs,
-                        rangeFrom = resumeFrom.takeIf { it > 0L },
+                        rangeFrom = resumeFrom.takeIf { it > 0L && probe.acceptRanges },
                         ifRange = ifRange,
                         maxRedirects = 10
                     )
@@ -173,7 +207,6 @@ class HttpUrlFileDownloader(
                         when (code) {
                             HttpURLConnection.HTTP_UNAUTHORIZED,
                             HttpURLConnection.HTTP_FORBIDDEN -> {
-                                // NOTE: Without a cap, this can loop forever when token/ACL is wrong.
                                 unauthorizedCount++
                                 val snippet = readErrorSnippet(conn)
                                 logw("GET $code: unauthorized/forbidden (count=$unauthorizedCount) ${snippet ?: ""}".trim())
@@ -181,7 +214,7 @@ class HttpUrlFileDownloader(
                                     throw IOException("GET HTTP $code: access denied. ${snippet ?: ""}".trim())
                                 }
                                 triesOnThisStream++
-                                resumeFrom = part.length().coerceIn(0, total)
+                                resumeFrom = part.length().coerceAtLeast(0L)
                                 continue@STREAM
                             }
 
@@ -193,6 +226,13 @@ class HttpUrlFileDownloader(
                                 resumeFrom = 0L
                                 if (++triesOnThisStream <= 3) continue@STREAM
                                 throw IOException("Server ignored Range repeatedly.")
+                            }
+
+                            HttpURLConnection.HTTP_PARTIAL -> {
+                                // Validate Content-Range when resuming.
+                                if (resumeFrom > 0) {
+                                    validateContentRangeStart(conn, expectedStart = resumeFrom)
+                                }
                             }
 
                             416 -> {
@@ -227,11 +267,7 @@ class HttpUrlFileDownloader(
                             )
                         }
 
-                        if (code !in listOf(
-                                HttpURLConnection.HTTP_OK,
-                                HttpURLConnection.HTTP_PARTIAL
-                            )
-                        ) {
+                        if (code !in listOf(HttpURLConnection.HTTP_OK, HttpURLConnection.HTTP_PARTIAL)) {
                             val snippet = readErrorSnippet(conn)
                             throw IOException("GET HTTP $code${snippet?.let { ": $it" } ?: ""}")
                         }
@@ -251,21 +287,23 @@ class HttpUrlFileDownloader(
                                             val n = input.read(buf)
                                             if (n == -1) break
                                             out.write(buf, 0, n)
-                                            downloaded += n
+                                            downloaded += n.toLong()
                                             onProgress(downloaded, total)
                                         }
                                         out.flush()
                                     }
+                                    // Best-effort durability: flush kernel buffers (may be slow on some devices).
+                                    runCatching { fos.fd.sync() }
                                 }
                             }
                         } catch (t: SocketTimeoutException) {
                             logw("Stall timeout; resuming.")
-                            resumeFrom = part.length().coerceIn(0, total)
+                            resumeFrom = part.length().coerceAtLeast(0L)
                             if (++triesOnThisStream <= 3) continue@STREAM
                             throw t
                         } catch (t: IOException) {
                             logw("Stream error: ${t.message}")
-                            resumeFrom = part.length().coerceIn(0, total)
+                            resumeFrom = part.length().coerceAtLeast(0L)
                             if (++triesOnThisStream <= 3) continue@STREAM
                             throw t
                         }
@@ -279,7 +317,7 @@ class HttpUrlFileDownloader(
                         meta.delete()
 
                         // Final validations.
-                        if (dst.length() != total) {
+                        if (total != null && dst.length() != total) {
                             throw IOException("Size mismatch: expected=$total got=${dst.length()}")
                         }
                         if (expectedSha256 != null) {
@@ -290,7 +328,7 @@ class HttpUrlFileDownloader(
                             }
                         }
 
-                        onProgress(total, total)
+                        onProgress(dst.length(), total ?: dst.length())
                         logd("Saved ${dst.name} (${dst.length()} bytes)")
                         return@withContext
                     } finally {
@@ -304,8 +342,7 @@ class HttpUrlFileDownloader(
                 val retryAfterMs = (t as? HttpExceptionWithRetryAfter)?.retryAfterMs
 
                 if (attempt < maxRetries - 1) {
-                    val backoffMs =
-                        retryAfterMs ?: (500.0 * 2.0.pow(attempt.toDouble())).toLong()
+                    val backoffMs = computeBackoffMs(attempt, retryAfterMs)
                     logw("Retrying in ${backoffMs}ms …")
                     delay(backoffMs)
                 }
@@ -330,6 +367,20 @@ class HttpUrlFileDownloader(
         val lastModified: String?,
         val finalUrl: String
     )
+
+    /**
+     * Smart probe:
+     * - HEAD with manual redirects
+     * - If HEAD is unsupported OR Content-Length is missing, try GET Range(0-0) to infer total
+     */
+    private fun headProbeSmart(srcUrl: String, connectTimeoutMs: Int, readTimeoutMs: Int): Probe {
+        val head = headProbe(srcUrl, connectTimeoutMs, readTimeoutMs)
+        if (head.total != null) return head
+
+        // HEAD succeeded but did not provide Content-Length (chunked/unknown). Try Range probe.
+        return runCatching { probeViaRangeGet(head.finalUrl, connectTimeoutMs, readTimeoutMs) }
+            .getOrElse { head }
+    }
 
     private fun headProbe(srcUrl: String, connectTimeoutMs: Int, readTimeoutMs: Int): Probe {
         var current = srcUrl
@@ -380,7 +431,7 @@ class HttpUrlFileDownloader(
     }
 
     /**
-     * Probe via GET Range(0-0) to support servers that reject HEAD.
+     * Probe via GET Range(0-0) to support servers that reject HEAD or omit Content-Length.
      *
      * This resolves redirects manually and tries to infer total size via Content-Range.
      */
@@ -507,7 +558,6 @@ class HttpUrlFileDownloader(
                 )
                 if (file.exists()) runCatching { file.delete() }
                 if (!tmp.renameTo(file)) {
-                    // Fallback
                     file.writeText(tmp.readText())
                     runCatching { tmp.delete() }
                 }
@@ -517,6 +567,8 @@ class HttpUrlFileDownloader(
         fun delete() {
             runCatching { if (file.exists()) file.delete() }
         }
+
+        fun exists(): Boolean = file.exists()
     }
 
     private data class PartialReconcile(val resumeFrom: Long)
@@ -526,14 +578,14 @@ class HttpUrlFileDownloader(
      *
      * Rules:
      * - If .part exists but .meta is missing -> restart (delete .part).
-     * - If total mismatch or validators mismatch -> restart.
-     * - If .part larger than total -> restart.
+     * - If total mismatch or validators mismatch -> restart (when total is known).
+     * - If .part larger than total -> restart (when total is known).
      */
     private fun reconcilePartial(
         part: File,
         meta: MetaFile,
         probe: Probe,
-        total: Long
+        total: Long?
     ): PartialReconcile {
         if (!part.exists()) return PartialReconcile(0L)
 
@@ -544,7 +596,7 @@ class HttpUrlFileDownloader(
             return PartialReconcile(0L)
         }
 
-        if (onDisk > total) {
+        if (total != null && onDisk > total) {
             logw("Partial larger than total (part=$onDisk total=$total). Restarting.")
             safeDelete(part)
             meta.delete()
@@ -559,7 +611,7 @@ class HttpUrlFileDownloader(
             return PartialReconcile(0L)
         }
 
-        if (m.total != null && m.total != total) {
+        if (total != null && m.total != null && m.total != total) {
             logw("Meta total mismatch (meta=${m.total} probe=$total). Restarting.")
             safeDelete(part)
             meta.delete()
@@ -584,11 +636,55 @@ class HttpUrlFileDownloader(
             return PartialReconcile(0L)
         }
 
-        return PartialReconcile(onDisk.coerceIn(0L, total))
+        val bounded = if (total != null) onDisk.coerceIn(0L, total) else onDisk.coerceAtLeast(0L)
+        return PartialReconcile(bounded)
+    }
+
+    /**
+     * Make sure meta exists when starting from scratch (or after in-stream restart).
+     */
+    private fun ensureMetaIfStartingFresh(
+        part: File,
+        meta: MetaFile,
+        probe: Probe,
+        total: Long?
+    ) {
+        if (part.exists()) return
+        if (meta.exists()) return
+        meta.write(Meta(probe.etag, probe.lastModified, total))
+    }
+
+    /**
+     * Truncate the tail by overlapBytes when resuming to reduce silent corruption risk.
+     */
+    private fun applyResumeOverlap(
+        part: File,
+        resumeFrom: Long,
+        overlapBytes: Int,
+        total: Long?
+    ): Long {
+        if (!part.exists()) return 0L
+        val len = part.length().coerceAtLeast(0L)
+        var from = resumeFrom.coerceIn(0L, total ?: Long.MAX_VALUE)
+
+        if (from <= 0L) return 0L
+        val overlap = overlapBytes.coerceAtLeast(0).toLong()
+        if (overlap <= 0L) return from
+
+        val newFrom = (from - overlap).coerceAtLeast(0L)
+        if (newFrom < len) {
+            runCatching {
+                RandomAccessFile(part, "rw").use { raf ->
+                    raf.setLength(newFrom)
+                }
+            }
+            return newFrom
+        }
+        return from
     }
 
     // ----------------------------------------------------------
-    // GET with manual redirects (keeps Range/If-Range/header behavior predictable)
+    // GET with manual redirects
     // ----------------------------------------------------------
 
     private fun openGetWithRedirects(
@@ -629,6 +725,31 @@ class HttpUrlFileDownloader(
         }
     }
 
+    /**
+     * Validate that Content-Range starts at expectedStart for 206 responses.
+     */
+    private fun validateContentRangeStart(conn: HttpURLConnection, expectedStart: Long) {
+        val cr = conn.getHeaderField("Content-Range")?.trim().orEmpty()
+        // Expect: "bytes <start>-<end>/<total>"
+        val lower = cr.lowercase()
+        if (!lower.startsWith("bytes ")) {
+            throw IOException("206 without Content-Range header.")
+        }
+        val space = cr.indexOf(' ')
+        val dash = cr.indexOf('-', startIndex = space + 1)
+        val slash = cr.indexOf('/', startIndex = dash + 1)
+        if (space < 0 || dash < 0 || slash < 0) {
+            throw IOException("Malformed Content-Range: $cr")
+        }
+        val startStr = cr.substring(space + 1, dash).trim()
+        val start = startStr.toLongOrNull()
+            ?: throw IOException("Malformed Content-Range start: $cr")
+
+        if (start != expectedStart) {
+            throw IOException("Content-Range start mismatch: expected=$expectedStart got=$start ($cr)")
+        }
+    }
+
     // ----------------------------------------------------------
     // 416 reconciliation
     // ----------------------------------------------------------
@@ -643,10 +764,17 @@ class HttpUrlFileDownloader(
         dst: File,
         part: File,
         meta: MetaFile,
-        total: Long,
+        total: Long?,
         expectedSha256: String?,
         onProgress: (Long, Long?) -> Unit
     ): Boolean {
+        if (total == null) {
+            logw("416 but total unknown; restarting cleanly.")
+            safeDelete(part)
+            meta.delete()
+            return false
+        }
+
         val onDisk = part.length()
 
         if (onDisk == total) {
@@ -761,6 +889,18 @@ class HttpUrlFileDownloader(
         }.getOrNull()
     }
 
+    private fun computeBackoffMs(attempt: Int, retryAfterMs: Long?): Long {
+        retryAfterMs?.let {
+            return it.coerceIn(500L, MAX_BACKOFF_MS)
+        }
+
+        // Exponential backoff with cap + jitter.
+        val base = (BASE_BACKOFF_MS * 2.0.pow(attempt.toDouble())).toLong()
+        val capped = base.coerceAtMost(MAX_BACKOFF_MS)
+        val jitter = Random.nextLong(0L, 300L)
+        return (capped + jitter).coerceAtMost(MAX_BACKOFF_MS)
+    }
+
     private fun checkFreeSpaceOrThrow(dir: File, required: Long) {
         val fs = StatFs(dir.absolutePath)
         val avail = max(0L, fs.availableBytes)
@@ -798,5 +938,12 @@ class HttpUrlFileDownloader(
     companion object {
         /** Maximum number of in-stream retries for 401/403 to avoid infinite loops. */
         private const val MAX_UNAUTHORIZED_RETRIES = 2
+
+        /** Extra safety margin (50 MiB) to avoid running out of space mid-download. */
+        private const val FREE_SPACE_MARGIN_BYTES = 50L * 1024L * 1024L
+
+        /** Backoff defaults. */
+        private const val BASE_BACKOFF_MS = 500L
+        private const val MAX_BACKOFF_MS = 20_000L
     }
 }

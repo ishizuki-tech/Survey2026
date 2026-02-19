@@ -26,6 +26,11 @@
  *  Robustness rule (voice):
  *   • Do NOT delete WAV until all REQUIRED destinations succeed.
  *     (See VoiceUploadCompletionStore)
+ *
+ *  GitHub note:
+ *   • GitHub Contents API is not suitable for large binary uploads.
+ *     We apply a conservative size guard and skip GitHub voice uploads
+ *     when a file is too large for reasonable Contents API usage.
  * =====================================================================
  */
 
@@ -120,6 +125,14 @@ private const val PENDING_DIR_SB = "pending_uploads_supabase"
 
 /** Shared pending root for voice so GitHub/Supabase won't race by moving/deleting the same WAV. */
 private const val PENDING_DIR_SHARED = "pending_uploads_shared"
+
+/**
+ * Conservative raw-byte limit for GitHub Contents API uploads.
+ *
+ * Base64 expands ~4/3, plus JSON wrapper overhead; large binaries frequently fail
+ * or cause poor mobile performance. We skip GitHub upload for voice over this limit.
+ */
+private const val MAX_GH_CONTENT_RAW_BYTES: Long = 700_000L
 
 private val LOGCAT_TAG_FILTERS = arrayOf(
     "WhisperEngine",
@@ -494,7 +507,7 @@ fun DoneScreen(
                                         stamp = exportedAtStamp
                                     )
 
-                                    val (jsonRes, voicesUploaded, didUploadLog) =
+                                    val (jsonRes, voicesUploaded, voicesSkipped, voicesFailed, didUploadLog) =
                                         withContext(Dispatchers.IO) {
                                             val jsonRemote = "$REMOTE_EXPORT_DIR/$fileName"
                                             val jsonResult = GitHubUploader.uploadJson(
@@ -513,39 +526,69 @@ fun DoneScreen(
                                                 )
 
                                             var uploadedVoices = 0
+                                            val skipped = ArrayList<String>()
+                                            val failed = ArrayList<String>()
+
                                             currentVoiceFiles.forEach { file ->
-                                                // Require both when both are configured, to prevent ordering races.
+                                                val canGh = canUploadToGitHubContentsApi(file)
+
+                                                // Require only destinations we can realistically satisfy.
                                                 VoiceUploadCompletionStore.requireDestinations(
                                                     context = context,
                                                     file = file,
-                                                    requireGitHub = true,
+                                                    requireGitHub = canGh,
                                                     requireSupabase = (supabaseCfg != null)
                                                 )
 
-                                                GitHubUploader.uploadFile(
-                                                    cfg = cfg,
-                                                    relativePath = "$REMOTE_VOICE_DIR/${file.name}",
-                                                    file = file,
-                                                    message = "Upload ${file.name}"
-                                                )
-
-                                                val st = VoiceUploadCompletionStore.markGitHubUploaded(context, file)
-                                                Log.d(
-                                                    LOG_TAG,
-                                                    "Voice flag (GitHub immediate): name=${file.name} reqGh=${st.requireGitHub} reqSb=${st.requireSupabase} " +
-                                                            "ghDone=${st.githubUploaded} sbDone=${st.supabaseUploaded} complete=${st.isComplete}"
-                                                )
-
-                                                if (VoiceUploadCompletionStore.shouldDeleteNow(context, file)) {
-                                                    Log.d(LOG_TAG, "Voice delete eligible (GitHub immediate): ${file.name}")
-                                                    runCatching { deleteVoiceSidecars(file) }
-                                                    runCatching { file.delete() }
-                                                    VoiceUploadCompletionStore.clear(context, file)
-                                                } else {
-                                                    Log.d(LOG_TAG, "Voice kept (GitHub immediate): waiting other required destination: ${file.name}")
+                                                if (!canGh) {
+                                                    skipped.add("${file.name}(${file.length()}B)")
+                                                    Log.w(
+                                                        LOG_TAG,
+                                                        "Skip GitHub voice (too large for Contents API): name=${file.name} bytes=${file.length()}"
+                                                    )
+                                                    return@forEach
                                                 }
 
-                                                uploadedVoices++
+                                                runCatching {
+                                                    GitHubUploader.uploadFile(
+                                                        cfg = cfg,
+                                                        relativePath = "$REMOTE_VOICE_DIR/${file.name}",
+                                                        file = file,
+                                                        message = "Upload ${file.name}"
+                                                    )
+                                                }.onSuccess {
+                                                    val st =
+                                                        VoiceUploadCompletionStore.markGitHubUploaded(context, file)
+                                                    Log.d(
+                                                        LOG_TAG,
+                                                        "Voice flag (GitHub immediate): name=${file.name} reqGh=${st.requireGitHub} reqSb=${st.requireSupabase} " +
+                                                                "ghDone=${st.githubUploaded} sbDone=${st.supabaseUploaded} complete=${st.isComplete}"
+                                                    )
+
+                                                    if (VoiceUploadCompletionStore.shouldDeleteNow(context, file)) {
+                                                        Log.d(
+                                                            LOG_TAG,
+                                                            "Voice delete eligible (GitHub immediate): ${file.name}"
+                                                        )
+                                                        runCatching { deleteVoiceSidecars(file) }
+                                                        runCatching { file.delete() }
+                                                        VoiceUploadCompletionStore.clear(context, file)
+                                                    } else {
+                                                        Log.d(
+                                                            LOG_TAG,
+                                                            "Voice kept (GitHub immediate): waiting other required destination: ${file.name}"
+                                                        )
+                                                    }
+
+                                                    uploadedVoices++
+                                                }.onFailure { t ->
+                                                    failed.add("${file.name}:${t.message}")
+                                                    Log.e(
+                                                        LOG_TAG,
+                                                        "GitHub voice upload failed (immediate): name=${file.name}",
+                                                        t
+                                                    )
+                                                }
                                             }
 
                                             val logFile = captureSessionLogcatToPendingFile(
@@ -567,23 +610,35 @@ fun DoneScreen(
 
                                             if (didUpload) runCatching { logFile.delete() }
 
-                                            Triple(jsonResult, uploadedVoices, didUpload)
+                                            Quintuple(
+                                                jsonResult,
+                                                uploadedVoices,
+                                                skipped.size,
+                                                failed.size,
+                                                didUpload
+                                            )
                                         }
 
                                     val resultLabel = jsonRes.fileUrl ?: jsonRes.commitSha ?: "(no URL)"
                                     val logMsg = if (didUploadLog) " + logs" else ""
-
-                                    if (voicesUploaded > 0) {
-                                        snackbar.showOnce("GitHub: Uploaded JSON + $voicesUploaded voice file(s)$logMsg: $resultLabel")
-                                    } else {
-                                        snackbar.showOnce("GitHub: Uploaded JSON$logMsg: $resultLabel")
+                                    val voiceMsg = buildString {
+                                        if (voicesUploaded > 0 || voicesSkipped > 0 || voicesFailed > 0) {
+                                            append(" + voice uploaded=$voicesUploaded")
+                                            if (voicesSkipped > 0) append(" skipped=$voicesSkipped")
+                                            if (voicesFailed > 0) append(" failed=$voicesFailed")
+                                        }
                                     }
+
+                                    snackbar.showOnce("GitHub: JSON$logMsg$voiceMsg: $resultLabel")
 
                                     val remaining = withContext(Dispatchers.IO) {
                                         scanVoiceFilesByNames(context, expectedVoiceFileNames)
                                     }
                                     voiceFilesState.value = remaining
                                 } catch (e: Exception) {
+                                    // English comments only.
+                                    /** Log full stacktrace to identify the failing step (JSON/voice/logcat). */
+                                    Log.e(LOG_TAG, "GitHub upload failed (immediate)", e)
                                     snackbar.showOnce("GitHub upload failed: ${e.message}")
                                 } finally {
                                     uploading = false
@@ -642,11 +697,14 @@ fun DoneScreen(
                                         currentVoiceFiles.forEach { file ->
                                             Log.d(LOG_TAG, "Supabase voice upload: name=${file.name} bytes=${file.length()}")
 
-                                            // Require both when both are configured, to prevent ordering races.
+                                            // Require GitHub only if feasible; otherwise deletion will never happen.
+                                            val canGh = canUploadToGitHubContentsApi(file)
+
+                                            // Require both when both are configured AND feasible, to prevent ordering races.
                                             VoiceUploadCompletionStore.requireDestinations(
                                                 context = context,
                                                 file = file,
-                                                requireGitHub = (gitHubConfig != null),
+                                                requireGitHub = (gitHubConfig != null && canGh),
                                                 requireSupabase = true
                                             )
 
@@ -715,6 +773,7 @@ fun DoneScreen(
                                     }
                                     voiceFilesState.value = remaining
                                 } catch (e: Exception) {
+                                    Log.e(LOG_TAG, "Supabase upload failed (immediate)", e)
                                     snackbar.showOnce("Supabase upload failed: ${e.message}")
                                 } finally {
                                     uploading = false
@@ -787,15 +846,29 @@ fun DoneScreen(
                                         emptyList()
                                     }
 
+                                    var scheduledGhVoices = 0
+                                    var skippedGhVoices = 0
+
                                     if (staged.isNotEmpty()) {
                                         staged.forEach { stagedFile ->
-                                            // Require both when both are configured, to prevent ordering races.
+                                            val canGh = canUploadToGitHubContentsApi(stagedFile)
+
+                                            // Require only destinations we can realistically satisfy.
                                             VoiceUploadCompletionStore.requireDestinations(
                                                 context = context,
                                                 file = stagedFile,
-                                                requireGitHub = true,
+                                                requireGitHub = canGh,
                                                 requireSupabase = (supabaseCfg != null)
                                             )
+
+                                            if (!canGh) {
+                                                skippedGhVoices++
+                                                Log.w(
+                                                    LOG_TAG,
+                                                    "Skip scheduling GitHub voice (too large for Contents API): name=${stagedFile.name} bytes=${stagedFile.length()}"
+                                                )
+                                                return@forEach
+                                            }
 
                                             runCatching {
                                                 enqueueGitHubWorkerFileUpload(
@@ -804,9 +877,20 @@ fun DoneScreen(
                                                     localFile = stagedFile,
                                                     remoteRelativePath = "$REMOTE_VOICE_DIR/${stagedFile.name}"
                                                 )
+                                            }.onSuccess {
+                                                scheduledGhVoices++
+                                            }.onFailure { t ->
+                                                Log.e(
+                                                    LOG_TAG,
+                                                    "Failed to schedule GitHub voice: name=${stagedFile.name}",
+                                                    t
+                                                )
                                             }
                                         }
-                                        snackbar.showOnce("GitHub: Upload scheduled (${staged.size} voice file(s)).")
+
+                                        snackbar.showOnce(
+                                            "GitHub: Upload scheduled (voice: scheduled=$scheduledGhVoices skipped=$skippedGhVoices)."
+                                        )
                                     }
 
                                     runCatching {
@@ -901,11 +985,13 @@ fun DoneScreen(
 
                                     if (staged.isNotEmpty()) {
                                         staged.forEach { stagedFile ->
-                                            // Require both when both are configured, to prevent ordering races.
+                                            val canGh = canUploadToGitHubContentsApi(stagedFile)
+
+                                            // Require GitHub only if feasible; otherwise deletion will never happen.
                                             VoiceUploadCompletionStore.requireDestinations(
                                                 context = context,
                                                 file = stagedFile,
-                                                requireGitHub = (gitHubConfig != null),
+                                                requireGitHub = (gitHubConfig != null && canGh),
                                                 requireSupabase = true
                                             )
 
@@ -996,13 +1082,17 @@ private fun enqueueGitHubWorkerFileUpload(
     val safeUnique = sanitizeWorkName(remoteRelativePath)
     val uniqueName = "gh_upload_$safeUnique"
 
+    // English comments only.
+    /** Normalize repo in case it is provided as "owner/repo". */
+    val repoName = normalizeRepoNameForWork(cfg.repo)
+
     val req: OneTimeWorkRequest =
         OneTimeWorkRequestBuilder<GitHubUploadWorker>()
             .setInputData(
                 workDataOf(
                     GitHubUploadWorker.KEY_MODE to "file",
                     GitHubUploadWorker.KEY_OWNER to cfg.owner,
-                    GitHubUploadWorker.KEY_REPO to cfg.repo,
+                    GitHubUploadWorker.KEY_REPO to repoName,
                     GitHubUploadWorker.KEY_TOKEN to cfg.token,
                     GitHubUploadWorker.KEY_BRANCH to cfg.branch,
                     GitHubUploadWorker.KEY_PATH_PREFIX to cfg.pathPrefix,
@@ -1025,8 +1115,9 @@ private fun enqueueGitHubWorkerFileUpload(
             .addTag("${GitHubUploadWorker.TAG}:file:$safeUnique")
             .build()
 
+    // REPLACE avoids "KEEP stuck forever" when a previous work exists in FAILED/BLOCKED state.
     WorkManager.getInstance(context)
-        .enqueueUniqueWork(uniqueName, ExistingWorkPolicy.KEEP, req)
+        .enqueueUniqueWork(uniqueName, ExistingWorkPolicy.REPLACE, req)
 }
 
 private fun enqueueSupabaseWorkerFileUpload(
@@ -1076,8 +1167,9 @@ private fun enqueueSupabaseWorkerFileUpload(
             .addTag("${SupabaseUploadWorker.TAG}:file:$safeUnique")
             .build()
 
+    // REPLACE avoids "KEEP stuck forever" when a previous work exists in FAILED/BLOCKED state.
     WorkManager.getInstance(context)
-        .enqueueUniqueWork(uniqueName, ExistingWorkPolicy.KEEP, req)
+        .enqueueUniqueWork(uniqueName, ExistingWorkPolicy.REPLACE, req)
 }
 
 private fun sanitizeWorkName(value: String): String {
@@ -1135,7 +1227,9 @@ private fun stageVoiceFilesToSharedPendingForRun(
     val out = ArrayList<File>(expectedBase.size)
 
     expectedBase.forEach { name ->
-        val dst = File(dir, sanitizeFileName(name))
+        // Keep the original base file name stable.
+        val safeName = stableVoiceFileName(name)
+        val dst = File(dir, safeName)
 
         // If already staged, use it.
         if (dst.exists() && dst.isFile && dst.length() > 0L) {
@@ -1164,7 +1258,10 @@ private fun stageVoiceFilesToSharedPendingForRun(
                 runCatching { src.delete() }
             }
         }.getOrElse { e ->
-            throw IOException("Failed to stage voice: ${src.absolutePath} -> ${dst.absolutePath}: ${e.message}", e)
+            throw IOException(
+                "Failed to stage voice: ${src.absolutePath} -> ${dst.absolutePath}: ${e.message}",
+                e
+            )
         }
 
         out.add(dst)
@@ -1258,6 +1355,14 @@ private fun writePendingTextFile(
 private fun sanitizeFileName(name: String): String {
     val flattened = name.replace("/", "_")
     return flattened.replace(Regex("""[^\w\-.]"""), "_")
+}
+
+private fun stableVoiceFileName(baseName: String): String {
+    val s = normalizeLocalName(baseName).trim()
+    if (s.isBlank()) return "unknown.wav"
+    // Base file name should not contain separators; if it does, sanitize to avoid filesystem issues.
+    if (s.contains('/') || s.contains('\\')) return sanitizeFileName(s)
+    return s
 }
 
 private fun uniqueIfExists(file: File): File {
@@ -1523,3 +1628,30 @@ private fun normalizeLocalName(name: String): String {
     val i = maxOf(i1, i2)
     return if (i >= 0 && i + 1 < s.length) s.substring(i + 1) else s
 }
+
+/**
+ * Returns true if the file is safe-ish to upload via GitHub Contents API.
+ */
+private fun canUploadToGitHubContentsApi(file: File): Boolean {
+    val len = runCatching { file.length() }.getOrDefault(0L)
+    return len in 1L..MAX_GH_CONTENT_RAW_BYTES
+}
+
+/**
+ * Normalize a repo string for worker inputs (strip "owner/").
+ */
+private fun normalizeRepoNameForWork(repo: String): String {
+    val t = repo.trim()
+    return if (t.contains('/')) t.substringAfterLast('/').trim() else t
+}
+
+/**
+ * Tuple helper to keep return types readable without adding dependencies.
+ */
+private data class Quintuple<A, B, C, D, E>(
+    val first: A,
+    val second: B,
+    val third: C,
+    val fourth: D,
+    val fifth: E
+)

@@ -40,6 +40,7 @@ import java.util.Locale
 import java.util.TimeZone
 import java.util.UUID
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import java.util.zip.GZIPOutputStream
 import kotlin.math.min
 import kotlin.system.measureTimeMillis
@@ -85,8 +86,8 @@ object GitHubLogUploader {
      * Collect and upload a logcat snapshot.
      *
      * @param context Android context.
-     * @param cfg GitHub config (owner/repo/token/branch).
-     * @param remoteDir Repo directory (e.g., "diagnostics/logs").
+     * @param cfg GitHub config (owner/repo/token/branch/pathPrefix).
+     * @param remoteDir Repo directory under cfg.pathPrefix (e.g., "diagnostics/logs").
      * @param addDateSubdir If true, inserts yyyy-MM-dd as a folder.
      * @param includeDeviceHeader If true, prepends device/app header.
      * @param maxUncompressedBytes Tail bytes before gzip.
@@ -108,6 +109,15 @@ object GitHubLogUploader {
 
         val pid = Process.myPid()
 
+        // Normalize repo name: accept "repo" or "owner/repo".
+        val repoName = cfg.repo.substringAfterLast('/').trim()
+
+        // Combine cfg.pathPrefix + remoteDir (avoid double-prefix).
+        val effectiveRemoteDir = computeEffectiveRemoteDir(
+            basePrefix = cfg.pathPrefix,
+            remoteDir = remoteDir
+        )
+
         // Use UTC for stable correlation across devices/timezones.
         val stamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).apply {
             timeZone = TimeZone.getTimeZone("UTC")
@@ -120,13 +130,20 @@ object GitHubLogUploader {
         val remoteName = "logcat_${stamp}_pid${pid}_$nonce.log.gz"
 
         val remotePath = buildRemotePath(
-            remoteDir = remoteDir,
+            remoteDir = effectiveRemoteDir,
             addDateSubdir = addDateSubdir,
             dateDir = dateDir,
             fileName = remoteName,
         )
 
         val header = if (includeDeviceHeader) buildHeader(context.applicationContext, pid) else ""
+
+        Log.d(
+            TAG,
+            "collectAndUploadLogcat: owner=${cfg.owner} repo=$repoName branch=${cfg.branch} " +
+                    "pathPrefix='${cfg.pathPrefix}' remoteDir='$remoteDir' effectiveRemoteDir='$effectiveRemoteDir' " +
+                    "remotePath='$remotePath' pid=$pid includeCrash=$includeCrashBuffer maxUncompressed=$maxUncompressedBytes"
+        )
 
         onProgress(5)
 
@@ -174,11 +191,13 @@ object GitHubLogUploader {
         val maxGzBytes = computeMaxGzBytes(cfg)
         val gz = gzipAndFitToMaxBytesBestEffort(trimmed, maxGzBytes)
 
+        Log.d(TAG, "log bytes: rawTrimmed=${trimmed.size} gz=${gz.size} maxGzBytes=$maxGzBytes")
+
         onProgress(35)
 
         val uploadResult = GitHubUploader.uploadFile(
             owner = cfg.owner,
-            repo = cfg.repo,
+            repo = repoName,
             branch = cfg.branch,
             path = remotePath,
             token = cfg.token,
@@ -201,6 +220,29 @@ object GitHubLogUploader {
             bytesRaw = trimmed.size,
             bytesGz = gz.size,
         )
+    }
+
+    /**
+     * Compute effective remoteDir from cfg.pathPrefix + remoteDir.
+     *
+     * Rules:
+     * - If basePrefix is blank -> remoteDir
+     * - If remoteDir already starts with basePrefix -> remoteDir (avoid duplication)
+     * - Else -> basePrefix/remoteDir
+     */
+    private fun computeEffectiveRemoteDir(basePrefix: String, remoteDir: String): String {
+        val base = basePrefix.trim().trim('/')
+        val dir = remoteDir.trim().trim('/')
+
+        if (base.isBlank()) return dir
+        if (dir.isBlank()) return base
+
+        val baseWithSlash = "$base/"
+        return if (dir == base || dir.startsWith(baseWithSlash)) {
+            dir
+        } else {
+            "$base/$dir"
+        }
     }
 
     /**
@@ -299,7 +341,7 @@ object GitHubLogUploader {
             .redirectErrorStream(true)
             .start()
 
-        var readError: Throwable? = null
+        val readErrorRef = AtomicReference<Throwable?>(null)
 
         val reader = Thread {
             runCatching {
@@ -307,7 +349,7 @@ object GitHubLogUploader {
                     pumpToTail(stream, tail)
                 }
             }.onFailure { t ->
-                readError = t
+                readErrorRef.set(t)
             }
         }.apply {
             isDaemon = true
@@ -324,10 +366,12 @@ object GitHubLogUploader {
         }
 
         // Give the reader a moment to observe EOF after destroy().
-        runCatching { reader.join(250L) }
+        runCatching { reader.join(350L) }
 
         runCatching { proc.destroy() }
+        runCatching { if (proc.isAlive) proc.destroyForcibly() }
 
+        val readError = readErrorRef.get()
         val out = if (readError != null) {
             "(logcat read failed: ${readError.message})\n"
         } else {

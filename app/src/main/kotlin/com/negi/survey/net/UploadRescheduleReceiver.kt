@@ -11,13 +11,19 @@
  *  Summary:
  *  ---------------------------------------------------------------------
  *  BroadcastReceiver that automatically re-enqueues any pending uploads
- *  after system reboot or app update.
+ *  after system reboot, user unlock, or app update.
  *
  *  - GitHub pending dir: /files/pending_uploads/
  *  - Supabase pending dirs (historical):
  *      /files/pending_uploads_supabase/
  *      /files/pending_uploads_sb/
  *      /files/pending_uploads/supabase/...
+ *
+ *  Notes:
+ *  - onReceive must return quickly. Heavy I/O is moved to goAsync + IO dispatcher.
+ *  - For LOCKED_BOOT_COMPLETED (Direct Boot), WorkManager enqueue may be unreliable
+ *    if its database lives in credential-protected storage. We defer enqueue until
+ *    USER_UNLOCKED / BOOT_COMPLETED whenever possible.
  * =====================================================================
  */
 
@@ -28,10 +34,18 @@ package com.negi.survey.net
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.os.Build
+import android.os.UserManager
 import android.util.Log
 import com.negi.survey.BuildConfig
 import java.io.File
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeout
 
 class UploadRescheduleReceiver : BroadcastReceiver() {
 
@@ -39,19 +53,60 @@ class UploadRescheduleReceiver : BroadcastReceiver() {
         val action = intent.action ?: return
         if (!isRelevantAction(action)) return
 
-        // For LOCKED_BOOT_COMPLETED, device-protected storage is available.
-        // But pending files may live in credential-protected storage (normal context).
-        // We scan both contexts and de-duplicate by absolute path.
-        val ctxNormal = context
-        val ctxDeviceProtected = runCatching { context.createDeviceProtectedStorageContext() }.getOrNull()
-
-        val contexts = buildList {
-            add(ctxNormal)
-            if (ctxDeviceProtected != null) add(ctxDeviceProtected)
+        // Avoid concurrent heavy scans from multiple broadcasts.
+        if (!IS_RUNNING.compareAndSet(false, true)) {
+            Log.d(TAG, "Reschedule already running; skip action=$action")
+            return
         }
 
-        rescheduleGitHub(contexts, action)
-        rescheduleSupabase(contexts, action)
+        val pending = goAsync()
+
+        CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+            try {
+                // Ensure we never hold the broadcast too long.
+                withTimeout(RECEIVER_WORK_TIMEOUT_MS) {
+                    val unlocked = isUserUnlocked(context)
+
+                    val ctxNormal = context
+                    val ctxDeviceProtected = createDeviceProtectedContextOrNull(context)
+
+                    // For locked boot, we defer enqueue because WorkManager may not be ready.
+                    // Still, we may scan device-protected storage if it exists.
+                    val contextsForScan = buildList {
+                        if (unlocked) {
+                            add(ctxNormal)
+                            if (ctxDeviceProtected != null) add(ctxDeviceProtected)
+                        } else {
+                            // Locked: only device-protected storage is safely available.
+                            if (ctxDeviceProtected != null) add(ctxDeviceProtected)
+                        }
+                    }
+
+                    if (contextsForScan.isEmpty()) {
+                        Log.d(TAG, "No accessible storage contexts for action=$action (unlocked=$unlocked)")
+                        return@withTimeout
+                    }
+
+                    if (!unlocked && action == ACTION_LOCKED_BOOT_COMPLETED) {
+                        Log.d(TAG, "User locked (Direct Boot). Deferring enqueue until USER_UNLOCKED/BOOT_COMPLETED.")
+                        // Best-effort: just log counts (optional) without enqueue.
+                        val ghCount = contextsForScan.sumOf { countPendingFiles(it, PENDING_DIR_GH, walk = false) }
+                        val sbCount = listOf(PENDING_DIR_SB_V2, PENDING_DIR_SB_V1, PENDING_DIR_SB_NESTED_ROOT)
+                            .sumOf { dir -> contextsForScan.sumOf { countPendingFiles(it, dir, walk = true) } }
+                        Log.d(TAG, "DirectBoot pending summary: github=$ghCount supabase=$sbCount")
+                        return@withTimeout
+                    }
+
+                    rescheduleGitHub(contextsForScan, action)
+                    rescheduleSupabase(contextsForScan, action)
+                }
+            } catch (t: Throwable) {
+                Log.w(TAG, "Reschedule failed action=$action: ${t.message}", t)
+            } finally {
+                IS_RUNNING.set(false)
+                pending.finish()
+            }
+        }
     }
 
     private fun rescheduleGitHub(contexts: List<Context>, action: String) {
@@ -70,8 +125,12 @@ class UploadRescheduleReceiver : BroadcastReceiver() {
 
         val allFiles = contexts
             .flatMap { ctx -> listPendingFiles(ctx, PENDING_DIR_GH, walk = false) }
-            .distinctBy { it.absolutePath }
+            .distinctBy { stableKey(it) }
+            .asSequence()
             .filter { it.isFile && it.length() > 0L }
+            .filterNot { shouldIgnorePendingFile(it) }
+            .take(MAX_SCAN_FILES)
+            .toList()
 
         if (allFiles.isEmpty()) {
             Log.d(TAG, "No GitHub pending files for action=$action")
@@ -80,9 +139,11 @@ class UploadRescheduleReceiver : BroadcastReceiver() {
 
         Log.d(TAG, "Rescheduling ${allFiles.size} GitHub pending uploads for action=$action")
 
+        val appCtx = contexts.first().applicationContext
+
         allFiles.forEach { file ->
             runCatching {
-                GitHubUploadWorker.enqueueExistingPayload(contexts.first().applicationContext, cfg, file)
+                GitHubUploadWorker.enqueueExistingPayload(appCtx, cfg, file)
             }.onFailure { t ->
                 Log.w(TAG, "GitHub enqueue failed file=${file.name}: ${t.message}")
             }
@@ -108,7 +169,6 @@ class UploadRescheduleReceiver : BroadcastReceiver() {
             return
         }
 
-        // Scan multiple historical pending roots.
         val sbRoots = listOf(
             PENDING_DIR_SB_V2,          // "pending_uploads_supabase"
             PENDING_DIR_SB_V1,          // "pending_uploads_sb"
@@ -119,9 +179,12 @@ class UploadRescheduleReceiver : BroadcastReceiver() {
             .flatMap { dirName ->
                 contexts.flatMap { ctx -> listPendingFiles(ctx, dirName, walk = true) }
             }
-            .distinctBy { it.absolutePath }
+            .distinctBy { stableKey(it) }
+            .asSequence()
             .filter { it.isFile && it.length() > 0L }
-            .filterNot { it.name.endsWith(".tmp", ignoreCase = true) }
+            .filterNot { shouldIgnorePendingFile(it) }
+            .take(MAX_SCAN_FILES)
+            .toList()
 
         if (allFiles.isEmpty()) {
             Log.d(TAG, "No Supabase pending files for action=$action")
@@ -130,13 +193,15 @@ class UploadRescheduleReceiver : BroadcastReceiver() {
 
         Log.d(TAG, "Rescheduling ${allFiles.size} Supabase pending uploads for action=$action")
 
+        val appCtx = contexts.first().applicationContext
+
         allFiles.forEach { file ->
             val remoteDir = guessSupabaseRemoteDir(file)
             val contentType = guessContentType(file)
 
             runCatching {
                 SupabaseUploadWorker.enqueueExistingPayload(
-                    context = contexts.first().applicationContext,
+                    context = appCtx,
                     cfg = cfg,
                     file = file,
                     remoteDir = remoteDir,
@@ -158,20 +223,66 @@ class UploadRescheduleReceiver : BroadcastReceiver() {
      */
     private fun listPendingFiles(context: Context, dirName: String, walk: Boolean): List<File> {
         val dir = File(context.filesDir, dirName)
-        if (!dir.exists() || !dir.isDirectory) {
-            return emptyList()
-        }
+        if (!dir.exists() || !dir.isDirectory) return emptyList()
 
-        val files = if (walk) {
-            dir.walkTopDown().filter { it.isFile }.toList()
-        } else {
-            dir.listFiles()?.filter { it.isFile } ?: emptyList()
+        val files = try {
+            if (walk) {
+                // Bound scan to avoid worst-case explosion.
+                dir.walkTopDown()
+                    .onEnter { it.isDirectory }
+                    .filter { it.isFile }
+                    .take(MAX_SCAN_FILES)
+                    .toList()
+            } else {
+                dir.listFiles()?.asSequence()
+                    ?.filter { it.isFile }
+                    ?.take(MAX_SCAN_FILES)
+                    ?.toList()
+                    ?: emptyList()
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "listPendingFiles failed dir=${dir.absolutePath}: ${t.message}")
+            emptyList()
         }
 
         if (files.isNotEmpty()) {
             Log.d(TAG, "Found pending: dir=${dir.absolutePath} files=${files.size}")
         }
         return files
+    }
+
+    /**
+     * Count pending files quickly without building a list (best-effort).
+     */
+    private fun countPendingFiles(context: Context, dirName: String, walk: Boolean): Int {
+        val dir = File(context.filesDir, dirName)
+        if (!dir.exists() || !dir.isDirectory) return 0
+        return runCatching {
+            if (walk) {
+                dir.walkTopDown()
+                    .filter { it.isFile }
+                    .take(MAX_SCAN_FILES)
+                    .count()
+            } else {
+                dir.listFiles()?.count { it.isFile } ?: 0
+            }
+        }.getOrDefault(0)
+    }
+
+    /**
+     * Build a stable de-duplication key for a file.
+     *
+     * Prefer canonicalPath when available; fallback to absolutePath.
+     */
+    private fun stableKey(file: File): String =
+        runCatching { file.canonicalPath }.getOrElse { file.absolutePath }
+
+    /**
+     * Ignore transient/metadata files to avoid enqueuing junk.
+     */
+    private fun shouldIgnorePendingFile(file: File): Boolean {
+        val n = file.name.lowercase(Locale.US)
+        return n.endsWith(".tmp") || n.endsWith(".meta") || n.endsWith(".part")
     }
 
     /**
@@ -217,12 +328,30 @@ class UploadRescheduleReceiver : BroadcastReceiver() {
         when (action) {
             Intent.ACTION_BOOT_COMPLETED -> true
             Intent.ACTION_MY_PACKAGE_REPLACED -> true
+            Intent.ACTION_USER_UNLOCKED -> true
             ACTION_LOCKED_BOOT_COMPLETED -> true
             else -> false
         }
 
+    private fun createDeviceProtectedContextOrNull(context: Context): Context? {
+        if (Build.VERSION.SDK_INT < 24) return null
+        return runCatching { context.createDeviceProtectedStorageContext() }.getOrNull()
+    }
+
+    private fun isUserUnlocked(context: Context): Boolean {
+        if (Build.VERSION.SDK_INT < 24) return true
+        val um = runCatching { context.getSystemService(UserManager::class.java) }.getOrNull()
+        return um?.isUserUnlocked == true
+    }
+
     private companion object {
         private const val TAG = "UploadRescheduleRcvr"
+
+        /** Hard timeout to finish receiver work (avoid ANR). */
+        private const val RECEIVER_WORK_TIMEOUT_MS = 9_000L
+
+        /** Upper bound for scanned files to avoid worst-case explosion. */
+        private const val MAX_SCAN_FILES = 2_000
 
         /** Directory under `/files/` containing pending GitHub upload payloads. */
         private const val PENDING_DIR_GH = "pending_uploads"
@@ -248,5 +377,8 @@ class UploadRescheduleReceiver : BroadcastReceiver() {
         /** String constant for locked boot action to avoid API gated references. */
         private const val ACTION_LOCKED_BOOT_COMPLETED =
             "android.intent.action.LOCKED_BOOT_COMPLETED"
+
+        /** Guard against concurrent runs. */
+        private val IS_RUNNING = AtomicBoolean(false)
     }
 }

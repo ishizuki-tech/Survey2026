@@ -16,7 +16,6 @@ package com.negi.survey.net
 import android.util.Base64
 import android.util.Base64OutputStream
 import android.util.Log
-import java.io.BufferedReader
 import java.io.File
 import java.io.IOException
 import java.io.InputStream
@@ -66,18 +65,11 @@ object GitHubUploader {
      *
      * For PCM_16BIT MONO WAV:
      *   bytes ≈ 44 + seconds * sampleRateHz * 2
-     *
-     * Examples (180s):
-     * - 16kHz: 44 + 180*16000*2 = 5,760,044 bytes
-     * - 48kHz: 44 + 180*48000*2 = 17,280,044 bytes
      */
     private const val DEFAULT_MAX_RAW_BYTES = 20_000_000
 
     /**
      * Default guard for the final JSON request size (rough).
-     *
-     * This is not an official GitHub limit; it is a safety guard to prevent
-     * confusing failures on mobile networks and memory pressure on device.
      *
      * Roughly:
      *   requestBytes ≈ JSON_overhead + Base64(contentBytes)
@@ -96,7 +88,7 @@ object GitHubUploader {
     /**
      * Configuration container for GitHub upload operations.
      *
-     * When using cfg overloads:
+     * When using cfg overloads (dated path mode):
      *   pathPrefix / yyyy-MM-dd / relativePath
      */
     data class GitHubConfig(
@@ -122,7 +114,7 @@ object GitHubUploader {
     // ---------------------------------------------------------------------
 
     /**
-     * Upload a JSON or text file using [GitHubConfig] (includes date folder).
+     * Upload a JSON or text file using [GitHubConfig] (includes UTC date folder).
      */
     suspend fun uploadJson(
         cfg: GitHubConfig,
@@ -170,12 +162,36 @@ object GitHubUploader {
         maxRequestBytesHint = maxRequestBytesHint
     )
 
+    /**
+     * Upload JSON/text using [GitHubConfig] to an explicit [path] (no auto date folder).
+     *
+     * This is useful when the caller wants deterministic paths (e.g., Worker-side path building).
+     */
+    suspend fun uploadJsonAtPath(
+        cfg: GitHubConfig,
+        path: String,
+        content: String,
+        message: String = DEFAULT_MESSAGE,
+        onProgress: (Int) -> Unit = {}
+    ): UploadResult = uploadJson(
+        owner = cfg.owner,
+        repo = cfg.repo,
+        branch = cfg.branch,
+        path = path,
+        token = cfg.token,
+        content = content,
+        message = message,
+        onProgress = onProgress,
+        maxRawBytesHint = cfg.maxRawBytesHint,
+        maxRequestBytesHint = cfg.maxRequestBytesHint
+    )
+
     // ---------------------------------------------------------------------
     // Public APIs — Binary Upload (ByteArray)
     // ---------------------------------------------------------------------
 
     /**
-     * Upload binary bytes using [GitHubConfig] (includes date folder).
+     * Upload binary bytes using [GitHubConfig] (includes UTC date folder).
      */
     suspend fun uploadFile(
         cfg: GitHubConfig,
@@ -223,12 +239,34 @@ object GitHubUploader {
         maxRequestBytesHint = maxRequestBytesHint
     )
 
+    /**
+     * Upload binary bytes using [GitHubConfig] to an explicit [path] (no auto date folder).
+     */
+    suspend fun uploadBytesAtPath(
+        cfg: GitHubConfig,
+        path: String,
+        bytes: ByteArray,
+        message: String = DEFAULT_MESSAGE,
+        onProgress: (Int) -> Unit = {}
+    ): UploadResult = uploadFile(
+        owner = cfg.owner,
+        repo = cfg.repo,
+        branch = cfg.branch,
+        path = path,
+        token = cfg.token,
+        bytes = bytes,
+        message = message,
+        onProgress = onProgress,
+        maxRawBytesHint = cfg.maxRawBytesHint,
+        maxRequestBytesHint = cfg.maxRequestBytesHint
+    )
+
     // ---------------------------------------------------------------------
     // Public APIs — Binary Upload (File streaming)
     // ---------------------------------------------------------------------
 
     /**
-     * Upload a local file using [GitHubConfig] (includes date folder).
+     * Upload a local file using [GitHubConfig] (includes UTC date folder).
      *
      * This avoids loading the entire file into memory.
      */
@@ -285,6 +323,28 @@ object GitHubUploader {
         )
     }
 
+    /**
+     * Upload a local file using [GitHubConfig] to an explicit [path] (no auto date folder).
+     */
+    suspend fun uploadFileAtPath(
+        cfg: GitHubConfig,
+        path: String,
+        file: File,
+        message: String = DEFAULT_MESSAGE,
+        onProgress: (Int) -> Unit = {}
+    ): UploadResult = uploadFile(
+        owner = cfg.owner,
+        repo = cfg.repo,
+        branch = cfg.branch,
+        path = path,
+        token = cfg.token,
+        file = file,
+        message = message,
+        onProgress = onProgress,
+        maxRawBytesHint = cfg.maxRawBytesHint,
+        maxRequestBytesHint = cfg.maxRequestBytesHint
+    )
+
     // ---------------------------------------------------------------------
     // Shared Implementation
     // ---------------------------------------------------------------------
@@ -325,6 +385,9 @@ object GitHubUploader {
      * 2) GET existing SHA (if any).
      * 3) PUT Base64 payload to Contents API (streaming).
      * 4) Parse JSON response.
+     *
+     * Special:
+     * - If PUT fails with 409 Conflict, re-fetch SHA and retry PUT once.
      */
     private suspend fun uploadStream(
         owner: String,
@@ -367,15 +430,101 @@ object GitHubUploader {
                     "maxRawBytesHint=$maxRawBytesHint maxRequestBytesHint=$maxRequestBytesHint"
         )
 
-        // Phase 1 — Lookup existing SHA (retry-capable, 404 allowed)
         onProgress(0)
-        val existingSha = getExistingSha(owner, repoName, branch, encodedPath, token)
+
+        // Phase 1 — Lookup existing SHA (retry-capable, 404 allowed)
+        var existingSha = getExistingSha(owner, repoName, branch, encodedPath, token)
         onProgress(10)
 
-        // Phase 2 — Prepare streaming body pieces + size guard (estimate, fail-fast)
+        // Phase 2 — PUT with streaming body (may retry once on 409)
+        try {
+            val response = putContents(
+                owner = owner,
+                repoName = repoName,
+                branch = branch,
+                path = path,
+                encodedPath = encodedPath,
+                token = token,
+                rawSize = rawSize,
+                openStream = openStream,
+                message = message,
+                sha = existingSha,
+                onProgress = onProgress,
+                maxRequestBytesHint = maxRequestBytesHint
+            )
+
+            onProgress(95)
+            return@withContext parseUploadResult(response.body)
+
+        } catch (e: HttpFailureException) {
+            if (e.code != 409) throw e
+
+            // 409 Conflict: SHA mismatch or concurrent update; refresh SHA and retry once.
+            Log.w(TAG, "uploadStream: 409 Conflict; refreshing SHA and retrying once.")
+            existingSha = getExistingSha(owner, repoName, branch, encodedPath, token)
+
+            val response2 = putContents(
+                owner = owner,
+                repoName = repoName,
+                branch = branch,
+                path = path,
+                encodedPath = encodedPath,
+                token = token,
+                rawSize = rawSize,
+                openStream = openStream,
+                message = message,
+                sha = existingSha,
+                onProgress = onProgress,
+                maxRequestBytesHint = maxRequestBytesHint
+            )
+
+            onProgress(95)
+            return@withContext parseUploadResult(response2.body)
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // PUT + Response parsing
+    // ---------------------------------------------------------------------
+
+    private fun parseUploadResult(body: String): UploadResult {
+        val json = try {
+            JSONObject(body)
+        } catch (e: JSONException) {
+            throw IOException("Malformed JSON from GitHub: ${e.message}", e)
+        }
+
+        val fileUrl =
+            json.optJSONObject("content")
+                ?.optString("html_url")
+                ?.takeIf { it.isNotBlank() }
+
+        val commitSha =
+            json.optJSONObject("commit")
+                ?.optString("sha")
+                ?.takeIf { it.isNotBlank() }
+
+        Log.d(TAG, "uploadStream: done url=$fileUrl sha=$commitSha")
+        return UploadResult(fileUrl, commitSha)
+    }
+
+    private suspend fun putContents(
+        owner: String,
+        repoName: String,
+        branch: String,
+        path: String,
+        encodedPath: String,
+        token: String,
+        rawSize: Long,
+        openStream: () -> InputStream,
+        message: String,
+        sha: String?,
+        onProgress: (Int) -> Unit,
+        maxRequestBytesHint: Int
+    ): HttpResponse {
         val msgJson = JSONObject.quote(message.ifBlank { DEFAULT_MESSAGE })
         val branchJson = JSONObject.quote(branch)
-        val shaJson = existingSha?.takeIf { it.isNotBlank() }?.let { JSONObject.quote(it) }
+        val shaJson = sha?.takeIf { it.isNotBlank() }?.let { JSONObject.quote(it) }
 
         val prefix = "{\"message\":$msgJson,\"branch\":$branchJson,\"content\":\""
         val suffix = if (shaJson != null) "\",\"sha\":$shaJson}" else "\"}"
@@ -391,28 +540,22 @@ object GitHubUploader {
             val msg =
                 "Request too large for upload guard " +
                         "(requestBytes~$guardedTotalLen, limit=$maxRequestBytesHint). " +
-                        "ContentBytes=$rawSize; Base64 expands ~4/3. " +
-                        "Consider stronger compression or alternate upload path for long-term scaling."
+                        "ContentBytes=$rawSize; Base64 expands ~4/3."
             throw IOException(msg)
         }
 
         val url = URL("$API_BASE/repos/$owner/$repoName/contents/$encodedPath")
 
         val writeBody: (HttpURLConnection) -> Unit = { conn ->
-            val totalLenForMode = totalLenLong
-
-            if (totalLenForMode <= Int.MAX_VALUE.toLong()) {
-                conn.setFixedLengthStreamingMode(totalLenForMode.toInt())
+            if (totalLenLong <= Int.MAX_VALUE.toLong()) {
+                conn.setFixedLengthStreamingMode(totalLenLong.toInt())
             } else {
-                // Should never happen with our guards, but keep it robust.
                 conn.setChunkedStreamingMode(0)
             }
 
             conn.outputStream.use { os ->
-                // Write JSON prefix
                 os.write(prefixBytes)
 
-                // Stream Base64 content without allocating a giant String/ByteArray
                 val b64Out = Base64OutputStream(NonClosingOutputStream(os), Base64.NO_WRAP)
 
                 var sent = 0L
@@ -432,42 +575,20 @@ object GitHubUploader {
                     }
                 }
 
-                b64Out.close() // flush base64 padding without closing underlying os
+                b64Out.close() // flush base64 tail without closing underlying os
+                onProgress(90)
 
-                // Write JSON suffix
                 os.write(suffixBytes)
                 os.flush()
             }
         }
 
-        // Phase 3 — Execute request with retry/backoff
-        val response = executeWithRetry(
+        return executeWithRetry(
             method = "PUT",
             url = url,
             token = token,
             writeBody = writeBody
         )
-        onProgress(95)
-
-        val json = try {
-            JSONObject(response.body)
-        } catch (e: JSONException) {
-            throw IOException("Malformed JSON from GitHub: ${e.message}", e)
-        }
-        onProgress(100)
-
-        val fileUrl =
-            json.optJSONObject("content")
-                ?.optString("html_url")
-                ?.takeIf { it.isNotBlank() }
-
-        val commitSha =
-            json.optJSONObject("commit")
-                ?.optString("sha")
-                ?.takeIf { it.isNotBlank() }
-
-        Log.d(TAG, "uploadStream: done url=$fileUrl sha=$commitSha")
-        UploadResult(fileUrl, commitSha)
     }
 
     // ---------------------------------------------------------------------
@@ -524,8 +645,9 @@ object GitHubUploader {
                 requestMethod = method
                 doInput = true
                 doOutput = (writeBody != null)
+                useCaches = false
 
-                // Use Bearer; GitHub accepts Bearer for PAT/OAuth in modern clients.
+                // GitHub REST docs commonly show "Bearer <token>".
                 setRequestProperty("Authorization", "Bearer ${token.trim()}")
                 setRequestProperty("Accept", "application/vnd.github+json")
                 setRequestProperty("X-GitHub-Api-Version", API_VERSION)
@@ -540,7 +662,6 @@ object GitHubUploader {
             }
 
             try {
-                // For PUT/POST-like calls, caller writes the body.
                 writeBody?.invoke(conn)
 
                 val code = conn.responseCode
@@ -641,15 +762,10 @@ object GitHubUploader {
 
     /**
      * Parse Retry-After seconds with case-insensitive header matching.
-     *
-     * Supports:
-     * - integer seconds
-     * - HTTP-date (best-effort; returns null if not parseable)
      */
     private fun parseRetryAfterSeconds(headers: Map<String, List<String>>): Long? {
         val v = getHeaderFirst(headers, "Retry-After") ?: return null
         v.toLongOrNull()?.let { return it.coerceAtLeast(0L) }
-        // HTTP-date fallback: intentionally omitted (rare for GitHub); treat as null.
         return null
     }
 
@@ -662,7 +778,7 @@ object GitHubUploader {
     }
 
     /**
-     * Detect primary rate limit signals.
+     * Detect primary/secondary rate limit signals.
      */
     private fun isPrimaryRateLimit(headers: Map<String, List<String>>, body: String): Boolean {
         val remaining = getHeaderFirst(headers, "X-RateLimit-Remaining")?.toLongOrNull()
@@ -670,8 +786,8 @@ object GitHubUploader {
 
         val b = body.lowercase(Locale.US)
         if (b.contains("api rate limit exceeded")) return true
-        if (b.contains("rate limit")) return true
         if (b.contains("secondary rate limit")) return true
+        if (b.contains("rate limit")) return true
         return false
     }
 
@@ -685,11 +801,6 @@ object GitHubUploader {
 
     /**
      * Compute retry delay for transient HTTP errors.
-     *
-     * Preference:
-     * 1) Retry-After seconds
-     * 2) X-RateLimit-Reset epoch seconds
-     * 3) Exponential backoff with jitter
      */
     private fun computeRetryDelayMs(
         attempt: Int,
@@ -725,17 +836,13 @@ object GitHubUploader {
      * Read an entire input stream as UTF-8 text.
      */
     private fun readAll(stream: InputStream): String =
-        stream.bufferedReader(Charsets.UTF_8).use(BufferedReader::readText)
+        stream.bufferedReader(Charsets.UTF_8).use { it.readText() }
 
     /**
      * Look up an existing file SHA if the path already exists on the target branch.
      *
      * Returns null when:
      * - File does not exist (404)
-     *
-     * Throws when:
-     * - Non-404 non-2xx errors occur (rate limit, auth issues, 5xx, etc.)
-     * - Network errors persist beyond retries
      */
     private suspend fun getExistingSha(
         owner: String,

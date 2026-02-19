@@ -9,7 +9,7 @@
  * =====================================================================
  */
 
-@file:Suppress("unused")
+@file:Suppress("unused", "UnusedImport")
 
 package com.negi.survey
 
@@ -76,6 +76,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -598,11 +599,18 @@ fun AppNav() {
         }
     }
 
-    var chosen by remember { mutableStateOf<ConfigOptionUi?>(null) }
-    var config by remember { mutableStateOf<SurveyConfig?>(null) }
-    var configLoading by remember { mutableStateOf(false) }
-    var configError by remember { mutableStateOf<String?>(null) }
-    var selectionEpoch by remember { mutableIntStateOf(0) }
+    // Persist selection across configuration changes safely (store only the ID).
+    var chosenId by rememberSaveable { mutableStateOf<String?>(null) }
+    var selectionEpoch by rememberSaveable { mutableIntStateOf(0) }
+
+    val chosen: ConfigOptionUi? = remember(options, chosenId) {
+        chosenId?.let { id -> options.firstOrNull { it.id == id } }
+    }
+
+    // Keyed states: when (chosenId/epoch) changes, these reset automatically.
+    var config by remember(chosenId, selectionEpoch) { mutableStateOf<SurveyConfig?>(null) }
+    var configLoading by remember(chosenId, selectionEpoch) { mutableStateOf(false) }
+    var configError by remember(chosenId, selectionEpoch) { mutableStateOf<String?>(null) }
 
     if (chosen == null) {
         IntroScreen(
@@ -610,10 +618,7 @@ fun AppNav() {
             defaultOptionId = options.firstOrNull()?.id,
             onStart = { option ->
                 selectionEpoch += 1
-                config = null
-                configError = null
-                configLoading = false
-                chosen = option
+                chosenId = option.id
                 Log.d(MainActivity.TAG, "Intro -> Start session. epoch=$selectionEpoch, file=${option.id}")
             },
             onResolveConfigDetails = { configId ->
@@ -626,8 +631,8 @@ fun AppNav() {
         return
     }
 
-    val sessionKey = remember(chosen!!.id, selectionEpoch) {
-        "${chosen!!.id}@$selectionEpoch"
+    val sessionKey = remember(chosen.id, selectionEpoch) {
+        "${chosen.id}@$selectionEpoch"
     }
 
     LaunchedEffect(sessionKey) {
@@ -641,7 +646,7 @@ fun AppNav() {
                 dumpSystemPrompts = true
             )
             val loaded = withContext(Dispatchers.IO) {
-                SurveyConfigLoader.fromAssetsValidated(appContext, chosen!!.id)
+                SurveyConfigLoader.fromAssetsValidated(appContext, chosen.id)
             }
             config = loaded
             Log.d(MainActivity.TAG, "Config loaded. session=$sessionKey")
@@ -734,10 +739,7 @@ fun AppNav() {
                         OutlinedButton(
                             onClick = {
                                 Log.d(MainActivity.TAG, "Error -> Back to selector. session=$sessionKey")
-                                chosen = null
-                                config = null
-                                configError = null
-                                configLoading = false
+                                chosenId = null
                             }
                         ) {
                             Text("Back to config selector")
@@ -854,10 +856,7 @@ fun AppNav() {
 
             val resetToSelector: () -> Unit = {
                 Log.d(MainActivity.TAG, "resetToSelector invoked. session=$sessionKey")
-                chosen = null
-                config = null
-                configError = null
-                configLoading = false
+                chosenId = null
             }
 
             val voiceEnabled = remember(cfg) { cfg.whisper.enabled ?: true }
@@ -1112,9 +1111,7 @@ fun SurveyNavHost(
 
                 entry<FlowDone> {
                     // Normalize GitHub config to avoid "owner/repo" vs "repo" mismatch bugs.
-                    val gh = remember {
-                        buildGitHubConfigOrNull()
-                    }
+                    val gh = remember { buildGitHubConfigOrNull() }
 
                     DoneScreen(
                         vm = vmSurvey,
@@ -1148,14 +1145,18 @@ fun SurveyNavHost(
  */
 private fun buildGitHubConfigOrNull(): GitHubUploader.GitHubConfig? {
     if (BuildConfig.GH_TOKEN.isBlank()) return null
+
     val owner = BuildConfig.GH_OWNER.trim()
     if (owner.isBlank()) return null
 
     val repoName = BuildConfig.GH_REPO.substringAfterLast('/').trim()
     if (repoName.isBlank()) return null
 
-    val branch = BuildConfig.GH_BRANCH.ifBlank { "main" }
+    val branch = BuildConfig.GH_BRANCH.trim().ifBlank { "main" }
     val prefix = BuildConfig.GH_PATH_PREFIX.trim().trim('/')
+
+    // Basic sanity checks (avoid weird whitespace configs causing subtle runtime bugs).
+    if (owner.contains(' ') || repoName.contains(' ')) return null
 
     return GitHubUploader.GitHubConfig(
         owner = owner,
