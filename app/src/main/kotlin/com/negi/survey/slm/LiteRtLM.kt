@@ -1761,6 +1761,7 @@ object LiteRtLM {
 
             try {
                 if (!hasMm) {
+                    Log.i(TAG, "LiteRT-LM 'conversation.sendMessageAsync' CALLED: trimmed='$trimmed'")
                     conversation.sendMessageAsync(trimmed, callback)
                 } else {
                     val contentList = buildContentList(input = trimmed, images = images, audioClips = audioClips)

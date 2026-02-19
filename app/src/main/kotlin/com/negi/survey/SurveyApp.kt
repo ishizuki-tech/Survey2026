@@ -3,7 +3,7 @@
  *  IshizukiTech LLC — Android App Shell
  *  ---------------------------------------------------------------------
  *  File: SurveyApp.kt
- *  Author: Shu Ishizuki
+ *  Author: Shu Ishizuki (石附 支)
  *  License: MIT License
  *  © 2026 IshizukiTech LLC. All rights reserved.
  * =====================================================================
@@ -17,7 +17,10 @@ import android.app.ActivityManager
 import android.app.Application
 import android.content.Context
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
+import androidx.work.WorkManager
 import com.negi.survey.slm.LiteRtLM
 import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
@@ -30,9 +33,10 @@ import java.util.concurrent.atomic.AtomicBoolean
  * - Enqueue pending crash uploads on next start (onCreate).
  * - Run only in the main process.
  *
- * Note:
- * - This class avoids explicitly touching base.applicationContext in attachBaseContext.
- * - CrashCapture.install() may internally touch filesDir; that is intentional for early bootstrap.
+ * Notes:
+ * - Avoid assuming applicationContext is non-null in attachBaseContext.
+ * - WorkManager may not be initialized in attachBaseContext; prefer enqueue from onCreate.
+ * - Add a delayed retry to avoid cooldown edge cases when early enqueue fails before WM init.
  */
 class SurveyApp : Application() {
 
@@ -57,10 +61,8 @@ class SurveyApp : Application() {
         }
 
         // Install as early as possible to catch crashes during Application startup.
-        safeCrashInstall(
-            where = "attachBaseContext",
-            context = base
-        )
+        // Do NOT force-enqueue pending uploads here; WM may not be ready yet.
+        safeCrashInstall(where = "attachBaseContext", context = base)
     }
 
     override fun onCreate() {
@@ -89,18 +91,18 @@ class SurveyApp : Application() {
                 Log.w(TAG, "LiteRtLM.setApplicationContext failed: ${t.message}", t)
             }
 
+        // Prime WorkManager early (best-effort) so crash upload enqueue won't be a no-op.
+        primeWorkManager(this)
+
         // Re-wrap default handler in case any SDK replaced it after attachBaseContext().
-        safeCrashInstall(
-            where = "onCreate(rewrap)",
-            context = this
-        )
+        safeCrashInstall(where = "onCreate(rewrap)", context = this)
 
         // Optional: self-heal if another SDK overwrites the handler later in runtime.
-        // NOTE: CrashCapture.registerSelfHealing expects Application (not Context).
         safeRegisterSelfHealingOnce(this)
 
         // Enqueue pending crash uploads from previous run (best-effort).
-        safeEnqueuePendingUploadsOnce(this)
+        // Also schedule a delayed retry to bypass cooldown edge cases if early enqueue ran before WM init.
+        safeEnqueuePendingUploadsWithRetryOnce(this)
     }
 
     /**
@@ -181,6 +183,21 @@ class SurveyApp : Application() {
     }
 
     /**
+     * Prime WorkManager initialization (best-effort).
+     *
+     * Some devices/entry points can hit crash-capture install before WM is ready.
+     * Calling getInstance here tends to initialize WM early enough for enqueue calls.
+     */
+    private fun primeWorkManager(context: Context) {
+        runCatching {
+            WorkManager.getInstance(context.applicationContext ?: context)
+            Log.d(TAG, "WorkManager primed.")
+        }.onFailure { t ->
+            Log.w(TAG, "WorkManager prime failed: ${t.message}", t)
+        }
+    }
+
+    /**
      * Register self-healing hook (Application required by CrashCapture API).
      */
     private fun safeRegisterSelfHealingOnce(app: Application) {
@@ -196,16 +213,43 @@ class SurveyApp : Application() {
         }
     }
 
-    private fun safeEnqueuePendingUploadsOnce(context: Context) {
+    /**
+     * Enqueue pending crash uploads once, plus one delayed retry.
+     *
+     * Why retry:
+     * - If an early enqueue happens before WM init, CrashCapture may record cooldown timing.
+     * - The immediate call in onCreate might get skipped due to cooldown.
+     * - A delayed retry (> cooldown) makes "next launch uploads" robust without tight coupling.
+     */
+    private fun safeEnqueuePendingUploadsWithRetryOnce(context: Context) {
         if (!enqueuePendingOnce.compareAndSet(false, true)) {
             Log.d(TAG, "CrashCapture pending enqueue already executed; skipping.")
             return
         }
+
+        val appCtx = context.applicationContext ?: context
+
+        // 1) Immediate attempt
         runCatching {
-            CrashCapture.enqueuePendingCrashUploadsIfPossible(context)
-            Log.d(TAG, "CrashCapture pending uploads enqueued.")
+            CrashCapture.enqueuePendingCrashUploadsIfPossible(appCtx)
+            Log.d(TAG, "CrashCapture pending uploads enqueued (immediate).")
         }.onFailure { t ->
-            Log.w(TAG, "CrashCapture.enqueuePendingCrashUploads failed: ${t.message}", t)
+            Log.w(TAG, "CrashCapture.enqueuePendingCrashUploads(immediate) failed: ${t.message}", t)
+        }
+
+        // 2) Delayed retry to bypass cooldown / WM-init timing edge cases
+        if (enqueueRetryScheduled.compareAndSet(false, true)) {
+            Handler(Looper.getMainLooper()).postDelayed(
+                {
+                    runCatching {
+                        CrashCapture.enqueuePendingCrashUploadsIfPossible(appCtx)
+                        Log.d(TAG, "CrashCapture pending uploads enqueued (delayed retry).")
+                    }.onFailure { t ->
+                        Log.w(TAG, "CrashCapture.enqueuePendingCrashUploads(delayed) failed: ${t.message}", t)
+                    }
+                },
+                ENQUEUE_RETRY_DELAY_MS
+            )
         }
     }
 
@@ -217,10 +261,14 @@ class SurveyApp : Application() {
     companion object {
         private const val TAG = "SurveyApp"
 
+        // Retry delay should exceed CrashCapture cooldown (~1200ms) with a small buffer.
+        private const val ENQUEUE_RETRY_DELAY_MS = 1600L
+
         // Process-level guards. These are static per-process.
         private val attachBootOnce = AtomicBoolean(false)
         private val onCreateBootOnce = AtomicBoolean(false)
         private val selfHealOnce = AtomicBoolean(false)
         private val enqueuePendingOnce = AtomicBoolean(false)
+        private val enqueueRetryScheduled = AtomicBoolean(false)
     }
 }

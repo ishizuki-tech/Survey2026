@@ -12,14 +12,24 @@
 package com.negi.survey
 
 import android.app.Activity
+import android.app.ActivityManager
 import android.app.Application
+import android.app.ApplicationExitInfo
 import android.content.Context
 import android.os.Build
 import android.os.Bundle
 import android.os.Process
 import android.os.SystemClock
 import android.util.Log
+import androidx.work.BackoffPolicy
+import androidx.work.Constraints
+import androidx.work.ExistingWorkPolicy
+import androidx.work.NetworkType
+import androidx.work.OneTimeWorkRequest
+import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.OutOfQuotaPolicy
 import androidx.work.WorkManager
+import androidx.work.workDataOf
 import com.negi.survey.net.GitHubDiagnosticsConfigStore
 import com.negi.survey.net.GitHubUploadWorker
 import com.negi.survey.net.GitHubUploader
@@ -70,6 +80,13 @@ object CrashCapture {
     /** Prevent ensure storms (handler re-wrap). */
     private const val ENSURE_COOLDOWN_MS = 800L
 
+    /** Exit-info staging guard (native crash capture on next launch). */
+    private val stagedExitInfoThisProcess = AtomicBoolean(false)
+
+    /** Persist "last processed exit timestamp" to avoid duplicating exit-info reports. */
+    private const val EXIT_PREF_NAME = "crash_capture_exit_v1"
+    private const val EXIT_PREF_KEY_LAST_TS = "last_exit_ts"
+
     private val capturing = AtomicBoolean(false)
     private val enqueueing = AtomicBoolean(false)
     private val selfHealingRegistered = AtomicBoolean(false)
@@ -104,6 +121,9 @@ object CrashCapture {
      * Also:
      * - Best-effort: enqueue pending crash uploads on each install call (lightweight + cooldown).
      *   This makes "crash happened -> next launch uploads" reliable even if the caller forgets.
+     *
+     * IMPORTANT:
+     * - DO NOT assume context.applicationContext is non-null (attachBaseContext can be early).
      */
     fun install(context: Context) {
         val root = runCatching { context.filesDir }.getOrNull()
@@ -114,9 +134,9 @@ object CrashCapture {
 
         filesDirRoot = root
 
-        // Best-effort: schedule pending uploads on startup.
+        // Best-effort: schedule pending uploads on startup (safe context, WM may not be ready yet).
         runCatching {
-            enqueuePendingCrashUploadsIfPossible(context.applicationContext)
+            enqueuePendingCrashUploadsIfPossible(safeAppContext(context))
         }.onFailure { e ->
             Log.w(TAG, "install: enqueuePendingCrashUploadsIfPossible failed: ${e.message}", e)
         }
@@ -189,12 +209,15 @@ object CrashCapture {
      *
      * Strategy:
      * - If Supabase is configured, enqueue Supabase uploads.
-     * - If GitHub is configured, ALSO enqueue GitHub mirror uploads (optional but useful).
+     * - If GitHub is configured, ALSO enqueue GitHub mirror uploads.
      * - Keep files locally if nothing is configured.
      *
      * Important ordering:
      * - If both targets are enabled, create GitHub mirror copies FIRST to avoid a race where
      *   Supabase worker deletes originals before mirror-copy happens.
+     *
+     * Also:
+     * - API 30+: stage previous-process exit info (native crash / signaled) ONCE per process.
      */
     fun enqueuePendingCrashUploadsIfPossible(context: Context) {
         val root = filesDirRoot ?: runCatching { context.filesDir }.getOrNull()
@@ -218,8 +241,14 @@ object CrashCapture {
             }
             lastEnqueueAt.set(now)
 
+            val appCtx = safeAppContext(context)
+
+            // Exit-info staging (native crash on previous run) - best-effort.
+            runCatching { stageLastExitInfoIfNeeded(appCtx, root) }
+                .onFailure { e -> Log.w(TAG, "stageLastExitInfoIfNeeded failed: ${e.message}", e) }
+
             // Fail-fast: if WorkManager isn't initialized, enqueuing will never work.
-            val wmOk = runCatching { WorkManager.getInstance(context.applicationContext) }
+            val wmOk = runCatching { WorkManager.getInstance(appCtx) }
                 .onFailure { e ->
                     Log.e(TAG, "WorkManager not available/initialized: ${e.message}", e)
                 }
@@ -239,7 +268,7 @@ object CrashCapture {
             if (files.isEmpty()) return
 
             val supabaseConfigured = SupabaseCrashUploadWorker.isConfigured()
-            val ghCfg = buildCrashGitHubConfigOrNull(context.applicationContext)
+            val ghCfg = buildCrashGitHubConfigOrNull(appCtx)
 
             Log.d(
                 TAG,
@@ -279,14 +308,14 @@ object CrashCapture {
                         .getOrNull()
 
                     if (mirror != null) {
-                        Log.d(
-                            TAG,
-                            "GitHub enqueue: name=${mirror.name} bytes=${mirror.length()} mtime=${mirror.lastModified()}"
-                        )
-                        GitHubUploadWorker.enqueueExistingPayload(
-                            context = context.applicationContext,
+                        val remoteRelativePath = mirror.name
+                        Log.d(TAG, "GitHub enqueue(file): name=${mirror.name} bytes=${mirror.length()} remote=$remoteRelativePath")
+
+                        enqueueGitHubWorkerFileUpload(
+                            context = appCtx,
                             cfg = ghCfg,
-                            file = mirror
+                            localFile = mirror,
+                            remoteRelativePath = remoteRelativePath
                         )
                     }
                 }
@@ -296,12 +325,9 @@ object CrashCapture {
             if (supabaseConfigured) {
                 Log.d(TAG, "Enqueuing Supabase crash uploads… prefix=$SUPABASE_CRASH_PREFIX")
                 targets.forEach { file ->
-                    Log.d(
-                        TAG,
-                        "Supabase enqueue: name=${file.name} bytes=${file.length()} mtime=${file.lastModified()}"
-                    )
+                    Log.d(TAG, "Supabase enqueue: name=${file.name} bytes=${file.length()} mtime=${file.lastModified()}")
                     SupabaseCrashUploadWorker.enqueueExistingCrash(
-                        context = context.applicationContext,
+                        context = appCtx,
                         file = file,
                         objectPrefix = SUPABASE_CRASH_PREFIX,
                         addDateSubdir = true
@@ -517,6 +543,91 @@ object CrashCapture {
     }
 
     /**
+     * API 30+: Convert previous process exit reason into a crash report file.
+     *
+     * Native SIGSEGV won't trigger UncaughtExceptionHandler; this covers it on next launch.
+     */
+    private fun stageLastExitInfoIfNeeded(context: Context, filesDir: File) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
+        if (!stagedExitInfoThisProcess.compareAndSet(false, true)) return
+
+        val appCtx = safeAppContext(context)
+        val prefs = appCtx.getSharedPreferences(EXIT_PREF_NAME, Context.MODE_PRIVATE)
+        val lastTs = prefs.getLong(EXIT_PREF_KEY_LAST_TS, 0L)
+
+        val am = appCtx.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager ?: return
+        val reasons: List<ApplicationExitInfo> = runCatching {
+            am.getHistoricalProcessExitReasons(appCtx.packageName, 0, 8)
+        }.getOrDefault(emptyList())
+
+        if (reasons.isEmpty()) return
+
+        val latest = reasons.first()
+        val ts = latest.timestamp
+        if (ts <= 0L || ts == lastTs) return
+
+        val reason = latest.reason
+        val isNativeLike =
+            reason == ApplicationExitInfo.REASON_CRASH_NATIVE ||
+                    reason == ApplicationExitInfo.REASON_SIGNALED
+
+        // Record ts even if not a crash, to avoid repeated work on every launch.
+        prefs.edit().putLong(EXIT_PREF_KEY_LAST_TS, ts).apply()
+
+        if (!isNativeLike) return
+
+        val now = Date()
+        val stampUtc = FILE_TS_UTC.format(now)
+        val stampLocal = HEADER_TS_LOCAL.format(now)
+
+        val pid = latest.pid
+        val status = latest.status
+        val desc = latest.description ?: ""
+
+        // English comments only.
+        /** Trace may be present; cap it to avoid huge files. */
+        val traceText = runCatching {
+            val ins = latest.traceInputStream ?: return@runCatching ""
+            ins.bufferedReader().use { it.readText().take(200_000) }
+        }.getOrDefault("")
+
+        val text = buildString {
+            appendLine("=== Previous Process Exit (API30+) ===")
+            appendLine("time_utc=$stampUtc")
+            appendLine("time_local=$stampLocal")
+            appendLine("exit_timestamp_ms=$ts")
+            appendLine("exit_reason=$reason")
+            appendLine("exit_status=$status")
+            appendLine("exit_pid=$pid")
+            appendLine("description=$desc")
+            appendLine("sdk=${Build.VERSION.SDK_INT}")
+            appendLine("device=${Build.MANUFACTURER} ${Build.MODEL}")
+            appendLine("appId=${BuildConfig.APPLICATION_ID}")
+            appendLine("versionName=${BuildConfig.VERSION_NAME}")
+            appendLine("versionCode=${BuildConfig.VERSION_CODE}")
+            if (traceText.isNotBlank()) {
+                appendLine()
+                appendLine("=== trace (capped) ===")
+                appendLine(traceText)
+            }
+        }.toByteArray(Charsets.UTF_8)
+
+        val dir = crashDir(filesDir).apply { mkdirs() }
+        val name = "crash_exit_${stampUtc}_pid${pid}_r${reason}.log.gz"
+        val outFile = File(dir, name)
+
+        FileOutputStream(outFile).use { fos ->
+            GZIPOutputStream(fos).use { gz ->
+                gz.write(text)
+                gz.flush()
+            }
+            runCatching { fos.fd.sync() }
+        }
+
+        Log.d(TAG, "Staged previous exit crash report: ${outFile.absolutePath} bytes=${outFile.length()} reason=$reason")
+    }
+
+    /**
      * Build GitHub config for crash uploads.
      *
      * Priority:
@@ -524,7 +635,7 @@ object CrashCapture {
      *  2) BuildConfig (gradle-injected secrets/config)
      *
      * Path prefix:
-     *  - Uses base prefix from config, then appends diagnostics/crash (avoids duplication when base already includes diagnostics).
+     *  - Uses base prefix from config, then appends diagnostics/crash.
      */
     private fun buildCrashGitHubConfigOrNull(context: Context): GitHubUploader.GitHubConfig? {
         val fromStore = runCatching { GitHubDiagnosticsConfigStore.buildGitHubConfigOrNull(context) }
@@ -572,6 +683,61 @@ object CrashCapture {
             pathPrefix = BuildConfig.GH_PATH_PREFIX.trim().trim('/'),
             token = BuildConfig.GH_TOKEN
         )
+    }
+
+    private fun enqueueGitHubWorkerFileUpload(
+        context: Context,
+        cfg: GitHubUploader.GitHubConfig,
+        localFile: File,
+        remoteRelativePath: String
+    ) {
+        val safeUnique = sanitizeWorkName("${cfg.pathPrefix}/${remoteRelativePath}")
+        val uniqueName = "gh_crash_upload_$safeUnique"
+
+        val req: OneTimeWorkRequest =
+            OneTimeWorkRequestBuilder<GitHubUploadWorker>()
+                .setInputData(
+                    workDataOf(
+                        GitHubUploadWorker.KEY_MODE to "file",
+                        GitHubUploadWorker.KEY_OWNER to cfg.owner,
+                        GitHubUploadWorker.KEY_REPO to cfg.repo,
+                        GitHubUploadWorker.KEY_TOKEN to cfg.token,
+                        GitHubUploadWorker.KEY_BRANCH to cfg.branch,
+                        GitHubUploadWorker.KEY_PATH_PREFIX to cfg.pathPrefix,
+                        GitHubUploadWorker.KEY_FILE_PATH to localFile.absolutePath,
+                        GitHubUploadWorker.KEY_FILE_NAME to remoteRelativePath
+                    )
+                )
+                .setConstraints(
+                    Constraints.Builder()
+                        .setRequiredNetworkType(NetworkType.CONNECTED)
+                        .build()
+                )
+                .setBackoffCriteria(
+                    BackoffPolicy.EXPONENTIAL,
+                    30,
+                    TimeUnit.SECONDS
+                )
+                .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
+                .addTag(GitHubUploadWorker.TAG)
+                .addTag("${GitHubUploadWorker.TAG}:crash:$safeUnique")
+                .build()
+
+        WorkManager.getInstance(context)
+            .enqueueUniqueWork(uniqueName, ExistingWorkPolicy.KEEP, req)
+    }
+
+    private fun sanitizeWorkName(value: String): String {
+        return value
+            .trim()
+            .replace(Regex("""[^\w\-.]+"""), "_")
+            .take(120)
+    }
+
+    private fun safeAppContext(context: Context): Context {
+        // English comments only.
+        /** applicationContext may be null very early; fall back to the provided context. */
+        return context.applicationContext ?: context
     }
 
     private fun describeHandler(h: Thread.UncaughtExceptionHandler?): String {
