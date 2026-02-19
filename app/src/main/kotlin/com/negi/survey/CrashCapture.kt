@@ -53,17 +53,17 @@ object CrashCapture {
 
     private const val TAG = "CrashCapture"
 
-    /** Local directory for captured crash logs (gz). */
+    /** Local directory for staged crash artifacts (.gz). */
     private const val CRASH_DIR_REL = "diagnostics/crash"
 
-    /** Local directory for GitHub mirror copies (so Supabase worker can delete originals). */
+    /** Local directory for GitHub mirror copies (Supabase may delete originals). */
     private const val CRASH_GH_MIRROR_DIR_REL = "diagnostics/crash_github_mirror"
 
     private const val MAX_LOGCAT_BYTES = 850_000
     private const val LOGCAT_MAX_MS = 700L
 
-    private const val LOGCAT_TAIL_LINES_PID = "2000"
     private const val LOGCAT_TAIL_LINES_FALLBACK = "3000"
+    private const val LOGCAT_TAIL_LINES_SINCE = "6000"
 
     private const val MAX_FILES_TO_KEEP = 80
     private const val MAX_FILES_TO_ENQUEUE = 20
@@ -80,12 +80,15 @@ object CrashCapture {
     /** Prevent ensure storms (handler re-wrap). */
     private const val ENSURE_COOLDOWN_MS = 800L
 
-    /** Exit-info staging guard (native crash capture on next launch). */
-    private val stagedExitInfoThisProcess = AtomicBoolean(false)
+    /** SharedPreferences for previous-session staging state. */
+    private const val STATE_PREF_NAME = "crash_capture_state_v2"
+    private const val KEY_LAST_EXIT_TS = "last_exit_ts"
+    private const val KEY_LAST_EXIT_PID = "last_exit_pid"
+    private const val KEY_LAST_LOGCAT_MARKER = "last_logcat_marker"
 
-    /** Persist "last processed exit timestamp" to avoid duplicating exit-info reports. */
-    private const val EXIT_PREF_NAME = "crash_capture_exit_v1"
-    private const val EXIT_PREF_KEY_LAST_TS = "last_exit_ts"
+    /** Stage guards (once per current process). */
+    private val stagedPrevSessionThisProcess = AtomicBoolean(false)
+    private val stagedExitInfoThisProcess = AtomicBoolean(false)
 
     private val capturing = AtomicBoolean(false)
     private val enqueueing = AtomicBoolean(false)
@@ -94,7 +97,7 @@ object CrashCapture {
     private val lastEnqueueAt = AtomicLong(0L)
     private val lastEnsureAt = AtomicLong(0L)
 
-    /** Root filesDir cached at install time to avoid keeping applicationContext references. */
+    /** Root filesDir cached at install time. */
     @Volatile
     private var filesDirRoot: File? = null
 
@@ -111,19 +114,24 @@ object CrashCapture {
     private val HEADER_TS_LOCAL = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US)
 
     /**
+     * Marker for `logcat -T`.
+     *
+     * Use a year-inclusive format to avoid ambiguity around year boundaries.
+     * logcat accepts "YYYY-MM-DD HH:MM:SS.mmm" on modern Android.
+     */
+    private val LOGCAT_MARKER = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
+
+    /**
      * Install (or re-wrap) the default uncaught exception handler.
      *
-     * Key behavior:
-     * - Safe to call multiple times.
-     * - If another SDK replaces the default handler after we installed, calling install() again
-     *   will wrap the new handler and restore CrashCapture to the chain.
-     *
-     * Also:
-     * - Best-effort: enqueue pending crash uploads on each install call (lightweight + cooldown).
-     *   This makes "crash happened -> next launch uploads" reliable even if the caller forgets.
+     * Notes:
+     * - Native SIGSEGV will NOT reach this handler.
+     * - For native crashes, we stage previous-process exit info + previous-session logcat on next launch.
      *
      * IMPORTANT:
-     * - DO NOT assume context.applicationContext is non-null (attachBaseContext can be early).
+     * - DO NOT touch WorkManager here. WorkManager may not be initialized in attachBaseContext,
+     *   especially when WorkManagerInitializer is disabled in the manifest.
+     * - Enqueue uploads from Application.onCreate (or later) after WorkManager init is guaranteed.
      */
     fun install(context: Context) {
         val root = runCatching { context.filesDir }.getOrNull()
@@ -133,13 +141,6 @@ object CrashCapture {
         }
 
         filesDirRoot = root
-
-        // Best-effort: schedule pending uploads on startup (safe context, WM may not be ready yet).
-        runCatching {
-            enqueuePendingCrashUploadsIfPossible(safeAppContext(context))
-        }.onFailure { e ->
-            Log.w(TAG, "install: enqueuePendingCrashUploadsIfPossible failed: ${e.message}", e)
-        }
 
         val currentDefault = Thread.getDefaultUncaughtExceptionHandler()
 
@@ -161,9 +162,6 @@ object CrashCapture {
 
     /**
      * Optional hardening: register lifecycle callbacks to periodically re-ensure the handler chain.
-     *
-     * Useful when:
-     * - Some SDK replaces the default handler later (e.g., after Application.onCreate()).
      */
     fun registerSelfHealing(application: Application) {
         if (!selfHealingRegistered.compareAndSet(false, true)) return
@@ -193,31 +191,27 @@ object CrashCapture {
     /**
      * Ensure we are the default handler (best-effort) with a small cooldown.
      *
-     * Safe to call often.
+     * Note: This only ensures handler installation; it does NOT enqueue WorkManager uploads.
      */
     fun ensureInstalled(context: Context) {
         val now = SystemClock.elapsedRealtime()
         val prev = lastEnsureAt.get()
         if (prev != 0L && (now - prev) in 0 until ENSURE_COOLDOWN_MS) return
         lastEnsureAt.set(now)
-
         install(context)
     }
 
     /**
-     * Enqueue pending crash files for upload.
+     * Enqueue pending crash artifacts for upload.
      *
      * Strategy:
-     * - If Supabase is configured, enqueue Supabase uploads.
-     * - If GitHub is configured, ALSO enqueue GitHub mirror uploads.
-     * - Keep files locally if nothing is configured.
+     * - Stage previous-process exit info (API30+) into crash dir (native crash / signaled).
+     * - Stage previous-session logcat into crash dir using `logcat -T <marker>`.
+     * - Then enqueue all files under crash dir to Supabase + GitHub (mirror-first).
      *
-     * Important ordering:
-     * - If both targets are enabled, create GitHub mirror copies FIRST to avoid a race where
-     *   Supabase worker deletes originals before mirror-copy happens.
-     *
-     * Also:
-     * - API 30+: stage previous-process exit info (native crash / signaled) ONCE per process.
+     * IMPORTANT:
+     * - This method touches WorkManager. Call it only after WorkManager is initialized
+     *   (typically from Application.onCreate or later).
      */
     fun enqueuePendingCrashUploadsIfPossible(context: Context) {
         val root = filesDirRoot ?: runCatching { context.filesDir }.getOrNull()
@@ -243,15 +237,21 @@ object CrashCapture {
 
             val appCtx = safeAppContext(context)
 
-            // Exit-info staging (native crash on previous run) - best-effort.
-            runCatching { stageLastExitInfoIfNeeded(appCtx, root) }
+            // 0) Stage previous-run artifacts BEFORE scanning the crash dir (no WorkManager dependency).
+            val stagedExitPid = runCatching { stageLastExitInfoIfNeeded(appCtx, root) }
                 .onFailure { e -> Log.w(TAG, "stageLastExitInfoIfNeeded failed: ${e.message}", e) }
+                .getOrNull()
 
-            // Fail-fast: if WorkManager isn't initialized, enqueuing will never work.
+            runCatching { stagePreviousSessionLogcatIfNeeded(appCtx, root, stagedExitPid) }
+                .onFailure { e -> Log.w(TAG, "stagePreviousSessionLogcatIfNeeded failed: ${e.message}", e) }
+
+            // Always persist marker for the NEXT run (after staging).
+            runCatching { persistCurrentLogcatMarker(appCtx) }
+                .onFailure { e -> Log.w(TAG, "persistCurrentLogcatMarker failed: ${e.message}", e) }
+
+            // 1) WorkManager availability check.
             val wmOk = runCatching { WorkManager.getInstance(appCtx) }
-                .onFailure { e ->
-                    Log.e(TAG, "WorkManager not available/initialized: ${e.message}", e)
-                }
+                .onFailure { e -> Log.e(TAG, "WorkManager not available/initialized: ${e.message}", e) }
                 .isSuccess
             if (!wmOk) return
 
@@ -272,7 +272,7 @@ object CrashCapture {
 
             Log.d(
                 TAG,
-                "Pending crash files=${files.size} dir=${dir.absolutePath} " +
+                "Pending crash artifacts=${files.size} dir=${dir.absolutePath} " +
                         "supabaseConfigured=$supabaseConfigured githubConfigured=${ghCfg != null}"
             )
 
@@ -293,23 +293,24 @@ object CrashCapture {
                 .take(MAX_FILES_TO_ENQUEUE)
 
             if (!supabaseConfigured && ghCfg == null) {
-                Log.d(TAG, "No upload config found; crash uploads will remain local.")
+                Log.d(TAG, "No upload config found; crash artifacts will remain local.")
                 return
             }
 
-            // 1) GitHub mirror upload (copy files first to avoid Supabase delete race)
+            // 2) GitHub mirror upload (copy files first to avoid Supabase delete race).
             if (ghCfg != null) {
-                Log.d(TAG, "Enqueuing GitHub crash uploads… (mirror)")
+                Log.d(TAG, "Enqueuing GitHub crash uploads… (mirror-first)")
                 targets.forEach { file ->
                     val mirror = runCatching { makeGitHubMirrorCopy(file, ghMirrorDir) }
-                        .onFailure { e ->
-                            Log.w(TAG, "GitHub mirror copy failed: ${file.name} err=${e.message}", e)
-                        }
+                        .onFailure { e -> Log.w(TAG, "GitHub mirror copy failed: ${file.name} err=${e.message}", e) }
                         .getOrNull()
 
                     if (mirror != null) {
                         val remoteRelativePath = mirror.name
-                        Log.d(TAG, "GitHub enqueue(file): name=${mirror.name} bytes=${mirror.length()} remote=$remoteRelativePath")
+                        Log.d(
+                            TAG,
+                            "GitHub enqueue(file): name=${mirror.name} bytes=${mirror.length()} remote=$remoteRelativePath"
+                        )
 
                         enqueueGitHubWorkerFileUpload(
                             context = appCtx,
@@ -321,7 +322,7 @@ object CrashCapture {
                 }
             }
 
-            // 2) Supabase upload for originals (preferred for cloud storage)
+            // 3) Supabase upload for originals (preferred for cloud storage).
             if (supabaseConfigured) {
                 Log.d(TAG, "Enqueuing Supabase crash uploads… prefix=$SUPABASE_CRASH_PREFIX")
                 targets.forEach { file ->
@@ -342,12 +343,178 @@ object CrashCapture {
     private fun ensureDefaultHandlerInstalled(h: CrashHandler, currentDefault: Thread.UncaughtExceptionHandler?) {
         val current = Thread.getDefaultUncaughtExceptionHandler()
         if (current === h) return
-
-        // Update delegate to whatever is currently installed (unless it is already us).
         h.updateDelegate(currentDefault ?: current)
-
-        // Install ourselves as the default.
         Thread.setDefaultUncaughtExceptionHandler(h)
+    }
+
+    /**
+     * API 30+: Convert previous process exit reason into a staged crash artifact.
+     *
+     * Returns:
+     * - The previous process pid (if known and a crash-like exit was found), else null.
+     */
+    private fun stageLastExitInfoIfNeeded(context: Context, filesDir: File): Int? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return null
+        if (!stagedExitInfoThisProcess.compareAndSet(false, true)) return null
+
+        val appCtx = safeAppContext(context)
+        val prefs = appCtx.getSharedPreferences(STATE_PREF_NAME, Context.MODE_PRIVATE)
+        val lastTs = prefs.getLong(KEY_LAST_EXIT_TS, 0L)
+
+        val am = appCtx.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager ?: return null
+        val reasons: List<ApplicationExitInfo> = runCatching {
+            am.getHistoricalProcessExitReasons(appCtx.packageName, 0, 16)
+        }.getOrDefault(emptyList())
+
+        if (reasons.isEmpty()) return null
+
+        // Sort newest-first defensively (OEMs should already do this, but don't trust it).
+        val sorted = reasons.sortedByDescending { it.timestamp }
+
+        // Update last processed timestamp to the newest item we observed (even if not crash-like),
+        // so we don't redo this scan on every launch.
+        val newestTs = sorted.firstOrNull()?.timestamp ?: 0L
+        if (newestTs > 0L && newestTs != lastTs) {
+            prefs.edit().putLong(KEY_LAST_EXIT_TS, newestTs).apply()
+        }
+
+        // Find the newest crash-like entry that is newer than lastTs.
+        val crashLike = sorted.firstOrNull { info ->
+            val ts = info.timestamp
+            if (ts <= 0L) return@firstOrNull false
+            if (ts == lastTs) return@firstOrNull false
+            val r = info.reason
+            r == ApplicationExitInfo.REASON_CRASH_NATIVE || r == ApplicationExitInfo.REASON_SIGNALED
+        } ?: return null
+
+        val ts = crashLike.timestamp
+        val reason = crashLike.reason
+        val pid = crashLike.pid
+        val status = crashLike.status
+        val desc = crashLike.description ?: ""
+
+        // Persist last exit pid to help previous-session logcat filtering.
+        prefs.edit().putInt(KEY_LAST_EXIT_PID, pid).apply()
+
+        val now = Date()
+        val stampUtc = FILE_TS_UTC.format(now)
+        val stampLocal = HEADER_TS_LOCAL.format(now)
+
+        val traceText = runCatching {
+            val ins = crashLike.traceInputStream ?: return@runCatching ""
+            ins.bufferedReader().use { it.readText().take(240_000) }
+        }.getOrDefault("")
+
+        val text = buildString {
+            appendLine("=== Previous Process Exit (API30+) ===")
+            appendLine("captured_time_utc=$stampUtc")
+            appendLine("captured_time_local=$stampLocal")
+            appendLine("exit_timestamp_ms=$ts")
+            appendLine("exit_reason=$reason")
+            appendLine("exit_status=$status")
+            appendLine("exit_pid=$pid")
+            appendLine("description=$desc")
+            appendLine("sdk=${Build.VERSION.SDK_INT}")
+            appendLine("device=${Build.MANUFACTURER} ${Build.MODEL}")
+            appendLine("appId=${BuildConfig.APPLICATION_ID}")
+            appendLine("versionName=${BuildConfig.VERSION_NAME}")
+            appendLine("versionCode=${BuildConfig.VERSION_CODE}")
+            if (traceText.isNotBlank()) {
+                appendLine()
+                appendLine("=== trace (capped) ===")
+                appendLine(traceText)
+            }
+        }.toByteArray(Charsets.UTF_8)
+
+        val dir = crashDir(filesDir).apply { mkdirs() }
+        val name = "exit_${stampUtc}_pid${pid}_r${reason}.log.gz"
+        val outFile = File(dir, name)
+
+        FileOutputStream(outFile).use { fos ->
+            GZIPOutputStream(fos).use { gz ->
+                gz.write(text)
+                gz.flush()
+            }
+            runCatching { fos.fd.sync() }
+        }
+
+        Log.d(TAG, "Staged exit info: ${outFile.absolutePath} bytes=${outFile.length()} reason=$reason pid=$pid")
+        return pid
+    }
+
+    /**
+     * Stage previous-session logcat on next launch.
+     *
+     * - Uses last persisted marker with `logcat -T <marker>`.
+     * - If a previous exit pid is known, tries `--pid=<pid>` first to reduce noise.
+     */
+    private fun stagePreviousSessionLogcatIfNeeded(context: Context, filesDir: File, preferredPid: Int?) {
+        if (!stagedPrevSessionThisProcess.compareAndSet(false, true)) return
+
+        val appCtx = safeAppContext(context)
+        val prefs = appCtx.getSharedPreferences(STATE_PREF_NAME, Context.MODE_PRIVATE)
+        val marker = prefs.getString(KEY_LAST_LOGCAT_MARKER, null)?.trim().orEmpty()
+        if (marker.isBlank()) {
+            Log.d(TAG, "prevSessionLogcat: no marker yet; skipping.")
+            return
+        }
+
+        val savedExitPid = prefs.getInt(KEY_LAST_EXIT_PID, 0).takeIf { it > 0 }
+        val pid = preferredPid ?: savedExitPid
+
+        val now = Date()
+        val stampUtc = FILE_TS_UTC.format(now)
+        val stampLocal = HEADER_TS_LOCAL.format(now)
+
+        val header = buildString {
+            appendLine("=== Previous Session Logcat ===")
+            appendLine("captured_time_utc=$stampUtc")
+            appendLine("captured_time_local=$stampLocal")
+            appendLine("marker=$marker")
+            appendLine("preferred_prev_pid=${pid ?: -1}")
+            appendLine("note=best-effort; buffers may be overwritten before next start")
+            appendLine("sdk=${Build.VERSION.SDK_INT}")
+            appendLine("device=${Build.MANUFACTURER} ${Build.MODEL}")
+            appendLine("appId=${BuildConfig.APPLICATION_ID}")
+            appendLine("versionName=${BuildConfig.VERSION_NAME}")
+            appendLine("versionCode=${BuildConfig.VERSION_CODE}")
+            appendLine()
+            appendLine("=== Logcat (since marker) ===")
+        }.toByteArray(Charsets.UTF_8)
+
+        val logBytes = collectLogcatBytesSinceMarker(
+            marker = marker,
+            preferredPid = pid,
+            maxBytes = MAX_LOGCAT_BYTES,
+            maxMs = 650L
+        )
+
+        val dir = crashDir(filesDir).apply { mkdirs() }
+        val name = "prevlog_${stampUtc}_pid${Process.myPid()}.log.gz"
+        val outFile = File(dir, name)
+
+        FileOutputStream(outFile).use { fos ->
+            GZIPOutputStream(fos).use { gz ->
+                gz.write(header)
+                gz.write(logBytes)
+                gz.flush()
+            }
+            runCatching { fos.fd.sync() }
+        }
+
+        Log.d(TAG, "Staged prev session logcat: ${outFile.absolutePath} bytes=${outFile.length()} marker=$marker pid=${pid ?: -1}")
+    }
+
+    /**
+     * Persist the current marker to be used on the NEXT app launch for prev-session logcat staging.
+     */
+    private fun persistCurrentLogcatMarker(context: Context) {
+        val appCtx = safeAppContext(context)
+        val prefs = appCtx.getSharedPreferences(STATE_PREF_NAME, Context.MODE_PRIVATE)
+        val marker = runCatching { LOGCAT_MARKER.format(Date()) }.getOrDefault("")
+        if (marker.isBlank()) return
+        prefs.edit().putString(KEY_LAST_LOGCAT_MARKER, marker).apply()
+        Log.d(TAG, "Persisted logcat marker for next run: $marker")
     }
 
     private fun makeGitHubMirrorCopy(src: File, mirrorDir: File): File {
@@ -355,17 +522,13 @@ object CrashCapture {
 
         val dst = File(mirrorDir, src.name)
 
-        // If a previous copy exists and looks identical, reuse it.
+        // Reuse existing mirror if identical.
         if (dst.exists() && dst.length() == src.length() && dst.lastModified() == src.lastModified()) {
             return dst
         }
 
-        // If a different file already exists at the same name, create a unique suffixed name.
-        val target = if (!dst.exists()) {
-            dst
-        } else {
-            makeUniqueLike(srcName = src.name, dir = mirrorDir)
-        }
+        // If name exists but differs, create a unique suffixed name.
+        val target = if (!dst.exists()) dst else makeUniqueLike(srcName = src.name, dir = mirrorDir)
 
         FileInputStream(src).use { input ->
             FileOutputStream(target).use { output ->
@@ -383,12 +546,6 @@ object CrashCapture {
         return target
     }
 
-    /**
-     * Preserve ".log.gz" naming when generating unique copies.
-     * Examples:
-     * - crash_x.log.gz -> crash_x-2.log.gz
-     * - foo.gz -> foo-2.gz
-     */
     private fun makeUniqueLike(srcName: String, dir: File): File {
         if (srcName.endsWith(".log.gz")) {
             val base = srcName.removeSuffix(".log.gz")
@@ -409,11 +566,7 @@ object CrashCapture {
         }
     }
 
-    private fun captureCrashToFile(
-        filesDir: File,
-        thread: Thread,
-        throwable: Throwable
-    ): File {
+    private fun captureCrashToFile(filesDir: File, thread: Thread, throwable: Throwable): File {
         val dir = crashDir(filesDir).apply { mkdirs() }
         purgeOldFiles(dir, MAX_FILES_TO_KEEP)
 
@@ -451,7 +604,7 @@ object CrashCapture {
 
                 gz.write(header)
 
-                val logBytes = collectLogcatBytes(
+                val logBytes = collectLogcatBytesCurrentPid(
                     pid = pid,
                     maxBytes = MAX_LOGCAT_BYTES,
                     maxMs = LOGCAT_MAX_MS
@@ -460,18 +613,15 @@ object CrashCapture {
                 gz.flush()
             }
 
-            // Best-effort durability (avoid secondary crash if it fails).
             runCatching { fos.fd.sync() }
         }
 
         return outFile
     }
 
-    private fun crashDir(filesDir: File): File =
-        File(filesDir, CRASH_DIR_REL)
+    private fun crashDir(filesDir: File): File = File(filesDir, CRASH_DIR_REL)
 
-    private fun crashGitHubMirrorDir(filesDir: File): File =
-        File(filesDir, CRASH_GH_MIRROR_DIR_REL)
+    private fun crashGitHubMirrorDir(filesDir: File): File = File(filesDir, CRASH_GH_MIRROR_DIR_REL)
 
     private fun purgeOldFiles(dir: File, maxKeep: Int) {
         val all = dir.listFiles { f -> f.isFile && f.length() > 0L && !f.name.startsWith(".") }?.toList().orEmpty()
@@ -482,13 +632,13 @@ object CrashCapture {
         toDelete.forEach { f -> runCatching { f.delete() } }
     }
 
-    private fun collectLogcatBytes(pid: Int, maxBytes: Int, maxMs: Long): ByteArray {
+    private fun collectLogcatBytesCurrentPid(pid: Int, maxBytes: Int, maxMs: Long): ByteArray {
         val primary = listOf(
             "logcat", "-d",
             "-v", "threadtime",
             "-b", "main", "-b", "system", "-b", "crash",
             "--pid=$pid",
-            "-t", LOGCAT_TAIL_LINES_PID
+            "-t", "2000"
         )
 
         val fallback = listOf(
@@ -505,6 +655,49 @@ object CrashCapture {
             }
     }
 
+    private fun collectLogcatBytesSinceMarker(
+        marker: String,
+        preferredPid: Int?,
+        maxBytes: Int,
+        maxMs: Long
+    ): ByteArray {
+        val withPid = preferredPid?.takeIf { it > 0 }?.let { pid ->
+            listOf(
+                "logcat", "-d",
+                "-v", "threadtime",
+                "-b", "main", "-b", "system", "-b", "crash",
+                "--pid=$pid",
+                "-T", marker,
+                "-t", LOGCAT_TAIL_LINES_SINCE
+            )
+        }
+
+        val noPid = listOf(
+            "logcat", "-d",
+            "-v", "threadtime",
+            "-b", "main", "-b", "system", "-b", "crash",
+            "-T", marker,
+            "-t", LOGCAT_TAIL_LINES_SINCE
+        )
+
+        val fallback = listOf(
+            "logcat", "-d",
+            "-v", "threadtime",
+            "-b", "main", "-b", "system", "-b", "crash",
+            "-t", LOGCAT_TAIL_LINES_FALLBACK
+        )
+
+        return runCatching {
+            if (withPid != null) execAndReadCapped(withPid, maxBytes, maxMs) else execAndReadCapped(noPid, maxBytes, maxMs)
+        }.recoverCatching {
+            execAndReadCapped(noPid, maxBytes, maxMs)
+        }.recoverCatching {
+            execAndReadCapped(fallback, maxBytes, maxMs)
+        }.getOrElse { e ->
+            ("(prev-session logcat capture failed: ${e.message})\n").toByteArray(Charsets.UTF_8)
+        }
+    }
+
     private fun execAndReadCapped(cmd: List<String>, maxBytes: Int, maxMs: Long): ByteArray {
         val start = SystemClock.elapsedRealtime()
 
@@ -519,7 +712,6 @@ object CrashCapture {
 
                 while (out.size() < maxBytes) {
                     if (SystemClock.elapsedRealtime() - start > maxMs) break
-
                     val remaining = maxBytes - out.size()
                     val n = input.read(buf, 0, min(buf.size, remaining))
                     if (n <= 0) break
@@ -529,9 +721,7 @@ object CrashCapture {
                 out.toByteArray()
             }
         } finally {
-            runCatching {
-                proc.waitFor(LOGCAT_WAITFOR_MS, TimeUnit.MILLISECONDS)
-            }
+            runCatching { proc.waitFor(LOGCAT_WAITFOR_MS, TimeUnit.MILLISECONDS) }
             runCatching {
                 proc.destroy()
                 proc.waitFor(LOGCAT_WAITFOR_MS, TimeUnit.MILLISECONDS)
@@ -543,104 +733,14 @@ object CrashCapture {
     }
 
     /**
-     * API 30+: Convert previous process exit reason into a crash report file.
-     *
-     * Native SIGSEGV won't trigger UncaughtExceptionHandler; this covers it on next launch.
-     */
-    private fun stageLastExitInfoIfNeeded(context: Context, filesDir: File) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
-        if (!stagedExitInfoThisProcess.compareAndSet(false, true)) return
-
-        val appCtx = safeAppContext(context)
-        val prefs = appCtx.getSharedPreferences(EXIT_PREF_NAME, Context.MODE_PRIVATE)
-        val lastTs = prefs.getLong(EXIT_PREF_KEY_LAST_TS, 0L)
-
-        val am = appCtx.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager ?: return
-        val reasons: List<ApplicationExitInfo> = runCatching {
-            am.getHistoricalProcessExitReasons(appCtx.packageName, 0, 8)
-        }.getOrDefault(emptyList())
-
-        if (reasons.isEmpty()) return
-
-        val latest = reasons.first()
-        val ts = latest.timestamp
-        if (ts <= 0L || ts == lastTs) return
-
-        val reason = latest.reason
-        val isNativeLike =
-            reason == ApplicationExitInfo.REASON_CRASH_NATIVE ||
-                    reason == ApplicationExitInfo.REASON_SIGNALED
-
-        // Record ts even if not a crash, to avoid repeated work on every launch.
-        prefs.edit().putLong(EXIT_PREF_KEY_LAST_TS, ts).apply()
-
-        if (!isNativeLike) return
-
-        val now = Date()
-        val stampUtc = FILE_TS_UTC.format(now)
-        val stampLocal = HEADER_TS_LOCAL.format(now)
-
-        val pid = latest.pid
-        val status = latest.status
-        val desc = latest.description ?: ""
-
-        // English comments only.
-        /** Trace may be present; cap it to avoid huge files. */
-        val traceText = runCatching {
-            val ins = latest.traceInputStream ?: return@runCatching ""
-            ins.bufferedReader().use { it.readText().take(200_000) }
-        }.getOrDefault("")
-
-        val text = buildString {
-            appendLine("=== Previous Process Exit (API30+) ===")
-            appendLine("time_utc=$stampUtc")
-            appendLine("time_local=$stampLocal")
-            appendLine("exit_timestamp_ms=$ts")
-            appendLine("exit_reason=$reason")
-            appendLine("exit_status=$status")
-            appendLine("exit_pid=$pid")
-            appendLine("description=$desc")
-            appendLine("sdk=${Build.VERSION.SDK_INT}")
-            appendLine("device=${Build.MANUFACTURER} ${Build.MODEL}")
-            appendLine("appId=${BuildConfig.APPLICATION_ID}")
-            appendLine("versionName=${BuildConfig.VERSION_NAME}")
-            appendLine("versionCode=${BuildConfig.VERSION_CODE}")
-            if (traceText.isNotBlank()) {
-                appendLine()
-                appendLine("=== trace (capped) ===")
-                appendLine(traceText)
-            }
-        }.toByteArray(Charsets.UTF_8)
-
-        val dir = crashDir(filesDir).apply { mkdirs() }
-        val name = "crash_exit_${stampUtc}_pid${pid}_r${reason}.log.gz"
-        val outFile = File(dir, name)
-
-        FileOutputStream(outFile).use { fos ->
-            GZIPOutputStream(fos).use { gz ->
-                gz.write(text)
-                gz.flush()
-            }
-            runCatching { fos.fd.sync() }
-        }
-
-        Log.d(TAG, "Staged previous exit crash report: ${outFile.absolutePath} bytes=${outFile.length()} reason=$reason")
-    }
-
-    /**
      * Build GitHub config for crash uploads.
      *
      * Priority:
      *  1) GitHubDiagnosticsConfigStore (user-configured token/prefs)
      *  2) BuildConfig (gradle-injected secrets/config)
-     *
-     * Path prefix:
-     *  - Uses base prefix from config, then appends diagnostics/crash.
      */
     private fun buildCrashGitHubConfigOrNull(context: Context): GitHubUploader.GitHubConfig? {
-        val fromStore = runCatching { GitHubDiagnosticsConfigStore.buildGitHubConfigOrNull(context) }
-            .getOrNull()
-
+        val fromStore = runCatching { GitHubDiagnosticsConfigStore.buildGitHubConfigOrNull(context) }.getOrNull()
         val base = fromStore ?: runCatching { buildCrashGitHubConfigFromBuildConfig() }.getOrNull()
         if (base == null) return null
 
@@ -655,16 +755,8 @@ object CrashCapture {
 
     private fun computeCrashPrefix(basePrefix: String): String {
         val p = basePrefix.trim('/')
-
-        // Already a crash prefix
         if (p.endsWith("diagnostics/crash")) return p
-
-        // If base already ends with diagnostics, append crash
-        if (p.endsWith("diagnostics")) {
-            return listOf(p, "crash").filter { it.isNotBlank() }.joinToString("/")
-        }
-
-        // Default: base + diagnostics/crash
+        if (p.endsWith("diagnostics")) return listOf(p, "crash").filter { it.isNotBlank() }.joinToString("/")
         return listOf(p, "diagnostics/crash").filter { it.isNotBlank() }.joinToString("/")
     }
 
@@ -672,7 +764,6 @@ object CrashCapture {
         if (BuildConfig.GH_TOKEN.isBlank()) return null
         if (BuildConfig.GH_OWNER.isBlank() || BuildConfig.GH_REPO.isBlank()) return null
 
-        // Accept either "repo" or "owner/repo" in GH_REPO, normalize to "repo".
         val repoName = BuildConfig.GH_REPO.substringAfterLast('/').trim()
         if (repoName.isBlank()) return null
 
@@ -691,7 +782,7 @@ object CrashCapture {
         localFile: File,
         remoteRelativePath: String
     ) {
-        val safeUnique = sanitizeWorkName("${cfg.pathPrefix}/${remoteRelativePath}")
+        val safeUnique = sanitizeWorkName("${cfg.pathPrefix}/$remoteRelativePath")
         val uniqueName = "gh_crash_upload_$safeUnique"
 
         val req: OneTimeWorkRequest =
@@ -713,11 +804,7 @@ object CrashCapture {
                         .setRequiredNetworkType(NetworkType.CONNECTED)
                         .build()
                 )
-                .setBackoffCriteria(
-                    BackoffPolicy.EXPONENTIAL,
-                    30,
-                    TimeUnit.SECONDS
-                )
+                .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
                 .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
                 .addTag(GitHubUploadWorker.TAG)
                 .addTag("${GitHubUploadWorker.TAG}:crash:$safeUnique")
@@ -728,14 +815,12 @@ object CrashCapture {
     }
 
     private fun sanitizeWorkName(value: String): String {
-        return value
-            .trim()
+        return value.trim()
             .replace(Regex("""[^\w\-.]+"""), "_")
             .take(120)
     }
 
     private fun safeAppContext(context: Context): Context {
-        // English comments only.
         /** applicationContext may be null very early; fall back to the provided context. */
         return context.applicationContext ?: context
     }
@@ -783,11 +868,7 @@ object CrashCapture {
             } finally {
                 try {
                     val d = delegate
-                    if (d != null) {
-                        d.uncaughtException(thread, throwable)
-                    } else {
-                        onHardKill()
-                    }
+                    if (d != null) d.uncaughtException(thread, throwable) else onHardKill()
                 } catch (_: Throwable) {
                     onHardKill()
                 }

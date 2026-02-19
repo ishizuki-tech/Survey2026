@@ -20,6 +20,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import androidx.work.Configuration
 import androidx.work.WorkManager
 import com.negi.survey.slm.LiteRtLM
 import java.io.File
@@ -34,11 +35,11 @@ import java.util.concurrent.atomic.AtomicBoolean
  * - Run only in the main process.
  *
  * Notes:
- * - Avoid assuming applicationContext is non-null in attachBaseContext.
- * - WorkManager may not be initialized in attachBaseContext; prefer enqueue from onCreate.
- * - Add a delayed retry to avoid cooldown edge cases when early enqueue fails before WM init.
+ * - WorkManagerInitializer may be disabled in the manifest; initialize WorkManager manually.
+ * - WorkManager may not be ready early on some devices/entry points; always guard getInstance().
+ * - Prefer enqueue from onCreate, but initialize WM in attachBaseContext to protect CrashCapture.
  */
-class SurveyApp : Application() {
+class SurveyApp : Application(), Configuration.Provider {
 
     override fun attachBaseContext(base: Context) {
         super.attachBaseContext(base)
@@ -60,8 +61,13 @@ class SurveyApp : Application() {
             return
         }
 
+        // CRITICAL: If WorkManagerInitializer is disabled, WorkManager is NOT auto-initialized.
+        // Initialize it manually as early as possible to prevent CrashCapture from crashing
+        // if it touches WorkManager during install.
+        ensureWorkManagerInitialized(where = "attachBaseContext")
+
         // Install as early as possible to catch crashes during Application startup.
-        // Do NOT force-enqueue pending uploads here; WM may not be ready yet.
+        // Do NOT force-enqueue pending uploads here; enqueue is done in onCreate.
         safeCrashInstall(where = "attachBaseContext", context = base)
     }
 
@@ -91,8 +97,8 @@ class SurveyApp : Application() {
                 Log.w(TAG, "LiteRtLM.setApplicationContext failed: ${t.message}", t)
             }
 
-        // Prime WorkManager early (best-effort) so crash upload enqueue won't be a no-op.
-        primeWorkManager(this)
+        // Ensure WorkManager is initialized (idempotent).
+        ensureWorkManagerInitialized(where = "onCreate")
 
         // Re-wrap default handler in case any SDK replaced it after attachBaseContext().
         safeCrashInstall(where = "onCreate(rewrap)", context = this)
@@ -101,8 +107,67 @@ class SurveyApp : Application() {
         safeRegisterSelfHealingOnce(this)
 
         // Enqueue pending crash uploads from previous run (best-effort).
-        // Also schedule a delayed retry to bypass cooldown edge cases if early enqueue ran before WM init.
+        // Also schedule a delayed retry to bypass cooldown edge cases.
         safeEnqueuePendingUploadsWithRetryOnce(this)
+    }
+
+    /**
+     * WorkManager Configuration provider.
+     *
+     * Even if WorkManagerInitializer is disabled and we call WorkManager.initialize() manually,
+     * providing a Configuration keeps behavior consistent and supports advanced setups later
+     * (e.g., setWorkerFactory, custom executor, etc.).
+     */
+    override val workManagerConfiguration: Configuration
+        get() = Configuration.Builder()
+            .setMinimumLoggingLevel(Log.INFO)
+            .build()
+
+    /**
+     * Ensure WorkManager is initialized.
+     *
+     * This is required when WorkManagerInitializer is explicitly disabled in AndroidManifest.xml.
+     * Safe to call multiple times (idempotent via try/catch).
+     */
+    private fun ensureWorkManagerInitialized(where: String) {
+        if (!workManagerInitOnce.compareAndSet(false, true)) {
+            // Already attempted; still verify it's accessible in case a prior attempt failed.
+            if (isWorkManagerReady()) return
+        }
+
+        // First: check if it's already initialized.
+        if (isWorkManagerReady()) {
+            Log.d(TAG, "WorkManager already initialized. where=$where")
+            return
+        }
+
+        // If initializer is disabled, we must initialize manually.
+        runCatching {
+            WorkManager.initialize(this, workManagerConfiguration)
+            Log.d(TAG, "WorkManager initialized manually. where=$where")
+        }.onFailure { t ->
+            // Do not crash app startup; log and continue.
+            Log.w(TAG, "WorkManager manual init failed: where=$where msg=${t.message}", t)
+        }
+
+        // Final check (best-effort).
+        if (!isWorkManagerReady()) {
+            Log.w(TAG, "WorkManager still not ready after init attempt. where=$where")
+        }
+    }
+
+    /**
+     * Returns true if WorkManager.getInstance() works without throwing.
+     */
+    private fun isWorkManagerReady(): Boolean {
+        return try {
+            WorkManager.getInstance(this)
+            true
+        } catch (_: IllegalStateException) {
+            false
+        } catch (_: Throwable) {
+            false
+        }
     }
 
     /**
@@ -183,21 +248,6 @@ class SurveyApp : Application() {
     }
 
     /**
-     * Prime WorkManager initialization (best-effort).
-     *
-     * Some devices/entry points can hit crash-capture install before WM is ready.
-     * Calling getInstance here tends to initialize WM early enough for enqueue calls.
-     */
-    private fun primeWorkManager(context: Context) {
-        runCatching {
-            WorkManager.getInstance(context.applicationContext ?: context)
-            Log.d(TAG, "WorkManager primed.")
-        }.onFailure { t ->
-            Log.w(TAG, "WorkManager prime failed: ${t.message}", t)
-        }
-    }
-
-    /**
      * Register self-healing hook (Application required by CrashCapture API).
      */
     private fun safeRegisterSelfHealingOnce(app: Application) {
@@ -227,7 +277,10 @@ class SurveyApp : Application() {
             return
         }
 
-        val appCtx = context.applicationContext ?: context
+        val appCtx = context.applicationContext
+
+        // Ensure WM is initialized before enqueue (idempotent).
+        ensureWorkManagerInitialized(where = "enqueuePending(immediate)")
 
         // 1) Immediate attempt
         runCatching {
@@ -241,6 +294,9 @@ class SurveyApp : Application() {
         if (enqueueRetryScheduled.compareAndSet(false, true)) {
             Handler(Looper.getMainLooper()).postDelayed(
                 {
+                    // Ensure again (idempotent).
+                    ensureWorkManagerInitialized(where = "enqueuePending(delayed)")
+
                     runCatching {
                         CrashCapture.enqueuePendingCrashUploadsIfPossible(appCtx)
                         Log.d(TAG, "CrashCapture pending uploads enqueued (delayed retry).")
@@ -270,5 +326,8 @@ class SurveyApp : Application() {
         private val selfHealOnce = AtomicBoolean(false)
         private val enqueuePendingOnce = AtomicBoolean(false)
         private val enqueueRetryScheduled = AtomicBoolean(false)
+
+        // Guard for manual WorkManager init attempt.
+        private val workManagerInitOnce = AtomicBoolean(false)
     }
 }

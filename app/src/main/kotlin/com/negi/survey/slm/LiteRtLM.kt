@@ -109,6 +109,7 @@ data class LiteRtLmInstance(
     val supportImage: Boolean,
     val supportAudio: Boolean,
     val engineConfigSnapshot: EngineConfig,
+    @Volatile var conversationConfigSnapshot: ConversationConfig,
 )
 
 /**
@@ -161,6 +162,17 @@ object LiteRtLM {
 
     /** Extractor debug counter. */
     private val extractDebugCounter: AtomicLong = AtomicLong(0L)
+
+    /**
+     * Per-key "session lock" (Conversation lifecycle lock).
+     *
+     * Why:
+     * - Some LiteRT-LM builds support only ONE active session per process/engine.
+     * - Conversation.close() may be async-ish; createConversation() immediately after close can
+     *   hit FAILED_PRECONDITION: "A session already exists".
+     * - We must serialize create/close/reset paths per key to eliminate races.
+     */
+    private val sessionMutexes: ConcurrentHashMap<String, Mutex> = ConcurrentHashMap()
 
     /** Returns true when a generateText call is currently in progress. */
     fun isBusy(): Boolean = busy.get()
@@ -283,10 +295,6 @@ object LiteRtLM {
 
     /**
      * Await completion of an in-flight initialization for the same key.
-     *
-     * Why:
-     * - Without this, runInference() could start on a soon-to-be-retired instance while initialize() is running.
-     * - That can lead to close() being called on an engine/conversation that is still streaming.
      */
     private suspend fun awaitInitIfInFlight(key: String, reason: String) {
         if (!initInFlight.contains(key)) return
@@ -391,6 +399,35 @@ object LiteRtLM {
         if (lc.contains("cancelled")) return true
         if (lc.contains("aborted") && lc.contains("user")) return true
         return false
+    }
+
+    /** Detect "session already exists" class of errors (FAILED_PRECONDITION). */
+    private fun isSessionAlreadyExistsError(t: Throwable): Boolean {
+        val m = (t.message ?: t.toString()).lowercase(Locale.US)
+        if (m.contains("a session already exists")) return true
+        if (m.contains("only one session is supported")) return true
+        if (m.contains("failed_precondition")) return true
+        return false
+    }
+
+    /** Detect "Conversation is not alive" errors for recovery paths. */
+    private fun isConversationNotAliveError(t: Throwable): Boolean {
+        val m = (t.message ?: t.toString()).lowercase(Locale.US)
+        return m.contains("conversation is not alive")
+    }
+
+    /** Get or create the per-key session mutex. */
+    private fun getSessionMutex(key: String): Mutex {
+        val existing = sessionMutexes[key]
+        if (existing != null) return existing
+        val created = Mutex()
+        val prev = sessionMutexes.putIfAbsent(key, created)
+        return prev ?: created
+    }
+
+    /** Run a block under the per-key session lock. */
+    private suspend fun <T> withSessionLock(key: String, reason: String, block: suspend () -> T): T {
+        return getSessionMutex(key).withLock { block() }
     }
 
     /** Convert this Bitmap to PNG bytes. */
@@ -733,10 +770,6 @@ object LiteRtLM {
 
     /**
      * Delay when a post-terminate cooldown is active for this key.
-     *
-     * Rationale:
-     * - Hard-close and native teardown can overlap with re-init on some devices.
-     * - This delay reduces the chance of "close vs init" races.
      */
     private suspend fun awaitCooldownIfNeeded(key: String, reason: String) {
         val rs = getRunState(key)
@@ -751,11 +784,6 @@ object LiteRtLM {
 
     /**
      * Upgrade (reinitialize) runtime capabilities if needed.
-     *
-     * Behavior:
-     * - If an instance was initialized with supportImage=false and a later request includes images,
-     *   we re-init with supportImage=true (same for audio).
-     * - This avoids "capability fixed at first call" failures in production flows.
      */
     private suspend fun upgradeCapabilitiesIfNeeded(
         context: Context,
@@ -775,7 +803,6 @@ object LiteRtLM {
             val needAudio = wantAudio && !inst.supportAudio
             if (!needImage && !needAudio) return@withLock null
 
-            // Only upgrade to true; never downgrade existing capabilities.
             val nextImage = inst.supportImage || wantImage
             val nextAudio = inst.supportAudio || wantAudio
             Triple(nextImage, nextAudio, "needImage=$needImage needAudio=$needAudio have(image=${inst.supportImage},audio=${inst.supportAudio})")
@@ -804,6 +831,75 @@ object LiteRtLM {
             ?: "Initialization timed out after ${INIT_AWAIT_TIMEOUT_MS}ms."
 
         if (err.isNotEmpty()) throw IllegalStateException("LiteRT-LM capability upgrade failed: $err")
+    }
+
+    /**
+     * Create a conversation with retry on FAILED_PRECONDITION ("session already exists").
+     */
+    private suspend fun createConversationWithRetry(
+        engine: Engine,
+        cfg: ConversationConfig,
+        key: String,
+        reason: String,
+        timeoutMs: Long = CLOSE_GRACE_MS,
+        initialDelayMs: Long = 25L,
+        maxDelayMs: Long = 250L,
+    ): Conversation {
+        val start = SystemClock.elapsedRealtime()
+        var delayMs = initialDelayMs
+        var attempt = 0
+
+        while (true) {
+            attempt++
+            try {
+                val conv = engine.createConversation(cfg)
+                if (attempt > 1) {
+                    Log.w(TAG, "createConversationWithRetry succeeded: key='$key' attempts=$attempt reason='$reason'")
+                }
+                return conv
+            } catch (t: Throwable) {
+                if (!isSessionAlreadyExistsError(t)) throw t
+
+                val now = SystemClock.elapsedRealtime()
+                val elapsed = now - start
+                if (elapsed >= timeoutMs) {
+                    Log.e(
+                        TAG,
+                        "createConversationWithRetry timed out: key='$key' attempts=$attempt elapsed=${elapsed}ms reason='$reason' err=${t.message}",
+                        t
+                    )
+                    throw t
+                }
+
+                Log.w(
+                    TAG,
+                    "createConversationWithRetry: session exists, retrying: key='$key' attempt=$attempt elapsed=${elapsed}ms nextDelay=${delayMs}ms reason='$reason'"
+                )
+                delay(delayMs)
+                delayMs = min(maxDelayMs, delayMs * 2)
+            }
+        }
+    }
+
+    /** Build conversation config for current model sampler + optional system/tools. */
+    private fun buildConversationConfig(
+        model: Model,
+        systemMessage: Message?,
+        tools: List<Any>,
+    ): ConversationConfig {
+        val topK = sanitizeTopK(model.getIntConfigValue(ConfigKey.TOP_K, DEFAULT_TOPK))
+        val topP = sanitizeTopP(model.getFloatConfigValue(ConfigKey.TOP_P, DEFAULT_TOPP))
+        val temperature = sanitizeTemperature(model.getFloatConfigValue(ConfigKey.TEMPERATURE, DEFAULT_TEMPERATURE))
+
+        return ConversationConfig(
+            samplerConfig = SamplerConfig(
+                topK = topK,
+                topP = topP.toDouble(),
+                temperature = temperature.toDouble(),
+            ),
+            systemMessage = systemMessage,
+            tools = tools,
+        )
     }
 
     /**
@@ -843,120 +939,118 @@ object LiteRtLM {
             try {
                 awaitCooldownIfNeeded(key, reason = "initialize")
 
-                stateMutex.withLock {
-                    val rs = getRunState(key)
-                    if (rs.active.get()) {
-                        throw IllegalStateException("Initialization rejected: active native stream in progress for key='$key'.")
+                withSessionLock(key, reason = "initialize") {
+                    stateMutex.withLock {
+                        val rs = getRunState(key)
+                        if (rs.active.get()) {
+                            throw IllegalStateException("Initialization rejected: active native stream in progress for key='$key'.")
+                        }
                     }
-                }
 
-                val defaultMax = defaultMaxTokensForModel(model.name)
-                val maxTokensRaw = model.getIntConfigValue(ConfigKey.MAX_TOKENS, defaultMax).coerceAtLeast(1)
-                val maxTokens = maxTokensRaw.coerceIn(1, ABS_MAX_NUM_TOKENS)
-
-                val topK = sanitizeTopK(model.getIntConfigValue(ConfigKey.TOP_K, DEFAULT_TOPK))
-                val topP = sanitizeTopP(model.getFloatConfigValue(ConfigKey.TOP_P, DEFAULT_TOPP))
-                val temperature = sanitizeTemperature(model.getFloatConfigValue(ConfigKey.TEMPERATURE, DEFAULT_TEMPERATURE))
-
-                val backend = preferredBackend(model)
-
-                Log.d(TAG, "Initializing LiteRT-LM: model='${model.name}', key='$key'")
-                Log.d(TAG, "Capabilities: image=$supportImage audio=$supportAudio")
-                Log.d(TAG, "Backend=$backend maxNumTokens=$maxTokens (raw=$maxTokensRaw) topK=$topK topP=$topP temp=$temperature")
-
-                val modelPath = model.getPath()
-
-                val cacheDirPath: String? = runCatching {
-                    if (modelPath.startsWith("/data/local/tmp")) {
-                        context.getExternalFilesDir(null)?.absolutePath
-                    } else {
-                        context.cacheDir?.absolutePath
+                    val existing: LiteRtLmInstance? = stateMutex.withLock { instances.remove(key) }
+                    if (existing != null) {
+                        Log.w(TAG, "initialize: closing existing instance before re-init: key='$key'")
+                        runCatching { existing.conversation.close() }
+                            .onFailure { Log.w(TAG, "initialize: failed to close existing conversation: ${it.message}", it) }
+                        runCatching { existing.engine.close() }
+                            .onFailure { Log.w(TAG, "initialize: failed to close existing engine: ${it.message}", it) }
+                        delay(RETIRED_CLOSE_GRACE_MS)
                     }
-                }.getOrNull()
 
-                fun buildConfig(forBackend: Backend, visionBackend: Backend?, audioBackend: Backend?): EngineConfig {
-                    return EngineConfig(
-                        modelPath = modelPath,
-                        backend = forBackend,
-                        visionBackend = visionBackend,
-                        audioBackend = audioBackend,
-                        maxNumTokens = maxTokens,
-                        cacheDir = cacheDirPath,
-                    )
-                }
+                    val defaultMax = defaultMaxTokensForModel(model.name)
+                    val maxTokensRaw = model.getIntConfigValue(ConfigKey.MAX_TOKENS, defaultMax).coerceAtLeast(1)
+                    val maxTokens = maxTokensRaw.coerceIn(1, ABS_MAX_NUM_TOKENS)
 
-                val visionPreferred = if (supportImage) Backend.GPU else null
-                val audioPreferred = if (supportAudio) Backend.CPU else null
+                    val topK = sanitizeTopK(model.getIntConfigValue(ConfigKey.TOP_K, DEFAULT_TOPK))
+                    val topP = sanitizeTopP(model.getFloatConfigValue(ConfigKey.TOP_P, DEFAULT_TOPP))
+                    val temperature = sanitizeTemperature(model.getFloatConfigValue(ConfigKey.TEMPERATURE, DEFAULT_TEMPERATURE))
 
-                var engineConfig = buildConfig(
-                    forBackend = backend,
-                    visionBackend = visionPreferred,
-                    audioBackend = audioPreferred,
-                )
+                    val backend = preferredBackend(model)
 
-                val engine = runCatching {
-                    Engine(engineConfig).also {
-                        engineToCloseOnFailure = it
-                        it.initialize()
-                    }
-                }.getOrElse { first ->
-                    // Best-effort fallback: if GPU init fails, try CPU.
-                    if (backend == Backend.GPU) {
-                        Log.w(TAG, "GPU init failed; trying CPU fallback: ${first.message}")
-                        val v = if (supportImage) Backend.CPU else null
-                        val a = if (supportAudio) Backend.CPU else null
-                        engineConfig = buildConfig(
-                            forBackend = Backend.CPU,
-                            visionBackend = v,
-                            audioBackend = a,
+                    Log.d(TAG, "Initializing LiteRT-LM: model='${model.name}', key='$key'")
+                    Log.d(TAG, "Capabilities: image=$supportImage audio=$supportAudio")
+                    Log.d(TAG, "Backend=$backend maxNumTokens=$maxTokens (raw=$maxTokensRaw) topK=$topK topP=$topP temp=$temperature")
+
+                    val modelPath = model.getPath()
+
+                    val cacheDirPath: String? = runCatching {
+                        if (modelPath.startsWith("/data/local/tmp")) {
+                            context.getExternalFilesDir(null)?.absolutePath
+                        } else {
+                            context.cacheDir?.absolutePath
+                        }
+                    }.getOrNull()
+
+                    fun buildConfig(forBackend: Backend, visionBackend: Backend?, audioBackend: Backend?): EngineConfig {
+                        return EngineConfig(
+                            modelPath = modelPath,
+                            backend = forBackend,
+                            visionBackend = visionBackend,
+                            audioBackend = audioBackend,
+                            maxNumTokens = maxTokens,
+                            cacheDir = cacheDirPath,
                         )
+                    }
+
+                    val visionPreferred = if (supportImage) Backend.GPU else null
+                    val audioPreferred = if (supportAudio) Backend.CPU else null
+
+                    var engineConfig = buildConfig(
+                        forBackend = backend,
+                        visionBackend = visionPreferred,
+                        audioBackend = audioPreferred,
+                    )
+
+                    val engine = runCatching {
                         Engine(engineConfig).also {
                             engineToCloseOnFailure = it
                             it.initialize()
                         }
-                    } else {
-                        throw first
+                    }.getOrElse { first ->
+                        if (backend == Backend.GPU) {
+                            Log.w(TAG, "GPU init failed; trying CPU fallback: ${first.message}")
+                            val v = if (supportImage) Backend.CPU else null
+                            val a = if (supportAudio) Backend.CPU else null
+                            engineConfig = buildConfig(
+                                forBackend = Backend.CPU,
+                                visionBackend = v,
+                                audioBackend = a,
+                            )
+                            Engine(engineConfig).also {
+                                engineToCloseOnFailure = it
+                                it.initialize()
+                            }
+                        } else {
+                            throw first
+                        }
                     }
-                }
 
-                val conversationConfig = ConversationConfig(
-                    samplerConfig = SamplerConfig(
-                        topK = topK,
-                        topP = topP.toDouble(),
-                        temperature = temperature.toDouble(),
-                    ),
-                    systemMessage = systemMessage,
-                    tools = tools,
-                )
+                    val conversationConfig = buildConversationConfig(model, systemMessage, tools)
 
-                val conversation = engine.createConversation(conversationConfig)
-
-                val retired: LiteRtLmInstance? = stateMutex.withLock {
-                    val prev = instances.remove(key)
-                    instances[key] = LiteRtLmInstance(
+                    val conversation = createConversationWithRetry(
                         engine = engine,
-                        conversation = conversation,
-                        supportImage = supportImage,
-                        supportAudio = supportAudio,
-                        engineConfigSnapshot = engineConfig,
+                        cfg = conversationConfig,
+                        key = key,
+                        reason = "initialize",
+                        timeoutMs = CLOSE_GRACE_MS + RETIRED_CLOSE_GRACE_MS
                     )
-                    prev
-                }
 
-                if (retired != null) {
-                    ioScope.launch {
-                        delay(RETIRED_CLOSE_GRACE_MS)
-                        runCatching { retired.conversation.close() }
-                            .onFailure { Log.w(TAG, "Failed to close retired conversation: ${it.message}", it) }
-                        runCatching { retired.engine.close() }
-                            .onFailure { Log.w(TAG, "Failed to close retired engine: ${it.message}", it) }
+                    stateMutex.withLock {
+                        instances[key] = LiteRtLmInstance(
+                            engine = engine,
+                            conversation = conversation,
+                            supportImage = supportImage,
+                            supportAudio = supportAudio,
+                            engineConfigSnapshot = engineConfig,
+                            conversationConfigSnapshot = conversationConfig,
+                        )
                     }
-                }
 
-                Log.d(TAG, "LiteRT-LM initialization succeeded: model='${model.name}', key='$key'")
-                postToMain { onDone("") }
-                completeInitSignal(signal, "")
-                completed = true
+                    Log.d(TAG, "LiteRT-LM initialization succeeded: model='${model.name}', key='$key'")
+                    postToMain { onDone("") }
+                    completeInitSignal(signal, "")
+                    completed = true
+                }
             } catch (e: Exception) {
                 val err = cleanError(e.message)
                 Log.e(TAG, "LiteRT-LM initialization failed: $err", e)
@@ -1032,48 +1126,49 @@ object LiteRtLM {
     private suspend fun closeInstanceNowBestEffort(key: String, reason: String) {
         cancelScheduledCleanup(key, "closeNow:$reason")
 
-        // Avoid racing with init; wait if needed.
         runCatching { awaitInitIfInFlight(key, reason = "closeNow:$reason") }
             .onFailure {
                 Log.w(TAG, "closeInstanceNowBestEffort: init wait failed: key='$key' reason='$reason' err=${it.message}")
                 return
             }
 
-        val instance: LiteRtLmInstance? = stateMutex.withLock {
-            val rs = getRunState(key)
-            if (rs.active.get()) return@withLock null
-            if (initInFlight.contains(key)) return@withLock null
+        withSessionLock(key, reason = "closeNow:$reason") {
+            val instance: LiteRtLmInstance? = stateMutex.withLock {
+                val rs = getRunState(key)
+                if (rs.active.get()) return@withLock null
+                if (initInFlight.contains(key)) return@withLock null
 
-            rs.cancelRequested.set(false)
-            rs.pendingCancel.set(false)
-            rs.logicalTerminator.set(null)
-            rs.nativeDoneHook.set(null)
-            rs.terminated.set(true)
-            rs.logicalDone.set(true)
+                rs.cancelRequested.set(false)
+                rs.pendingCancel.set(false)
+                rs.logicalTerminator.set(null)
+                rs.nativeDoneHook.set(null)
+                rs.terminated.set(true)
+                rs.logicalDone.set(true)
 
-            pendingAfterStream.remove(key)
-            instances.remove(key).also {
-                initSignals.remove(key)
+                pendingAfterStream.remove(key)
+                instances.remove(key).also {
+                    initSignals.remove(key)
+                }
             }
+
+            if (instance == null) {
+                Log.d(TAG, "closeInstanceNowBestEffort: nothing to close (or active/initInFlight): key='$key' reason='$reason'")
+                return@withSessionLock
+            }
+
+            val rs = getRunState(key)
+            val now = SystemClock.elapsedRealtime()
+            val sinceTerminate = now - rs.lastTerminateAtMs.get()
+            val extraDelay = if (sinceTerminate in 0..CLOSE_GRACE_MS) (CLOSE_GRACE_MS - sinceTerminate) else 0L
+            if (extraDelay > 0) delay(extraDelay)
+
+            runCatching { instance.conversation.close() }
+                .onFailure { Log.e(TAG, "Failed to close conversation: key='$key' reason='$reason' err=${it.message}", it) }
+            runCatching { instance.engine.close() }
+                .onFailure { Log.e(TAG, "Failed to close engine: key='$key' reason='$reason' err=${it.message}", it) }
+
+            Log.d(TAG, "LiteRT-LM closed: key='$key' reason='$reason'")
         }
-
-        if (instance == null) {
-            Log.d(TAG, "closeInstanceNowBestEffort: nothing to close (or active/initInFlight): key='$key' reason='$reason'")
-            return
-        }
-
-        val rs = getRunState(key)
-        val now = SystemClock.elapsedRealtime()
-        val sinceTerminate = now - rs.lastTerminateAtMs.get()
-        val extraDelay = if (sinceTerminate in 0..CLOSE_GRACE_MS) (CLOSE_GRACE_MS - sinceTerminate) else 0L
-        if (extraDelay > 0) delay(extraDelay)
-
-        runCatching { instance.conversation.close() }
-            .onFailure { Log.e(TAG, "Failed to close conversation: key='$key' reason='$reason' err=${it.message}", it) }
-        runCatching { instance.engine.close() }
-            .onFailure { Log.e(TAG, "Failed to close engine: key='$key' reason='$reason' err=${it.message}", it) }
-
-        Log.d(TAG, "LiteRT-LM closed: key='$key' reason='$reason'")
     }
 
     private data class IdleClosePlan(
@@ -1091,73 +1186,74 @@ object LiteRtLM {
         requiredToken: Long,
         reason: String,
     ) {
-        // Avoid racing with init; if init is in flight, skip this idle close.
         if (initInFlight.contains(key)) {
             Log.d(TAG, "Idle cleanup skipped (init in flight): key='$key'")
             return
         }
 
-        val plan: IdleClosePlan? = stateMutex.withLock {
+        withSessionLock(key, reason = "idleClose:$reason") {
+            val plan: IdleClosePlan? = stateMutex.withLock {
+                val rs = getRunState(key)
+                val nowInner = SystemClock.elapsedRealtime()
+                val idleForInner = nowInner - rs.lastUseAtMs.get()
+                val tokenInner = rs.cleanupToken.get()
+
+                if (rs.active.get()) {
+                    Log.d(TAG, "Idle cleanup skipped (active native stream): key='$key'")
+                    return@withLock null
+                }
+                if (initInFlight.contains(key)) {
+                    Log.d(TAG, "Idle cleanup skipped (init in flight): key='$key'")
+                    return@withLock null
+                }
+                if (tokenInner != requiredToken) {
+                    Log.d(TAG, "Idle cleanup skipped (token changed): key='$key' required=$requiredToken now=$tokenInner")
+                    return@withLock null
+                }
+                if (idleForInner < requiredIdleMs) {
+                    Log.d(TAG, "Idle cleanup skipped (recent use): key='$key' idleFor=${idleForInner}ms < ${requiredIdleMs}ms")
+                    return@withLock null
+                }
+
+                rs.cancelRequested.set(false)
+                rs.pendingCancel.set(false)
+                rs.logicalTerminator.set(null)
+                rs.nativeDoneHook.set(null)
+                rs.terminated.set(true)
+                rs.logicalDone.set(true)
+
+                pendingAfterStream.remove(key)
+                val inst = instances.remove(key)
+                if (inst == null) {
+                    Log.d(TAG, "Idle cleanup: nothing to close: key='$key'")
+                    return@withLock null
+                }
+
+                initSignals.remove(key)
+
+                IdleClosePlan(
+                    instance = inst,
+                    idleForMs = idleForInner,
+                    tokenNow = tokenInner,
+                    nowMs = nowInner,
+                    reason = reason,
+                )
+            }
+
+            if (plan == null) return@withSessionLock
+
             val rs = getRunState(key)
-            val nowInner = SystemClock.elapsedRealtime()
-            val idleForInner = nowInner - rs.lastUseAtMs.get()
-            val tokenInner = rs.cleanupToken.get()
+            val sinceTerminate = plan.nowMs - rs.lastTerminateAtMs.get()
+            val extraDelay = if (sinceTerminate in 0..CLOSE_GRACE_MS) (CLOSE_GRACE_MS - sinceTerminate) else 0L
+            if (extraDelay > 0) delay(extraDelay)
 
-            if (rs.active.get()) {
-                Log.d(TAG, "Idle cleanup skipped (active native stream): key='$key'")
-                return@withLock null
-            }
-            if (initInFlight.contains(key)) {
-                Log.d(TAG, "Idle cleanup skipped (init in flight): key='$key'")
-                return@withLock null
-            }
-            if (tokenInner != requiredToken) {
-                Log.d(TAG, "Idle cleanup skipped (token changed): key='$key' required=$requiredToken now=$tokenInner")
-                return@withLock null
-            }
-            if (idleForInner < requiredIdleMs) {
-                Log.d(TAG, "Idle cleanup skipped (recent use): key='$key' idleFor=${idleForInner}ms < ${requiredIdleMs}ms")
-                return@withLock null
-            }
+            runCatching { plan.instance.conversation.close() }
+                .onFailure { Log.e(TAG, "Failed to close conversation: key='$key' reason='${plan.reason}' err=${it.message}", it) }
+            runCatching { plan.instance.engine.close() }
+                .onFailure { Log.e(TAG, "Failed to close engine: key='$key' reason='${plan.reason}' err=${it.message}", it) }
 
-            rs.cancelRequested.set(false)
-            rs.pendingCancel.set(false)
-            rs.logicalTerminator.set(null)
-            rs.nativeDoneHook.set(null)
-            rs.terminated.set(true)
-            rs.logicalDone.set(true)
-
-            pendingAfterStream.remove(key)
-            val inst = instances.remove(key)
-            if (inst == null) {
-                Log.d(TAG, "Idle cleanup: nothing to close: key='$key'")
-                return@withLock null
-            }
-
-            initSignals.remove(key)
-
-            IdleClosePlan(
-                instance = inst,
-                idleForMs = idleForInner,
-                tokenNow = tokenInner,
-                nowMs = nowInner,
-                reason = reason,
-            )
+            Log.d(TAG, "LiteRT-LM closed: key='$key' reason='${plan.reason}' idleFor=${plan.idleForMs}ms token=${plan.tokenNow}")
         }
-
-        if (plan == null) return
-
-        val rs = getRunState(key)
-        val sinceTerminate = plan.nowMs - rs.lastTerminateAtMs.get()
-        val extraDelay = if (sinceTerminate in 0..CLOSE_GRACE_MS) (CLOSE_GRACE_MS - sinceTerminate) else 0L
-        if (extraDelay > 0) delay(extraDelay)
-
-        runCatching { plan.instance.conversation.close() }
-            .onFailure { Log.e(TAG, "Failed to close conversation: key='$key' reason='${plan.reason}' err=${it.message}", it) }
-        runCatching { plan.instance.engine.close() }
-            .onFailure { Log.e(TAG, "Failed to close engine: key='$key' reason='${plan.reason}' err=${it.message}", it) }
-
-        Log.d(TAG, "LiteRT-LM closed: key='$key' reason='${plan.reason}' idleFor=${plan.idleForMs}ms token=${plan.tokenNow}")
     }
 
     /** Request a deferred idle cleanup. */
@@ -1165,7 +1261,6 @@ object LiteRtLM {
         val key = runtimeKey(model)
 
         ioScope.launch {
-            // If init is in flight, wait briefly so we don't schedule cleanup on a transient state.
             runCatching { awaitInitIfInFlight(key, reason = "cleanUp") }
                 .onFailure { Log.w(TAG, "cleanUp: init wait failed: key='$key' err=${it.message}") }
 
@@ -1188,9 +1283,8 @@ object LiteRtLM {
     /**
      * Reset conversation while reusing the existing Engine.
      *
-     * Contract:
-     * - If a native stream is active, defer the reset until after termination.
-     * - supportImage/supportAudio must match the initialized capabilities.
+     * NOTE:
+     * - Public API is fire-and-forget; internal implementation is suspend to allow safe composition.
      */
     fun resetConversation(
         model: Model,
@@ -1205,68 +1299,116 @@ object LiteRtLM {
             markUsed(key)
             cancelScheduledCleanup(key, "resetConversation")
 
-            // Avoid resetting while init is building a new engine.
             runCatching { awaitInitIfInFlight(key, reason = "resetConversation") }
                 .onFailure {
                     Log.w(TAG, "resetConversation skipped (init wait failed): key='$key' err=${it.message}")
                     return@launch
                 }
 
-            val action: suspend () -> Unit = action@{
-                val inst = stateMutex.withLock { instances[key] }
-                if (inst == null) {
-                    Log.w(TAG, "resetConversation skipped: not initialized key='$key'")
-                    return@action
-                }
-
-                if (inst.supportImage != supportImage || inst.supportAudio != supportAudio) {
-                    Log.w(
-                        TAG,
-                        "resetConversation rejected: capability mismatch key='$key' " +
-                                "have(image=${inst.supportImage},audio=${inst.supportAudio}) " +
-                                "want(image=$supportImage,audio=$supportAudio)"
-                    )
-                    return@action
-                }
-
-                val topK = sanitizeTopK(model.getIntConfigValue(ConfigKey.TOP_K, DEFAULT_TOPK))
-                val topP = sanitizeTopP(model.getFloatConfigValue(ConfigKey.TOP_P, DEFAULT_TOPP))
-                val temperature = sanitizeTemperature(model.getFloatConfigValue(ConfigKey.TEMPERATURE, DEFAULT_TEMPERATURE))
-
-                val cfg = ConversationConfig(
-                    samplerConfig = SamplerConfig(
-                        topK = topK,
-                        topP = topP.toDouble(),
-                        temperature = temperature.toDouble(),
-                    ),
-                    systemMessage = systemMessage,
-                    tools = tools,
-                )
-
-                val old = inst.conversation
-                val fresh = inst.engine.createConversation(cfg)
-
-                inst.conversation = fresh
-
-                runCatching { old.close() }
-                    .onFailure { Log.w(TAG, "resetConversation: failed to close old conversation: ${it.message}", it) }
-
-                Log.d(TAG, "resetConversation done: key='$key'")
-            }
-
             val defer = stateMutex.withLock { getRunState(key).active.get() }
             if (defer) {
                 stateMutex.withLock {
                     pendingAfterStream.getOrPut(key) { mutableListOf() }.add {
-                        ioScope.launch { runCatching { action() } }
+                        ioScope.launch { runCatching { resetConversationInternal(key, model, supportImage, supportAudio, systemMessage, tools, "resetConversation") } }
                     }
                 }
                 Log.w(TAG, "resetConversation deferred (active stream): key='$key'")
                 return@launch
             }
 
-            runCatching { action() }
-                .onFailure { Log.w(TAG, "resetConversation failed: key='$key' err=${it.message}", it) }
+            runCatching { resetConversationInternal(key, model, supportImage, supportAudio, systemMessage, tools, "resetConversation") }
+                .onFailure { Log.w(TAG, "resetConversation action failed: key='$key' err=${it.message}", it) }
+        }
+    }
+
+    /**
+     * Internal suspend reset that is lifecycle-serialized via session lock.
+     *
+     * Contract:
+     * - Must not run while native stream is active.
+     */
+    private suspend fun resetConversationInternal(
+        key: String,
+        model: Model,
+        supportImage: Boolean,
+        supportAudio: Boolean,
+        systemMessage: Message?,
+        tools: List<Any>,
+        reason: String,
+    ) {
+        withSessionLock(key, reason = "resetConversationInternal:$reason") {
+            val (inst, rs) = stateMutex.withLock {
+                val i = instances[key]
+                val r = getRunState(key)
+                i to r
+            }
+
+            if (inst == null) {
+                Log.w(TAG, "resetConversationInternal skipped: not initialized key='$key'")
+                return@withSessionLock
+            }
+            if (rs.active.get()) {
+                Log.w(TAG, "resetConversationInternal rejected: active stream key='$key'")
+                return@withSessionLock
+            }
+
+            if (inst.supportImage != supportImage || inst.supportAudio != supportAudio) {
+                Log.w(
+                    TAG,
+                    "resetConversationInternal rejected: capability mismatch key='$key' " +
+                            "have(image=${inst.supportImage},audio=${inst.supportAudio}) " +
+                            "want(image=$supportImage,audio=$supportAudio)"
+                )
+                return@withSessionLock
+            }
+
+            val cfg = buildConversationConfig(model, systemMessage, tools)
+
+            val engine = inst.engine
+            val old = inst.conversation
+
+            runCatching { old.close() }
+                .onFailure { Log.w(TAG, "resetConversationInternal: failed to close old conversation: ${it.message}", it) }
+
+            delay(POST_TERMINATE_COOLDOWN_MS)
+
+            val fresh = try {
+                createConversationWithRetry(
+                    engine = engine,
+                    cfg = cfg,
+                    key = key,
+                    reason = "resetConversationInternal:$reason",
+                    timeoutMs = CLOSE_GRACE_MS + RETIRED_CLOSE_GRACE_MS
+                )
+            } catch (t: Throwable) {
+                Log.e(TAG, "resetConversationInternal failed: key='$key' err=${t.message}", t)
+
+                runCatching { closeInstanceNowBestEffort(key, reason = "resetConversationInternal-recover") }
+                    .onFailure { Log.w(TAG, "resetConversationInternal recovery close failed: key='$key' err=${it.message}", it) }
+
+                val ctx = appContextRef.get()
+                if (ctx != null) {
+                    runCatching {
+                        awaitInitializedInternal(
+                            context = ctx,
+                            model = model,
+                            supportImage = supportImage,
+                            supportAudio = supportAudio,
+                            systemMessage = systemMessage,
+                            tools = tools,
+                        )
+                    }.onFailure { re ->
+                        Log.e(TAG, "resetConversationInternal recovery re-init failed: key='$key' err=${re.message}", re)
+                    }
+                } else {
+                    Log.w(TAG, "resetConversationInternal recovery skipped: no application context set")
+                }
+                return@withSessionLock
+            }
+
+            inst.conversation = fresh
+            inst.conversationConfigSnapshot = cfg
+            Log.d(TAG, "resetConversationInternal done: key='$key' reason='$reason'")
         }
     }
 
@@ -1283,7 +1425,6 @@ object LiteRtLM {
             markUsed(key)
             cancelScheduledCleanup(key, "forceCleanUp")
 
-            // If init is in flight, wait to avoid tearing down right after creating.
             runCatching { awaitInitIfInFlight(key, reason = "forceCleanUp") }
                 .onFailure { Log.w(TAG, "forceCleanUp: init wait failed: key='$key' err=${it.message}") }
 
@@ -1344,30 +1485,30 @@ object LiteRtLM {
 
                         Log.e(TAG, "Hard-close watchdog firing: key='$key' elapsed=${elapsed}ms sinceMsg=${sinceMsg}ms")
 
-                        val inst: LiteRtLmInstance? = stateMutex.withLock {
-                            if (!rs.active.get()) return@withLock null
-                            // IMPORTANT:
-                            // Do NOT clear pendingAfterStream here.
-                            // It will be drained by nativeDoneHook via scheduleDeferredActions().
-                            instances.remove(key)
+                        // Serialize with session lifecycle ops to avoid racing with reset/init/close.
+                        withSessionLock(key, reason = "hardClose:$reason") {
+                            val inst: LiteRtLmInstance? = stateMutex.withLock {
+                                if (!rs.active.get()) return@withLock null
+                                instances.remove(key)
+                            }
+
+                            if (inst != null) {
+                                runCatching { inst.conversation.close() }
+                                    .onFailure { Log.e(TAG, "Hard-close: conversation.close failed: key='$key' err=${it.message}", it) }
+                                runCatching { inst.engine.close() }
+                                    .onFailure { Log.e(TAG, "Hard-close: engine.close failed: key='$key' err=${it.message}", it) }
+                            }
+
+                            val tNow = SystemClock.elapsedRealtime()
+                            rs.lastTerminateAtMs.set(tNow)
+                            rs.cooldownUntilMs.set(tNow + POST_TERMINATE_COOLDOWN_MS)
+
+                            rs.active.set(false)
+                            rs.logicalDone.set(true)
+                            rs.logicalTerminator.set(null)
+
+                            fireNativeDoneHookOnce(key)
                         }
-
-                        if (inst != null) {
-                            runCatching { inst.conversation.close() }
-                                .onFailure { Log.e(TAG, "Hard-close: conversation.close failed: key='$key' err=${it.message}", it) }
-                            runCatching { inst.engine.close() }
-                                .onFailure { Log.e(TAG, "Hard-close: engine.close failed: key='$key' err=${it.message}", it) }
-                        }
-
-                        val tNow = SystemClock.elapsedRealtime()
-                        rs.lastTerminateAtMs.set(tNow)
-                        rs.cooldownUntilMs.set(tNow + POST_TERMINATE_COOLDOWN_MS)
-
-                        rs.active.set(false)
-                        rs.logicalDone.set(true)
-                        rs.logicalTerminator.set(null)
-
-                        fireNativeDoneHookOnce(key)
 
                         Log.e(TAG, "Hard-close completed: key='$key'")
                         return@launch
@@ -1386,10 +1527,6 @@ object LiteRtLM {
      * - resultListener(..., done=true) is "logical completion" (UI completion).
      * - cleanUpListener() is invoked ONLY after native termination (onDone/onError),
      *   or after hard-close watchdog if enabled.
-     *
-     * @param notifyCancelToOnError When true, cancellation will be forwarded to onError("Cancelled"),
-     *        which is useful for suspend callers that want cancellation as an exception.
-     *        For UI streaming, keep this false to avoid treating user cancel as an error.
      */
     fun runInference(
         model: Model,
@@ -1407,7 +1544,6 @@ object LiteRtLM {
             markUsed(key)
             cancelScheduledCleanup(key, "runInference")
 
-            // Critical guard: never start inference while init is building a new instance.
             runCatching { awaitInitIfInFlight(key, reason = "runInference") }
                 .onFailure { t ->
                     val msg = "LiteRT-LM cannot start inference while initialization is in progress: ${cleanError(t.message)}"
@@ -1457,7 +1593,6 @@ object LiteRtLM {
                 }
             }
 
-            // Capability upgrade path (text-only first, multimodal later).
             val wantImage = images.isNotEmpty()
             val wantAudio = audioClips.isNotEmpty()
             if (wantImage || wantAudio) {
@@ -1483,74 +1618,7 @@ object LiteRtLM {
                 }
             }
 
-            var instNullable: LiteRtLmInstance? = null
-            var rsNullable: RunState? = null
-            var myRunId = 0L
-            var convNullable: Conversation? = null
-            var rejectMsg: String? = null
-            var cooldownDelayMs = 0L
-
-            stateMutex.withLock {
-                val inst = instances[key]
-                if (inst == null) {
-                    rejectMsg = "LiteRT-LM model '${model.name}' is not initialized. Call initializeIfNeeded() first."
-                    return@withLock
-                }
-
-                if (images.isNotEmpty() && !inst.supportImage) {
-                    rejectMsg = "Vision input rejected: supportImage=false for key='$key'. Reinitialize with supportImage=true."
-                    return@withLock
-                }
-                if (audioClips.isNotEmpty() && !inst.supportAudio) {
-                    rejectMsg = "Audio input rejected: supportAudio=false for key='$key'. Reinitialize with supportAudio=true."
-                    return@withLock
-                }
-
-                val rs = getRunState(key)
-
-                val now = SystemClock.elapsedRealtime()
-                val until = rs.cooldownUntilMs.get()
-                cooldownDelayMs = max(0L, until - now)
-
-                val acquired = rs.active.compareAndSet(false, true)
-                if (!acquired) {
-                    rejectMsg = "LiteRT-LM runInference rejected: another native stream is already active for key='$key'."
-                    return@withLock
-                }
-
-                myRunId = rs.runId.incrementAndGet()
-                rs.terminated.set(false)
-                rs.logicalDone.set(false)
-                rs.lastMessageAtMs.set(0L)
-
-                val preCancelled = rs.pendingCancel.getAndSet(false)
-                rs.cancelRequested.set(preCancelled)
-
-                instNullable = inst
-                rsNullable = rs
-                convNullable = inst.conversation
-            }
-
-            val inst = instNullable
-            val rsLocal = rsNullable
-            val conversation = convNullable
-            val reject = rejectMsg
-
-            if (reject != null || inst == null || rsLocal == null || conversation == null) {
-                val msg = reject ?: "LiteRT-LM start rejected: unknown reason."
-                Log.w(TAG, msg)
-                postToMain {
-                    onError(msg)
-                    resultListener("", true)
-                    runCatching { cleanUpListener.invoke() }
-                }
-                return@launch
-            }
-
-            if (cooldownDelayMs > 0) {
-                Log.d(TAG, "Post-terminate cooldown: delaying start ${cooldownDelayMs}ms for key='$key'")
-                delay(cooldownDelayMs)
-            }
+            awaitCooldownIfNeeded(key, reason = "runInference-start")
 
             val trimmed = input.trim()
             val hasText = trimmed.isNotEmpty()
@@ -1559,13 +1627,6 @@ object LiteRtLM {
             if (!hasText && !hasMm) {
                 val msg = "LiteRT-LM input rejected: empty message (no text/images/audio)."
                 Log.w(TAG, msg)
-                stateMutex.withLock {
-                    rsLocal.active.set(false)
-                    rsLocal.terminated.set(true)
-                    rsLocal.logicalDone.set(true)
-                    rsLocal.logicalTerminator.set(null)
-                    rsLocal.nativeDoneHook.set(null)
-                }
                 postToMain {
                     onError(msg)
                     resultListener("", true)
@@ -1574,205 +1635,332 @@ object LiteRtLM {
                 return@launch
             }
 
-            Log.d(
-                TAG,
-                "runInference start: key='$key' runId=$myRunId " +
-                        "hasText=$hasText textLen=${trimmed.length} images=${images.size} audioClips=${audioClips.size}"
-            )
+            var inst: LiteRtLmInstance? = null
+            var rsLocal: RunState? = null
+            var myRunId = 0L
+            var conversation: Conversation? = null
+            var rejectMsg: String? = null
 
-            var emittedSoFar = ""
-            var msgCount = 0
+            // IMPORTANT:
+            // Serialize "select conversation + start sendMessageAsync" with session lifecycle ops.
+            // This prevents races with resetConversation() that closes the conversation right before send.
+            withSessionLock(key, reason = "runInference-start") {
+                stateMutex.withLock {
+                    val i = instances[key]
+                    if (i == null) {
+                        rejectMsg = "LiteRT-LM model '${model.name}' is not initialized. Call initializeIfNeeded() first."
+                        return@withLock
+                    }
 
-            suspend fun runDeferredActions() {
-                val deferred: List<() -> Unit> = stateMutex.withLock {
-                    pendingAfterStream.remove(key)?.toList() ?: emptyList()
+                    if (images.isNotEmpty() && !i.supportImage) {
+                        rejectMsg = "Vision input rejected: supportImage=false for key='$key'. Reinitialize with supportImage=true."
+                        return@withLock
+                    }
+                    if (audioClips.isNotEmpty() && !i.supportAudio) {
+                        rejectMsg = "Audio input rejected: supportAudio=false for key='$key'. Reinitialize with supportAudio=true."
+                        return@withLock
+                    }
+
+                    val rs = getRunState(key)
+
+                    val acquired = rs.active.compareAndSet(false, true)
+                    if (!acquired) {
+                        rejectMsg = "LiteRT-LM runInference rejected: another native stream is already active for key='$key'."
+                        return@withLock
+                    }
+
+                    myRunId = rs.runId.incrementAndGet()
+                    rs.terminated.set(false)
+                    rs.logicalDone.set(false)
+                    rs.lastMessageAtMs.set(0L)
+
+                    val preCancelled = rs.pendingCancel.getAndSet(false)
+                    rs.cancelRequested.set(preCancelled)
+
+                    inst = i
+                    rsLocal = rs
+                    conversation = i.conversation
                 }
-                deferred.forEach { act ->
-                    runCatching { act.invoke() }
-                        .onFailure { t -> Log.w(TAG, "Deferred action failed for key='$key': ${t.message}", t) }
+
+                val i = inst
+                val rs = rsLocal
+                var conv = conversation
+                val reject = rejectMsg
+
+                if (reject != null || i == null || rs == null || conv == null) return@withSessionLock
+
+                Log.d(
+                    TAG,
+                    "runInference start: key='$key' runId=$myRunId " +
+                            "hasText=$hasText textLen=${trimmed.length} images=${images.size} audioClips=${audioClips.size}"
+                )
+
+                var emittedSoFar = ""
+                var msgCount = 0
+
+                suspend fun runDeferredActions() {
+                    val deferred: List<() -> Unit> = stateMutex.withLock {
+                        pendingAfterStream.remove(key)?.toList() ?: emptyList()
+                    }
+                    deferred.forEach { act ->
+                        runCatching { act.invoke() }
+                            .onFailure { t -> Log.w(TAG, "Deferred action failed for key='$key': ${t.message}", t) }
+                    }
                 }
-            }
 
-            fun scheduleDeferredActions() {
-                ioScope.launch { runDeferredActions() }
-            }
-
-            fun scheduleCleanUpListener() {
-                postToMain {
-                    runCatching { cleanUpListener.invoke() }
-                        .onFailure { t -> Log.w(TAG, "cleanUpListener failed: ${t.message}", t) }
+                fun scheduleDeferredActions() {
+                    ioScope.launch { runDeferredActions() }
                 }
-            }
 
-            rsLocal.nativeDoneHook.set hook@{
-                if (rsLocal.runId.get() != myRunId) return@hook
-                scheduleCleanUpListener()
-                scheduleDeferredActions()
-            }
+                fun scheduleCleanUpListener() {
+                    postToMain {
+                        runCatching { cleanUpListener.invoke() }
+                            .onFailure { t -> Log.w(TAG, "cleanUpListener failed: ${t.message}", t) }
+                    }
+                }
 
-            var watchdog: Job? = null
-            var nativeStarted = false
+                rs.nativeDoneHook.set hook@{
+                    if (rs.runId.get() != myRunId) return@hook
+                    scheduleCleanUpListener()
+                    scheduleDeferredActions()
+                }
 
-            fun deliverLogicalDoneOnce(errorMessage: String? = null, isCancel: Boolean = false) {
-                if (!rsLocal.logicalDone.compareAndSet(false, true)) return
+                var watchdog: Job? = null
+                var nativeStarted = false
 
-                postToMain {
-                    val cancelled = isCancel || rsLocal.cancelRequested.get()
-                    if (cancelled) {
-                        if (notifyCancelToOnError && !errorMessage.isNullOrBlank()) {
+                fun deliverLogicalDoneOnce(errorMessage: String? = null, isCancel: Boolean = false) {
+                    if (!rs.logicalDone.compareAndSet(false, true)) return
+                    postToMain {
+                        val cancelled = isCancel || rs.cancelRequested.get()
+                        if (cancelled) {
+                            if (notifyCancelToOnError && !errorMessage.isNullOrBlank()) {
+                                onError(errorMessage)
+                            }
+                        } else if (!errorMessage.isNullOrBlank()) {
                             onError(errorMessage)
                         }
-                    } else if (!errorMessage.isNullOrBlank()) {
-                        onError(errorMessage)
+                        resultListener("", true)
                     }
+                }
+
+                fun markNativeDoneOnce(errorMessage: String? = null, isCancel: Boolean = false) {
+                    if (!rs.terminated.compareAndSet(false, true)) return
+
+                    watchdog?.cancel()
+                    watchdog = null
+
+                    val now = SystemClock.elapsedRealtime()
+                    rs.lastTerminateAtMs.set(now)
+                    rs.cooldownUntilMs.set(now + POST_TERMINATE_COOLDOWN_MS)
+
+                    rs.active.set(false)
+                    rs.logicalTerminator.set(null)
+
+                    deliverLogicalDoneOnce(errorMessage = errorMessage, isCancel = isCancel)
+
+                    fireNativeDoneHookOnce(key)
+                }
+
+                fun requestLogicalCancel(reason: String) {
+                    rs.cancelRequested.set(true)
+                    deliverLogicalDoneOnce(errorMessage = reason, isCancel = true)
+
+                    runCatching { conv!!.cancelProcess() }
+                        .onFailure { t -> Log.w(TAG, "cancelProcess() failed: key='$key' err=${t.message}", t) }
+
+                    if (HARD_CLOSE_ENABLE) startHardCloseWatchdog(key, reason = "logicalCancel")
+                }
+
+                rs.logicalTerminator.set { requestLogicalCancel("Cancelled") }
+
+                if (rs.cancelRequested.get()) {
+                    Log.i(TAG, "LiteRT-LM start cancelled before sendMessageAsync: key='$key'")
+                    markNativeDoneOnce(errorMessage = "Cancelled", isCancel = true)
+                    return@withSessionLock
+                }
+
+                watchdog = ioScope.launch {
+                    delay(STREAM_WATCHDOG_MS)
+                    if (rs.runId.get() != myRunId) return@launch
+                    if (rs.terminated.get()) return@launch
+
+                    Log.e(TAG, "Stream watchdog fired: key='$key' runId=$myRunId timeout=${STREAM_WATCHDOG_MS}ms")
+
+                    deliverLogicalDoneOnce("Timeout: inference did not complete in ${STREAM_WATCHDOG_MS}ms")
+
+                    runCatching { conv!!.cancelProcess() }
+                        .onFailure { t -> Log.w(TAG, "cancelProcess() failed on watchdog: key='$key' err=${t.message}", t) }
+
+                    if (HARD_CLOSE_ENABLE) startHardCloseWatchdog(key, reason = "watchdog")
+
+                    if (!nativeStarted) markNativeDoneOnce("Timeout before native start")
+                }
+
+                val callback = object : MessageCallback {
+
+                    override fun onMessage(message: Message) {
+                        if (rs.runId.get() != myRunId) return
+                        if (rs.terminated.get()) return
+                        if (rs.logicalDone.get() || rs.cancelRequested.get()) return
+
+                        rs.lastMessageAtMs.set(SystemClock.elapsedRealtime())
+                        msgCount++
+
+                        val snapshotRaw = extractRenderedText(message)
+                        if (snapshotRaw.isEmpty()) return
+
+                        val (deltaRaw, nextEmitted) = computeDeltaSmart(emittedSoFar, snapshotRaw)
+                        emittedSoFar = nextEmitted
+                        if (deltaRaw.isEmpty()) return
+
+                        val delta = normalizeDeltaText(deltaRaw)
+
+                        if (DEBUG_STREAM && (msgCount == 1 || msgCount % DEBUG_STREAM_EVERY_N == 0)) {
+                            val lead = deltaRaw.firstOrNull()
+                            val leadInfo =
+                                if (lead == null) "null"
+                                else "U+${lead.code.toString(16).uppercase()} ws=${lead.isWhitespace()} ch='$lead'"
+
+                            val dPreview = delta.take(DEBUG_PREFIX_CHARS).replace("\n", "\\n")
+                            val sPreview = snapshotRaw.take(DEBUG_PREFIX_CHARS).replace("\n", "\\n")
+
+                            Log.d(
+                                TAG,
+                                "stream[key=$key runId=$myRunId] msg#$msgCount " +
+                                        "snapLen=${snapshotRaw.length} deltaLen=${delta.length} " +
+                                        "lead=$leadInfo snapPreview='$sPreview' deltaPreview='$dPreview' emittedLen=${emittedSoFar.length}"
+                            )
+                        }
+
+                        postToMain { resultListener(delta, false) }
+                    }
+
+                    override fun onDone() {
+                        if (rs.runId.get() != myRunId) return
+                        markNativeDoneOnce(null)
+                    }
+
+                    override fun onError(throwable: Throwable) {
+                        if (rs.runId.get() != myRunId) return
+
+                        val rawMsg = throwable.message ?: throwable.toString()
+                        val msg = cleanError(rawMsg)
+                        val code = extractStatusCodeBestEffort(throwable)
+
+                        if (DEBUG_ERROR_THROWABLE) {
+                            val cls = throwable::class.java.name
+                            val codeStr = code?.toString() ?: "n/a"
+                            Log.e(
+                                TAG,
+                                "LiteRT-LM onError(Throwable): key='$key' runId=$myRunId type=$cls code=$codeStr msg='$msg'\n" +
+                                        shortStack(throwable),
+                                throwable
+                            )
+                        }
+
+                        val cancelled = rs.cancelRequested.get() || isCancellationThrowable(throwable, msg)
+                        if (cancelled) {
+                            Log.i(TAG, "LiteRT-LM inference cancelled: key='$key' runId=$myRunId")
+                            markNativeDoneOnce(errorMessage = "Cancelled", isCancel = true)
+                            return
+                        }
+
+                        val decorated = if (code != null) "Error($code): $msg" else "Error: $msg"
+                        Log.e(TAG, "LiteRT-LM inference error: key='$key' runId=$myRunId $decorated")
+                        markNativeDoneOnce(decorated)
+                    }
+                }
+
+                // Attempt sendMessageAsync under the session lock.
+                // If the conversation was closed by a just-finished reset, recover once by recreating conversation.
+                try {
+                    if (!hasMm) {
+                        Log.i(TAG, "LiteRT-LM 'conversation.sendMessageAsync' CALLED: trimmed='$trimmed'")
+                        conv.sendMessageAsync(trimmed, callback)
+                    } else {
+                        val contentList = buildContentList(input = trimmed, images = images, audioClips = audioClips)
+                        val contentsObj = buildContentsObject(contentList)
+                        conv.sendMessageAsync(contentsObj, callback)
+                    }
+                    nativeStarted = true
+                } catch (e: Exception) {
+                    val recoverable = isConversationNotAliveError(e)
+                    Log.e(TAG, "LiteRT-LM sendMessageAsync failed: key='$key' msg=${e.message}", e)
+
+                    if (recoverable) {
+                        Log.w(TAG, "Recovering from not-alive conversation: key='$key' runId=$myRunId")
+
+                        // Release active before recovery, but keep session lock held so no other lifecycle op can interleave.
+                        stateMutex.withLock {
+                            rs.active.set(false)
+                            rs.logicalTerminator.set(null)
+                        }
+
+                        val ok = runCatching {
+                            val i2 = stateMutex.withLock { instances[key] }
+                            if (i2 != null) {
+                                val cfg = i2.conversationConfigSnapshot
+                                runCatching { i2.conversation.close() }
+                                delay(POST_TERMINATE_COOLDOWN_MS)
+                                val fresh = createConversationWithRetry(
+                                    engine = i2.engine,
+                                    cfg = cfg,
+                                    key = key,
+                                    reason = "runInference-recover",
+                                    timeoutMs = CLOSE_GRACE_MS + RETIRED_CLOSE_GRACE_MS
+                                )
+                                i2.conversation = fresh
+                                conv = fresh
+                                conversation = fresh
+                            }
+                        }.isSuccess
+
+                        if (ok) {
+                            // Re-acquire active and retry exactly once.
+                            val reacquired = stateMutex.withLock {
+                                val acquired2 = rs.active.compareAndSet(false, true)
+                                if (acquired2) {
+                                    rs.logicalTerminator.set { requestLogicalCancel("Cancelled") }
+                                }
+                                acquired2
+                            }
+
+                            if (reacquired) {
+                                runCatching {
+                                    if (!hasMm) {
+                                        conv!!.sendMessageAsync(trimmed, callback)
+                                    } else {
+                                        val contentList = buildContentList(input = trimmed, images = images, audioClips = audioClips)
+                                        val contentsObj = buildContentsObject(contentList)
+                                        conv!!.sendMessageAsync(contentsObj, callback)
+                                    }
+                                }.onSuccess {
+                                    Log.w(TAG, "Recovery retry succeeded: key='$key' runId=$myRunId")
+                                    nativeStarted = true
+                                }.onFailure { e2 ->
+                                    Log.e(TAG, "Recovery retry failed: key='$key' runId=$myRunId err=${e2.message}", e2)
+                                    markNativeDoneOnce(cleanError(e2.message))
+                                }
+                            } else {
+                                markNativeDoneOnce("Recovery failed: could not reacquire active stream")
+                            }
+                        } else {
+                            markNativeDoneOnce(cleanError(e.message))
+                        }
+                    } else {
+                        markNativeDoneOnce(cleanError(e.message))
+                    }
+                }
+            } // end session lock
+
+            val reject = rejectMsg
+            if (reject != null) {
+                Log.w(TAG, reject)
+                postToMain {
+                    onError(reject)
                     resultListener("", true)
+                    runCatching { cleanUpListener.invoke() }
                 }
-            }
-
-            fun markNativeDoneOnce(errorMessage: String? = null, isCancel: Boolean = false) {
-                if (!rsLocal.terminated.compareAndSet(false, true)) return
-
-                watchdog?.cancel()
-                watchdog = null
-
-                val now = SystemClock.elapsedRealtime()
-                rsLocal.lastTerminateAtMs.set(now)
-                rsLocal.cooldownUntilMs.set(now + POST_TERMINATE_COOLDOWN_MS)
-
-                rsLocal.active.set(false)
-                rsLocal.logicalTerminator.set(null)
-
-                deliverLogicalDoneOnce(errorMessage = errorMessage, isCancel = isCancel)
-
-                // IMPORTANT: cleanup must run even if native termination was forced.
-                fireNativeDoneHookOnce(key)
-            }
-
-            fun requestLogicalCancel(reason: String) {
-                rsLocal.cancelRequested.set(true)
-
-                deliverLogicalDoneOnce(errorMessage = reason, isCancel = true)
-
-                runCatching { conversation.cancelProcess() }
-                    .onFailure { t -> Log.w(TAG, "cancelProcess() failed: key='$key' err=${t.message}", t) }
-
-                if (HARD_CLOSE_ENABLE) startHardCloseWatchdog(key, reason = "logicalCancel")
-            }
-
-            rsLocal.logicalTerminator.set { requestLogicalCancel("Cancelled") }
-
-            if (rsLocal.cancelRequested.get()) {
-                Log.i(TAG, "LiteRT-LM start cancelled before sendMessageAsync: key='$key'")
-                markNativeDoneOnce(errorMessage = "Cancelled", isCancel = true)
-                return@launch
-            }
-
-            watchdog = ioScope.launch {
-                delay(STREAM_WATCHDOG_MS)
-                if (rsLocal.runId.get() != myRunId) return@launch
-                if (rsLocal.terminated.get()) return@launch
-
-                Log.e(TAG, "Stream watchdog fired: key='$key' runId=$myRunId timeout=${STREAM_WATCHDOG_MS}ms")
-
-                deliverLogicalDoneOnce("Timeout: inference did not complete in ${STREAM_WATCHDOG_MS}ms")
-
-                runCatching { conversation.cancelProcess() }
-                    .onFailure { t -> Log.w(TAG, "cancelProcess() failed on watchdog: key='$key' err=${t.message}", t) }
-
-                if (HARD_CLOSE_ENABLE) startHardCloseWatchdog(key, reason = "watchdog")
-
-                if (!nativeStarted) markNativeDoneOnce("Timeout before native start")
-            }
-
-            val callback = object : MessageCallback {
-
-                override fun onMessage(message: Message) {
-                    if (rsLocal.runId.get() != myRunId) return
-                    if (rsLocal.terminated.get()) return
-                    if (rsLocal.logicalDone.get() || rsLocal.cancelRequested.get()) return
-
-                    rsLocal.lastMessageAtMs.set(SystemClock.elapsedRealtime())
-                    msgCount++
-
-                    val snapshotRaw = extractRenderedText(message)
-                    if (snapshotRaw.isEmpty()) return
-
-                    val (deltaRaw, nextEmitted) = computeDeltaSmart(emittedSoFar, snapshotRaw)
-                    emittedSoFar = nextEmitted
-                    if (deltaRaw.isEmpty()) return
-
-                    val delta = normalizeDeltaText(deltaRaw)
-
-                    if (DEBUG_STREAM && (msgCount == 1 || msgCount % DEBUG_STREAM_EVERY_N == 0)) {
-                        val lead = deltaRaw.firstOrNull()
-                        val leadInfo =
-                            if (lead == null) "null"
-                            else "U+${lead.code.toString(16).uppercase()} ws=${lead.isWhitespace()} ch='$lead'"
-
-                        val dPreview = delta.take(DEBUG_PREFIX_CHARS).replace("\n", "\\n")
-                        val sPreview = snapshotRaw.take(DEBUG_PREFIX_CHARS).replace("\n", "\\n")
-
-                        Log.d(
-                            TAG,
-                            "stream[key=$key runId=$myRunId] msg#$msgCount " +
-                                    "snapLen=${snapshotRaw.length} deltaLen=${delta.length} " +
-                                    "lead=$leadInfo snapPreview='$sPreview' deltaPreview='$dPreview' emittedLen=${emittedSoFar.length}"
-                        )
-                    }
-
-                    postToMain { resultListener(delta, false) }
-                }
-
-                override fun onDone() {
-                    if (rsLocal.runId.get() != myRunId) return
-                    markNativeDoneOnce(null)
-                }
-
-                override fun onError(throwable: Throwable) {
-                    if (rsLocal.runId.get() != myRunId) return
-
-                    val rawMsg = throwable.message ?: throwable.toString()
-                    val msg = cleanError(rawMsg)
-                    val code = extractStatusCodeBestEffort(throwable)
-
-                    if (DEBUG_ERROR_THROWABLE) {
-                        val cls = throwable::class.java.name
-                        val codeStr = code?.toString() ?: "n/a"
-                        Log.e(
-                            TAG,
-                            "LiteRT-LM onError(Throwable): key='$key' runId=$myRunId type=$cls code=$codeStr msg='$msg'\n" +
-                                    shortStack(throwable),
-                            throwable
-                        )
-                    }
-
-                    val cancelled = rsLocal.cancelRequested.get() || isCancellationThrowable(throwable, msg)
-                    if (cancelled) {
-                        Log.i(TAG, "LiteRT-LM inference cancelled: key='$key' runId=$myRunId")
-                        markNativeDoneOnce(errorMessage = "Cancelled", isCancel = true)
-                        return
-                    }
-
-                    val decorated = if (code != null) "Error($code): $msg" else "Error: $msg"
-                    Log.e(TAG, "LiteRT-LM inference error: key='$key' runId=$myRunId $decorated")
-                    markNativeDoneOnce(decorated)
-                }
-            }
-
-            try {
-                if (!hasMm) {
-                    Log.i(TAG, "LiteRT-LM 'conversation.sendMessageAsync' CALLED: trimmed='$trimmed'")
-                    conversation.sendMessageAsync(trimmed, callback)
-                } else {
-                    val contentList = buildContentList(input = trimmed, images = images, audioClips = audioClips)
-                    val contentsObj = buildContentsObject(contentList)
-                    conversation.sendMessageAsync(contentsObj, callback)
-                }
-
-                nativeStarted = true
-            } catch (e: Exception) {
-                Log.e(TAG, "LiteRT-LM sendMessageAsync failed: key='$key' msg=${e.message}", e)
-                markNativeDoneOnce(cleanError(e.message))
             }
         }
     }

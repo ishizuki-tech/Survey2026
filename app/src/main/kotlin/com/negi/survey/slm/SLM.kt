@@ -259,25 +259,16 @@ internal class StreamDeltaNormalizer(
     enum class PartialMode { AUTO, DELTA, ACCUMULATED }
 
     companion object {
-        /**
-         * Minimum prefix/tail sample size to be considered "strong evidence".
-         * Short samples (e.g., "I", " ") are highly collision-prone.
-         */
+        /** Minimum prefix/tail sample size to be considered "strong evidence". */
         private const val MIN_STRONG_SAMPLE_CHARS = 16
 
-        /**
-         * When the previous length is tiny, require a larger growth to reduce false positives.
-         */
+        /** When previous length is tiny, require larger growth to reduce collisions. */
         private const val SMALL_PREV_FORCE_GROWTH_CHARS = 8
 
-        /**
-         * General minimum growth required to consider ACCUMULATED.
-         */
+        /** General minimum growth required to consider ACCUMULATED. */
         private const val MIN_GROWTH_CHARS = 1
 
-        /**
-         * If ACCUMULATED mode repeatedly mismatches, downgrade to DELTA mode.
-         */
+        /** If ACCUMULATED mode repeatedly mismatches, downgrade to DELTA mode. */
         private const val ACCUM_MISMATCH_TO_DELTA_THRESHOLD = 2
     }
 
@@ -339,10 +330,7 @@ internal class StreamDeltaNormalizer(
         if (!looksLikeAccumulated(incoming)) {
             accumMismatchCount++
             if (accumMismatchCount >= ACCUM_MISMATCH_TO_DELTA_THRESHOLD) {
-                /**
-                 * If the backend behavior changed (or our decision was wrong),
-                 * downgrade to DELTA mode to avoid persistent substring damage.
-                 */
+                /** Backend behavior changed (or decision was wrong). */
                 decided = PartialMode.DELTA
                 d { "StreamDeltaNormalizer: downgrade to DELTA after $accumMismatchCount mismatches" }
             }
@@ -370,44 +358,33 @@ internal class StreamDeltaNormalizer(
     }
 
     private fun looksLikeAccumulated(incoming: String): Boolean {
-        /**
-         * ACCUMULATED must grow (or at least not shrink). If no growth, treat as not-accumulated
-         * to avoid deleting text on ambiguous repeats.
-         */
+        /** ACCUMULATED must not shrink. */
         if (incoming.length < lastLen) return false
+
+        /** No growth => treat as not-accumulated to avoid deleting text on repeats. */
         val growth = incoming.length - lastLen
         if (growth < MIN_GROWTH_CHARS) return false
 
-        /**
-         * Fast reject: accumulated output must start with previous prefix (even if short).
-         */
+        /** Fast reject: accumulated output should keep prior prefix. */
         if (prefixSample.isNotEmpty() && !incoming.startsWith(prefixSample)) return false
 
-        /**
-         * Strong evidence using first-chunk full prefix (only when long enough).
-         */
+        /** Strong evidence using first-chunk full prefix (only when long enough). */
         val fc = firstChunk
         if (fc != null && firstChunkLen >= MIN_STRONG_SAMPLE_CHARS) {
             if (incoming.length >= firstChunkLen && incoming.startsWith(fc)) return true
         }
 
-        /**
-         * When previous length is tiny, require a larger growth to reduce collisions on short prefixes.
-         */
+        /** When previous length is tiny, require larger growth to reduce collisions. */
         if (lastLen < MIN_STRONG_SAMPLE_CHARS && growth < SMALL_PREV_FORCE_GROWTH_CHARS) {
             return false
         }
 
-        /**
-         * Strong prefix sample check (only when sample is long enough).
-         */
+        /** Strong prefix sample check (only when sample is long enough). */
         if (prefixSample.length >= MIN_STRONG_SAMPLE_CHARS && !incoming.startsWith(prefixSample)) {
             return false
         }
 
-        /**
-         * Strong boundary sample alignment check (only when sample is long enough).
-         */
+        /** Strong boundary alignment check (only when sample is long enough). */
         if (boundarySample.length >= MIN_STRONG_SAMPLE_CHARS) {
             val start = (lastLen - boundarySample.length).coerceAtLeast(0)
             val ok = incoming.regionMatches(
@@ -439,6 +416,11 @@ private fun bucketKey(cls: Class<*>, methodName: String, argc: Int): String =
 
 /**
  * Get all methods (public + declared) matching name+arity, cached.
+ *
+ * Notes:
+ * - We combine both `methods` and `declaredMethods` because Kotlin/JVM and proguarded builds
+ *   can expose members differently.
+ * - We de-duplicate by (name + parameter type list) to avoid double candidates.
  */
 private fun getMethodBucket(cls: Class<*>, methodName: String, argc: Int): List<Method> {
     val key = bucketKey(cls, methodName, argc)
@@ -929,9 +911,7 @@ object SLM {
         systemMessage: Message? = null,
         tools: List<Any> = emptyList(),
     ) {
-        d {
-            "initializeIfNeeded: model='${model.name}' image=$supportImage audio=$supportAudio"
-        }
+        d { "initializeIfNeeded: model='${model.name}' image=$supportImage audio=$supportAudio" }
 
         try {
             val ret = invokeLiteRtLmBestEffortSuspend(
@@ -1108,10 +1088,7 @@ object SLM {
             val buffer = StringBuilder()
             val normalizer = StreamDeltaNormalizer(StreamDeltaNormalizer.PartialMode.AUTO)
 
-            /**
-             * Terminal guard for done/error/invoke-failure races.
-             * This avoids double-resume crashes under callback concurrency.
-             */
+            /** Terminal guard for done/error/invoke-failure races. */
             val terminal = AtomicBoolean(false)
 
             val resultListener: ResultListener = result@{ partial, done ->

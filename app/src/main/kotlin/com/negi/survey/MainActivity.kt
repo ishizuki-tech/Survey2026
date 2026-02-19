@@ -829,7 +829,7 @@ fun AppNav() {
             val backStack = rememberNavBackStack(FlowHome)
 
             val repo: Repository = remember(slmModel, cfg) {
-                LiteRtRepository(slmModel, cfg)
+                LiteRtRepository(slmModel, cfg, appContext)
             }
 
             val vmSurvey: SurveyViewModel = viewModel(
