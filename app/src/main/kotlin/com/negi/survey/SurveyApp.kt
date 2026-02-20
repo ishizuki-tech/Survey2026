@@ -127,32 +127,48 @@ class SurveyApp : Application(), Configuration.Provider {
      * Ensure WorkManager is initialized.
      *
      * This is required when WorkManagerInitializer is explicitly disabled in AndroidManifest.xml.
-     * Safe to call multiple times (idempotent via try/catch).
+     *
+     * Key properties:
+     * - Safe to call multiple times.
+     * - Protects against concurrent init attempts using a lock.
+     * - Re-attempts init if WorkManager is still not accessible.
      */
     private fun ensureWorkManagerInitialized(where: String) {
-        if (!workManagerInitOnce.compareAndSet(false, true)) {
-            // Already attempted; still verify it's accessible in case a prior attempt failed.
-            if (isWorkManagerReady()) return
-        }
-
-        // First: check if it's already initialized.
+        // Fast-path: if already accessible, do nothing.
         if (isWorkManagerReady()) {
-            Log.d(TAG, "WorkManager already initialized. where=$where")
+            Log.d(TAG, "WorkManager already ready. where=$where")
             return
         }
 
-        // If initializer is disabled, we must initialize manually.
-        runCatching {
-            WorkManager.initialize(this, workManagerConfiguration)
-            Log.d(TAG, "WorkManager initialized manually. where=$where")
-        }.onFailure { t ->
-            // Do not crash app startup; log and continue.
-            Log.w(TAG, "WorkManager manual init failed: where=$where msg=${t.message}", t)
-        }
+        // Prevent concurrent init attempts from different stages/threads.
+        synchronized(workManagerInitLock) {
+            // Re-check inside the lock (another caller may have initialized it).
+            if (isWorkManagerReady()) {
+                Log.d(TAG, "WorkManager became ready (after lock). where=$where")
+                return
+            }
 
-        // Final check (best-effort).
-        if (!isWorkManagerReady()) {
-            Log.w(TAG, "WorkManager still not ready after init attempt. where=$where")
+            // Record that we attempted initialization at least once (debug/guard).
+            if (workManagerInitAttempted.compareAndSet(false, true)) {
+                Log.d(TAG, "WorkManager init attempt begins. where=$where")
+            } else {
+                Log.d(TAG, "WorkManager init re-attempt begins. where=$where")
+            }
+
+            // If initializer is disabled, we must initialize manually.
+            runCatching {
+                // Use applicationContext to avoid edge-case context issues.
+                WorkManager.initialize(applicationContext, workManagerConfiguration)
+                Log.d(TAG, "WorkManager initialized manually. where=$where")
+            }.onFailure { t ->
+                // If already initialized, WorkManager may throw. That's fine; we still verify readiness below.
+                Log.w(TAG, "WorkManager manual init failed: where=$where msg=${t.message}", t)
+            }
+
+            // Final check (best-effort).
+            if (!isWorkManagerReady()) {
+                Log.w(TAG, "WorkManager still not ready after init attempt. where=$where")
+            }
         }
     }
 
@@ -161,7 +177,7 @@ class SurveyApp : Application(), Configuration.Provider {
      */
     private fun isWorkManagerReady(): Boolean {
         return try {
-            WorkManager.getInstance(this)
+            WorkManager.getInstance(applicationContext)
             true
         } catch (_: IllegalStateException) {
             false
@@ -327,7 +343,8 @@ class SurveyApp : Application(), Configuration.Provider {
         private val enqueuePendingOnce = AtomicBoolean(false)
         private val enqueueRetryScheduled = AtomicBoolean(false)
 
-        // Guard for manual WorkManager init attempt.
-        private val workManagerInitOnce = AtomicBoolean(false)
+        // WorkManager init guards.
+        private val workManagerInitAttempted = AtomicBoolean(false)
+        private val workManagerInitLock = Any()
     }
 }
