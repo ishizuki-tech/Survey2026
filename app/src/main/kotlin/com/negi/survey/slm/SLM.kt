@@ -48,10 +48,10 @@ package com.negi.survey.slm
 
 import android.content.Context
 import android.graphics.Bitmap
-import android.util.Log
 import com.google.ai.edge.litertlm.Message
 import com.negi.survey.BuildConfig
 import com.negi.survey.config.SurveyConfig
+import com.negi.survey.net.RuntimeLogStore
 import java.lang.reflect.InvocationTargetException
 import java.lang.reflect.Method
 import java.lang.reflect.Modifier
@@ -64,7 +64,6 @@ import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.suspendCancellableCoroutine
-import kotlin.math.min
 
 private const val TAG = "SLM"
 
@@ -114,14 +113,14 @@ private const val ABS_MAX_TOP_K = 2048
  * Debug log with lazy message construction.
  */
 private inline fun d(msg: () -> String) {
-    if (DEBUG_SLM) Log.d(TAG, msg())
+    if (DEBUG_SLM) RuntimeLogStore.d(TAG, msg())
 }
 
 /**
  * Warning log with lazy message construction.
  */
 private inline fun w(t: Throwable? = null, msg: () -> String) {
-    if (t != null) Log.w(TAG, msg(), t) else Log.w(TAG, msg())
+    if (t != null) RuntimeLogStore.w(TAG, msg(), t) else RuntimeLogStore.w(TAG, msg())
 }
 
 /* ───────────────────────────── Model config ───────────────────────────── */

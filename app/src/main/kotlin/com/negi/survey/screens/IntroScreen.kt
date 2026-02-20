@@ -203,9 +203,12 @@ fun IntroScreen(
                 onResolveConfigDetails = onResolveConfigDetails,
             )
 
-            if (BuildConfig.DEBUG) {
+            if (true) //(BuildConfig.DEBUG)
+            {
                 OutlinedButton(
-                    onClick = { throw RuntimeException("Debug crash button pressed") }
+                    onClick = {
+                        throw RuntimeException("Debug crash button pressed")
+                    }
                 ) {
                     Text("Crash now (debug)")
                 }

@@ -16,6 +16,7 @@ package com.negi.survey.net
 import android.util.Base64
 import android.util.Base64OutputStream
 import android.util.Log
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.IOException
 import java.io.InputStream
@@ -44,9 +45,8 @@ import org.json.JSONObject
  * - Retry transient failures with backoff (429, 5xx, rate-limit, network IO).
  *
  * Notes:
- * - GitHub Contents API is not designed for extremely large binaries.
- * - Storing many WAV files inside a git repo can bloat clone/pull over time.
- * - Consider Releases assets or external object storage for long-term scaling.
+ * - GitHub Contents API is best suited for relatively small payloads.
+ * - For large binaries (e.g., long WAV), prefer Releases assets or object storage.
  */
 object GitHubUploader {
 
@@ -61,12 +61,10 @@ object GitHubUploader {
     /**
      * Default guard for raw bytes before Base64 expansion.
      *
-     * Base64 expands by ~4/3; request JSON adds overhead.
-     *
-     * For PCM_16BIT MONO WAV:
-     *   bytes ≈ 44 + seconds * sampleRateHz * 2
+     * Conservative by default for Contents API workflows.
+     * Caller may override via GitHubConfig if needed.
      */
-    private const val DEFAULT_MAX_RAW_BYTES = 20_000_000
+    private const val DEFAULT_MAX_RAW_BYTES = 1_000_000
 
     /**
      * Default guard for the final JSON request size (rough).
@@ -75,15 +73,15 @@ object GitHubUploader {
      *   requestBytes ≈ JSON_overhead + Base64(contentBytes)
      *   Base64(contentBytes) ≈ ceil(contentBytes/3)*4
      */
-    private const val DEFAULT_MAX_REQUEST_BYTES = 32_000_000
+    private const val DEFAULT_MAX_REQUEST_BYTES = 2_800_000
 
     /** Additional overhead margin for JSON wrapper and small header variations. */
     private const val REQUEST_OVERHEAD_BYTES = 16_384L
 
     /** Retry defaults. */
     private const val DEFAULT_MAX_ATTEMPTS = 3
-    private const val BASE_BACKOFF_MS = 600L
-    private const val MAX_BACKOFF_MS = 20_000L
+    private const val BASE_BACKOFF_MS = 800L
+    private const val MAX_BACKOFF_MS = 120_000L
 
     /**
      * Configuration container for GitHub upload operations.
@@ -417,8 +415,7 @@ object GitHubUploader {
         if (rawSize > maxRawBytesHint.toLong()) {
             val msg =
                 "Content too large for upload guard (size=$rawSize, limit=$maxRawBytesHint). " +
-                        "Base64 expands ~4/3; request grows further due to JSON. " +
-                        "For PCM_16BIT MONO WAV: bytes ≈ 44 + seconds * sampleRateHz * 2."
+                        "Base64 expands ~4/3; request grows further due to JSON."
             throw IOException(msg)
         }
 
@@ -646,6 +643,7 @@ object GitHubUploader {
                 doInput = true
                 doOutput = (writeBody != null)
                 useCaches = false
+                instanceFollowRedirects = false
 
                 // GitHub REST docs commonly show "Bearer <token>".
                 setRequestProperty("Authorization", "Bearer ${token.trim()}")
@@ -808,7 +806,7 @@ object GitHubUploader {
         rateLimitResetEpochSeconds: Long?
     ): Long {
         retryAfterSeconds?.let {
-            val ms = (it.coerceAtMost(120L) * 1000L)
+            val ms = (it.coerceAtMost(180L) * 1000L)
             return ms.coerceIn(500L, MAX_BACKOFF_MS)
         }
 
@@ -826,9 +824,9 @@ object GitHubUploader {
      * Exponential backoff with small jitter.
      */
     private fun computeBackoffMs(attempt: Int): Long {
-        val pow = (attempt - 1).coerceIn(0, 6)
+        val pow = (attempt - 1).coerceIn(0, 7)
         val base = (BASE_BACKOFF_MS shl pow).coerceAtMost(MAX_BACKOFF_MS)
-        val jitter = Random.nextLong(from = 0L, until = 250L)
+        val jitter = Random.nextLong(from = 0L, until = 350L)
         return (base + jitter).coerceAtMost(MAX_BACKOFF_MS)
     }
 

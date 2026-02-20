@@ -43,9 +43,7 @@
 
 package com.negi.survey.screens
 
-import android.annotation.SuppressLint
 import android.os.SystemClock
-import android.util.Log
 import android.content.ClipData
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.animateContentSize
@@ -142,6 +140,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.platform.ClipEntry
+import com.negi.survey.net.RuntimeLogStore
 import com.negi.survey.slm.FollowupExtractor
 import com.negi.survey.vm.AiViewModel
 import com.negi.survey.vm.SurveyViewModel
@@ -627,7 +626,7 @@ fun AiScreen(
                 activePromptQuestion = fuNorm
                 inputRole = InputRole.FOLLOWUP
 
-                Log.i(
+                RuntimeLogStore.i(
                     TAG,
                     "Follow-up persisted (node=$nid runId=${step.runId} mode=${step.mode} len=${fuNorm.length} preview=${clipForLog(fuNorm, 120)})"
                 )
@@ -640,7 +639,7 @@ fun AiScreen(
                 }
             }
 
-            Log.d(
+            RuntimeLogStore.d(
                 TAG,
                 "Step rendered (node=$nid runId=${step.runId} mode=${step.mode} showJson=$showAsJson rawLen=${stepRaw.length} followups=${step.followups.size} timedOut=${step.timedOut})"
             )
@@ -688,7 +687,7 @@ fun AiScreen(
                 vmSurvey.clearAnswer(nid)
             }
 
-            Log.d(TAG, "Speech started (node=$nid role=$inputRole)")
+            RuntimeLogStore.d(TAG, "Speech started (node=$nid role=$inputRole)")
         }
 
         val finishedThisUtterance =
@@ -705,9 +704,9 @@ fun AiScreen(
                     vmSurvey.setAnswer(text, nid)
                 }
 
-                Log.d(TAG, "Speech committed (node=$nid role=$inputRole len=${text.length})")
+                RuntimeLogStore.d(TAG, "Speech committed (node=$nid role=$inputRole len=${text.length})")
             } else {
-                Log.d(TAG, "Speech finished with empty/no-change (node=$nid role=$inputRole)")
+                RuntimeLogStore.d(TAG, "Speech finished with empty/no-change (node=$nid role=$inputRole)")
             }
         }
 
@@ -800,7 +799,7 @@ fun AiScreen(
             val q = rootQuestion
             val isTwoStep = vmSurvey.hasTwoStepPrompt(nid)
 
-            Log.i(
+            RuntimeLogStore.i(
                 TAG,
                 "Submit begin runId=$runId node=$nid role=$inputRole isTwoStep=$isTwoStep " +
                         "sessionId=${runSafe { vmSurvey.sessionId.value }} surveyUuid=${runSafe { vmSurvey.surveyUuid.value }} " +
@@ -810,31 +809,31 @@ fun AiScreen(
 
             runCatching {
                 if (!isTwoStep) {
-                    Log.d(TAG, "ONE_STEP prompt build start runId=$runId node=$nid")
+                    RuntimeLogStore.d(TAG, "ONE_STEP prompt build start runId=$runId node=$nid")
 
                     val prompt = vmSurvey.getPrompt(nid, q, mainAnswerStable)
-                    Log.i(
+                    RuntimeLogStore.i(
                         TAG,
                         "ONE_STEP prompt build ok runId=$runId node=$nid " +
                                 "promptLen=${prompt.length} promptHash=${shortHash(prompt)} " +
                                 "promptPreview=${clipForLog(prompt, 120)}"
                     )
 
-                    Log.d(TAG, "ONE_STEP evaluateAsync call runId=$runId node=$nid elapsed=${SystemClock.uptimeMillis() - t0}ms")
+                    RuntimeLogStore.d(TAG, "ONE_STEP evaluateAsync call runId=$runId node=$nid elapsed=${SystemClock.uptimeMillis() - t0}ms")
                     vmAI.evaluateAsync(prompt)
-                    Log.d(TAG, "ONE_STEP evaluateAsync returned runId=$runId node=$nid elapsed=${SystemClock.uptimeMillis() - t0}ms")
+                    RuntimeLogStore.d(TAG, "ONE_STEP evaluateAsync returned runId=$runId node=$nid elapsed=${SystemClock.uptimeMillis() - t0}ms")
                 } else {
-                    Log.d(TAG, "TWO_STEP step1 prompt build start runId=$runId node=$nid")
+                    RuntimeLogStore.d(TAG, "TWO_STEP step1 prompt build start runId=$runId node=$nid")
 
                     val prompt1 = vmSurvey.getEvalPrompt(nid, q, mainAnswerStable)
-                    Log.i(
+                    RuntimeLogStore.i(
                         TAG,
                         "TWO_STEP step1 prompt build ok runId=$runId node=$nid " +
                                 "prompt1Len=${prompt1.length} prompt1Hash=${shortHash(prompt1)} " +
                                 "prompt1Preview=${clipForLog(prompt1, 120)}"
                     )
 
-                    Log.d(TAG, "TWO_STEP evaluateConditionalTwoStepAsync call runId=$runId node=$nid elapsed=${SystemClock.uptimeMillis() - t0}ms")
+                    RuntimeLogStore.d(TAG, "TWO_STEP evaluateConditionalTwoStepAsync call runId=$runId node=$nid elapsed=${SystemClock.uptimeMillis() - t0}ms")
 
                     vmAI.evaluateConditionalTwoStepAsync(
                         firstPrompt = prompt1,
@@ -848,7 +847,7 @@ fun AiScreen(
                          */
                         shouldRunSecond = { step1 ->
                             val needed = extractFollowupNeeded(prettyJson, step1.raw) ?: false
-                            Log.i(
+                            RuntimeLogStore.i(
                                 TAG,
                                 "TWO_STEP shouldRunSecond runId=$runId node=$nid " +
                                         "followup_needed=$needed timedOut=${step1.timedOut} rawLen=${step1.raw.length}"
@@ -858,7 +857,7 @@ fun AiScreen(
 
                         buildSecondPrompt = { step1 ->
                             val step1Raw = step1.raw
-                            Log.d(
+                            RuntimeLogStore.d(
                                 TAG,
                                 "TWO_STEP step2 prompt build start runId=$runId node=$nid " +
                                         "step1TimedOut=${step1.timedOut} step1RawLen=${step1Raw.length}"
@@ -872,14 +871,14 @@ fun AiScreen(
                                     evalJsonRaw = step1Raw
                                 )
                             }.onSuccess { built ->
-                                Log.i(
+                                RuntimeLogStore.i(
                                     TAG,
                                     "TWO_STEP step2 prompt build ok runId=$runId node=$nid " +
                                             "prompt2Len=${built.length} prompt2Hash=${shortHash(built)} " +
                                             "prompt2Preview=${clipForLog(built, 120)}"
                                 )
                             }.getOrElse { err ->
-                                Log.e(
+                                RuntimeLogStore.e(
                                     TAG,
                                     "TWO_STEP step2 prompt build failed runId=$runId node=$nid " +
                                             "errType=${err::class.java.simpleName} errMsg=${err.message}",
@@ -892,7 +891,7 @@ fun AiScreen(
                                     append(step1Raw)
                                     append("\n")
                                 }.also { fallback ->
-                                    Log.w(
+                                    RuntimeLogStore.w(
                                         TAG,
                                         "TWO_STEP step2 prompt fallback used runId=$runId node=$nid " +
                                                 "fallbackLen=${fallback.length} fallbackHash=${shortHash(fallback)}"
@@ -900,19 +899,19 @@ fun AiScreen(
                                 }
                             }
 
-                            Log.d(TAG, "TWO_STEP step2 prompt build end runId=$runId node=$nid prompt2Len=${prompt2.length}")
+                            RuntimeLogStore.d(TAG, "TWO_STEP step2 prompt build end runId=$runId node=$nid prompt2Len=${prompt2.length}")
                             prompt2
                         }
                     )
 
-                    Log.d(
+                    RuntimeLogStore.d(
                         TAG,
                         "TWO_STEP evaluateConditionalTwoStepAsync returned runId=$runId node=$nid " +
                                 "elapsed=${SystemClock.uptimeMillis() - t0}ms"
                     )
                 }
             }.onFailure { err ->
-                Log.e(
+                RuntimeLogStore.e(
                     TAG,
                     "Submit failed runId=$runId node=$nid " +
                             "errType=${err::class.java.simpleName} errMsg=${err.message} " +
@@ -924,7 +923,7 @@ fun AiScreen(
                 snack.showSnackbar("Submit failed: ${err.message ?: "unknown error"}")
                 removeTypingBubble(chat, nid)
             }.also {
-                Log.i(TAG, "Submit end runId=$runId node=$nid elapsed=${SystemClock.uptimeMillis() - t0}ms")
+                RuntimeLogStore.i(TAG, "Submit end runId=$runId node=$nid elapsed=${SystemClock.uptimeMillis() - t0}ms")
             }
         }
 

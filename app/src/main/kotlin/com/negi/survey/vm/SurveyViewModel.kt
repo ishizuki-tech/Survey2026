@@ -35,12 +35,12 @@
 
 package com.negi.survey.vm
 
-import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.navigation3.runtime.NavBackStack
 import androidx.navigation3.runtime.NavKey
 import com.negi.survey.config.NodeDTO
 import com.negi.survey.config.SurveyConfig
+import com.negi.survey.net.RuntimeLogStore
 import java.util.UUID
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -413,7 +413,7 @@ open class SurveyViewModel(
             mutable.toImmutableLists()
         }
 
-        Log.d(TAG, "addAudioRef -> q=$qid, file=$fileName, sid=$sid")
+        RuntimeLogStore.d(TAG, "addAudioRef -> q=$qid, file=$fileName, sid=$sid")
     }
 
     @Synchronized
@@ -440,7 +440,7 @@ open class SurveyViewModel(
             mutable.toImmutableLists()
         }
 
-        Log.d(TAG, "replaceAudioRef -> q=$qid, file=$fileName, sid=$sid")
+        RuntimeLogStore.d(TAG, "replaceAudioRef -> q=$qid, file=$fileName, sid=$sid")
     }
 
     @Synchronized
@@ -456,7 +456,7 @@ open class SurveyViewModel(
             mutable.toImmutableLists()
         }
 
-        Log.d(TAG, "removeAudioRef -> q=$qid, file=$fileName")
+        RuntimeLogStore.d(TAG, "removeAudioRef -> q=$qid, file=$fileName")
     }
 
     @Synchronized
@@ -468,13 +468,13 @@ open class SurveyViewModel(
             mutable.toImmutableLists()
         }
 
-        Log.d(TAG, "clearAudioRefs -> q=$qid")
+        RuntimeLogStore.d(TAG, "clearAudioRefs -> q=$qid")
     }
 
     @Synchronized
     fun resetAudioRefs() {
         _recordedAudioRefs.value = LinkedHashMap()
-        Log.d(TAG, "resetAudioRefs -> cleared")
+        RuntimeLogStore.d(TAG, "resetAudioRefs -> cleared")
     }
 
     fun getAudioRefs(questionId: String): List<AudioRef> =
@@ -509,7 +509,7 @@ open class SurveyViewModel(
         } else {
             addAudioRef(questionId, fileName, byteSize, checksum, dedupByFileName = true)
         }
-        Log.d(TAG, "onVoiceExported -> q=${questionId.trim()}, file=$fileName, replace=$replace")
+        RuntimeLogStore.d(TAG, "onVoiceExported -> q=${questionId.trim()}, file=$fileName, replace=$replace")
     }
 
     /* ───────────────────────────── Prompt Helpers ───────────────────────────── */
@@ -523,7 +523,7 @@ open class SurveyViewModel(
         val has = !eval.isNullOrBlank() && !follow.isNullOrBlank()
 
         if (DEBUG_PROMPTS) {
-            Log.d(
+            RuntimeLogStore.d(
                 TAG,
                 "hasTwoStepPrompt[$k] -> $has (eval=${eval?.length ?: 0}, fu=${follow?.length ?: 0})"
             )
@@ -563,7 +563,7 @@ open class SurveyViewModel(
         )
 
         if (DEBUG_PROMPTS) {
-            Log.d(TAG, "getPrompt[$k] -> len=${rendered.length} (src=$src)")
+            RuntimeLogStore.d(TAG, "getPrompt[$k] -> len=${rendered.length} (src=$src)")
         }
 
         return rendered
@@ -586,7 +586,7 @@ open class SurveyViewModel(
         )
 
         if (DEBUG_PROMPTS) {
-            Log.d(TAG, "getEvalPrompt[$k] -> len=${rendered.length}")
+            RuntimeLogStore.d(TAG, "getEvalPrompt[$k] -> len=${rendered.length}")
         }
 
         return rendered
@@ -615,7 +615,7 @@ open class SurveyViewModel(
         )
 
         if (DEBUG_PROMPTS) {
-            Log.d(TAG, "getFollowupPrompt[$k] -> len=${rendered.length} evalLen=${evalJsonRaw.length}")
+            RuntimeLogStore.d(TAG, "getFollowupPrompt[$k] -> len=${rendered.length} evalLen=${evalJsonRaw.length}")
         }
 
         return rendered
@@ -630,13 +630,13 @@ open class SurveyViewModel(
         }
 
         if (DEBUG_RENDER) {
-            Log.v(TAG, "renderTemplate -> inLen=${template.length} outLen=${out.length} keys=${vars.keys}")
+            RuntimeLogStore.d(TAG, "renderTemplate -> inLen=${template.length} outLen=${out.length} keys=${vars.keys}")
         }
 
         if (DEBUG_PROMPTS) {
             val leftover = Regex("\\{\\{\\s*[A-Z0-9_]+\\s*\\}\\}").find(out)?.value
             if (leftover != null) {
-                Log.w(TAG, "renderTemplate -> unresolved placeholder detected: '$leftover' (outLen=${out.length})")
+                RuntimeLogStore.w(TAG, "renderTemplate -> unresolved placeholder detected: '$leftover' (outLen=${out.length})")
             }
         }
 
@@ -689,7 +689,7 @@ open class SurveyViewModel(
         nav.add(navKeyFor(node))
         updateCanGoBack()
 
-        Log.d(TAG, "push -> ${node.id}, navSize=${nav.size}, stackSize=${nodeStack.size}")
+        RuntimeLogStore.d(TAG, "push -> ${node.id}, navSize=${nav.size}, stackSize=${nodeStack.size}")
     }
 
     private fun ensureQuestion(id: String) {
@@ -720,7 +720,7 @@ open class SurveyViewModel(
         }
 
         push(node)
-        Log.d(TAG, "replaceTo -> ${node.id}")
+        RuntimeLogStore.d(TAG, "replaceTo -> ${node.id}")
     }
 
     @Synchronized
@@ -728,7 +728,7 @@ open class SurveyViewModel(
         val startKey = navKeyFor(start)
         while (nav.size > 0) nav.removeLastOrNull()
         nav.add(startKey)
-        Log.d(TAG, "resetNavToStart -> key=$startKey, navSize=${nav.size}")
+        RuntimeLogStore.d(TAG, "resetNavToStart -> key=$startKey, navSize=${nav.size}")
     }
 
     @Synchronized
@@ -754,13 +754,13 @@ open class SurveyViewModel(
         updateCanGoBack()
         _sessionId.update { it + 1 }
 
-        Log.d(TAG, "resetToStart -> ${start.id}, session=${_sessionId.value}, uuid=${_surveyUuid.value}")
+        RuntimeLogStore.d(TAG, "resetToStart -> ${start.id}, session=${_sessionId.value}, uuid=${_surveyUuid.value}")
     }
 
     @Synchronized
     fun backToPrevious() {
         if (nodeStack.size <= 1) {
-            Log.d(TAG, "backToPrevious: at root (no-op)")
+            RuntimeLogStore.d(TAG, "backToPrevious: at root (no-op)")
             return
         }
 
@@ -773,7 +773,7 @@ open class SurveyViewModel(
 
         clearSelections()
 
-        Log.d(TAG, "backToPrevious -> $prevId")
+        RuntimeLogStore.d(TAG, "backToPrevious -> $prevId")
     }
 
     @Synchronized
@@ -781,7 +781,7 @@ open class SurveyViewModel(
         val cur = _currentNode.value
         val nextId = cur.nextId?.trim().orEmpty()
         if (nextId.isBlank()) {
-            Log.d(TAG, "advanceToNext: no nextId from ${cur.id}")
+            RuntimeLogStore.d(TAG, "advanceToNext: no nextId from ${cur.id}")
             return
         }
 
@@ -844,7 +844,7 @@ open class SurveyViewModel(
             "DONE", "FINISH", "FINAL" -> NodeType.DONE
             else -> {
                 // Unknown types are treated as TEXT to keep the flow robust.
-                Log.w(TAG, "Unknown node type '$rawType' for id='${this.id}'. Defaulting to TEXT.")
+                RuntimeLogStore.w(TAG, "Unknown node type '$rawType' for id='${this.id}'. Defaulting to TEXT.")
                 NodeType.TEXT
             }
         }
@@ -866,8 +866,8 @@ open class SurveyViewModel(
         val evalIds = config.promptsEval.map { it.nodeId.trim() }.filter { it.isNotBlank() }.distinct().sorted()
         val followIds = config.promptsFollowup.map { it.nodeId.trim() }.filter { it.isNotBlank() }.distinct().sorted()
 
-        Log.d(TAG, "promptSources -> legacy=${legacyIds.size}, eval=${evalIds.size}, follow=${followIds.size}")
-        Log.d(TAG, "promptSources.preview -> legacy=${legacyIds.take(24)}, eval=${evalIds.take(24)}, follow=${followIds.take(24)}")
+        RuntimeLogStore.d(TAG, "promptSources -> legacy=${legacyIds.size}, eval=${evalIds.size}, follow=${followIds.size}")
+        RuntimeLogStore.d(TAG, "promptSources.preview -> legacy=${legacyIds.take(24)}, eval=${evalIds.take(24)}, follow=${followIds.take(24)}")
 
         val aiNodeIds = graph.values.asSequence()
             .filter { it.type == NodeType.AI }
@@ -885,9 +885,9 @@ open class SurveyViewModel(
             }
 
             if (missing.isNotEmpty()) {
-                Log.e(TAG, "AI prompt coverage missing for nodeIds=${missing.take(64)} (count=${missing.size})")
+                RuntimeLogStore.e(TAG, "AI prompt coverage missing for nodeIds=${missing.take(64)} (count=${missing.size})")
             } else {
-                Log.d(TAG, "AI prompt coverage OK (aiCount=${aiNodeIds.size})")
+                RuntimeLogStore.d(TAG, "AI prompt coverage OK (aiCount=${aiNodeIds.size})")
             }
         }
     }
@@ -947,7 +947,7 @@ open class SurveyViewModel(
 
         updateCanGoBack()
 
-        Log.d(
+        RuntimeLogStore.d(
             TAG,
             "init -> ${start.id}, session=${_sessionId.value}, uuid=${_surveyUuid.value}, navSize=${nav.size}, graphSize=${graph.size}"
         )
@@ -958,9 +958,9 @@ open class SurveyViewModel(
             } catch (t: Throwable) {
                 listOf("validate() crashed: ${t.message}")
             }
-            Log.d(TAG, "config.validate -> issues=${issues.size}")
+            RuntimeLogStore.d(TAG, "config.validate -> issues=${issues.size}")
             if (issues.isNotEmpty()) {
-                issues.take(64).forEach { Log.w(TAG, "  - $it") }
+                issues.take(64).forEach { RuntimeLogStore.w(TAG, "  - $it") }
             }
 
             debugDumpPromptSummary()
