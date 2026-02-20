@@ -28,9 +28,11 @@ import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
+import kotlin.coroutines.coroutineContext
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.cancel
@@ -189,7 +191,7 @@ private object AiTrace {
         var i = 0
         var part = 0
         while (i < lines.length) {
-            val end = minOf(lines.length, i + LOG_CHUNK)
+            val end = kotlin.math.min(lines.length, i + LOG_CHUNK)
             val slice = lines.substring(i, end)
             val prefix = "[part=${part.toString().padStart(3, '0')}] "
             when (level) {
@@ -361,6 +363,15 @@ class LiteRtRepository(
         }
     }
 
+    /**
+     * A repository-lifetime scope that survives callbackFlow cancellation.
+     *
+     * Rationale:
+     * - callbackFlow scope is cancelled immediately when collector cancels.
+     * - We still want a best-effort SLM.cancel() to run on the SLM thread.
+     */
+    private val repoScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
     init {
         appContext?.let { AiTrace.install(it) }
     }
@@ -490,7 +501,10 @@ class LiteRtRepository(
 
             when {
                 initAttempt == null -> {
-                    Log.w(TAG, "warmUp: initializeIfNeeded timed out (${INIT_TIMEOUT_MS}ms) gateWaitMs=$gateMs initMs=$initMs")
+                    Log.w(
+                        TAG,
+                        "warmUp: initializeIfNeeded timed out (${INIT_TIMEOUT_MS}ms) gateWaitMs=$gateMs initMs=$initMs"
+                    )
                 }
                 initAttempt.isFailure -> {
                     val e = initAttempt.exceptionOrNull()
@@ -506,104 +520,290 @@ class LiteRtRepository(
     override suspend fun request(prompt: String): Flow<String> {
         return callbackFlow {
             val out = this
+
             val requestId = REQ_SEQ.incrementAndGet()
             val gateReqAt = SystemClock.elapsedRealtime()
 
-            // IMPORTANT: callbackFlow block is NOT suspend.
-            // Move all suspend work into a coroutine body.
+            /**
+             * External cancel / internal close coordination:
+             * - internalClose: set true when *we* close the channel (normal completion or internal error).
+             * - gateActive: true only while inside the withPermit critical section (this request is the active one).
+             * - cancelIssued: ensures we send SLM.cancel() at most once for collector cancellation.
+             * - cancelTag: shared so awaitClose can mark "collector-cancelled", preventing CANCELLED from being treated as an error.
+             */
+            val internalClose = AtomicBoolean(false)
+            val gateActive = AtomicBoolean(false)
+            val cancelIssued = AtomicBoolean(false)
+            val cancelTag = AtomicReference<String?>(null)
+
+            // IMPORTANT: callbackFlow block is NOT suspend. Move all suspend work into a coroutine body.
             val driverJob = launch(Dispatchers.Default) {
                 AI_INFERENCE_GATE.withPermit {
-                    val gateWaitMs = SystemClock.elapsedRealtime() - gateReqAt
+                    gateActive.set(true)
+                    try {
+                        val gateWaitMs = SystemClock.elapsedRealtime() - gateReqAt
 
-                    val anchorJob = SupervisorJob()
-                    val anchorScope = CoroutineScope(Dispatchers.Default + anchorJob)
+                        val parentJob = coroutineContext[Job] ?: SupervisorJob()
 
-                    /**
-                     * IMPORTANT FIX (2026-02):
-                     * - Separate "logging/finalize" scope from "post-cleanup/reset" scope.
-                     * - finalizeOnce() cancels logJob, and MUST NOT cancel resetConversation work.
-                     */
-                    val logJob = SupervisorJob()
-                    val logScope = CoroutineScope(Dispatchers.IO + logJob)
+                        val anchorJob = SupervisorJob(parentJob)
+                        val anchorScope = CoroutineScope(Dispatchers.Default + anchorJob)
 
-                    val postJob = SupervisorJob()
-                    val postScope = CoroutineScope(Dispatchers.IO + postJob)
+                        /**
+                         * IMPORTANT:
+                         * - Separate "logging/finalize" scope from "post-cleanup/reset" scope.
+                         * - finalizeOnce() cancels logJob, and MUST NOT cancel resetConversation work.
+                         * - All jobs are parented to driverJob, so cancellation will not leak.
+                         */
+                        val logJob = SupervisorJob(parentJob)
+                        val logScope = CoroutineScope(Dispatchers.IO + logJob)
 
-                    val closed = AtomicBoolean(false)
-                    val finalized = AtomicBoolean(false)
+                        val postJob = SupervisorJob(parentJob)
+                        val postScope = CoroutineScope(Dispatchers.IO + postJob)
 
-                    val startAt = AtomicLong(SystemClock.elapsedRealtime())
-                    val firstTokenAt = AtomicLong(-1L)
-                    val lastEventAt = AtomicLong(startAt.get())
-                    val lastDeltaAt = AtomicLong(startAt.get())
+                        val closed = AtomicBoolean(false)
+                        val finalized = AtomicBoolean(false)
 
-                    val logicalDone = AtomicBoolean(false)
-                    val logicalDoneAt = AtomicLong(-1L)
+                        val startAt = AtomicLong(SystemClock.elapsedRealtime())
+                        val firstTokenAt = AtomicLong(-1L)
+                        val lastEventAt = AtomicLong(startAt.get())
+                        val lastDeltaAt = AtomicLong(startAt.get())
 
-                    val cancelTag = AtomicReference<String?>(null)
-                    val nativeTerminated = AtomicBoolean(false)
+                        val logicalDone = AtomicBoolean(false)
+                        val logicalDoneAt = AtomicLong(-1L)
 
-                    val chunks = AtomicLong(0L)
-                    val capturedAll = AtomicBoolean(true)
+                        val nativeTerminated = AtomicBoolean(false)
 
-                    val outLock = Any()
-                    val fullOut = StringBuilder(8 * 1024)
+                        val chunks = AtomicLong(0L)
+                        val capturedAll = AtomicBoolean(true)
 
-                    val normalizer = LocalDeltaNormalizer(LocalDeltaNormalizer.Mode.AUTO)
+                        val outLock = Any()
+                        val fullOut = StringBuilder(8 * 1024)
 
-                    @Suppress("ObjectPropertyName")
-                    val FORCE_REINIT = Companion.FORCE_REINIT
+                        val normalizer = LocalDeltaNormalizer(LocalDeltaNormalizer.Mode.AUTO)
 
-                    fun markEvent() {
-                        lastEventAt.set(SystemClock.elapsedRealtime())
-                    }
-
-                    fun appendOutput(delta: String) {
-                        if (delta.isEmpty()) return
-                        val now = SystemClock.elapsedRealtime()
-                        if (firstTokenAt.get() < 0L) firstTokenAt.compareAndSet(-1L, now)
-                        lastDeltaAt.set(now)
-                        chunks.incrementAndGet()
-
-                        val ok = synchronized(outLock) { AiTrace.capAppend(fullOut, delta) }
-                        if (!ok) capturedAll.set(false)
-                    }
-
-                    fun snapshotForDebug(prefixChars: Int): Pair<Int, String> {
-                        return synchronized(outLock) {
-                            val len = fullOut.length
-                            if (len <= 0) return@synchronized (0 to "")
-                            val end = minOf(len, prefixChars.coerceAtLeast(0))
-                            val preview =
-                                if (end == len && len <= prefixChars) fullOut.toString()
-                                else fullOut.substring(0, end)
-                            len to preview
+                        fun markEvent() {
+                            lastEventAt.set(SystemClock.elapsedRealtime())
                         }
-                    }
 
-                    fun requestCancelOnly(tag: String) {
-                        if (!cancelTag.compareAndSet(null, tag)) return
+                        fun appendOutput(delta: String) {
+                            if (delta.isEmpty()) return
+                            val now = SystemClock.elapsedRealtime()
+                            if (firstTokenAt.get() < 0L) firstTokenAt.compareAndSet(-1L, now)
+                            lastDeltaAt.set(now)
+                            chunks.incrementAndGet()
 
-                        anchorScope.launch {
-                            runCatchingSuspend {
-                                runOnSlmThread { SLM.cancel(model) }
-                            }.onFailure { e ->
-                                Log.w(TAG, "[$requestId] cancel failed ($tag): ${e.message}", e)
+                            val ok = synchronized(outLock) { AiTrace.capAppend(fullOut, delta) }
+                            if (!ok) capturedAll.set(false)
+                        }
+
+                        fun snapshotForDebug(prefixChars: Int): Pair<Int, String> {
+                            return synchronized(outLock) {
+                                val len = fullOut.length
+                                if (len <= 0) return@synchronized (0 to "")
+                                val end = kotlin.math.min(len, prefixChars.coerceAtLeast(0))
+                                val preview =
+                                    if (end == len && len <= prefixChars) fullOut.toString()
+                                    else fullOut.substring(0, end)
+                                len to preview
                             }
                         }
 
-                        Log.w(TAG, "[$requestId] cancel requested: tag='$tag'")
-                    }
+                        fun requestCancelOnly(tag: String) {
+                            if (!cancelTag.compareAndSet(null, tag)) return
 
-                    fun scheduleResetAfterSafepoint(tag: String) {
-                        postScope.launch {
-                            // NOTE: This scope must outlive logScope cancellations.
-                            Log.d(TAG, "[$requestId] scheduleResetAfterSafepoint: begin (tag='$tag')")
+                            anchorScope.launch {
+                                runCatchingSuspend {
+                                    runOnSlmThread { SLM.cancel(model) }
+                                }.onFailure { e ->
+                                    Log.w(TAG, "[$requestId] cancel failed ($tag): ${e.message}", e)
+                                }
+                            }
 
-                            try {
+                            Log.w(TAG, "[$requestId] cancel requested: tag='$tag'")
+                        }
+
+                        fun scheduleResetAfterSafepoint(tag: String) {
+                            postScope.launch {
+                                Log.d(TAG, "[$requestId] scheduleResetAfterSafepoint: begin (tag='$tag')")
+
+                                try {
+                                    runCatchingSuspend {
+                                        runOnSlmThread {
+                                            SLM.resetConversation(
+                                                model = model,
+                                                supportImage = supportImage,
+                                                supportAudio = supportAudio,
+                                                systemMessage = systemMessage,
+                                                tools = tools,
+                                            )
+                                        }
+                                    }.onSuccess {
+                                        Log.d(TAG, "[$requestId] resetConversation ok (after safepoint, tag='$tag')")
+                                    }.onFailure { e ->
+                                        // NOTE:
+                                        // Cancellation during shutdown/flow completion is not a functional failure.
+                                        // Only warn for non-cancellation exceptions.
+                                        if (e is CancellationException) {
+                                            Log.d(TAG, "[$requestId] resetConversation cancelled (after safepoint, tag='$tag'): ${e.message}")
+                                        } else {
+                                            Log.w(TAG, "[$requestId] resetConversation failed (after safepoint, tag='$tag'): ${e.message}", e)
+                                        }
+                                    }
+                                } finally {
+                                    postJob.cancel()
+                                    Log.d(TAG, "[$requestId] scheduleResetAfterSafepoint: end (tag='$tag')")
+                                }
+                            }
+                        }
+
+                        fun finalizeOnce(reason: String, cause: Throwable? = null) {
+                            if (!finalized.compareAndSet(false, true)) return
+
+                            logScope.launch {
+                                val now = SystemClock.elapsedRealtime()
+                                val elapsedMs = now - startAt.get()
+                                val firstMs = firstTokenAt.get().let { if (it < 0L) -1L else (it - startAt.get()) }
+                                val lastDeltaMsAgo = now - lastDeltaAt.get()
+                                val lastEventMsAgo = now - lastEventAt.get()
+
+                                val outText = synchronized(outLock) { fullOut.toString() }
+
+                                val stats = buildString {
+                                    appendLine("=== AI TRACE STATS (LiteRtRepository) ===")
+                                    appendLine("rid=$requestId model='${model.name}' reason=$reason")
+                                    appendLine("gateWaitMs=$gateWaitMs elapsedMs=$elapsedMs firstTokenMs=$firstMs")
+                                    appendLine("logicalDone=${logicalDone.get()} logicalDoneAt=${logicalDoneAt.get()}")
+                                    appendLine("nativeTerminated=${nativeTerminated.get()} cancelTag='${cancelTag.get()}'")
+                                    appendLine("lastDeltaMsAgo=$lastDeltaMsAgo lastEventMsAgo=$lastEventMsAgo")
+                                    appendLine("chunks=${chunks.get()} capturedAll=${capturedAll.get()} out.len=${outText.length}")
+                                    if (cause != null) {
+                                        appendLine("--- exception ---")
+                                        appendLine(Log.getStackTraceString(cause))
+                                    }
+                                    appendLine("=== OUTPUT (FULL) ===")
+                                    append(outText)
+                                    if (!capturedAll.get()) appendLine("\n... (output capture truncated by MAX_CAPTURE_CHARS)")
+                                }
+
+                                AiTrace.logLong(TAG, if (cause != null) Log.WARN else Log.DEBUG, "[$requestId] FINALIZE: $reason", stats)
+                                AiTrace.dumpToFile("litert", requestId, model.name, stats)
+                            }.invokeOnCompletion {
+                                logJob.cancel()
+                                Log.d(TAG, "[$requestId] finalizeOnce: logJob cancelled (reason='$reason')")
+                            }
+                        }
+
+                        fun closeOnce(reason: String, cause: Throwable? = null) {
+                            if (!closed.compareAndSet(false, true)) return
+
+                            internalClose.set(true)
+                            finalizeOnce(reason, cause)
+
+                            runCatching { anchorScope.cancel(CancellationException("closeOnce: $reason")) }
+
+                            runCatching {
+                                if (cause != null) out.close(cause) else out.close()
+                            }
+                        }
+
+                        if (Companion.FORCE_REINIT.getAndSet(false)) {
+                            Log.w(TAG, "[$requestId] FORCE_REINIT=true -> safe reset before inference")
+
+                            runCatchingSuspend {
+                                runOnSlmThread {
+                                    SLM.resetConversation(
+                                        model = model,
+                                        supportImage = supportImage,
+                                        supportAudio = supportAudio,
+                                        systemMessage = systemMessage,
+                                        tools = tools,
+                                    )
+                                }
+                            }.onFailure { e ->
+                                Log.w(TAG, "[$requestId] pre-run resetConversation failed: ${e.message}", e)
+                            }
+
+                            runCatchingSuspend {
+                                runOnSlmThread {
+                                    SLM.cleanUp(model) {
+                                        Log.d(TAG, "[$requestId] pre-run cleanUp done (force reinit)")
+                                    }
+                                }
+                            }.onFailure { e ->
+                                Log.w(TAG, "[$requestId] pre-run cleanUp failed: ${e.message}", e)
+                            }
+                        }
+
+                        val normalized = prompt.normalizePrompt()
+                        val escaped = escapeReservedTurnTokens(normalized)
+                        val cappedPrompt = capPromptIfNeeded(escaped, PROMPT_CHAR_CAP, PROMPT_KEEP_TAIL_CHARS)
+                        val promptSha = AiTrace.sha256Short(cappedPrompt)
+
+                        Log.d(TAG, "[$requestId] request start: model='${model.name}', prompt.len=${cappedPrompt.length}, sha=$promptSha, gateWaitMs=$gateWaitMs")
+                        AiTrace.logLong(TAG, Log.DEBUG, "[$requestId] PROMPT (FULL) sha=$promptSha", cappedPrompt)
+
+                        // Watchdog
+                        anchorScope.launch {
+                            while (isActive && !closed.get()) {
+                                val now = SystemClock.elapsedRealtime()
+                                val elapsed = now - startAt.get()
+                                val hasAnyToken = firstTokenAt.get() >= 0L
+
+                                if (elapsed >= HARD_WATCHDOG_MS) {
+                                    val r = "hard-watchdog-timeout"
+                                    Log.w(TAG, "[$requestId] $r (${elapsed}ms) -> cancel-only + close")
+                                    requestCancelOnly(r)
+                                    closeOnce(r)
+                                    break
+                                }
+
+                                if (!hasAnyToken && elapsed >= FIRST_TOKEN_TIMEOUT_MS) {
+                                    val r = "first-token-timeout"
+                                    Log.w(TAG, "[$requestId] $r (${elapsed}ms) -> cancel-only + close")
+                                    requestCancelOnly(r)
+                                    closeOnce(r)
+                                    break
+                                }
+
+                                if (hasAnyToken && !logicalDone.get()) {
+                                    val stalled = now - lastEventAt.get()
+                                    if (stalled >= EVENT_STALL_TIMEOUT_MS) {
+                                        val r = "event-stall-timeout"
+                                        Log.w(TAG, "[$requestId] $r (${stalled}ms) -> cancel-only + close")
+                                        requestCancelOnly(r)
+                                        closeOnce(r)
+                                        break
+                                    }
+                                }
+
+                                if (logicalDone.get()) {
+                                    val doneAt = logicalDoneAt.get()
+                                    if (doneAt > 0L) {
+                                        val afterDone = now - doneAt
+                                        if (afterDone >= POST_DONE_TIMEOUT_MS) {
+                                            val r = "post-done-termination-timeout"
+                                            Log.w(TAG, "[$requestId] $r (${afterDone}ms) -> cancel-only + close + force reinit")
+                                            requestCancelOnly(r)
+                                            Companion.FORCE_REINIT.set(true)
+                                            closeOnce(r)
+                                            break
+                                        }
+                                    }
+                                }
+
+                                delay(PROGRESS_POLL_MS)
+                            }
+                        }
+
+                        // Initialize
+                        val ctx = appContext
+                        if (ctx != null) {
+                            val initT0 = SystemClock.elapsedRealtime()
+                            val initAttempt: Result<Unit>? = withTimeoutOrNull(INIT_TIMEOUT_MS) {
                                 runCatchingSuspend {
                                     runOnSlmThread {
-                                        SLM.resetConversation(
+                                        SLM.initializeIfNeeded(
+                                            context = ctx,
                                             model = model,
                                             supportImage = supportImage,
                                             supportAudio = supportAudio,
@@ -611,632 +811,146 @@ class LiteRtRepository(
                                             tools = tools,
                                         )
                                     }
-                                }.onSuccess {
-                                    Log.d(TAG, "[$requestId] resetConversation ok (after safepoint, tag='$tag')")
-                                }.onFailure { e ->
-                                    Log.w(TAG, "[$requestId] resetConversation failed (after safepoint, tag='$tag'): ${e.message}", e)
-                                }
-                            } finally {
-                                // NOTE: Release post-cleanup resources after attempting reset.
-                                postJob.cancel()
-                                Log.d(TAG, "[$requestId] scheduleResetAfterSafepoint: end (tag='$tag')")
-                            }
-                        }
-                    }
-
-                    fun finalizeOnce(reason: String, cause: Throwable? = null) {
-                        if (!finalized.compareAndSet(false, true)) return
-
-                        logScope.launch {
-                            val now = SystemClock.elapsedRealtime()
-                            val elapsedMs = now - startAt.get()
-                            val firstMs = firstTokenAt.get().let { if (it < 0L) -1L else (it - startAt.get()) }
-                            val lastDeltaMsAgo = now - lastDeltaAt.get()
-                            val lastEventMsAgo = now - lastEventAt.get()
-
-                            val outText = synchronized(outLock) { fullOut.toString() }
-
-                            val stats = buildString {
-                                appendLine("=== AI TRACE STATS (LiteRtRepository) ===")
-                                appendLine("rid=$requestId model='${model.name}' reason=$reason")
-                                appendLine("gateWaitMs=$gateWaitMs elapsedMs=$elapsedMs firstTokenMs=$firstMs")
-                                appendLine("logicalDone=${logicalDone.get()} logicalDoneAt=${logicalDoneAt.get()}")
-                                appendLine("nativeTerminated=${nativeTerminated.get()} cancelTag='${cancelTag.get()}'")
-                                appendLine("lastDeltaMsAgo=$lastDeltaMsAgo lastEventMsAgo=$lastEventMsAgo")
-                                appendLine("chunks=${chunks.get()} capturedAll=${capturedAll.get()} out.len=${outText.length}")
-                                if (cause != null) {
-                                    appendLine("--- exception ---")
-                                    appendLine(Log.getStackTraceString(cause))
-                                }
-                                appendLine("=== OUTPUT (FULL) ===")
-                                append(outText)
-                                if (!capturedAll.get()) appendLine("\n... (output capture truncated by MAX_CAPTURE_CHARS)")
-                            }
-
-                            AiTrace.logLong(TAG, if (cause != null) Log.WARN else Log.DEBUG, "[$requestId] FINALIZE: $reason", stats)
-                            AiTrace.dumpToFile("litert", requestId, model.name, stats)
-                        }.invokeOnCompletion {
-                            // NOTE: Cancels logging only. Must not cancel postScope.
-                            logJob.cancel()
-                            Log.d(TAG, "[$requestId] finalizeOnce: logJob cancelled (reason='$reason')")
-                        }
-                    }
-
-                    fun closeOnce(reason: String, cause: Throwable? = null) {
-                        if (!closed.compareAndSet(false, true)) return
-
-                        finalizeOnce(reason, cause)
-
-                        runCatching { anchorScope.cancel(CancellationException("closeOnce: $reason")) }
-
-                        runCatching {
-                            if (cause != null) out.close(cause) else out.close()
-                        }
-                    }
-
-                    if (FORCE_REINIT.getAndSet(false)) {
-                        Log.w(TAG, "[$requestId] FORCE_REINIT=true -> safe reset before inference")
-
-                        runCatchingSuspend {
-                            runOnSlmThread {
-                                SLM.resetConversation(
-                                    model = model,
-                                    supportImage = supportImage,
-                                    supportAudio = supportAudio,
-                                    systemMessage = systemMessage,
-                                    tools = tools,
-                                )
-                            }
-                        }.onFailure { e ->
-                            Log.w(TAG, "[$requestId] pre-run resetConversation failed: ${e.message}", e)
-                        }
-
-                        runCatchingSuspend {
-                            runOnSlmThread {
-                                SLM.cleanUp(model) {
-                                    Log.d(TAG, "[$requestId] pre-run cleanUp done (force reinit)")
                                 }
                             }
-                        }.onFailure { e ->
-                            Log.w(TAG, "[$requestId] pre-run cleanUp failed: ${e.message}", e)
-                        }
-                    }
+                            val initMs = SystemClock.elapsedRealtime() - initT0
 
-                    val normalized = prompt.normalizePrompt()
-                    val escaped = escapeReservedTurnTokens(normalized)
-                    val cappedPrompt = capPromptIfNeeded(escaped, PROMPT_CHAR_CAP, PROMPT_KEEP_TAIL_CHARS)
-                    val promptSha = AiTrace.sha256Short(cappedPrompt)
-
-                    Log.d(TAG, "[$requestId] request start: model='${model.name}', prompt.len=${cappedPrompt.length}, sha=$promptSha, gateWaitMs=$gateWaitMs")
-                    AiTrace.logLong(TAG, Log.DEBUG, "[$requestId] PROMPT (FULL) sha=$promptSha", cappedPrompt)
-
-                    anchorScope.launch {
-                        while (isActive && !closed.get()) {
-                            val now = SystemClock.elapsedRealtime()
-                            val elapsed = now - startAt.get()
-                            val hasAnyToken = firstTokenAt.get() >= 0L
-
-                            if (elapsed >= HARD_WATCHDOG_MS) {
-                                val r = "hard-watchdog-timeout"
-                                Log.w(TAG, "[$requestId] $r (${elapsed}ms) -> cancel-only + close")
-                                requestCancelOnly(r)
-                                closeOnce(r)
-                                break
-                            }
-
-                            if (!hasAnyToken && elapsed >= FIRST_TOKEN_TIMEOUT_MS) {
-                                val r = "first-token-timeout"
-                                Log.w(TAG, "[$requestId] $r (${elapsed}ms) -> cancel-only + close")
-                                requestCancelOnly(r)
-                                closeOnce(r)
-                                break
-                            }
-
-                            if (hasAnyToken && !logicalDone.get()) {
-                                val stalled = now - lastEventAt.get()
-                                if (stalled >= EVENT_STALL_TIMEOUT_MS) {
-                                    val r = "event-stall-timeout"
-                                    Log.w(TAG, "[$requestId] $r (${stalled}ms) -> cancel-only + close")
-                                    requestCancelOnly(r)
-                                    closeOnce(r)
-                                    break
+                            when {
+                                initAttempt == null -> {
+                                    val msg = "SLM.initializeIfNeeded timed out after ${INIT_TIMEOUT_MS}ms (initMs=$initMs)"
+                                    Log.e(TAG, "[$requestId] $msg")
+                                    requestCancelOnly("init-timeout")
+                                    Companion.FORCE_REINIT.set(true)
+                                    closeOnce("init-timeout", RuntimeException(msg))
+                                }
+                                initAttempt.isFailure -> {
+                                    val e = initAttempt.exceptionOrNull()
+                                    Log.e(TAG, "[$requestId] initializeIfNeeded failed (initMs=$initMs): ${e?.message}", e)
+                                    requestCancelOnly("init-error")
+                                    Companion.FORCE_REINIT.set(true)
+                                    closeOnce("init-error", e ?: RuntimeException("init-error"))
+                                }
+                                else -> {
+                                    Log.d(TAG, "[$requestId] initializeIfNeeded ok (initMs=$initMs)")
                                 }
                             }
-
-                            if (logicalDone.get()) {
-                                val doneAt = logicalDoneAt.get()
-                                if (doneAt > 0L) {
-                                    val afterDone = now - doneAt
-                                    if (afterDone >= POST_DONE_TIMEOUT_MS) {
-                                        val r = "post-done-termination-timeout"
-                                        Log.w(TAG, "[$requestId] $r (${afterDone}ms) -> cancel-only + close + force reinit")
-                                        requestCancelOnly(r)
-                                        FORCE_REINIT.set(true)
-                                        closeOnce(r)
-                                        break
-                                    }
-                                }
-                            }
-
-                            delay(PROGRESS_POLL_MS)
+                        } else {
+                            Log.d(TAG, "[$requestId] appContext=null -> skip initializeIfNeeded (assume already initialized)")
                         }
-                    }
 
-                    val ctx = appContext
-                    if (ctx != null) {
-                        val initT0 = SystemClock.elapsedRealtime()
-                        val initAttempt: Result<Unit>? = withTimeoutOrNull(INIT_TIMEOUT_MS) {
-                            runCatchingSuspend {
+                        // Inference
+                        if (!closed.get()) {
+                            var msgCount = 0
+                            try {
                                 runOnSlmThread {
-                                    SLM.initializeIfNeeded(
-                                        context = ctx,
+                                    SLM.runInference(
                                         model = model,
-                                        supportImage = supportImage,
-                                        supportAudio = supportAudio,
-                                        systemMessage = systemMessage,
-                                        tools = tools,
+                                        input = cappedPrompt,
+                                        resultListener = { partial, done ->
+                                            if (closed.get()) return@runInference
+
+                                            markEvent()
+                                            msgCount++
+
+                                            val delta = normalizer.toDelta(partial)
+                                            if (delta.isNotEmpty()) {
+                                                appendOutput(delta)
+                                                out.trySend(delta)
+                                            }
+
+                                            if (DEBUG_STREAM && (msgCount == 1 || msgCount % DEBUG_STREAM_EVERY_N == 0)) {
+                                                val dPreview = delta.take(DEBUG_PREFIX_CHARS).replace("\n", "\\n")
+                                                val (outLen, outPreviewRaw) = snapshotForDebug(DEBUG_PREFIX_CHARS)
+                                                val sPreview = outPreviewRaw.replace("\n", "\\n")
+
+                                                Log.d(
+                                                    TAG,
+                                                    "stream[rid=$requestId msg#$msgCount] done=$done " +
+                                                            "deltaLen=${delta.length} outLen=$outLen " +
+                                                            "outPreview='$sPreview' deltaPreview='$dPreview'"
+                                                )
+                                            }
+
+                                            if (done) {
+                                                if (logicalDone.compareAndSet(false, true)) {
+                                                    logicalDoneAt.set(SystemClock.elapsedRealtime())
+                                                }
+                                                Log.d(TAG, "[$requestId] logical done=true (waiting native termination safe point)")
+                                            }
+                                        },
+                                        cleanUpListener = {
+                                            nativeTerminated.set(true)
+                                            markEvent()
+                                            Log.d(TAG, "[$requestId] cleanUpListener (native termination safe point)")
+
+                                            scheduleResetAfterSafepoint(tag = "native-terminated")
+                                            closeOnce("native-terminated")
+                                        },
+                                        onError = { message ->
+                                            if (closed.get()) return@runInference
+
+                                            markEvent()
+                                            val msg = message.trim()
+                                            val upper = msg.uppercase(Locale.US)
+
+                                            val isCancelled =
+                                                upper.contains("CANCELLED") ||
+                                                        upper.contains("CANCELED") ||
+                                                        msg.equals("Cancelled", ignoreCase = true)
+
+                                            val tag = cancelTag.get()
+
+                                            if (isCancelled && tag != null) {
+                                                Log.w(TAG, "[$requestId] onError(cancelled): '$msg' tag='$tag' -> close without exception")
+                                                closeOnce(tag)
+                                                return@runInference
+                                            }
+
+                                            Log.e(TAG, "[$requestId] onError: '$msg' -> force reinit next time")
+                                            Companion.FORCE_REINIT.set(true)
+                                            closeOnce("error", RuntimeException(msg))
+                                        }
                                     )
                                 }
+                            } catch (t: Throwable) {
+                                Log.e(TAG, "[$requestId] runInference threw: ${t.message}", t)
+                                Companion.FORCE_REINIT.set(true)
+                                closeOnce("exception", t)
                             }
                         }
-                        val initMs = SystemClock.elapsedRealtime() - initT0
-
-                        when {
-                            initAttempt == null -> {
-                                val msg = "SLM.initializeIfNeeded timed out after ${INIT_TIMEOUT_MS}ms (initMs=$initMs)"
-                                Log.e(TAG, "[$requestId] $msg")
-                                requestCancelOnly("init-timeout")
-                                FORCE_REINIT.set(true)
-                                closeOnce("init-timeout", RuntimeException(msg))
-                            }
-                            initAttempt.isFailure -> {
-                                val e = initAttempt.exceptionOrNull()
-                                Log.e(TAG, "[$requestId] initializeIfNeeded failed (initMs=$initMs): ${e?.message}", e)
-                                requestCancelOnly("init-error")
-                                FORCE_REINIT.set(true)
-                                closeOnce("init-error", e ?: RuntimeException("init-error"))
-                            }
-                            else -> {
-                                Log.d(TAG, "[$requestId] initializeIfNeeded ok (initMs=$initMs)")
-                            }
-                        }
-                    } else {
-                        Log.d(TAG, "[$requestId] appContext=null -> skip initializeIfNeeded (assume already initialized)")
-                    }
-
-                    if (!closed.get()) {
-                        var msgCount = 0
-                        try {
-                            runOnSlmThread {
-                                SLM.runInference(
-                                    model = model,
-                                    input = cappedPrompt,
-                                    resultListener = { partial, done ->
-                                        if (closed.get()) return@runInference
-
-                                        markEvent()
-                                        msgCount++
-
-                                        val delta = normalizer.toDelta(partial)
-                                        if (delta.isNotEmpty()) {
-                                            appendOutput(delta)
-                                            out.trySend(delta)
-                                        }
-
-                                        if (DEBUG_STREAM && (msgCount == 1 || msgCount % DEBUG_STREAM_EVERY_N == 0)) {
-                                            val dPreview = delta.take(DEBUG_PREFIX_CHARS).replace("\n", "\\n")
-                                            val (outLen, outPreviewRaw) = snapshotForDebug(DEBUG_PREFIX_CHARS)
-                                            val sPreview = outPreviewRaw.replace("\n", "\\n")
-
-                                            Log.d(
-                                                TAG,
-                                                "stream[rid=$requestId msg#$msgCount] done=$done " +
-                                                        "deltaLen=${delta.length} outLen=$outLen " +
-                                                        "outPreview='$sPreview' deltaPreview='$dPreview'"
-                                            )
-                                        }
-
-                                        if (done) {
-                                            if (logicalDone.compareAndSet(false, true)) {
-                                                logicalDoneAt.set(SystemClock.elapsedRealtime())
-                                            }
-                                            Log.d(TAG, "[$requestId] logical done=true (waiting native termination safe point)")
-                                        }
-                                    },
-                                    cleanUpListener = {
-                                        nativeTerminated.set(true)
-                                        markEvent()
-                                        Log.d(TAG, "[$requestId] cleanUpListener (native termination safe point)")
-
-                                        scheduleResetAfterSafepoint(tag = "native-terminated")
-                                        closeOnce("native-terminated")
-                                    },
-                                    onError = { message ->
-                                        if (closed.get()) return@runInference
-
-                                        markEvent()
-                                        val msg = message.trim()
-                                        val upper = msg.uppercase(Locale.US)
-
-                                        val isCancelled =
-                                            upper.contains("CANCELLED") ||
-                                                    upper.contains("CANCELED") ||
-                                                    msg.equals("Cancelled", ignoreCase = true)
-
-                                        val tag = cancelTag.get()
-
-                                        if (isCancelled && tag != null) {
-                                            Log.w(TAG, "[$requestId] onError(cancelled): '$msg' tag='$tag' -> close without exception")
-                                            closeOnce(tag)
-                                            return@runInference
-                                        }
-
-                                        Log.e(TAG, "[$requestId] onError: '$msg' -> force reinit next time")
-                                        FORCE_REINIT.set(true)
-                                        closeOnce("error", RuntimeException(msg))
-                                    }
-                                )
-                            }
-                        } catch (t: Throwable) {
-                            Log.e(TAG, "[$requestId] runInference threw: ${t.message}", t)
-                            FORCE_REINIT.set(true)
-                            closeOnce("exception", t)
-                        }
+                    } finally {
+                        gateActive.set(false)
                     }
                 }
             }
 
             awaitClose {
-                // callbackFlow awaitClose is NOT suspend. Only cancel jobs here.
-                driverJob.cancel(CancellationException("callbackFlow closed"))
-            }
-        }
-            .buffer(Channel.BUFFERED)
-            .flowOn(Dispatchers.Default)
-    }
+                // callbackFlow awaitClose is NOT suspend.
+                // Only do non-suspending coordination here.
 
-    /**
-     * Legacy version retained for reference.
-     * Consider deleting once the new request() is stable in production.
-     */
-    suspend fun request_old(prompt: String): Flow<String> {
-        return callbackFlow {
-            val out = this
-            val requestId = REQ_SEQ.incrementAndGet()
-            val gateReqAt = SystemClock.elapsedRealtime()
+                // If we are closing because *we* called out.close(), do NOT cancel the engine.
+                if (!internalClose.get()) {
+                    // Collector cancellation path.
+                    cancelTag.compareAndSet(null, "collector-cancelled")
 
-            // IMPORTANT: callbackFlow block is NOT suspend.
-            // Move all suspend work into a coroutine body.
-            val driverJob = launch(Dispatchers.Default) {
-                AI_INFERENCE_GATE.withPermit {
-                    val gateWaitMs = SystemClock.elapsedRealtime() - gateReqAt
-
-                    val anchorJob = SupervisorJob()
-                    val anchorScope = CoroutineScope(Dispatchers.Default + anchorJob)
-
-                    val finalizeJob = SupervisorJob()
-                    val finalizeScope = CoroutineScope(Dispatchers.IO + finalizeJob)
-
-                    val closed = AtomicBoolean(false)
-                    val finalized = AtomicBoolean(false)
-
-                    val startAt = AtomicLong(SystemClock.elapsedRealtime())
-                    val firstTokenAt = AtomicLong(-1L)
-                    val lastEventAt = AtomicLong(startAt.get())
-                    val lastDeltaAt = AtomicLong(startAt.get())
-
-                    val logicalDone = AtomicBoolean(false)
-                    val logicalDoneAt = AtomicLong(-1L)
-
-                    val cancelTag = AtomicReference<String?>(null)
-
-                    val chunks = AtomicLong(0L)
-                    val capturedAll = AtomicBoolean(true)
-
-                    val outLock = Any()
-                    val fullOut = StringBuilder(8 * 1024)
-
-                    val normalizer = LocalDeltaNormalizer(LocalDeltaNormalizer.Mode.AUTO)
-
-                    fun markEvent() {
-                        lastEventAt.set(SystemClock.elapsedRealtime())
-                    }
-
-                    fun appendOutput(delta: String) {
-                        if (delta.isEmpty()) return
-
-                        val now = SystemClock.elapsedRealtime()
-                        if (firstTokenAt.get() < 0L) firstTokenAt.compareAndSet(-1L, now)
-                        lastDeltaAt.set(now)
-
-                        chunks.incrementAndGet()
-
-                        val ok = synchronized(outLock) {
-                            AiTrace.capAppend(fullOut, delta)
-                        }
-                        if (!ok) capturedAll.set(false)
-                    }
-
-                    fun snapshotForDebug(prefixChars: Int): Pair<Int, String> {
-                        return synchronized(outLock) {
-                            val len = fullOut.length
-                            if (len <= 0) return@synchronized (0 to "")
-                            val end = minOf(len, prefixChars.coerceAtLeast(0))
-                            val preview =
-                                if (end == len && len <= prefixChars) fullOut.toString()
-                                else fullOut.substring(0, end)
-                            len to preview
-                        }
-                    }
-
-                    /**
-                     * Cancel request at most once per request.
-                     *
-                     * IMPORTANT:
-                     * - Do NOT call resetConversation/cleanUp from watchdog.
-                     * - Only request cancellation and wait for cleanUpListener (native safepoint).
-                     *
-                     * Runs cancel on the dedicated SLM thread to reduce JNI cross-thread risk.
-                     */
-                    fun requestCancel(tag: String) {
-                        if (!cancelTag.compareAndSet(null, tag)) return
-
-                        anchorScope.launch {
+                    // Only cancel if this request is actually the active one (inside the gate).
+                    if (gateActive.get() && cancelIssued.compareAndSet(false, true)) {
+                        repoScope.launch {
                             runCatchingSuspend {
                                 runOnSlmThread { SLM.cancel(model) }
                             }.onFailure { e ->
-                                Log.w(TAG, "[$requestId] cancel failed ($tag): ${e.message}", e)
+                                Log.w(TAG, "[$requestId] cancel failed (collector-cancelled): ${e.message}", e)
                             }
                         }
+                        Log.w(TAG, "[$requestId] awaitClose: collector cancelled -> SLM.cancel requested")
                     }
 
-                    fun finalizeOnce(reason: String, cause: Throwable? = null) {
-                        if (!finalized.compareAndSet(false, true)) return
-
-                        finalizeScope.launch {
-                            val now = SystemClock.elapsedRealtime()
-                            val elapsedMs = now - startAt.get()
-                            val firstMs =
-                                firstTokenAt.get().let { if (it < 0L) -1L else (it - startAt.get()) }
-                            val lastDeltaMsAgo = now - lastDeltaAt.get()
-                            val lastEventMsAgo = now - lastEventAt.get()
-
-                            val outText = synchronized(outLock) { fullOut.toString() }
-
-                            val stats = buildString {
-                                appendLine("=== AI TRACE STATS (LiteRtRepository request_old) ===")
-                                appendLine("rid=$requestId model='${model.name}' reason=$reason")
-                                appendLine("gateWaitMs=$gateWaitMs elapsedMs=$elapsedMs firstTokenMs=$firstMs")
-                                appendLine("logicalDone=${logicalDone.get()} logicalDoneAt=${logicalDoneAt.get()}")
-                                appendLine(
-                                    "lastDeltaMsAgo=$lastDeltaMsAgo lastEventMsAgo=$lastEventMsAgo cancelTag='${cancelTag.get()}'"
-                                )
-                                appendLine("chunks=${chunks.get()} capturedAll=${capturedAll.get()} out.len=${outText.length}")
-                                if (cause != null) {
-                                    appendLine("--- exception ---")
-                                    appendLine(Log.getStackTraceString(cause))
-                                }
-                                appendLine("=== OUTPUT (FULL) ===")
-                                append(outText)
-                                if (!capturedAll.get()) appendLine("\n... (output capture truncated by MAX_CAPTURE_CHARS)")
-                            }
-
-                            AiTrace.logLong(
-                                TAG,
-                                if (cause != null) Log.WARN else Log.DEBUG,
-                                "[$requestId] FINALIZE(old): $reason",
-                                stats
-                            )
-                            AiTrace.dumpToFile("litert_old", requestId, model.name, stats)
-                        }.invokeOnCompletion {
-                            finalizeJob.cancel()
-                        }
-                    }
-
-                    fun closeOnce(reason: String, cause: Throwable? = null) {
-                        if (!closed.compareAndSet(false, true)) return
-
-                        finalizeOnce(reason, cause)
-
-                        runCatching { anchorScope.cancel(CancellationException("closeOnce: $reason")) }
-
-                        runCatching {
-                            if (cause != null) out.close(cause) else out.close()
-                        }
-                    }
-
-                    val normalized = prompt.normalizePrompt()
-                    val escaped = escapeReservedTurnTokens(normalized)
-                    val cappedPrompt = capPromptIfNeeded(escaped, PROMPT_CHAR_CAP, PROMPT_KEEP_TAIL_CHARS)
-                    val promptSha = AiTrace.sha256Short(cappedPrompt)
-
-                    Log.d(
-                        TAG,
-                        "[$requestId] request_old start: model='${model.name}', prompt.len=${cappedPrompt.length}, sha=$promptSha, gateWaitMs=$gateWaitMs"
-                    )
-                    AiTrace.logLong(TAG, Log.DEBUG, "[$requestId] PROMPT(old) sha=$promptSha", cappedPrompt)
-
-                    anchorScope.launch {
-                        while (isActive && !closed.get()) {
-                            val now = SystemClock.elapsedRealtime()
-                            val elapsed = now - startAt.get()
-                            val hasAnyToken = firstTokenAt.get() >= 0L
-
-                            if (elapsed >= HARD_WATCHDOG_MS) {
-                                val r = "hard-watchdog-timeout"
-                                Log.w(TAG, "[$requestId] $r (${elapsed}ms) -> cancel/close")
-                                requestCancel(r)
-                                closeOnce(r)
-                                break
-                            }
-
-                            if (!hasAnyToken && elapsed >= FIRST_TOKEN_TIMEOUT_MS) {
-                                val r = "first-token-timeout"
-                                Log.w(TAG, "[$requestId] $r (${elapsed}ms) -> cancel/close")
-                                requestCancel(r)
-                                closeOnce(r)
-                                break
-                            }
-
-                            if (hasAnyToken && !logicalDone.get()) {
-                                val stalled = now - lastEventAt.get()
-                                if (stalled >= EVENT_STALL_TIMEOUT_MS) {
-                                    val r = "event-stall-timeout"
-                                    Log.w(TAG, "[$requestId] $r (${stalled}ms) -> cancel/close")
-                                    requestCancel(r)
-                                    closeOnce(r)
-                                    break
-                                }
-                            }
-
-                            if (logicalDone.get()) {
-                                val doneAt = logicalDoneAt.get()
-                                if (doneAt > 0L) {
-                                    val afterDone = now - doneAt
-                                    if (afterDone >= POST_DONE_TIMEOUT_MS) {
-                                        val r = "post-done-termination-timeout"
-                                        Log.w(TAG, "[$requestId] $r (${afterDone}ms) -> cancel/close")
-                                        requestCancel(r)
-                                        closeOnce(r)
-                                        break
-                                    }
-                                }
-                            }
-
-                            delay(PROGRESS_POLL_MS)
-                        }
-                    }
-
-                    val ctx = appContext
-                    if (ctx != null) {
-                        val initT0 = SystemClock.elapsedRealtime()
-                        val initAttempt: Result<Unit>? = withTimeoutOrNull(INIT_TIMEOUT_MS) {
-                            runCatchingSuspend {
-                                runOnSlmThread {
-                                    SLM.initializeIfNeeded(
-                                        context = ctx,
-                                        model = model,
-                                        supportImage = supportImage,
-                                        supportAudio = supportAudio,
-                                        systemMessage = systemMessage,
-                                        tools = tools,
-                                    )
-                                }
-                            }
-                        }
-                        val initMs = SystemClock.elapsedRealtime() - initT0
-
-                        when {
-                            initAttempt == null -> {
-                                val msg =
-                                    "SLM.initializeIfNeeded timed out after ${INIT_TIMEOUT_MS}ms (initMs=$initMs)"
-                                Log.e(TAG, "[$requestId] $msg")
-                                requestCancel("init-timeout")
-                                closeOnce("init-timeout", RuntimeException(msg))
-                            }
-
-                            initAttempt.isFailure -> {
-                                val e = initAttempt.exceptionOrNull()
-                                Log.e(TAG, "[$requestId] initializeIfNeeded failed (initMs=$initMs): ${e?.message}", e)
-                                requestCancel("init-error")
-                                closeOnce("init-error", e ?: RuntimeException("init-error"))
-                            }
-
-                            else -> {
-                                Log.d(TAG, "[$requestId] initializeIfNeeded ok (initMs=$initMs)")
-                            }
-                        }
-                    } else {
-                        Log.d(TAG, "[$requestId] appContext=null -> skip initializeIfNeeded (assume already initialized)")
-                    }
-
-                    if (!closed.get()) {
-                        var msgCount = 0
-
-                        try {
-                            runOnSlmThread {
-                                SLM.runInference(
-                                    model = model,
-                                    input = cappedPrompt,
-                                    resultListener = { partial, done ->
-                                        if (closed.get()) return@runInference
-
-                                        markEvent()
-                                        msgCount++
-
-                                        val delta = normalizer.toDelta(partial)
-                                        if (delta.isNotEmpty()) {
-                                            appendOutput(delta)
-
-                                            val r = out.trySend(delta)
-                                            if (r.isFailure && DEBUG_STREAM) {
-                                                Log.w(TAG, "[$requestId] out.trySend failed: ${r.exceptionOrNull()?.message}")
-                                            }
-                                        }
-
-                                        if (DEBUG_STREAM && (msgCount == 1 || msgCount % DEBUG_STREAM_EVERY_N == 0)) {
-                                            val dPreview = delta.take(DEBUG_PREFIX_CHARS).replace("\n", "\\n")
-                                            val (outLen, outPreviewRaw) = snapshotForDebug(DEBUG_PREFIX_CHARS)
-                                            val sPreview = outPreviewRaw.replace("\n", "\\n")
-
-                                            Log.d(
-                                                TAG,
-                                                "stream_old[rid=$requestId msg#$msgCount] done=$done " +
-                                                        "deltaLen=${delta.length} outLen=$outLen " +
-                                                        "outPreview='$sPreview' deltaPreview='$dPreview'"
-                                            )
-                                        }
-
-                                        if (done) {
-                                            if (logicalDone.compareAndSet(false, true)) {
-                                                logicalDoneAt.set(SystemClock.elapsedRealtime())
-                                            }
-                                            Log.d(TAG, "[$requestId] logical done=true (waiting native termination safe point)")
-                                        }
-                                    },
-                                    cleanUpListener = {
-                                        markEvent()
-                                        Log.d(TAG, "[$requestId] cleanUpListener (native termination safe point)")
-                                        closeOnce("native-terminated")
-                                    },
-                                    onError = { message ->
-                                        if (closed.get()) return@runInference
-
-                                        markEvent()
-                                        val msg = message.trim()
-                                        val upper = msg.uppercase(Locale.US)
-
-                                        val isCancelled =
-                                            upper.contains("CANCELLED") ||
-                                                    upper.contains("CANCELED") ||
-                                                    msg.equals("Cancelled", ignoreCase = true)
-
-                                        val tag = cancelTag.get()
-
-                                        if (isCancelled && tag != null) {
-                                            Log.w(TAG, "[$requestId] onError(cancelled): '$msg' tag='$tag' -> close without exception")
-                                            closeOnce(tag)
-                                            return@runInference
-                                        }
-
-                                        Log.e(TAG, "[$requestId] onError(old): '$msg'")
-                                        requestCancel("onError")
-                                        closeOnce("error", RuntimeException(msg))
-                                    }
-                                )
-                            }
-                        } catch (t: Throwable) {
-                            Log.e(TAG, "[$requestId] runInference(old) threw: ${t.message}", t)
-                            requestCancel("exception")
-                            closeOnce("exception", t)
-                        }
-                    }
+                    // IMPORTANT:
+                    // Only cancel the driver on collector-cancelled.
+                    // If internalClose=true (normal completion), cancelling driverJob here would
+                    // cancel post-safepoint cleanup (resetConversation) and produce noisy warnings.
+                    driverJob.cancel(CancellationException("callbackFlow closed"))
                 }
-            }
-
-            awaitClose {
-                // callbackFlow awaitClose is NOT suspend. Only cancel jobs here.
-                driverJob.cancel(CancellationException("callbackFlow closed"))
             }
         }
             .buffer(Channel.BUFFERED)

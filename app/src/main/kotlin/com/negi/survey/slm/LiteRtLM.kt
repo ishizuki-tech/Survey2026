@@ -97,6 +97,10 @@ private const val DEBUG_EXTRACT_EVERY_N = 64
 private val DEBUG_ERROR_THROWABLE: Boolean = BuildConfig.DEBUG
 private const val DEBUG_ERROR_STACK_LINES = 18
 
+/** RunState snapshot logging (safe + short). */
+private val DEBUG_STATE: Boolean = BuildConfig.DEBUG
+private const val DEBUG_STATE_EVERY_N = 1
+
 /**
  * Holder for a LiteRT-LM Engine and its active Conversation.
  *
@@ -188,6 +192,20 @@ object LiteRtLM {
     /** Allow host app to set context early. */
     fun setApplicationContext(context: Context) {
         appContextRef.set(context.applicationContext)
+    }
+
+    /**
+     * Render a safe log preview. Avoid dumping raw prompts to logcat.
+     *
+     * NOTE:
+     * - This is intentionally conservative (short, single-line).
+     */
+    private fun safeLogPreview(s: String, maxChars: Int = 48): String {
+        val t = s
+            .replace("\r", "")
+            .replace("\n", "\\n")
+            .trim()
+        return if (t.length <= maxChars) t else t.take(maxChars) + "…"
     }
 
     /**
@@ -513,6 +531,8 @@ object LiteRtLM {
 
         throw IllegalStateException("Unable to construct Contents for current LiteRT-LM SDK.")
     }
+
+    // ---- (extractRenderedText / delta logic) ----
 
     /**
      * Best-effort parse for debug strings like:
@@ -1122,6 +1142,24 @@ object LiteRtLM {
             .onFailure { t -> Log.w(TAG, "nativeDoneHook failed: key='$key' err=${t.message}", t) }
     }
 
+    /** Log a compact snapshot of RunState (debug only). */
+    private fun debugState(key: String, rs: RunState, prefix: String) {
+        if (!DEBUG_STATE) return
+        val rid = rs.runId.get()
+        val active = rs.active.get()
+        val term = rs.terminated.get()
+        val logical = rs.logicalDone.get()
+        val cancel = rs.cancelRequested.get()
+        val pending = rs.pendingCancel.get()
+        val lastMsg = rs.lastMessageAtMs.get()
+        val lastTerm = rs.lastTerminateAtMs.get()
+        Log.d(
+            TAG,
+            "state[$prefix] key='$key' runId=$rid active=$active terminated=$term logicalDone=$logical " +
+                    "cancel=$cancel pendingCancel=$pending lastMsgAt=$lastMsg lastTermAt=$lastTerm"
+        )
+    }
+
     /** Close and remove an instance NOW (best-effort). */
     private suspend fun closeInstanceNowBestEffort(key: String, reason: String) {
         cancelScheduledCleanup(key, "closeNow:$reason")
@@ -1484,11 +1522,17 @@ object LiteRtLM {
                         }
 
                         Log.e(TAG, "Hard-close watchdog firing: key='$key' elapsed=${elapsed}ms sinceMsg=${sinceMsg}ms")
+                        debugState(key, rs, "hardClose:firing")
 
                         // Serialize with session lifecycle ops to avoid racing with reset/init/close.
                         withSessionLock(key, reason = "hardClose:$reason") {
                             val inst: LiteRtLmInstance? = stateMutex.withLock {
                                 if (!rs.active.get()) return@withLock null
+
+                                // Clear related state to avoid stale defers/signals after emergency teardown.
+                                pendingAfterStream.remove(key)
+                                initSignals.remove(key)
+
                                 instances.remove(key)
                             }
 
@@ -1511,6 +1555,7 @@ object LiteRtLM {
                         }
 
                         Log.e(TAG, "Hard-close completed: key='$key'")
+                        debugState(key, rs, "hardClose:done")
                         return@launch
                     }
                 }
@@ -1672,7 +1717,11 @@ object LiteRtLM {
                     myRunId = rs.runId.incrementAndGet()
                     rs.terminated.set(false)
                     rs.logicalDone.set(false)
-                    rs.lastMessageAtMs.set(0L)
+
+                    // NOTE:
+                    // Set lastMessageAtMs to "now" so watchdog telemetry has a meaningful baseline.
+                    // Actual token arrival will update it again.
+                    rs.lastMessageAtMs.set(SystemClock.elapsedRealtime())
 
                     val preCancelled = rs.pendingCancel.getAndSet(false)
                     rs.cancelRequested.set(preCancelled)
@@ -1689,14 +1738,22 @@ object LiteRtLM {
 
                 if (reject != null || i == null || rs == null || conv == null) return@withSessionLock
 
+                debugState(key, rs, "run:start")
+
                 Log.d(
                     TAG,
                     "runInference start: key='$key' runId=$myRunId " +
                             "hasText=$hasText textLen=${trimmed.length} images=${images.size} audioClips=${audioClips.size}"
                 )
 
+                // IMPORTANT:
+                // These variables are touched by callback methods which may be invoked from different threads.
+                // We serialize them with a local lock to prevent delta corruption (duplicate/missing chunks).
+                val callbackLock = Any()
                 var emittedSoFar = ""
                 var msgCount = 0
+
+                val nativeStarted = AtomicBoolean(false)
 
                 suspend fun runDeferredActions() {
                     val deferred: List<() -> Unit> = stateMutex.withLock {
@@ -1725,11 +1782,31 @@ object LiteRtLM {
                     scheduleDeferredActions()
                 }
 
+                /**
+                 * Cancel the current process in a race-tolerant way.
+                 *
+                 * NOTE:
+                 * - Do not use a captured local Conversation reference, because reset/recovery may swap it.
+                 */
+                fun cancelProcessBestEffort(stage: String) {
+                    ioScope.launch {
+                        val convNow = stateMutex.withLock { instances[key]?.conversation }
+                        if (convNow == null) {
+                            Log.w(TAG, "cancelProcess skipped: conversation missing key='$key' stage='$stage'")
+                            return@launch
+                        }
+                        runCatching { convNow.cancelProcess() }
+                            .onFailure { t -> Log.w(TAG, "cancelProcess() failed: key='$key' stage='$stage' err=${t.message}", t) }
+                    }
+                }
+
                 var watchdog: Job? = null
-                var nativeStarted = false
 
                 fun deliverLogicalDoneOnce(errorMessage: String? = null, isCancel: Boolean = false) {
                     if (!rs.logicalDone.compareAndSet(false, true)) return
+
+                    if (DEBUG_STATE) debugState(key, rs, "logicalDone")
+
                     postToMain {
                         val cancelled = isCancel || rs.cancelRequested.get()
                         if (cancelled) {
@@ -1759,14 +1836,15 @@ object LiteRtLM {
                     deliverLogicalDoneOnce(errorMessage = errorMessage, isCancel = isCancel)
 
                     fireNativeDoneHookOnce(key)
+
+                    if (DEBUG_STATE) debugState(key, rs, "nativeDone")
                 }
 
                 fun requestLogicalCancel(reason: String) {
                     rs.cancelRequested.set(true)
                     deliverLogicalDoneOnce(errorMessage = reason, isCancel = true)
 
-                    runCatching { conv!!.cancelProcess() }
-                        .onFailure { t -> Log.w(TAG, "cancelProcess() failed: key='$key' err=${t.message}", t) }
+                    cancelProcessBestEffort(stage = "logicalCancel")
 
                     if (HARD_CLOSE_ENABLE) startHardCloseWatchdog(key, reason = "logicalCancel")
                 }
@@ -1785,15 +1863,15 @@ object LiteRtLM {
                     if (rs.terminated.get()) return@launch
 
                     Log.e(TAG, "Stream watchdog fired: key='$key' runId=$myRunId timeout=${STREAM_WATCHDOG_MS}ms")
+                    debugState(key, rs, "watchdog:fired")
 
                     deliverLogicalDoneOnce("Timeout: inference did not complete in ${STREAM_WATCHDOG_MS}ms")
 
-                    runCatching { conv!!.cancelProcess() }
-                        .onFailure { t -> Log.w(TAG, "cancelProcess() failed on watchdog: key='$key' err=${t.message}", t) }
+                    cancelProcessBestEffort(stage = "watchdog")
 
                     if (HARD_CLOSE_ENABLE) startHardCloseWatchdog(key, reason = "watchdog")
 
-                    if (!nativeStarted) markNativeDoneOnce("Timeout before native start")
+                    if (!nativeStarted.get()) markNativeDoneOnce("Timeout before native start")
                 }
 
                 val callback = object : MessageCallback {
@@ -1803,33 +1881,48 @@ object LiteRtLM {
                         if (rs.terminated.get()) return
                         if (rs.logicalDone.get() || rs.cancelRequested.get()) return
 
-                        rs.lastMessageAtMs.set(SystemClock.elapsedRealtime())
-                        msgCount++
+                        val now = SystemClock.elapsedRealtime()
+                        rs.lastMessageAtMs.set(now)
 
                         val snapshotRaw = extractRenderedText(message)
                         if (snapshotRaw.isEmpty()) return
 
-                        val (deltaRaw, nextEmitted) = computeDeltaSmart(emittedSoFar, snapshotRaw)
-                        emittedSoFar = nextEmitted
+                        var deltaRaw = ""
+                        var nextEmitted = ""
+
+                        synchronized(callbackLock) {
+                            msgCount++
+
+                            val pair = computeDeltaSmart(emittedSoFar, snapshotRaw)
+                            deltaRaw = pair.first
+                            nextEmitted = pair.second
+
+                            emittedSoFar = nextEmitted
+                        }
+
                         if (deltaRaw.isEmpty()) return
 
                         val delta = normalizeDeltaText(deltaRaw)
 
-                        if (DEBUG_STREAM && (msgCount == 1 || msgCount % DEBUG_STREAM_EVERY_N == 0)) {
-                            val lead = deltaRaw.firstOrNull()
-                            val leadInfo =
-                                if (lead == null) "null"
-                                else "U+${lead.code.toString(16).uppercase()} ws=${lead.isWhitespace()} ch='$lead'"
+                        if (DEBUG_STREAM) {
+                            val c: Int
+                            synchronized(callbackLock) { c = msgCount }
+                            if (c == 1 || c % DEBUG_STREAM_EVERY_N == 0) {
+                                val lead = deltaRaw.firstOrNull()
+                                val leadInfo =
+                                    if (lead == null) "null"
+                                    else "U+${lead.code.toString(16).uppercase()} ws=${lead.isWhitespace()} ch='$lead'"
 
-                            val dPreview = delta.take(DEBUG_PREFIX_CHARS).replace("\n", "\\n")
-                            val sPreview = snapshotRaw.take(DEBUG_PREFIX_CHARS).replace("\n", "\\n")
+                                val dPreview = delta.take(DEBUG_PREFIX_CHARS).replace("\n", "\\n")
+                                val sPreview = snapshotRaw.take(DEBUG_PREFIX_CHARS).replace("\n", "\\n")
 
-                            Log.d(
-                                TAG,
-                                "stream[key=$key runId=$myRunId] msg#$msgCount " +
-                                        "snapLen=${snapshotRaw.length} deltaLen=${delta.length} " +
-                                        "lead=$leadInfo snapPreview='$sPreview' deltaPreview='$dPreview' emittedLen=${emittedSoFar.length}"
-                            )
+                                Log.d(
+                                    TAG,
+                                    "stream[key=$key runId=$myRunId] msg#$c " +
+                                            "snapLen=${snapshotRaw.length} deltaLen=${delta.length} " +
+                                            "lead=$leadInfo snapPreview='$sPreview' deltaPreview='$dPreview' emittedLen=${nextEmitted.length}"
+                                )
+                            }
                         }
 
                         postToMain { resultListener(delta, false) }
@@ -1875,14 +1968,25 @@ object LiteRtLM {
                 // If the conversation was closed by a just-finished reset, recover once by recreating conversation.
                 try {
                     if (!hasMm) {
-                        Log.i(TAG, "LiteRT-LM 'conversation.sendMessageAsync' CALLED: trimmed='$trimmed'")
+                        if (BuildConfig.DEBUG) {
+                            Log.i(
+                                TAG,
+                                "LiteRT-LM sendMessageAsync(text): key='$key' runId=$myRunId len=${trimmed.length} preview='${safeLogPreview(trimmed)}'"
+                            )
+                        } else {
+                            Log.i(TAG, "LiteRT-LM sendMessageAsync(text): key='$key' runId=$myRunId len=${trimmed.length}")
+                        }
                         conv.sendMessageAsync(trimmed, callback)
                     } else {
+                        Log.i(
+                            TAG,
+                            "LiteRT-LM sendMessageAsync(mm): key='$key' runId=$myRunId textLen=${trimmed.length} images=${images.size} audio=${audioClips.size}"
+                        )
                         val contentList = buildContentList(input = trimmed, images = images, audioClips = audioClips)
                         val contentsObj = buildContentsObject(contentList)
                         conv.sendMessageAsync(contentsObj, callback)
                     }
-                    nativeStarted = true
+                    nativeStarted.set(true)
                 } catch (e: Exception) {
                     val recoverable = isConversationNotAliveError(e)
                     Log.e(TAG, "LiteRT-LM sendMessageAsync failed: key='$key' msg=${e.message}", e)
@@ -1936,7 +2040,7 @@ object LiteRtLM {
                                     }
                                 }.onSuccess {
                                     Log.w(TAG, "Recovery retry succeeded: key='$key' runId=$myRunId")
-                                    nativeStarted = true
+                                    nativeStarted.set(true)
                                 }.onFailure { e2 ->
                                     Log.e(TAG, "Recovery retry failed: key='$key' runId=$myRunId err=${e2.message}", e2)
                                     markNativeDoneOnce(cleanError(e2.message))
@@ -2062,6 +2166,8 @@ object LiteRtLM {
             } else {
                 rs.pendingCancel.set(true)
             }
+
+            if (DEBUG_STATE) debugState(key, rs, "cancel")
         }
     }
 }

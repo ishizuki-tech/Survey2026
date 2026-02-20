@@ -18,6 +18,7 @@ import android.app.ApplicationExitInfo
 import android.content.Context
 import android.os.Build
 import android.os.Bundle
+import android.os.Looper
 import android.os.Process
 import android.os.SystemClock
 import android.util.Log
@@ -121,6 +122,10 @@ object CrashCapture {
      */
     private val LOGCAT_MARKER = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
 
+    // -----------------------------------------------------------------------------
+    // Public API
+    // -----------------------------------------------------------------------------
+
     /**
      * Install (or re-wrap) the default uncaught exception handler.
      *
@@ -134,71 +139,65 @@ object CrashCapture {
      * - Enqueue uploads from Application.onCreate (or later) after WorkManager init is guaranteed.
      */
     fun install(context: Context) {
-        val root = runCatching { context.filesDir }.getOrNull()
-        if (root == null) {
-            Log.w(TAG, "install: context.filesDir unavailable; skipping install.")
-            return
-        }
+        installInternal(context = context, where = "install(legacy)")
+    }
 
-        filesDirRoot = root
-
-        val currentDefault = Thread.getDefaultUncaughtExceptionHandler()
-
-        // Create the handler once, then keep re-wrapping the delegate as needed.
-        val h = handler ?: synchronized(this) {
-            handler ?: CrashHandler(
-                filesDir = root,
-                capturing = capturing,
-                onHardKill = { hardKill() }
-            ).also { handler = it }
-        }
-
-        ensureDefaultHandlerInstalled(h, currentDefault)
-        Log.d(
-            TAG,
-            "install: ensured default handler. pid=${Process.myPid()} default=${describeHandler(Thread.getDefaultUncaughtExceptionHandler())}"
-        )
+    /**
+     * Install with a caller label.
+     *
+     * This helps identify unexpected re-installs (e.g., self-healing, receivers, SDK overrides).
+     */
+    fun install(context: Context, where: String) {
+        installInternal(context = context, where = where.ifBlank { "install(custom)" })
     }
 
     /**
      * Optional hardening: register lifecycle callbacks to periodically re-ensure the handler chain.
+     *
+     * A-Plan:
+     * - Keep this lightweight.
+     * - Avoid calling ensureInstalled() on multiple lifecycle events back-to-back.
+     * - Use an internal cooldown (ENSURE_COOLDOWN_MS) to prevent storms.
      */
     fun registerSelfHealing(application: Application) {
         if (!selfHealingRegistered.compareAndSet(false, true)) return
 
         application.registerActivityLifecycleCallbacks(object : Application.ActivityLifecycleCallbacks {
-            override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) {
-                ensureInstalled(activity)
-            }
-
-            override fun onActivityStarted(activity: Activity) {
-                ensureInstalled(activity)
-            }
 
             override fun onActivityResumed(activity: Activity) {
-                ensureInstalled(activity)
+                ensureInstalled(activity, where = "selfHeal:onActivityResumed")
             }
 
+            override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) = Unit
+            override fun onActivityStarted(activity: Activity) = Unit
             override fun onActivityPaused(activity: Activity) = Unit
             override fun onActivityStopped(activity: Activity) = Unit
             override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) = Unit
             override fun onActivityDestroyed(activity: Activity) = Unit
         })
 
-        Log.d(TAG, "registerSelfHealing: ActivityLifecycleCallbacks registered.")
+        Log.d(TAG, "registerSelfHealing: ActivityLifecycleCallbacks registered. mode=onResumedOnly")
     }
 
     /**
      * Ensure we are the default handler (best-effort) with a small cooldown.
      *
-     * Note: This only ensures handler installation; it does NOT enqueue WorkManager uploads.
+     * Note:
+     * - This only ensures handler installation; it does NOT enqueue WorkManager uploads.
      */
     fun ensureInstalled(context: Context) {
+        ensureInstalled(context = context, where = "ensureInstalled(legacy)")
+    }
+
+    /**
+     * Ensure installed with a caller label for debug.
+     */
+    fun ensureInstalled(context: Context, where: String) {
         val now = SystemClock.elapsedRealtime()
         val prev = lastEnsureAt.get()
         if (prev != 0L && (now - prev) in 0 until ENSURE_COOLDOWN_MS) return
         lastEnsureAt.set(now)
-        install(context)
+        installInternal(context = context, where = where.ifBlank { "ensureInstalled(custom)" })
     }
 
     /**
@@ -212,16 +211,42 @@ object CrashCapture {
      * IMPORTANT:
      * - This method touches WorkManager. Call it only after WorkManager is initialized
      *   (typically from Application.onCreate or later).
+     *
+     * HARDENING:
+     * - If called on the main thread, offload to a dedicated background thread to avoid startup jank / ANR.
      */
     fun enqueuePendingCrashUploadsIfPossible(context: Context) {
+        enqueuePendingCrashUploadsIfPossible(context = context, where = "enqueue(legacy)")
+    }
+
+    /**
+     * Enqueue with a caller label for debug.
+     *
+     * This is the key hook to identify who is calling enqueue twice within cooldown.
+     */
+    fun enqueuePendingCrashUploadsIfPossible(context: Context, where: String) {
+        // Offload heavy staging (logcat / IO) from main thread.
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            val appCtx = safeAppContext(context)
+            val label = where.ifBlank { "enqueue(main_offload)" }
+            Thread(
+                {
+                    runCatching { enqueuePendingCrashUploadsIfPossible(appCtx, "$label:bg") }
+                        .onFailure { e -> Log.w(TAG, "enqueue offload failed: ${e.message} where=$label", e) }
+                },
+                "CrashCapture-Enqueue"
+            ).apply { isDaemon = true }.start()
+            return
+        }
+
         val root = filesDirRoot ?: runCatching { context.filesDir }.getOrNull()
         if (root == null) {
-            Log.w(TAG, "enqueuePendingCrashUploadsIfPossible: filesDir unavailable; skipping.")
+            Log.w(TAG, "enqueuePendingCrashUploadsIfPossible: filesDir unavailable; skipping. where=$where")
             return
         }
 
         if (!enqueueing.compareAndSet(false, true)) {
-            Log.d(TAG, "enqueuePendingCrashUploadsIfPossible skipped (already running).")
+            Log.d(TAG, "enqueuePendingCrashUploadsIfPossible skipped (already running). where=$where")
             return
         }
 
@@ -230,12 +255,22 @@ object CrashCapture {
             val prev = lastEnqueueAt.get()
             val dt = now - prev
             if (prev != 0L && dt in 0 until ENQUEUE_COOLDOWN_MS) {
-                Log.d(TAG, "enqueuePendingCrashUploadsIfPossible skipped (cooldown). dt=${dt}ms")
+                Log.d(
+                    TAG,
+                    "enqueuePendingCrashUploadsIfPossible skipped (cooldown). dt=${dt}ms where=$where " +
+                            "thread=${Thread.currentThread().name}"
+                )
                 return
             }
             lastEnqueueAt.set(now)
 
             val appCtx = safeAppContext(context)
+
+            Log.d(
+                TAG,
+                "enqueuePendingCrashUploadsIfPossible enter where=$where pid=${Process.myPid()} " +
+                        "thread=${Thread.currentThread().name}"
+            )
 
             // 0) Stage previous-run artifacts BEFORE scanning the crash dir (no WorkManager dependency).
             val stagedExitPid = runCatching { stageLastExitInfoIfNeeded(appCtx, root) }
@@ -250,8 +285,14 @@ object CrashCapture {
                 .onFailure { e -> Log.w(TAG, "persistCurrentLogcatMarker failed: ${e.message}", e) }
 
             // 1) WorkManager availability check.
+            // Treat "not initialized yet" as a normal situation depending on init strategy.
             val wmOk = runCatching { WorkManager.getInstance(appCtx) }
-                .onFailure { e -> Log.e(TAG, "WorkManager not available/initialized: ${e.message}", e) }
+                .onFailure { e ->
+                    Log.w(
+                        TAG,
+                        "WorkManager not available yet; will retry on next enqueue call. where=$where err=${e.message}"
+                    )
+                }
                 .isSuccess
             if (!wmOk) return
 
@@ -273,7 +314,7 @@ object CrashCapture {
             Log.d(
                 TAG,
                 "Pending crash artifacts=${files.size} dir=${dir.absolutePath} " +
-                        "supabaseConfigured=$supabaseConfigured githubConfigured=${ghCfg != null}"
+                        "supabaseConfigured=$supabaseConfigured githubConfigured=${ghCfg != null} where=$where"
             )
 
             Log.d(
@@ -293,13 +334,13 @@ object CrashCapture {
                 .take(MAX_FILES_TO_ENQUEUE)
 
             if (!supabaseConfigured && ghCfg == null) {
-                Log.d(TAG, "No upload config found; crash artifacts will remain local.")
+                Log.d(TAG, "No upload config found; crash artifacts will remain local. where=$where")
                 return
             }
 
             // 2) GitHub mirror upload (copy files first to avoid Supabase delete race).
             if (ghCfg != null) {
-                Log.d(TAG, "Enqueuing GitHub crash uploads… (mirror-first)")
+                Log.d(TAG, "Enqueuing GitHub crash uploads… (mirror-first) where=$where")
                 targets.forEach { file ->
                     val mirror = runCatching { makeGitHubMirrorCopy(file, ghMirrorDir) }
                         .onFailure { e -> Log.w(TAG, "GitHub mirror copy failed: ${file.name} err=${e.message}", e) }
@@ -309,7 +350,7 @@ object CrashCapture {
                         val remoteRelativePath = mirror.name
                         Log.d(
                             TAG,
-                            "GitHub enqueue(file): name=${mirror.name} bytes=${mirror.length()} remote=$remoteRelativePath"
+                            "GitHub enqueue(file): name=${mirror.name} bytes=${mirror.length()} remote=$remoteRelativePath where=$where"
                         )
 
                         enqueueGitHubWorkerFileUpload(
@@ -324,9 +365,9 @@ object CrashCapture {
 
             // 3) Supabase upload for originals (preferred for cloud storage).
             if (supabaseConfigured) {
-                Log.d(TAG, "Enqueuing Supabase crash uploads… prefix=$SUPABASE_CRASH_PREFIX")
+                Log.d(TAG, "Enqueuing Supabase crash uploads… prefix=$SUPABASE_CRASH_PREFIX where=$where")
                 targets.forEach { file ->
-                    Log.d(TAG, "Supabase enqueue: name=${file.name} bytes=${file.length()} mtime=${file.lastModified()}")
+                    Log.d(TAG, "Supabase enqueue: name=${file.name} bytes=${file.length()} mtime=${file.lastModified()} where=$where")
                     SupabaseCrashUploadWorker.enqueueExistingCrash(
                         context = appCtx,
                         file = file,
@@ -340,12 +381,50 @@ object CrashCapture {
         }
     }
 
-    private fun ensureDefaultHandlerInstalled(h: CrashHandler, currentDefault: Thread.UncaughtExceptionHandler?) {
+    // -----------------------------------------------------------------------------
+    // Install internals
+    // -----------------------------------------------------------------------------
+
+    private fun installInternal(context: Context, where: String) {
+        val root = runCatching { context.filesDir }.getOrNull()
+        if (root == null) {
+            Log.w(TAG, "install: context.filesDir unavailable; skipping install. where=$where")
+            return
+        }
+
+        filesDirRoot = root
+
+        // Create the handler once, then keep re-wrapping the delegate as needed.
+        val h = handler ?: synchronized(this) {
+            handler ?: CrashHandler(
+                filesDir = root,
+                capturing = capturing,
+                onHardKill = { hardKill() }
+            ).also { handler = it }
+        }
+
+        ensureDefaultHandlerInstalled(h)
+
+        Log.d(
+            TAG,
+            "install: ensured default handler. where=$where pid=${Process.myPid()} " +
+                    "default=${describeHandler(Thread.getDefaultUncaughtExceptionHandler())}"
+        )
+    }
+
+    private fun ensureDefaultHandlerInstalled(h: CrashHandler) {
         val current = Thread.getDefaultUncaughtExceptionHandler()
         if (current === h) return
-        h.updateDelegate(currentDefault ?: current)
+
+        // Always delegate to what is currently installed (if any), avoiding self-loop.
+        h.updateDelegate(current)
+
         Thread.setDefaultUncaughtExceptionHandler(h)
     }
+
+    // -----------------------------------------------------------------------------
+    // Staging (previous process / previous session)
+    // -----------------------------------------------------------------------------
 
     /**
      * API 30+: Convert previous process exit reason into a staged crash artifact.
@@ -517,6 +596,10 @@ object CrashCapture {
         Log.d(TAG, "Persisted logcat marker for next run: $marker")
     }
 
+    // -----------------------------------------------------------------------------
+    // Mirror / file utils
+    // -----------------------------------------------------------------------------
+
     private fun makeGitHubMirrorCopy(src: File, mirrorDir: File): File {
         mirrorDir.mkdirs()
 
@@ -632,6 +715,10 @@ object CrashCapture {
         toDelete.forEach { f -> runCatching { f.delete() } }
     }
 
+    // -----------------------------------------------------------------------------
+    // Logcat capture
+    // -----------------------------------------------------------------------------
+
     private fun collectLogcatBytesCurrentPid(pid: Int, maxBytes: Int, maxMs: Long): ByteArray {
         val primary = listOf(
             "logcat", "-d",
@@ -732,6 +819,10 @@ object CrashCapture {
         }
     }
 
+    // -----------------------------------------------------------------------------
+    // GitHub enqueue
+    // -----------------------------------------------------------------------------
+
     /**
      * Build GitHub config for crash uploads.
      *
@@ -829,6 +920,10 @@ object CrashCapture {
         if (h == null) return "null"
         return "${h.javaClass.name}@${Integer.toHexString(System.identityHashCode(h))}"
     }
+
+    // -----------------------------------------------------------------------------
+    // Crash handler
+    // -----------------------------------------------------------------------------
 
     private class CrashHandler(
         private val filesDir: File,

@@ -34,6 +34,11 @@
  *   • StreamDeltaNormalizer: reduce false ACCUMULATED decisions on very short prefixes.
  *   • DEBUG_SLM follows BuildConfig.DEBUG (avoid noisy release logs).
  *   • Add isBusy(model) overload for compatibility with older call sites.
+ *
+ *  Fix (2026-02-19):
+ *   • Reflective suspend invocation MUST treat "invoked" as success even if return value is null
+ *     (Unit/void-like returns from Method.invoke()).
+ *   • Prevent double-execution due to "null == fallback" misclassification.
  * =====================================================================
  */
 
@@ -59,6 +64,7 @@ import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlin.math.min
 
 private const val TAG = "SLM"
 
@@ -740,18 +746,32 @@ private fun invokeLiteRtLmBestEffortUnit(
 }
 
 /**
+ * Result for reflective suspend invocation.
+ *
+ * NOTE:
+ * - invoked=true means we successfully located and invoked a compatible method.
+ * - value may be null for Unit/void-like returns.
+ */
+private data class SuspendInvokeResult(
+    val invoked: Boolean,
+    val value: Any?
+)
+
+/**
  * Call a LiteRtLM suspend function by name using reflection.
  *
- * The Kotlin suspend method is compiled as:
+ * Kotlin suspend is compiled as:
  *   fun foo(..., continuation: Continuation<T>): Any?
  *
- * Returns null if method not found (caller can fallback).
+ * IMPORTANT:
+ * - "Invoked" is the success criterion, NOT "value != null".
+ * - Method.invoke() may return null for Unit/void-like methods even on success.
  */
 private suspend fun invokeLiteRtLmBestEffortSuspend(
     methodName: String,
     argsNoCont: Array<Any?>,
     onFailLog: String,
-): Any? {
+): SuspendInvokeResult {
     val cls = LiteRtLM::class.java
     val candidates = buildArgCandidates(argsNoCont)
 
@@ -766,7 +786,7 @@ private suspend fun invokeLiteRtLmBestEffortSuspend(
                 if (outer.isCompleted) return
                 result.fold(
                     onSuccess = { v ->
-                        if (!outer.isCompleted) outer.resume(v)
+                        if (!outer.isCompleted) outer.resume(SuspendInvokeResult(invoked = true, value = v))
                     },
                     onFailure = { e ->
                         if (!outer.isCompleted) outer.resumeWithException(e)
@@ -774,8 +794,6 @@ private suspend fun invokeLiteRtLmBestEffortSuspend(
                 )
             }
         }
-
-        var invoked = false
 
         for (cand in candidates) {
             try {
@@ -799,11 +817,12 @@ private suspend fun invokeLiteRtLmBestEffortSuspend(
                 d { "invokeSuspend: picked ${m.signatureString()} (argc=${args.size})" }
                 val ret = m.invoke(receiver, *coercedArgs)
 
-                invoked = true
                 if (ret !== COROUTINE_SUSPENDED) {
-                    if (!outer.isCompleted) outer.resume(ret)
+                    if (!outer.isCompleted) {
+                        outer.resume(SuspendInvokeResult(invoked = true, value = ret))
+                    }
                 }
-                break
+                return@suspendCancellableCoroutine
             } catch (ite: InvocationTargetException) {
                 val root = ite.targetException ?: ite
                 w(root) { "$onFailLog (suspend target threw): name='$methodName' err=${root.message}" }
@@ -812,7 +831,7 @@ private suspend fun invokeLiteRtLmBestEffortSuspend(
             }
         }
 
-        if (!invoked && !outer.isCompleted) outer.resume(null)
+        if (!outer.isCompleted) outer.resume(SuspendInvokeResult(invoked = false, value = null))
     }
 }
 
@@ -914,12 +933,12 @@ object SLM {
         d { "initializeIfNeeded: model='${model.name}' image=$supportImage audio=$supportAudio" }
 
         try {
-            val ret = invokeLiteRtLmBestEffortSuspend(
+            val res = invokeLiteRtLmBestEffortSuspend(
                 methodName = "initializeIfNeeded",
                 argsNoCont = arrayOf(context, model, supportImage, supportAudio, systemMessage, tools),
                 onFailLog = "LiteRtLM.initializeIfNeeded unavailable",
             )
-            if (ret != null) return
+            if (res.invoked) return
         } catch (ce: CancellationException) {
             throw ce
         } catch (t: Throwable) {
@@ -1070,13 +1089,16 @@ object SLM {
 
         /** Try reflection suspend call first. */
         try {
-            val ret = invokeLiteRtLmBestEffortSuspend(
+            val res = invokeLiteRtLmBestEffortSuspend(
                 methodName = "generateText",
                 argsNoCont = arrayOf(model, input, images, audioClips, onPartial),
                 onFailLog = "LiteRtLM.generateText unavailable",
             )
-            val s = ret as? String
-            if (s != null) return s
+            if (res.invoked) {
+                val s = res.value as? String
+                if (s != null) return s
+                // invoked=true but no String => signature drift; fallback to streaming.
+            }
         } catch (ce: CancellationException) {
             throw ce
         } catch (t: Throwable) {

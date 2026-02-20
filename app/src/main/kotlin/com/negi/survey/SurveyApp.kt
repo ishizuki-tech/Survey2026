@@ -25,6 +25,7 @@ import androidx.work.WorkManager
 import com.negi.survey.slm.LiteRtLM
 import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Application bootstrap:
@@ -61,10 +62,11 @@ class SurveyApp : Application(), Configuration.Provider {
             return
         }
 
-        // CRITICAL: If WorkManagerInitializer is disabled, WorkManager is NOT auto-initialized.
-        // Initialize it manually as early as possible to prevent CrashCapture from crashing
-        // if it touches WorkManager during install.
-        ensureWorkManagerInitialized(where = "attachBaseContext")
+        // IMPORTANT:
+        // Do NOT initialize WorkManager here.
+        // Some devices/OS versions crash because WorkManager treats the context as null
+        // during early attachBaseContext phase.
+        Log.d(TAG, "Skipping WorkManager init in attachBaseContext; will init in onCreate.")
 
         // Install as early as possible to catch crashes during Application startup.
         // Do NOT force-enqueue pending uploads here; enqueue is done in onCreate.
@@ -98,7 +100,7 @@ class SurveyApp : Application(), Configuration.Provider {
             }
 
         // Ensure WorkManager is initialized (idempotent).
-        ensureWorkManagerInitialized(where = "onCreate")
+        ensureWorkManagerInitialized(where = "onCreate", ctx = this)
 
         // Re-wrap default handler in case any SDK replaced it after attachBaseContext().
         safeCrashInstall(where = "onCreate(rewrap)", context = this)
@@ -107,7 +109,7 @@ class SurveyApp : Application(), Configuration.Provider {
         safeRegisterSelfHealingOnce(this)
 
         // Enqueue pending crash uploads from previous run (best-effort).
-        // Also schedule a delayed retry to bypass cooldown edge cases.
+        // A-Plan: schedule delayed retry ONLY if the immediate call fails.
         safeEnqueuePendingUploadsWithRetryOnce(this)
     }
 
@@ -121,6 +123,7 @@ class SurveyApp : Application(), Configuration.Provider {
     override val workManagerConfiguration: Configuration
         get() = Configuration.Builder()
             .setMinimumLoggingLevel(Log.INFO)
+            .setDefaultProcessName(packageName)
             .build()
 
     /**
@@ -132,10 +135,13 @@ class SurveyApp : Application(), Configuration.Provider {
      * - Safe to call multiple times.
      * - Protects against concurrent init attempts using a lock.
      * - Re-attempts init if WorkManager is still not accessible.
+     * - NEVER assumes Application.getApplicationContext() is non-null during attachBaseContext().
      */
-    private fun ensureWorkManagerInitialized(where: String) {
+    private fun ensureWorkManagerInitialized(where: String, ctx: Context) {
+        val appCtx = ctx.applicationContext ?: ctx
+
         // Fast-path: if already accessible, do nothing.
-        if (isWorkManagerReady()) {
+        if (isWorkManagerReady(appCtx)) {
             Log.d(TAG, "WorkManager already ready. where=$where")
             return
         }
@@ -143,7 +149,7 @@ class SurveyApp : Application(), Configuration.Provider {
         // Prevent concurrent init attempts from different stages/threads.
         synchronized(workManagerInitLock) {
             // Re-check inside the lock (another caller may have initialized it).
-            if (isWorkManagerReady()) {
+            if (isWorkManagerReady(appCtx)) {
                 Log.d(TAG, "WorkManager became ready (after lock). where=$where")
                 return
             }
@@ -155,10 +161,8 @@ class SurveyApp : Application(), Configuration.Provider {
                 Log.d(TAG, "WorkManager init re-attempt begins. where=$where")
             }
 
-            // If initializer is disabled, we must initialize manually.
             runCatching {
-                // Use applicationContext to avoid edge-case context issues.
-                WorkManager.initialize(applicationContext, workManagerConfiguration)
+                WorkManager.initialize(appCtx, workManagerConfiguration)
                 Log.d(TAG, "WorkManager initialized manually. where=$where")
             }.onFailure { t ->
                 // If already initialized, WorkManager may throw. That's fine; we still verify readiness below.
@@ -166,7 +170,7 @@ class SurveyApp : Application(), Configuration.Provider {
             }
 
             // Final check (best-effort).
-            if (!isWorkManagerReady()) {
+            if (!isWorkManagerReady(appCtx)) {
                 Log.w(TAG, "WorkManager still not ready after init attempt. where=$where")
             }
         }
@@ -175,9 +179,9 @@ class SurveyApp : Application(), Configuration.Provider {
     /**
      * Returns true if WorkManager.getInstance() works without throwing.
      */
-    private fun isWorkManagerReady(): Boolean {
+    private fun isWorkManagerReady(ctx: Context): Boolean {
         return try {
-            WorkManager.getInstance(applicationContext)
+            WorkManager.getInstance(ctx)
             true
         } catch (_: IllegalStateException) {
             false
@@ -255,11 +259,13 @@ class SurveyApp : Application(), Configuration.Provider {
     }
 
     private fun safeCrashInstall(where: String, context: Context) {
+        val appCtx = context.applicationContext ?: context
+        val label = "SurveyApp:$where"
         runCatching {
-            CrashCapture.install(context)
-            Log.d(TAG, "CrashCapture installed: where=$where")
+            CrashCapture.install(appCtx, where = label)
+            Log.d(TAG, "CrashCapture installed: where=$label")
         }.onFailure { t ->
-            Log.w(TAG, "CrashCapture.install failed: where=$where msg=${t.message}", t)
+            Log.w(TAG, "CrashCapture.install failed: where=$label msg=${t.message}", t)
         }
     }
 
@@ -280,12 +286,15 @@ class SurveyApp : Application(), Configuration.Provider {
     }
 
     /**
-     * Enqueue pending crash uploads once, plus one delayed retry.
+     * Enqueue pending crash uploads once.
      *
-     * Why retry:
-     * - If an early enqueue happens before WM init, CrashCapture may record cooldown timing.
-     * - The immediate call in onCreate might get skipped due to cooldown.
-     * - A delayed retry (> cooldown) makes "next launch uploads" robust without tight coupling.
+     * A-plan change:
+     * - Do the immediate enqueue.
+     * - Schedule the delayed retry ONLY if the immediate call fails (throws).
+     *
+     * Rationale:
+     * - Avoid noisy double-enqueue on healthy boots.
+     * - Still recover from "WM not ready / early cooldown / transient" failures.
      */
     private fun safeEnqueuePendingUploadsWithRetryOnce(context: Context) {
         if (!enqueuePendingOnce.compareAndSet(false, true)) {
@@ -293,35 +302,48 @@ class SurveyApp : Application(), Configuration.Provider {
             return
         }
 
-        val appCtx = context.applicationContext
+        val appCtx = context.applicationContext ?: context
 
         // Ensure WM is initialized before enqueue (idempotent).
-        ensureWorkManagerInitialized(where = "enqueuePending(immediate)")
+        ensureWorkManagerInitialized(where = "enqueuePending(immediate)", ctx = appCtx)
 
         // 1) Immediate attempt
-        runCatching {
-            CrashCapture.enqueuePendingCrashUploadsIfPossible(appCtx)
+        val immediateOk = runCatching {
+            CrashCapture.enqueuePendingCrashUploadsIfPossible(appCtx, where = "SurveyApp:enqueuePending(immediate)")
+        }.onSuccess {
             Log.d(TAG, "CrashCapture pending uploads enqueued (immediate).")
+            lastEnqueueAtUptimeMs.set(android.os.SystemClock.uptimeMillis())
         }.onFailure { t ->
             Log.w(TAG, "CrashCapture.enqueuePendingCrashUploads(immediate) failed: ${t.message}", t)
-        }
+        }.isSuccess
 
-        // 2) Delayed retry to bypass cooldown / WM-init timing edge cases
-        if (enqueueRetryScheduled.compareAndSet(false, true)) {
-            Handler(Looper.getMainLooper()).postDelayed(
-                {
-                    // Ensure again (idempotent).
-                    ensureWorkManagerInitialized(where = "enqueuePending(delayed)")
+        // 2) Delayed retry ONLY if immediate failed
+        if (!immediateOk) {
+            if (enqueueRetryScheduled.compareAndSet(false, true)) {
+                val now = android.os.SystemClock.uptimeMillis()
+                val last = lastEnqueueAtUptimeMs.get()
+                val dt = if (last > 0L) now - last else -1L
+                Log.d(TAG, "Scheduling delayed enqueue retry because immediate failed. dtSinceLastAttemptMs=$dt")
 
-                    runCatching {
-                        CrashCapture.enqueuePendingCrashUploadsIfPossible(appCtx)
-                        Log.d(TAG, "CrashCapture pending uploads enqueued (delayed retry).")
-                    }.onFailure { t ->
-                        Log.w(TAG, "CrashCapture.enqueuePendingCrashUploads(delayed) failed: ${t.message}", t)
-                    }
-                },
-                ENQUEUE_RETRY_DELAY_MS
-            )
+                Handler(Looper.getMainLooper()).postDelayed(
+                    {
+                        ensureWorkManagerInitialized(where = "enqueuePending(delayed)", ctx = appCtx)
+
+                        runCatching {
+                            CrashCapture.enqueuePendingCrashUploadsIfPossible(appCtx, where = "SurveyApp:enqueuePending(delayed)")
+                            Log.d(TAG, "CrashCapture pending uploads enqueued (delayed retry).")
+                            lastEnqueueAtUptimeMs.set(android.os.SystemClock.uptimeMillis())
+                        }.onFailure { t ->
+                            Log.w(TAG, "CrashCapture.enqueuePendingCrashUploads(delayed) failed: ${t.message}", t)
+                        }
+                    },
+                    ENQUEUE_RETRY_DELAY_MS
+                )
+            } else {
+                Log.d(TAG, "Delayed enqueue retry already scheduled; skipping.")
+            }
+        } else {
+            Log.d(TAG, "Delayed enqueue retry not scheduled (immediate succeeded).")
         }
     }
 
@@ -333,7 +355,7 @@ class SurveyApp : Application(), Configuration.Provider {
     companion object {
         private const val TAG = "SurveyApp"
 
-        // Retry delay should exceed CrashCapture cooldown (~1200ms) with a small buffer.
+        // A-plan: retry exists but only used on immediate failure.
         private const val ENQUEUE_RETRY_DELAY_MS = 1600L
 
         // Process-level guards. These are static per-process.
@@ -346,5 +368,8 @@ class SurveyApp : Application(), Configuration.Provider {
         // WorkManager init guards.
         private val workManagerInitAttempted = AtomicBoolean(false)
         private val workManagerInitLock = Any()
+
+        // Debug: track when we last attempted to enqueue (uptime).
+        private val lastEnqueueAtUptimeMs = AtomicLong(0L)
     }
 }

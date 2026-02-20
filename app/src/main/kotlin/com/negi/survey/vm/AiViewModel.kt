@@ -16,6 +16,7 @@ package com.negi.survey.vm
 import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.negi.survey.BuildConfig
 import com.negi.survey.slm.FollowupExtractor
 import com.negi.survey.slm.PromptPhase
 import com.negi.survey.slm.Repository
@@ -77,6 +78,12 @@ class AiViewModel(
          * Stream is emitted in chunks of at least this many newly appended chars.
          */
         private const val STREAM_EMIT_MIN_DELTA_CHARS = 96
+
+        /** Logcat chunk size to avoid line truncation. */
+        private const val LOG_CHUNK = 3_200
+
+        /** Hard cap for long logs to avoid gigantic spam. */
+        private const val MAX_LONG_LOG_CHARS = 120_000
     }
 
     // ───────────────────────── UI state ─────────────────────────
@@ -377,10 +384,6 @@ class AiViewModel(
      * Conditional two-step:
      * 1) Run step1 with phase=EVAL.
      * 2) Only if [shouldRunSecond] returns true, build prompt2 from step1 result and run step2 with phase=FOLLOWUP.
-     *
-     * UI goal:
-     * - Keep Step1 pinned in primary UI state (score/raw/followups).
-     * - Append Step2 into [stepHistory] without overwriting Step1.
      */
     fun evaluateConditionalTwoStepAsync(
         firstPrompt: String,
@@ -448,11 +451,6 @@ class AiViewModel(
                     return@launch
                 }
 
-                /**
-                 * Prepare next step without clearing Step1 primary state.
-                 * - Step1 remains visible through score/raw/followups.
-                 * - Step2 streaming uses _stream.
-                 */
                 prepareUiForNextStep()
 
                 val runId2 = runSeq.incrementAndGet()
@@ -511,13 +509,6 @@ class AiViewModel(
         stopCurrentRunInternal(reason = "cleared", emitCancelledEvent = false, setCancelledError = false)
     }
 
-    /**
-     * Backward-compatible alias for older call sites.
-     *
-     * Prefer [resetStates] for new code.
-     *
-     * @param keepError Whether to preserve the last error string.
-     */
     @Deprecated(
         message = "Use resetStates(keepError) instead.",
         replaceWith = ReplaceWith("resetStates(keepError = keepError)")
@@ -571,6 +562,8 @@ class AiViewModel(
         var timedOut = false
         var lastStreamEmitLen = 0
 
+        val enableFullLogs = BuildConfig.DEBUG && DEBUG_LOGS
+
         fun isActiveRun(): Boolean = activeRunId.get() == runId
 
         fun maybeEmitStream(force: Boolean = false) {
@@ -621,9 +614,6 @@ class AiViewModel(
         var stepError: String? = null
 
         try {
-            // IMPORTANT: Use repo's PromptPhase directly (no ViewModel-local enum).
-            // Repository has a default buildPrompt(userPrompt, phase) that falls back to buildPrompt(userPrompt),
-            // so single-step remains compatible even if a repo does not override phase-specific behavior.
             val fullPrompt = runCatching { repo.buildPrompt(userPrompt, phase) }
                 .onFailure { t ->
                     Log.e(TAG, "run[$runId]: repo.buildPrompt failed; falling back to userPrompt", t)
@@ -639,13 +629,26 @@ class AiViewModel(
                 Log.d(TAG, "run[$runId]: sha(prompt)=${sha256Hex(userPrompt)} sha(full)=${sha256Hex(fullPrompt)}")
             }
 
-            // Make phase visible in a dedicated log tag for quick grep.
-            Log.i(FULL_PROMPT_TAG, "run[$runId]: phase=$phase FullPrompt=\n$fullPrompt")
+            if (enableFullLogs) {
+                logLong(
+                    tag = FULL_PROMPT_TAG,
+                    header = "run[$runId]: phase=$phase FullPrompt",
+                    body = fullPrompt,
+                    level = Log.INFO
+                )
+            }
 
             try {
                 withTimeout(timeoutMs) {
                     repo.request(fullPrompt).collect { part ->
-                        if (!isActiveRun()) return@collect
+                        /**
+                         * IMPORTANT:
+                         * If this run is no longer active, cancel collection immediately.
+                         * This ensures the upstream callbackFlow sees cancellation and triggers SLM.cancel().
+                         */
+                        if (!isActiveRun()) {
+                            throw CancellationException("stale-run")
+                        }
 
                         if (part.isNotEmpty()) {
                             chunkCount++
@@ -666,7 +669,6 @@ class AiViewModel(
                 stepError = "timeout"
                 if (DEBUG_LOGS) Log.w(TAG, "run[$runId]: timeout after ${timeoutMs}ms", e)
             } catch (e: CancellationException) {
-                // If this run is no longer active, just stop quietly.
                 if (!isActiveRun()) {
                     if (DEBUG_LOGS) Log.w(TAG, "run[$runId]: cancelled (stale run) -> stop quietly")
                     return EvalResult(runId = runId, raw = "", score = null, followups = emptyList(), timedOut = false)
@@ -685,7 +687,6 @@ class AiViewModel(
                 return EvalResult(runId = runId, raw = "", score = null, followups = emptyList(), timedOut = timedOut)
             }
 
-            // Ensure final stream emission.
             maybeEmitStream(force = true)
 
             val rawText = buf.toString().ifBlank { _stream.value }
@@ -758,10 +759,8 @@ class AiViewModel(
                 }
             }
 
-            // Reflect step-local error state to the global UI error flow.
             _error.value = stepError
 
-            // Always record history so UI can show both Step1 and Step2.
             appendStepSnapshot(
                 StepSnapshot(
                     runId = runId,
@@ -775,7 +774,6 @@ class AiViewModel(
                 )
             )
 
-            // Commit to primary UI state only when requested (keep Step1 pinned).
             if (commitToPrimaryState) {
                 _raw.value = rawText
                 _score.value = parsedScore
@@ -793,7 +791,15 @@ class AiViewModel(
                 TAG,
                 "run[$runId] done: phase=$phase mode=$mode score=$parsedScore FU[0]=${q0 ?: "<none>"} commit=$commitToPrimaryState err=${stepError ?: "<none>"}"
             )
-            Log.i(FULL_TEXT_OUT_TAG, "run[$runId]: RawTextOut=\n$rawText")
+
+            if (enableFullLogs) {
+                logLong(
+                    tag = FULL_TEXT_OUT_TAG,
+                    header = "run[$runId]: RawTextOut",
+                    body = rawText,
+                    level = Log.INFO
+                )
+            }
 
             return EvalResult(runId = runId, raw = rawText, score = parsedScore, followups = top3, timedOut = timedOut)
         } catch (e: CancellationException) {
@@ -814,7 +820,6 @@ class AiViewModel(
 
             val rawText = _stream.value
 
-            // Still record a snapshot for UI (partial/error).
             appendStepSnapshot(
                 StepSnapshot(
                     runId = runId,
@@ -842,11 +847,6 @@ class AiViewModel(
 
     // ───────────────────────── UI preparation ─────────────────────────
 
-    /**
-     * Prepare UI for a brand-new chain/run (clears primary state and optionally clears history).
-     *
-     * @param clearHistory True to clear [stepHistory].
-     */
     private fun prepareUiForNewChain(clearHistory: Boolean) {
         _loading.value = true
         _score.value = null
@@ -858,20 +858,12 @@ class AiViewModel(
         if (clearHistory) clearStepHistory()
     }
 
-    /**
-     * Prepare UI for the next step in a chain WITHOUT clearing Step1 primary state.
-     *
-     * Behavior:
-     * - Keeps _score/_raw/_followups/_followupQuestion intact.
-     * - Resets only streaming buffer and clears error.
-     */
     private fun prepareUiForNextStep() {
         _loading.value = true
         _stream.value = ""
         _error.value = null
     }
 
-    /** Finalize flags after an evaluation completes, but only if [runId] is still active. */
     private fun finalizeRunFlagsIfActive(runId: Long) {
         if (activeRunId.get() != runId) return
         _loading.value = false
@@ -880,7 +872,6 @@ class AiViewModel(
         activeRunId.set(0L)
     }
 
-    /** Finalize flags after a chained sequence completes. */
     private fun finalizeChainFlags() {
         _loading.value = false
         running.set(false)
@@ -888,13 +879,6 @@ class AiViewModel(
         activeRunId.set(0L)
     }
 
-    /**
-     * Stop current run (if any).
-     *
-     * @param reason For logs and optional error state.
-     * @param emitCancelledEvent Whether to emit [AiEvent.Cancelled].
-     * @param setCancelledError Whether to set error="cancelled".
-     */
     private fun stopCurrentRunInternal(
         reason: String,
         emitCancelledEvent: Boolean,
@@ -920,9 +904,6 @@ class AiViewModel(
         }
     }
 
-    /**
-     * Cancel an unexpected leftover job reference without touching [running]/[_loading].
-     */
     private fun cancelDanglingJobIfAny(reason: String) {
         val job = evalJob ?: return
         evalJob = null
@@ -950,7 +931,6 @@ class AiViewModel(
         bytes.joinToString("") { b -> "%02x".format(b.toInt() and 0xff) }
     }.getOrElse { "sha256_error" }
 
-    /** Convert whitespace/newlines/tabs to visible markers for logs. */
     private fun debugVisible(s: String): String {
         if (s.isEmpty()) return ""
         return buildString(s.length) {
@@ -968,11 +948,44 @@ class AiViewModel(
         }
     }
 
-    /** Safe preview for logs (avoid huge lines). */
     private fun preview(s: String): String {
         if (s.isEmpty()) return ""
         val n = min(DEBUG_PREVIEW_CHARS, s.length)
         return s.take(n)
+    }
+
+    /**
+     * Chunked log printer to reduce logcat truncation.
+     *
+     * Notes:
+     * - Never call this in production for sensitive payloads; caller should gate with BuildConfig.DEBUG.
+     */
+    private fun logLong(tag: String, header: String, body: String, level: Int) {
+        val trimmed = if (body.length > MAX_LONG_LOG_CHARS) {
+            body.take(MAX_LONG_LOG_CHARS) + "\n... (truncated)"
+        } else {
+            body
+        }
+
+        val full = buildString {
+            if (header.isNotBlank()) appendLine(header)
+            append(trimmed)
+        }
+
+        var i = 0
+        var part = 0
+        while (i < full.length) {
+            val end = min(full.length, i + LOG_CHUNK)
+            val slice = full.substring(i, end)
+            val prefix = "[part=${part.toString().padStart(3, '0')}] "
+            when (level) {
+                Log.ERROR -> Log.e(tag, prefix + slice)
+                Log.WARN -> Log.w(tag, prefix + slice)
+                else -> Log.i(tag, prefix + slice)
+            }
+            i = end
+            part++
+        }
     }
 }
 

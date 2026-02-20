@@ -25,6 +25,7 @@
  *  Robustness upgrades (this revision):
  *   • Validate graph node IDs (blank / duplicates after trim)
  *   • Validate startId exists
+ *   • Validate nextId references (fail fast at init)
  *   • Normalize NavBackStack root to match start node key
  *   • Warn on unknown node types
  * =====================================================================
@@ -143,6 +144,8 @@ open class SurveyViewModel(
         private const val KEY_ANSWER = "ANSWER"
         private const val KEY_NODE_ID = "NODE_ID"
         private const val KEY_EVAL_JSON = "EVAL_JSON"
+
+        private const val KEY_PREVIEW_LIMIT = 64
     }
 
     /**
@@ -783,7 +786,10 @@ open class SurveyViewModel(
         }
 
         if (!graph.containsKey(nextId)) {
-            throw IllegalStateException("nextId '$nextId' from node '${cur.id}' does not exist in graph.")
+            throw IllegalStateException(
+                "nextId '$nextId' from node '${cur.id}' does not exist in graph. " +
+                        "graphSize=${graph.size}, preview=${graph.keys.sorted().take(KEY_PREVIEW_LIMIT)}"
+            )
         }
 
         ensureQuestion(nextId)
@@ -792,7 +798,17 @@ open class SurveyViewModel(
 
     private fun nodeOf(id: String): Node {
         val k = id.trim()
-        return graph[k] ?: error("Node not found: id=$k (defined nodes=${graph.keys})")
+        return graph[k] ?: error(buildNodeNotFoundError(k))
+    }
+
+    private fun buildNodeNotFoundError(id: String): String {
+        val preview = graph.keys.sorted().take(KEY_PREVIEW_LIMIT)
+        return buildString {
+            append("Node not found: id='$id'. ")
+            append("graphSize=${graph.size}. ")
+            append("definedPreview=$preview")
+            if (graph.size > preview.size) append(" ...(truncated)")
+        }
     }
 
     private fun updateCanGoBack() {
@@ -885,6 +901,23 @@ open class SurveyViewModel(
 
         val dup = ids.groupingBy { it }.eachCount().filterValues { it > 1 }.keys
         require(dup.isEmpty()) { "Duplicate node IDs after trim: ${dup.sorted()}" }
+
+        val idSet = ids.toSet()
+        require(idSet.contains(startId)) {
+            "startId '$startId' does not exist in graph. graphSize=${idSet.size}, preview=${idSet.sorted().take(KEY_PREVIEW_LIMIT)}"
+        }
+
+        val missingNext = dtos.asSequence()
+            .mapNotNull { it.nextId?.trim() }
+            .filter { it.isNotBlank() }
+            .filter { !idSet.contains(it) }
+            .distinct()
+            .sorted()
+            .toList()
+
+        require(missingNext.isEmpty()) {
+            "Graph contains nextId references that do not exist: $missingNext"
+        }
     }
 
     /* ───────────────────────────── Initialization ───────────────────────────── */
@@ -896,10 +929,6 @@ open class SurveyViewModel(
         graph = dtos
             .associateBy { it.id.trim() }
             .mapValues { (_, dto) -> dto.toVmNode() }
-
-        require(graph.containsKey(startId)) {
-            "startId '$startId' does not exist in graph. defined=${graph.keys.take(64)}"
-        }
 
         val start = nodeOf(startId)
         ensureQuestion(start.id)
@@ -920,7 +949,7 @@ open class SurveyViewModel(
 
         Log.d(
             TAG,
-            "init -> ${start.id}, session=${_sessionId.value}, uuid=${_surveyUuid.value}, navSize=${nav.size}"
+            "init -> ${start.id}, session=${_sessionId.value}, uuid=${_surveyUuid.value}, navSize=${nav.size}, graphSize=${graph.size}"
         )
 
         if (DEBUG_PROMPTS) {
