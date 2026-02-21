@@ -23,9 +23,10 @@
  *  Fix (2026-02-20 hotfix):
  *  ---------------------------------------------------------------------
  *   • Avoid duplicate follow-up bubbles:
- *     - Persist/display follow-up question ONLY from Step2 (phase=FOLLOWUP) for TWO_STEP nodes.
- *     - For ONE_STEP nodes, persist/display follow-up from Step1 (phase=ONE_STEP).
- *     - If a step already displays follow-up as plain text bubble, do NOT add a second "fuq" bubble.
+ *     - TWO_STEP: persist/display follow-up ONLY from Step2 (phase=FOLLOWUP).
+ *     - ONE_STEP: persist/display follow-up from Step1 (phase=ONE_STEP).
+ *     - If the step bubble already displays the follow-up as plain text,
+ *       do NOT add a second "fuq" bubble.
  * =====================================================================
  */
 
@@ -377,7 +378,7 @@ fun AiScreen(
     // Step snapshots -> persisted chat
     // ---------------------------------------------------------------------
 
-    LaunchedEffect(stepHistory.size, contextKey) {
+    LaunchedEffect(stepHistory.size, contextKey, isTwoStepNode) {
         if (stepHistory.size < renderedStepCount) {
             renderedStepCount = 0
         }
@@ -471,8 +472,8 @@ fun AiScreen(
                         RuntimeLogStore.i(
                             TAG,
                             "Follow-up persisted (context=$contextKey node=$nid runId=${step.runId} " +
-                                    "phase=${step.phase} mode=${step.mode} twoStep=$isTwoStepNode " +
-                                    "len=${fuNorm.length} preview=${clipForLog(fuNorm, 120)} displayedAsPlain=$displayedAsPlain)"
+                                    "phase=${step.phase} twoStep=$isTwoStepNode mode=${step.mode} len=${fuNorm.length} " +
+                                    "preview=${clipForLog(fuNorm, 120)} displayedAsPlain=$displayedAsPlain)"
                         )
 
                         scope.launch {
@@ -487,8 +488,8 @@ fun AiScreen(
             RuntimeLogStore.d(
                 TAG,
                 "Step rendered (context=$contextKey node=$nid runId=${step.runId} phase=${step.phase} " +
-                        "mode=${step.mode} showJson=$showAsJson twoStep=$isTwoStepNode " +
-                        "rawLen=${stepRaw.length} followups=${step.followups.size} timedOut=${step.timedOut})"
+                        "mode=${step.mode} showJson=$showAsJson rawLen=${stepRaw.length} followups=${step.followups.size} " +
+                        "timedOut=${step.timedOut} twoStep=$isTwoStepNode)"
             )
         }
 
@@ -591,7 +592,8 @@ fun AiScreen(
 
         vmAI.appendUserMessage(contextKey, input)
 
-        val questionForTurn = if (isSubmittingMain) rootQuestion else conv.activePromptQuestion.ifBlank { rootQuestion }
+        val questionForTurn =
+            if (isSubmittingMain) rootQuestion else conv.activePromptQuestion.ifBlank { rootQuestion }
         val answerForTurn = input
 
         scope.launch {
@@ -661,7 +663,8 @@ fun AiScreen(
     // ---------------------------------------------------------------------
 
     val bgBrush = animatedMonotoneBackplate()
-    val title = if (conv.role == AiViewModel.ComposerRole.FOLLOWUP) "Follow-up • $nid" else "Question • $nid"
+    val title =
+        if (conv.role == AiViewModel.ComposerRole.FOLLOWUP) "Follow-up • $nid" else "Question • $nid"
 
     Scaffold(
         topBar = { CompactTopBar(title = title) },

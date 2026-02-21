@@ -121,14 +121,14 @@ object RuntimeLogStore {
 
     /**
      * Optional logcat mirroring:
-     * - OFF by default to preserve "app-owned log" semantics.
-     * - When enabled, RuntimeLogStore.* will also emit to Android logcat.
+     * - Disabled in release by default (privacy + noise).
+     * - Enabled in debug by default (developer ergonomics).
      *
      * Recommended usage:
      *   RuntimeLogStore.setLogcatMirrorEnabled(BuildConfig.DEBUG)
      */
     @Volatile
-    private var logcatMirrorEnabled: Boolean = true
+    private var logcatMirrorEnabled: Boolean = BuildConfig.DEBUG
 
     /**
      * Enable/disable logcat mirroring (independent from file logging).

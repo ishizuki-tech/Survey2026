@@ -79,6 +79,20 @@ object AppRingLogStore {
     }
 
     /**
+     * Returns the ring directory (best-effort).
+     *
+     * Notes:
+     * - This does NOT implicitly install the store (no segment selection, no header write).
+     * - It is safe to call even before [install]; callers may use it for discovery.
+     */
+    fun ringDir(context: Context): File {
+        val appCtx = context.applicationContext ?: context
+        val dir = File(appCtx.filesDir, DIR_REL)
+        runCatching { dir.mkdirs() }
+        return dir
+    }
+
+    /**
      * Install (initialize) the ring directory and pick a writable segment.
      *
      * Call early (Application.onCreate).
@@ -86,7 +100,7 @@ object AppRingLogStore {
     fun install(context: Context) {
         if (!installed.compareAndSet(false, true)) return
 
-        val dir = File(context.filesDir, DIR_REL)
+        val dir = ringDir(context)
         dir.mkdirs()
         rootDir = dir
 

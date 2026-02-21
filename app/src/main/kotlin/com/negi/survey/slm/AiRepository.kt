@@ -17,6 +17,7 @@ import android.content.Context
 import android.os.SystemClock
 import android.util.Log
 import com.google.ai.edge.litertlm.Message
+import com.negi.survey.AppRingLogStore
 import com.negi.survey.BuildConfig
 import com.negi.survey.config.SurveyConfig
 import com.negi.survey.net.RuntimeLogStore
@@ -32,7 +33,6 @@ import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.cancel
@@ -129,11 +129,21 @@ private object AiTrace {
     @Volatile
     private var appContext: Context? = null
 
-    /** Enables verbose prompt/output tracing. */
+    /** Enables verbose prompt/output tracing (FULL prompt/output). */
     private val ENABLED_DEFAULT: Boolean = BuildConfig.DEBUG
 
     @Volatile
     var enabled: Boolean = ENABLED_DEFAULT
+
+    /**
+     * Ring "meta" logging is safe to keep enabled because we log only non-sensitive metadata.
+     *
+     * Notes:
+     * - Do NOT log full prompt or full model output into ring.
+     * - Ring is intended for crash-time postmortem and may be uploaded.
+     */
+    @Volatile
+    var ringEnabled: Boolean = true
 
     /**
      * Install an application context for optional file dumps.
@@ -142,8 +152,15 @@ private object AiTrace {
      *   AiTrace.install(applicationContext)
      */
     fun install(context: Context) {
-        appContext = context.applicationContext
-        RuntimeLogStore.d(TAG, "Installed (enabled=$enabled)")
+        val ctx = context.applicationContext
+        appContext = ctx
+
+        // Ensure the app-owned ring logger is installed (idempotent).
+        runCatching { AppRingLogStore.install(ctx) }
+            .onFailure { e -> RuntimeLogStore.w(TAG, "AppRingLogStore.install failed (ignored): ${e.message}", e) }
+
+        RuntimeLogStore.d(TAG, "Installed (enabled=$enabled ringEnabled=$ringEnabled)")
+        ringD(TAG, "Installed (enabled=$enabled ringEnabled=$ringEnabled)")
     }
 
     /**
@@ -172,7 +189,10 @@ private object AiTrace {
     }
 
     /**
-     * Chunked logcat printer to avoid line truncation.
+     * Chunked log printer to avoid line truncation.
+     *
+     * Notes:
+     * - FULL payload printing (prompt/output) must be guarded by [enabled].
      */
     fun logLong(tag: String, level: Int, header: String, body: String) {
         if (!enabled) return
@@ -222,6 +242,30 @@ private object AiTrace {
         }.onFailure { e ->
             RuntimeLogStore.w(TAG, "dumpToFile failed: ${e.message}", e)
         }.getOrNull()
+    }
+
+    // ------------------------------------------------------------------
+    // Ring-safe meta logging (NO full prompt/output).
+    // ------------------------------------------------------------------
+
+    fun ringD(tag: String, message: String) {
+        if (!ringEnabled) return
+        AppRingLogStore.log("D", tag, message)
+    }
+
+    fun ringI(tag: String, message: String) {
+        if (!ringEnabled) return
+        AppRingLogStore.log("I", tag, message)
+    }
+
+    fun ringW(tag: String, message: String, tr: Throwable? = null) {
+        if (!ringEnabled) return
+        AppRingLogStore.log("W", tag, message, tr)
+    }
+
+    fun ringE(tag: String, message: String, tr: Throwable? = null) {
+        if (!ringEnabled) return
+        AppRingLogStore.log("E", tag, message, tr)
     }
 }
 
@@ -491,6 +535,7 @@ class LiteRtRepository(
         val ctx = appContext
         if (ctx == null) {
             RuntimeLogStore.w(TAG, "warmUp skipped: appContext=null")
+            AiTrace.ringW(TAG, "warmUp skipped: appContext=null")
             return
         }
 
@@ -519,13 +564,16 @@ class LiteRtRepository(
             when {
                 initAttempt == null -> {
                     RuntimeLogStore.w(TAG, "warmUp: initializeIfNeeded timed out (${INIT_TIMEOUT_MS}ms) gateWaitMs=$gateMs initMs=$initMs")
+                    AiTrace.ringW(TAG, "warmUp timeout initMs=$initMs gateWaitMs=$gateMs")
                 }
                 initAttempt.isFailure -> {
                     val e = initAttempt.exceptionOrNull()
                     RuntimeLogStore.w(TAG, "warmUp: initializeIfNeeded failed gateWaitMs=$gateMs initMs=$initMs err=${e?.message}", e)
+                    AiTrace.ringW(TAG, "warmUp init failed initMs=$initMs gateWaitMs=$gateMs err=${e?.message}", e)
                 }
                 else -> {
                     RuntimeLogStore.d(TAG, "warmUp: initializeIfNeeded ok gateWaitMs=$gateMs initMs=$initMs")
+                    AiTrace.ringD(TAG, "warmUp ok initMs=$initMs gateWaitMs=$gateMs")
                 }
             }
         }
@@ -577,10 +625,6 @@ class LiteRtRepository(
 
                         val normalizer = LocalDeltaNormalizer(LocalDeltaNormalizer.Mode.AUTO)
 
-                        fun markEvent() {
-                            lastEventAt.set(SystemClock.elapsedRealtime())
-                        }
-
                         fun appendOutput(delta: String) {
                             if (delta.isEmpty()) return
                             val now = SystemClock.elapsedRealtime()
@@ -613,16 +657,19 @@ class LiteRtRepository(
                                     runOnSlmThread { SLM.cancel(model) }
                                 }.onFailure { e ->
                                     RuntimeLogStore.w(TAG, "[$requestId] cancel failed ($tag): ${e.message}", e)
+                                    AiTrace.ringW(TAG, "[$requestId] cancel failed tag='$tag' err=${e.message}", e)
                                 }
                             }
 
                             RuntimeLogStore.w(TAG, "[$requestId] cancel requested: tag='$tag'")
+                            AiTrace.ringW(TAG, "[$requestId] cancel requested tag='$tag'")
                         }
 
                         fun scheduleResetAfterSafepoint(tag: String) {
                             // IMPORTANT: run on repoScope so it survives collector cancellation.
                             repoScope.launch(Dispatchers.IO) {
                                 RuntimeLogStore.d(TAG, "[$requestId] scheduleResetAfterSafepoint: begin (tag='$tag')")
+                                AiTrace.ringD(TAG, "[$requestId] resetConversation begin tag='$tag'")
 
                                 runCatchingSuspend {
                                     runOnSlmThread {
@@ -636,11 +683,14 @@ class LiteRtRepository(
                                     }
                                 }.onSuccess {
                                     RuntimeLogStore.d(TAG, "[$requestId] resetConversation ok (after safepoint, tag='$tag')")
+                                    AiTrace.ringD(TAG, "[$requestId] resetConversation ok tag='$tag'")
                                 }.onFailure { e ->
                                     if (e is CancellationException) {
                                         RuntimeLogStore.d(TAG, "[$requestId] resetConversation cancelled (after safepoint, tag='$tag'): ${e.message}")
+                                        AiTrace.ringW(TAG, "[$requestId] resetConversation cancelled tag='$tag' msg=${e.message}")
                                     } else {
                                         RuntimeLogStore.w(TAG, "[$requestId] resetConversation failed (after safepoint, tag='$tag'): ${e.message}", e)
+                                        AiTrace.ringW(TAG, "[$requestId] resetConversation failed tag='$tag' err=${e.message}", e)
                                     }
                                 }
 
@@ -658,6 +708,15 @@ class LiteRtRepository(
                                 val firstMs = firstTokenAt.get().let { if (it < 0L) -1L else (it - startAt.get()) }
                                 val lastDeltaMsAgo = now - lastDeltaAt.get()
                                 val lastEventMsAgo = now - lastEventAt.get()
+
+                                val outLen = synchronized(outLock) { fullOut.length }
+                                AiTrace.ringI(
+                                    TAG,
+                                    "[$requestId] finalize reason='$reason' elapsedMs=$elapsedMs firstTokenMs=$firstMs " +
+                                            "chunks=${chunks.get()} out.len=$outLen capturedAll=${capturedAll.get()} " +
+                                            "logicalDone=${logicalDone.get()} nativeTerminated=${nativeTerminated.get()} cancelTag='${cancelTag.get()}' " +
+                                            "lastDeltaMsAgo=$lastDeltaMsAgo lastEventMsAgo=$lastEventMsAgo"
+                                )
 
                                 val outText = synchronized(outLock) { fullOut.toString() }
 
@@ -696,6 +755,7 @@ class LiteRtRepository(
 
                         if (FORCE_REINIT.getAndSet(false)) {
                             RuntimeLogStore.w(TAG, "[$requestId] FORCE_REINIT=true -> safe reset before inference")
+                            AiTrace.ringW(TAG, "[$requestId] FORCE_REINIT=true -> pre-run reset+cleanup")
 
                             runCatchingSuspend {
                                 runOnSlmThread {
@@ -709,6 +769,7 @@ class LiteRtRepository(
                                 }
                             }.onFailure { e ->
                                 RuntimeLogStore.w(TAG, "[$requestId] pre-run resetConversation failed: ${e.message}", e)
+                                AiTrace.ringW(TAG, "[$requestId] pre-run resetConversation failed err=${e.message}", e)
                             }
 
                             runCatchingSuspend {
@@ -719,6 +780,7 @@ class LiteRtRepository(
                                 }
                             }.onFailure { e ->
                                 RuntimeLogStore.w(TAG, "[$requestId] pre-run cleanUp failed: ${e.message}", e)
+                                AiTrace.ringW(TAG, "[$requestId] pre-run cleanUp failed err=${e.message}", e)
                             }
                         }
 
@@ -732,6 +794,9 @@ class LiteRtRepository(
                         val promptSha = AiTrace.sha256Short(cappedPrompt)
 
                         RuntimeLogStore.d(TAG, "[$requestId] request start: model='${model.name}', prompt.len=${cappedPrompt.length}, sha=$promptSha, gateWaitMs=$gateWaitMs")
+                        AiTrace.ringD(TAG, "[$requestId] start model='${model.name}' prompt.len=${cappedPrompt.length} sha=$promptSha gateWaitMs=$gateWaitMs")
+
+                        // FULL prompt only in debug tracing mode.
                         AiTrace.logLong(TAG, Log.DEBUG, "[$requestId] PROMPT (FULL) sha=$promptSha", cappedPrompt)
 
                         // Watchdog
@@ -744,6 +809,7 @@ class LiteRtRepository(
                                 if (elapsed >= HARD_WATCHDOG_MS) {
                                     val r = "hard-watchdog-timeout"
                                     RuntimeLogStore.w(TAG, "[$requestId] $r (${elapsed}ms) -> cancel-only + close")
+                                    AiTrace.ringW(TAG, "[$requestId] $r elapsedMs=$elapsed -> cancel+close")
                                     requestCancelOnly(r)
                                     closeOnce(r)
                                     break
@@ -752,6 +818,7 @@ class LiteRtRepository(
                                 if (!hasAnyToken && elapsed >= FIRST_TOKEN_TIMEOUT_MS) {
                                     val r = "first-token-timeout"
                                     RuntimeLogStore.w(TAG, "[$requestId] $r (${elapsed}ms) -> cancel-only + close")
+                                    AiTrace.ringW(TAG, "[$requestId] $r elapsedMs=$elapsed -> cancel+close")
                                     requestCancelOnly(r)
                                     closeOnce(r)
                                     break
@@ -762,6 +829,7 @@ class LiteRtRepository(
                                     if (stalled >= EVENT_STALL_TIMEOUT_MS) {
                                         val r = "event-stall-timeout"
                                         RuntimeLogStore.w(TAG, "[$requestId] $r (${stalled}ms) -> cancel-only + close")
+                                        AiTrace.ringW(TAG, "[$requestId] $r stalledMs=$stalled -> cancel+close")
                                         requestCancelOnly(r)
                                         closeOnce(r)
                                         break
@@ -775,6 +843,7 @@ class LiteRtRepository(
                                         if (afterDone >= POST_DONE_TIMEOUT_MS) {
                                             val r = "post-done-termination-timeout"
                                             RuntimeLogStore.w(TAG, "[$requestId] $r (${afterDone}ms) -> cancel-only + close + force reinit")
+                                            AiTrace.ringW(TAG, "[$requestId] $r afterDoneMs=$afterDone -> cancel+close FORCE_REINIT")
                                             requestCancelOnly(r)
                                             FORCE_REINIT.set(true)
                                             closeOnce(r)
@@ -811,6 +880,7 @@ class LiteRtRepository(
                                 initAttempt == null -> {
                                     val msg = "SLM.initializeIfNeeded timed out after ${INIT_TIMEOUT_MS}ms (initMs=$initMs)"
                                     RuntimeLogStore.e(TAG, "[$requestId] $msg")
+                                    AiTrace.ringE(TAG, "[$requestId] init-timeout initMs=$initMs -> FORCE_REINIT")
                                     requestCancelOnly("init-timeout")
                                     FORCE_REINIT.set(true)
                                     closeOnce("init-timeout", RuntimeException(msg))
@@ -818,16 +888,19 @@ class LiteRtRepository(
                                 initAttempt.isFailure -> {
                                     val e = initAttempt.exceptionOrNull()
                                     RuntimeLogStore.e(TAG, "[$requestId] initializeIfNeeded failed (initMs=$initMs): ${e?.message}", e)
+                                    AiTrace.ringE(TAG, "[$requestId] init-error initMs=$initMs err=${e?.message} -> FORCE_REINIT", e)
                                     requestCancelOnly("init-error")
                                     FORCE_REINIT.set(true)
                                     closeOnce("init-error", e ?: RuntimeException("init-error"))
                                 }
                                 else -> {
                                     RuntimeLogStore.d(TAG, "[$requestId] initializeIfNeeded ok (initMs=$initMs)")
+                                    AiTrace.ringD(TAG, "[$requestId] init ok initMs=$initMs")
                                 }
                             }
                         } else {
                             RuntimeLogStore.d(TAG, "[$requestId] appContext=null -> skip initializeIfNeeded (assume already initialized)")
+                            AiTrace.ringW(TAG, "[$requestId] appContext=null -> skip initializeIfNeeded")
                         }
 
                         // Inference
@@ -849,7 +922,6 @@ class LiteRtRepository(
                                                 appendOutput(delta)
                                                 val sent = out.trySend(delta)
                                                 if (!sent.isSuccess) {
-                                                    // Channel already closed: treat as cancellation-like behavior.
                                                     requestCancelOnly("channel-closed")
                                                     closeOnce("channel-closed")
                                                     return@runInference
@@ -872,6 +944,7 @@ class LiteRtRepository(
                                             if (done) {
                                                 if (logicalDone.compareAndSet(false, true)) {
                                                     logicalDoneAt.set(SystemClock.elapsedRealtime())
+                                                    AiTrace.ringD(TAG, "[$requestId] logicalDone=true")
                                                 }
                                                 RuntimeLogStore.d(TAG, "[$requestId] logical done=true (waiting native termination safe point)")
                                             }
@@ -880,6 +953,7 @@ class LiteRtRepository(
                                             nativeTerminated.set(true)
                                             lastEventAt.set(SystemClock.elapsedRealtime())
                                             RuntimeLogStore.d(TAG, "[$requestId] cleanUpListener (native termination safe point)")
+                                            AiTrace.ringD(TAG, "[$requestId] native termination safe point -> reset+close")
 
                                             scheduleResetAfterSafepoint(tag = "native-terminated")
                                             closeOnce("native-terminated")
@@ -900,11 +974,13 @@ class LiteRtRepository(
 
                                             if (isCancelled && tag != null) {
                                                 RuntimeLogStore.w(TAG, "[$requestId] onError(cancelled): '$msg' tag='$tag' -> close without exception")
+                                                AiTrace.ringW(TAG, "[$requestId] onError(cancelled) tag='$tag'")
                                                 closeOnce(tag)
                                                 return@runInference
                                             }
 
                                             RuntimeLogStore.e(TAG, "[$requestId] onError: '$msg' -> force reinit next time")
+                                            AiTrace.ringE(TAG, "[$requestId] onError -> FORCE_REINIT msg='${msg.take(120)}'")
                                             FORCE_REINIT.set(true)
                                             closeOnce("error", RuntimeException(msg))
                                         }
@@ -912,6 +988,7 @@ class LiteRtRepository(
                                 }
                             } catch (t: Throwable) {
                                 RuntimeLogStore.e(TAG, "[$requestId] runInference threw: ${t.message}", t)
+                                AiTrace.ringE(TAG, "[$requestId] runInference threw err=${t.message} -> FORCE_REINIT", t)
                                 FORCE_REINIT.set(true)
                                 closeOnce("exception", t)
                             }
@@ -935,9 +1012,11 @@ class LiteRtRepository(
                                 runOnSlmThread { SLM.cancel(model) }
                             }.onFailure { e ->
                                 RuntimeLogStore.w(TAG, "[$requestId] cancel failed (collector-cancelled): ${e.message}", e)
+                                AiTrace.ringW(TAG, "[$requestId] cancel failed tag='collector-cancelled' err=${e.message}", e)
                             }
                         }
                         RuntimeLogStore.w(TAG, "[$requestId] awaitClose: collector cancelled -> SLM.cancel requested")
+                        AiTrace.ringW(TAG, "[$requestId] awaitClose: collector cancelled -> SLM.cancel requested")
                     }
 
                     driverJob.cancel(CancellationException("callbackFlow closed"))

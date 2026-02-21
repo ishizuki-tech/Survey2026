@@ -17,6 +17,7 @@ import android.os.SystemClock
 import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.negi.survey.AppRingLogStore
 import com.negi.survey.BuildConfig
 import com.negi.survey.net.RuntimeLogStore
 import com.negi.survey.slm.FollowupExtractor
@@ -74,8 +75,9 @@ class AiViewModel(
         private const val FULL_PROMPT_TAG = "FullPromptReview"
         private const val FULL_TEXT_OUT_TAG = "FullTextOut"
 
-        private const val DEBUG_LOGS = true
-        private const val DEBUG_WHITESPACE = true
+        /** Debug toggles (must NOT be const if referencing BuildConfig). */
+        private val DEBUG_LOGS: Boolean = BuildConfig.DEBUG
+        private val DEBUG_WHITESPACE: Boolean = BuildConfig.DEBUG
         private const val DEBUG_PREVIEW_CHARS = 240
 
         private const val DEFAULT_TIMEOUT_MS = 120_000L
@@ -100,6 +102,35 @@ class AiViewModel(
 
         /** Hard cap for long logs to avoid gigantic spam. */
         private const val MAX_LONG_LOG_CHARS = 120_000
+    }
+
+    // ───────────────────────── Logging bridge ─────────────────────────
+
+    /**
+     * Emit logs both to RuntimeLogStore (existing pipeline) and AppRingLogStore (crash-uploadable ring).
+     *
+     * Notes:
+     * - AppRingLogStore is a best-effort sink; if not installed yet, calls are no-ops.
+     * - Full prompt / full raw output logs must be gated by BuildConfig.DEBUG.
+     */
+    private fun logD(tag: String, msg: String) {
+        RuntimeLogStore.d(tag, msg)
+        AppRingLogStore.log("D", tag, msg)
+    }
+
+    private fun logI(tag: String, msg: String) {
+        RuntimeLogStore.i(tag, msg)
+        AppRingLogStore.log("I", tag, msg)
+    }
+
+    private fun logW(tag: String, msg: String, tr: Throwable? = null) {
+        if (tr != null) RuntimeLogStore.w(tag, msg, tr) else RuntimeLogStore.w(tag, msg)
+        AppRingLogStore.log("W", tag, msg, tr)
+    }
+
+    private fun logE(tag: String, msg: String, tr: Throwable? = null) {
+        if (tr != null) RuntimeLogStore.e(tag, msg, tr) else RuntimeLogStore.e(tag, msg)
+        AppRingLogStore.log("E", tag, msg, tr)
     }
 
     // ───────────────────────── UI state ─────────────────────────
@@ -198,7 +229,7 @@ class AiViewModel(
         }
         if (DEBUG_LOGS) {
             val fu0 = s.followups.firstOrNull()?.let { preview(it) } ?: "<none>"
-            RuntimeLogStore.d(
+            logD(
                 TAG,
                 "stepHistory+ runId=${s.runId} phase=${s.phase} mode=${s.mode} " +
                         "raw.len=${s.raw.length} score=${s.score} FU=${s.followups.size} " +
@@ -476,7 +507,7 @@ class AiViewModel(
                     chatStore.remove(evict)
                     conversationStore.remove(evict)
                     followupSeen.remove(evict)
-                    if (DEBUG_LOGS) RuntimeLogStore.d(TAG, "chatStore evicted contextKey='$evict'")
+                    if (DEBUG_LOGS) logD(TAG, "chatStore evicted contextKey='$evict'")
                 }
             }
         }
@@ -513,13 +544,13 @@ class AiViewModel(
 
     suspend fun evaluate(prompt: String, timeoutMs: Long = defaultTimeoutMs): Int? {
         if (prompt.isBlank()) {
-            RuntimeLogStore.i(TAG, "evaluate: blank prompt -> reset states and return null")
+            logI(TAG, "evaluate: blank prompt -> reset states and return null")
             resetStates(keepError = false)
             return null
         }
 
         if (!running.compareAndSet(false, true)) {
-            RuntimeLogStore.w(TAG, "evaluate: already running -> returning current score=${_score.value}")
+            logW(TAG, "evaluate: already running -> returning current score=${_score.value}")
             return _score.value
         }
 
@@ -543,7 +574,7 @@ class AiViewModel(
             job.join()
         }
 
-        RuntimeLogStore.d(TAG, "evaluate: finished in ${elapsed}ms, score=${_score.value}, err=${_error.value}")
+        logD(TAG, "evaluate: finished in ${elapsed}ms, score=${_score.value}, err=${_error.value}")
         return _score.value
     }
 
@@ -554,7 +585,7 @@ class AiViewModel(
         }
 
         if (!running.compareAndSet(false, true)) {
-            RuntimeLogStore.w(TAG, "evaluateAsync: already running -> returning existing job")
+            logW(TAG, "evaluateAsync: already running -> returning existing job")
             return evalJob ?: viewModelScope.launch { }
         }
 
@@ -591,7 +622,7 @@ class AiViewModel(
         }
 
         if (!running.compareAndSet(false, true)) {
-            RuntimeLogStore.w(TAG, "evaluateConditionalTwoStepAsync: already running -> returning existing job")
+            logW(TAG, "evaluateConditionalTwoStepAsync: already running -> returning existing job")
             return evalJob ?: viewModelScope.launch { }
         }
 
@@ -615,17 +646,17 @@ class AiViewModel(
                 )
 
                 if (step1.timedOut && !proceedOnTimeout) {
-                    if (DEBUG_LOGS) RuntimeLogStore.w(TAG, "chain2: step1 timed out -> skipping step2 (proceedOnTimeout=false)")
+                    if (DEBUG_LOGS) logW(TAG, "chain2: step1 timed out -> skipping step2 (proceedOnTimeout=false)")
                     return@launch
                 }
 
                 val doStep2 = runCatching { shouldRunSecond(step1) }
-                    .onFailure { t -> RuntimeLogStore.e(TAG, "chain2: shouldRunSecond failed -> treat as false", t) }
+                    .onFailure { t -> logE(TAG, "chain2: shouldRunSecond failed -> treat as false", t) }
                     .getOrElse { false }
 
                 if (!doStep2) {
                     if (DEBUG_LOGS) {
-                        RuntimeLogStore.d(
+                        logD(
                             TAG,
                             "chain2: step2 skipped (score=${step1.score}, followups=${step1.followups.size}, timedOut=${step1.timedOut}, rawPreview='${debugVisible(preview(step1.raw))}')"
                         )
@@ -635,11 +666,11 @@ class AiViewModel(
 
                 // --- step 2 (FOLLOWUP; JSON or raw text) ---
                 val p2 = runCatching { buildSecondPrompt(step1).trim() }
-                    .onFailure { t -> RuntimeLogStore.e(TAG, "chain2: buildSecondPrompt failed", t) }
+                    .onFailure { t -> logE(TAG, "chain2: buildSecondPrompt failed", t) }
                     .getOrElse { "" }
 
                 if (p2.isEmpty()) {
-                    if (DEBUG_LOGS) RuntimeLogStore.w(TAG, "chain2: step2 prompt is blank -> done")
+                    if (DEBUG_LOGS) logW(TAG, "chain2: step2 prompt is blank -> done")
                     return@launch
                 }
 
@@ -666,7 +697,7 @@ class AiViewModel(
     }
 
     fun cancel() {
-        RuntimeLogStore.i(TAG, "cancel: invoked (isRunning=${running.get()}, loading=${_loading.value})")
+        logI(TAG, "cancel: invoked (isRunning=${running.get()}, loading=${_loading.value})")
         stopCurrentRunInternal(reason = "cancelled", emitCancelledEvent = true, setCancelledError = true)
     }
 
@@ -692,7 +723,7 @@ class AiViewModel(
     }
 
     override fun onCleared() {
-        RuntimeLogStore.i(TAG, "onCleared: ViewModel is being cleared -> stopCurrentRunInternal()")
+        logI(TAG, "onCleared: ViewModel is being cleared -> stopCurrentRunInternal()")
         super.onCleared()
         stopCurrentRunInternal(reason = "cleared", emitCancelledEvent = false, setCancelledError = false)
     }
@@ -735,7 +766,7 @@ class AiViewModel(
         var timedOut = false
         var lastStreamEmitLen = 0
 
-        val enableFullLogs = true //BuildConfig.DEBUG && DEBUG_LOGS
+        val enableFullLogs = BuildConfig.DEBUG && DEBUG_LOGS
 
         fun isActiveRun(): Boolean = activeRunId.get() == runId
 
@@ -785,17 +816,17 @@ class AiViewModel(
         try {
             val fullPrompt = runCatching { repo.buildPrompt(userPrompt, phase) }
                 .onFailure { t ->
-                    RuntimeLogStore.e(TAG, "run[$runId]: repo.buildPrompt failed; falling back to userPrompt", t)
+                    logE(TAG, "run[$runId]: repo.buildPrompt failed; falling back to userPrompt", t)
                 }
                 .getOrElse { userPrompt }
 
             if (DEBUG_LOGS) {
-                RuntimeLogStore.d(
+                logD(
                     TAG,
                     "run[$runId]: mode=$mode phase=$phase commit=$commitToPrimaryState " +
                             "prompt.len=${userPrompt.length}, fullPrompt.len=${fullPrompt.length}, timeoutMs=$timeoutMs"
                 )
-                RuntimeLogStore.d(TAG, "run[$runId]: sha(prompt)=${sha256Hex(userPrompt)} sha(full)=${sha256Hex(fullPrompt)}")
+                logD(TAG, "run[$runId]: sha(prompt)=${sha256Hex(userPrompt)} sha(full)=${sha256Hex(fullPrompt)}")
             }
 
             if (enableFullLogs) {
@@ -823,7 +854,7 @@ class AiViewModel(
                             _events.tryEmit(AiEvent.Stream(part))
 
                             if (DEBUG_LOGS) {
-                                RuntimeLogStore.d(TAG, "run[$runId] chunk[$chunkCount].preview='${debugVisible(preview(part))}'")
+                                logD(TAG, "run[$runId] chunk[$chunkCount].preview='${debugVisible(preview(part))}'")
                             }
                         }
                     }
@@ -831,17 +862,17 @@ class AiViewModel(
             } catch (e: TimeoutCancellationException) {
                 timedOut = true
                 stepError = "timeout"
-                if (DEBUG_LOGS) RuntimeLogStore.w(TAG, "run[$runId]: timeout after ${timeoutMs}ms", e)
+                if (DEBUG_LOGS) logW(TAG, "run[$runId]: timeout after ${timeoutMs}ms", e)
             } catch (e: CancellationException) {
                 if (!isActiveRun()) {
-                    if (DEBUG_LOGS) RuntimeLogStore.w(TAG, "run[$runId]: cancelled (stale run) -> stop quietly")
+                    if (DEBUG_LOGS) logW(TAG, "run[$runId]: cancelled (stale run) -> stop quietly")
                     return EvalResult(runId = runId, raw = "", score = null, followups = emptyList(), timedOut = false)
                 }
 
                 if (looksLikeTimeout(e)) {
                     timedOut = true
                     stepError = "timeout"
-                    if (DEBUG_LOGS) RuntimeLogStore.w(TAG, "run[$runId]: timeout-like cancellation (${e.javaClass.name})")
+                    if (DEBUG_LOGS) logW(TAG, "run[$runId]: timeout-like cancellation (${e.javaClass.name})")
                 } else {
                     throw e
                 }
@@ -857,11 +888,11 @@ class AiViewModel(
             val rawTrim = rawText.trim()
 
             if (DEBUG_LOGS) {
-                RuntimeLogStore.d(TAG, "run[$runId] stats: chunks=$chunkCount, chars=$totalChars, raw.len=${rawText.length}")
-                RuntimeLogStore.d(TAG, "run[$runId] sha(raw)=${sha256Hex(rawText)}")
+                logD(TAG, "run[$runId] stats: chunks=$chunkCount, chars=$totalChars, raw.len=${rawText.length}")
+                logD(TAG, "run[$runId] sha(raw)=${sha256Hex(rawText)}")
             }
             if (DEBUG_LOGS && DEBUG_WHITESPACE) {
-                RuntimeLogStore.d(TAG, "run[$runId] rawVisible='${debugVisible(preview(rawText))}'")
+                logD(TAG, "run[$runId] rawVisible='${debugVisible(preview(rawText))}'")
             }
 
             val parsedScore: Int?
@@ -875,7 +906,7 @@ class AiViewModel(
                         top3 = emptyList()
                         q0 = null
                         if (DEBUG_LOGS) {
-                            RuntimeLogStore.w(
+                            logW(
                                 TAG,
                                 "run[$runId]: EVAL_JSON output is empty/trivial ('${debugVisible(preview(rawTrim))}') -> score=null, followups=0"
                             )
@@ -889,7 +920,7 @@ class AiViewModel(
                         q0 = top3.firstOrNull()
 
                         if (DEBUG_LOGS) {
-                            RuntimeLogStore.d(
+                            logD(
                                 TAG,
                                 "run[$runId]: EVAL_JSON parsed score=$parsedScore followups=${top3.size} fu0='${debugVisible(preview(q0.orEmpty()))}'"
                             )
@@ -912,7 +943,7 @@ class AiViewModel(
                     q0 = best
 
                     if (DEBUG_LOGS) {
-                        RuntimeLogStore.d(
+                        logD(
                             TAG,
                             "run[$runId]: FOLLOWUP parse " +
                                     "extractorQ='${debugVisible(preview(fromExtractor.orEmpty()))}' " +
@@ -951,7 +982,7 @@ class AiViewModel(
                 _events.tryEmit(AiEvent.Timeout)
             }
 
-            RuntimeLogStore.i(
+            logI(
                 TAG,
                 "run[$runId] done: phase=$phase mode=$mode score=$parsedScore FU[0]=${q0 ?: "<none>"} commit=$commitToPrimaryState err=${stepError ?: "<none>"}"
             )
@@ -970,7 +1001,7 @@ class AiViewModel(
             if (isActiveRun() && _error.value == "cancelled") {
                 _events.tryEmit(AiEvent.Cancelled)
             }
-            if (DEBUG_LOGS) RuntimeLogStore.w(TAG, "run[$runId]: cancelled", e)
+            if (DEBUG_LOGS) logW(TAG, "run[$runId]: cancelled", e)
             throw e
         } catch (t: Throwable) {
             if (!isActiveRun()) {
@@ -980,7 +1011,7 @@ class AiViewModel(
             val msg = t.message ?: "error"
             _error.value = msg
             _events.tryEmit(AiEvent.Error(msg))
-            RuntimeLogStore.e(TAG, "run[$runId]: error", t)
+            logE(TAG, "run[$runId]: error", t)
 
             val rawText = _stream.value
 
@@ -1057,7 +1088,7 @@ class AiViewModel(
 
         if (job != null) {
             runCatching { job.cancel(CancellationException(reason)) }
-                .onFailure { t -> RuntimeLogStore.w(TAG, "stopCurrentRunInternal: exception during cancel (ignored)", t) }
+                .onFailure { t -> logW(TAG, "stopCurrentRunInternal: exception during cancel (ignored)", t) }
         }
 
         _loading.value = false
@@ -1074,7 +1105,7 @@ class AiViewModel(
         activeRunId.set(-1L)
 
         runCatching { job.cancel(CancellationException(reason)) }
-            .onFailure { t -> RuntimeLogStore.w(TAG, "cancelDanglingJobIfAny: exception during cancel (ignored)", t) }
+            .onFailure { t -> logW(TAG, "cancelDanglingJobIfAny: exception during cancel (ignored)", t) }
     }
 
     // ───────────────────────── helpers ─────────────────────────
@@ -1122,7 +1153,7 @@ class AiViewModel(
      * Chunked log printer to reduce logcat truncation.
      *
      * Notes:
-     * - Never call this in production for sensitive payloads; caller should gate with BuildConfig.DEBUG.
+     * - Caller must gate sensitive payloads with BuildConfig.DEBUG.
      */
     private fun logLong(tag: String, header: String, body: String, level: Int) {
         val trimmed = if (body.length > MAX_LONG_LOG_CHARS) {
@@ -1143,9 +1174,9 @@ class AiViewModel(
             val slice = full.substring(i, end)
             val prefix = "[part=${part.toString().padStart(3, '0')}] "
             when (level) {
-                Log.ERROR -> RuntimeLogStore.e(tag, prefix + slice)
-                Log.WARN -> RuntimeLogStore.w(tag, prefix + slice)
-                else -> RuntimeLogStore.i(tag, prefix + slice)
+                Log.ERROR -> logE(tag, prefix + slice)
+                Log.WARN -> logW(tag, prefix + slice)
+                else -> logI(tag, prefix + slice)
             }
             i = end
             part++
