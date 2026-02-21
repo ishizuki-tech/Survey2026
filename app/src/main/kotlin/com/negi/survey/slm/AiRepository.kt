@@ -294,121 +294,6 @@ private object PromptDefaults {
 }
 
 /* ====================================================================== */
-/*  Stream normalization                                                   */
-/* ====================================================================== */
-
-/**
- * Normalizes a stream where callbacks may return:
- * - True deltas (only newly generated text)
- * - Snapshots (accumulated prefix, i.e., full text so far)
- *
- * AUTO strategy (robust):
- * - Primary: if incoming startsWith(emitted) => snapshot extension; emit suffix.
- * - Rewind: if emitted startsWith(incoming) => snapshot rewind; emit empty (no new text).
- * - Otherwise: choose between "delta" vs "divergent snapshot" using prefix overlap.
- *
- * Safety:
- * - If incoming diverges but shares a meaningful prefix, treat it as a snapshot and emit the suffix
- *   from the common prefix (best-effort).
- * - If overlap is weak, treat incoming as a delta and append it.
- */
-private class LocalDeltaNormalizer(
-    private val mode: Mode = Mode.AUTO
-) {
-
-    enum class Mode {
-        /** Always treat incoming as delta. */
-        DELTA,
-        /** Always treat incoming as snapshot (accumulated) and compute suffix. */
-        SNAPSHOT,
-        /** Detect snapshot vs delta at runtime (best-effort). */
-        AUTO
-    }
-
-    private val lock = Any()
-
-    /** Tracks what we've logically emitted so far (used for snapshot detection). */
-    private var emitted: String = ""
-
-    private fun commonPrefixLen(a: String, b: String): Int {
-        val n = kotlin.math.min(a.length, b.length)
-        var i = 0
-        while (i < n && a[i] == b[i]) i++
-        return i
-    }
-
-    fun toDelta(incomingRaw: String): String {
-        val incoming = incomingRaw
-        if (incoming.isEmpty()) return ""
-
-        return synchronized(lock) {
-            when (mode) {
-                Mode.DELTA -> {
-                    emitted += incoming
-                    incoming
-                }
-
-                Mode.SNAPSHOT -> {
-                    when {
-                        incoming.startsWith(emitted) -> {
-                            val delta = incoming.substring(emitted.length)
-                            emitted = incoming
-                            delta
-                        }
-                        emitted.startsWith(incoming) -> {
-                            // Snapshot rewind: no new text.
-                            ""
-                        }
-                        else -> {
-                            // Divergent snapshot: reset and emit full (best-effort).
-                            emitted = incoming
-                            incoming
-                        }
-                    }
-                }
-
-                Mode.AUTO -> {
-                    when {
-                        emitted.isEmpty() -> {
-                            emitted = incoming
-                            incoming
-                        }
-                        incoming.startsWith(emitted) -> {
-                            // Snapshot extension.
-                            val delta = incoming.substring(emitted.length)
-                            emitted = incoming
-                            delta
-                        }
-                        emitted.startsWith(incoming) -> {
-                            // Snapshot rewind: do not shrink emitted to avoid duplicating later.
-                            ""
-                        }
-                        else -> {
-                            val lcp = commonPrefixLen(emitted, incoming)
-
-                            // Heuristic: treat as snapshot if there's a decent shared prefix.
-                            // This helps when the backend returns slightly "drifty" snapshots.
-                            val minMeaningful = 32
-                            val isMeaningfulOverlap = lcp >= minMeaningful || (lcp >= incoming.length / 2 && incoming.length >= 64)
-
-                            if (isMeaningfulOverlap) {
-                                val delta = incoming.substring(lcp)
-                                emitted = incoming
-                                delta
-                            } else {
-                                // Treat as true delta.
-                                emitted += incoming
-                                incoming
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-/* ====================================================================== */
 /*  LiteRtLM backend                                                      */
 /* ====================================================================== */
 
@@ -701,7 +586,9 @@ class LiteRtRepository(
                         val outLock = Any()
                         val fullOut = StringBuilder(8 * 1024)
 
-                        val normalizer = LocalDeltaNormalizer(LocalDeltaNormalizer.Mode.AUTO)
+                        // IMPORTANT:
+                        // Use the shared StreamDeltaNormalizer from SLM.kt to avoid diverging logic.
+                        val normalizer = StreamDeltaNormalizer(StreamDeltaNormalizer.PartialMode.AUTO)
 
                         fun appendOutput(delta: String) {
                             if (delta.isEmpty()) return
@@ -774,6 +661,14 @@ class LiteRtRepository(
 
                                 RuntimeLogStore.d(TAG, "[$requestId] scheduleResetAfterSafepoint: end (tag='$tag')")
                             }
+                        }
+
+                        fun markForceReinit(reason: String) {
+                            // IMPORTANT:
+                            // We set FORCE_REINIT when we cannot trust we reached native termination safepoint.
+                            FORCE_REINIT.set(true)
+                            RuntimeLogStore.w(TAG, "[$requestId] FORCE_REINIT=true (reason='$reason')")
+                            AiTrace.ringW(TAG, "[$requestId] FORCE_REINIT=true reason='$reason'")
                         }
 
                         fun finalizeOnce(reason: String, cause: Throwable? = null) {
@@ -886,18 +781,20 @@ class LiteRtRepository(
 
                                 if (elapsed >= HARD_WATCHDOG_MS) {
                                     val r = "hard-watchdog-timeout"
-                                    RuntimeLogStore.w(TAG, "[$requestId] $r (${elapsed}ms) -> cancel-only + close")
-                                    AiTrace.ringW(TAG, "[$requestId] $r elapsedMs=$elapsed -> cancel+close")
+                                    RuntimeLogStore.w(TAG, "[$requestId] $r (${elapsed}ms) -> cancel-only + close + FORCE_REINIT")
+                                    AiTrace.ringW(TAG, "[$requestId] $r elapsedMs=$elapsed -> cancel+close FORCE_REINIT")
                                     requestCancelOnly(r)
+                                    markForceReinit(r)
                                     closeOnce(r)
                                     break
                                 }
 
                                 if (!hasAnyToken && elapsed >= FIRST_TOKEN_TIMEOUT_MS) {
                                     val r = "first-token-timeout"
-                                    RuntimeLogStore.w(TAG, "[$requestId] $r (${elapsed}ms) -> cancel-only + close")
-                                    AiTrace.ringW(TAG, "[$requestId] $r elapsedMs=$elapsed -> cancel+close")
+                                    RuntimeLogStore.w(TAG, "[$requestId] $r (${elapsed}ms) -> cancel-only + close + FORCE_REINIT")
+                                    AiTrace.ringW(TAG, "[$requestId] $r elapsedMs=$elapsed -> cancel+close FORCE_REINIT")
                                     requestCancelOnly(r)
+                                    markForceReinit(r)
                                     closeOnce(r)
                                     break
                                 }
@@ -906,9 +803,10 @@ class LiteRtRepository(
                                     val stalled = now - lastEventAt.get()
                                     if (stalled >= EVENT_STALL_TIMEOUT_MS) {
                                         val r = "event-stall-timeout"
-                                        RuntimeLogStore.w(TAG, "[$requestId] $r (${stalled}ms) -> cancel-only + close")
-                                        AiTrace.ringW(TAG, "[$requestId] $r stalledMs=$stalled -> cancel+close")
+                                        RuntimeLogStore.w(TAG, "[$requestId] $r (${stalled}ms) -> cancel-only + close + FORCE_REINIT")
+                                        AiTrace.ringW(TAG, "[$requestId] $r stalledMs=$stalled -> cancel+close FORCE_REINIT")
                                         requestCancelOnly(r)
+                                        markForceReinit(r)
                                         closeOnce(r)
                                         break
                                     }
@@ -920,10 +818,10 @@ class LiteRtRepository(
                                         val afterDone = now - doneAt
                                         if (afterDone >= POST_DONE_TIMEOUT_MS) {
                                             val r = "post-done-termination-timeout"
-                                            RuntimeLogStore.w(TAG, "[$requestId] $r (${afterDone}ms) -> cancel-only + close + force reinit")
+                                            RuntimeLogStore.w(TAG, "[$requestId] $r (${afterDone}ms) -> cancel-only + close + FORCE_REINIT")
                                             AiTrace.ringW(TAG, "[$requestId] $r afterDoneMs=$afterDone -> cancel+close FORCE_REINIT")
                                             requestCancelOnly(r)
-                                            FORCE_REINIT.set(true)
+                                            markForceReinit(r)
                                             closeOnce(r)
                                             break
                                         }
@@ -960,7 +858,7 @@ class LiteRtRepository(
                                     RuntimeLogStore.e(TAG, "[$requestId] $msg")
                                     AiTrace.ringE(TAG, "[$requestId] init-timeout initMs=$initMs -> FORCE_REINIT")
                                     requestCancelOnly("init-timeout")
-                                    FORCE_REINIT.set(true)
+                                    markForceReinit("init-timeout")
                                     closeOnce("init-timeout", RuntimeException(msg))
                                 }
                                 initAttempt.isFailure -> {
@@ -968,7 +866,7 @@ class LiteRtRepository(
                                     RuntimeLogStore.e(TAG, "[$requestId] initializeIfNeeded failed (initMs=$initMs): ${e?.message}", e)
                                     AiTrace.ringE(TAG, "[$requestId] init-error initMs=$initMs err=${e?.message} -> FORCE_REINIT", e)
                                     requestCancelOnly("init-error")
-                                    FORCE_REINIT.set(true)
+                                    markForceReinit("init-error")
                                     closeOnce("init-error", e ?: RuntimeException("init-error"))
                                 }
                                 else -> {
@@ -1001,6 +899,8 @@ class LiteRtRepository(
                                                 val sent = out.trySend(delta)
                                                 if (!sent.isSuccess) {
                                                     requestCancelOnly("channel-closed")
+                                                    // Channel close means we may not see native termination safepoint.
+                                                    markForceReinit("channel-closed")
                                                     closeOnce("channel-closed")
                                                     return@runInference
                                                 }
@@ -1057,9 +957,9 @@ class LiteRtRepository(
                                                 return@runInference
                                             }
 
-                                            RuntimeLogStore.e(TAG, "[$requestId] onError: '$msg' -> force reinit next time")
+                                            RuntimeLogStore.e(TAG, "[$requestId] onError: '$msg' -> FORCE_REINIT")
                                             AiTrace.ringE(TAG, "[$requestId] onError -> FORCE_REINIT msg='${msg.take(120)}'")
-                                            FORCE_REINIT.set(true)
+                                            markForceReinit("onError")
                                             closeOnce("error", RuntimeException(msg))
                                         }
                                     )
@@ -1067,7 +967,7 @@ class LiteRtRepository(
                             } catch (t: Throwable) {
                                 RuntimeLogStore.e(TAG, "[$requestId] runInference threw: ${t.message}", t)
                                 AiTrace.ringE(TAG, "[$requestId] runInference threw err=${t.message} -> FORCE_REINIT", t)
-                                FORCE_REINIT.set(true)
+                                markForceReinit("exception")
                                 closeOnce("exception", t)
                             }
                         }
