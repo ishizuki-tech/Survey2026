@@ -5,7 +5,7 @@
  *  File: SLM.kt
  *  Author: Shu Ishizuki (石附 支)
  *  License: MIT License
- *  © 2025 IshizukiTech LLC. All rights reserved.
+ *  © 2026 IshizukiTech LLC. All rights reserved.
  * =====================================================================
  *
  *  Summary:
@@ -69,6 +69,7 @@ private const val TAG = "SLM"
 
 /** Toggle facade logs (safe to keep enabled in dev builds). */
 private val DEBUG_SLM: Boolean = BuildConfig.DEBUG
+
 /**
  * Hardware accelerator options for inference (CPU or GPU).
  */
@@ -467,26 +468,14 @@ private fun boxedOfPrimitive(p: Class<*>): Class<*>? {
     }
 }
 
-/**
- * Try to coerce an argument to match the parameter type.
- *
- * Supports:
- * - Number widening/narrowing to required primitive/boxed types
- * - Function0 -> Runnable
- * - Function1 -> java.util.function.Consumer (best-effort)
- */
 @Suppress("UNCHECKED_CAST")
 private fun coerceArgForParam(param: Class<*>, arg: Any?): Any? {
     if (arg == null) return null
-
-    /** Direct instance match. */
     if (param.isInstance(arg)) return arg
 
-    /** Primitive params accept boxed instances. */
     val boxed = boxedOfPrimitive(param)
     if (boxed != null && boxed.isInstance(arg)) return arg
 
-    /** Numeric coercions. */
     val intP = Int::class.javaPrimitiveType
     val longP = Long::class.javaPrimitiveType
     val floatP = Float::class.javaPrimitiveType
@@ -520,12 +509,10 @@ private fun coerceArgForParam(param: Class<*>, arg: Any?): Any? {
         }
     }
 
-    /** Function0 -> Runnable. */
     if (param == Runnable::class.java && arg is Function0<*>) {
         return Runnable { arg.invoke() }
     }
 
-    /** Function1 -> Consumer (best-effort). */
     if (param.name == "java.util.function.Consumer" && arg is Function1<*, *>) {
         return runCatching {
             val f = arg as Function1<Any?, Any?>
@@ -547,9 +534,6 @@ private fun coerceArgForParam(param: Class<*>, arg: Any?): Any? {
     return arg
 }
 
-/**
- * Score a (param,arg) match for selecting the "best" overload.
- */
 private fun scoreParamMatch(param: Class<*>, arg: Any?): Int {
     if (arg == null) return if (param.isPrimitive) -10_000 else 1
     val coerced = coerceArgForParam(param, arg) ?: return if (param.isPrimitive) -10_000 else 1
@@ -570,13 +554,6 @@ private fun scoreParamMatch(param: Class<*>, arg: Any?): Int {
     }
 }
 
-/**
- * Find the best matching method by name + arity + parameter compatibility.
- *
- * Preference order:
- * 1) higher match score
- * 2) instance methods over static (Kotlin object style)
- */
 private fun findBestMethod(cls: Class<*>, methodName: String, args: Array<Any?>): Method? {
     val bucket = getMethodBucket(cls, methodName, args.size)
     if (bucket.isEmpty()) return null
@@ -599,7 +576,6 @@ private fun findBestMethod(cls: Class<*>, methodName: String, args: Array<Any?>)
         }
         if (!ok) continue
 
-        /** Prefer instance methods for Kotlin object APIs. */
         if (!Modifier.isStatic(m.modifiers)) score += 3
 
         if (score > bestScore) {
@@ -611,15 +587,6 @@ private fun findBestMethod(cls: Class<*>, methodName: String, args: Array<Any?>)
     return best
 }
 
-/**
- * Produce argument candidates to survive signature drift by trimming optional tails.
- *
- * Strategy:
- * - Try full args
- * - If last is emptyList -> drop it
- * - If last is null -> drop it
- * - Also try dropping last N (1..4) always (best-effort)
- */
 private fun buildArgCandidates(args: Array<Any?>): List<Array<Any?>> {
     if (args.isEmpty()) return listOf(args)
 
@@ -634,17 +601,12 @@ private fun buildArgCandidates(args: Array<Any?>): List<Array<Any?>> {
     if (last is List<*> && last.isEmpty()) dropLast(1)
     if (last == null) dropLast(1)
 
-    /** Generic trims (works for optional tails like systemMessage/tools/onPartial). */
     val maxDrop = minOf(4, args.size - 1)
     for (n in 1..maxDrop) dropLast(n)
 
-    /** De-dupe by arity. */
     return out.distinctBy { it.size }
 }
 
-/**
- * Format method signature for debugging.
- */
 private fun Method.signatureString(): String {
     return buildString {
         append(name).append("(")
@@ -656,11 +618,6 @@ private fun Method.signatureString(): String {
     }
 }
 
-/**
- * Call a LiteRtLM method by name using reflection (non-suspend), returning Any?.
- *
- * Returns null if no compatible method was found or invocation failed.
- */
 private fun invokeLiteRtLmBestEffortReturn(
     methodName: String,
     args: Array<Any?>,
@@ -680,7 +637,6 @@ private fun invokeLiteRtLmBestEffortReturn(
             m.isAccessible = true
             val receiver: Any? = if (Modifier.isStatic(m.modifiers)) null else LiteRtLM
 
-            /** Coerce args per param types. */
             val coercedArgs = Array<Any?>(cand.size) { i ->
                 coerceArgForParam(m.parameterTypes[i], cand[i])
             }
@@ -698,13 +654,6 @@ private fun invokeLiteRtLmBestEffortReturn(
     return null
 }
 
-/**
- * Call a LiteRtLM method by name using reflection (non-suspend), returning success boolean.
- *
- * IMPORTANT:
- * - Kotlin Unit/Java void methods return null from Method.invoke().
- * - So success must be "invoked without throwing", not "return != null".
- */
 private fun invokeLiteRtLmBestEffortUnit(
     methodName: String,
     args: Array<Any?>,
@@ -724,7 +673,6 @@ private fun invokeLiteRtLmBestEffortUnit(
             m.isAccessible = true
             val receiver: Any? = if (Modifier.isStatic(m.modifiers)) null else LiteRtLM
 
-            /** Coerce args per param types. */
             val coercedArgs = Array<Any?>(cand.size) { i ->
                 coerceArgForParam(m.parameterTypes[i], cand[i])
             }
@@ -743,28 +691,11 @@ private fun invokeLiteRtLmBestEffortUnit(
     return false
 }
 
-/**
- * Result for reflective suspend invocation.
- *
- * NOTE:
- * - invoked=true means we successfully located and invoked a compatible method.
- * - value may be null for Unit/void-like returns.
- */
 private data class SuspendInvokeResult(
     val invoked: Boolean,
     val value: Any?
 )
 
-/**
- * Call a LiteRtLM suspend function by name using reflection.
- *
- * Kotlin suspend is compiled as:
- *   fun foo(..., continuation: Continuation<T>): Any?
- *
- * IMPORTANT:
- * - "Invoked" is the success criterion, NOT "value != null".
- * - Method.invoke() may return null for Unit/void-like methods even on success.
- */
 private suspend fun invokeLiteRtLmBestEffortSuspend(
     methodName: String,
     argsNoCont: Array<Any?>,
@@ -837,12 +768,6 @@ private suspend fun invokeLiteRtLmBestEffortSuspend(
 
 object SLM {
 
-    /**
-     * True when a suspend generateText call is currently in progress.
-     *
-     * NOTE:
-     * - Some older call sites may use isBusy(model). Keep both.
-     */
     fun isBusy(): Boolean {
         return runCatching {
             val ret = invokeLiteRtLmBestEffortReturn(
@@ -854,13 +779,6 @@ object SLM {
         }.getOrDefault(false)
     }
 
-    /**
-     * Compatibility overload: isBusy(model).
-     *
-     * Strategy:
-     * 1) Try isBusy(model) if present.
-     * 2) Fallback to isBusy() if not present.
-     */
     fun isBusy(model: Model): Boolean {
         return runCatching {
             val ret = invokeLiteRtLmBestEffortReturn(
@@ -872,7 +790,6 @@ object SLM {
         }.getOrDefault(false)
     }
 
-    /** Allow host app to set context early (recommended). */
     fun setApplicationContext(context: Context) {
         val ok = invokeLiteRtLmBestEffortUnit(
             methodName = "setApplicationContext",
@@ -884,12 +801,6 @@ object SLM {
         }
     }
 
-    /**
-     * Initialize LiteRtLM Engine + Conversation (async).
-     *
-     * NOTE:
-     * - supportImage/supportAudio must match your actual requests later.
-     */
     fun initialize(
         context: Context,
         model: Model,
@@ -915,11 +826,6 @@ object SLM {
         }
     }
 
-    /**
-     * Suspend-style initializer.
-     *
-     * Best-effort reflection call. If unavailable, falls back to initialize() and waits for onDone.
-     */
     suspend fun initializeIfNeeded(
         context: Context,
         model: Model,
@@ -943,7 +849,6 @@ object SLM {
             w(t) { "initializeIfNeeded: reflection failed err=${t.message}" }
         }
 
-        /** Fallback: call async initialize and suspend until onDone fires (and honor errors). */
         suspendCancellableCoroutine<Unit> { cont ->
             initialize(
                 context = context,
@@ -969,12 +874,6 @@ object SLM {
         }
     }
 
-    /**
-     * Reset conversation (reuse engine) safely.
-     *
-     * If LiteRtLM.resetConversation does not exist in the current build,
-     * we fall back to a no-op and log a warning (avoids build/runtime crash).
-     */
     fun resetConversation(
         model: Model,
         supportImage: Boolean,
@@ -995,9 +894,6 @@ object SLM {
         }
     }
 
-    /**
-     * Request a deferred idle cleanup.
-     */
     fun cleanUp(model: Model, onDone: () -> Unit) {
         d { "cleanUp: model='${model.name}'" }
 
@@ -1013,11 +909,6 @@ object SLM {
         }
     }
 
-    /**
-     * Force immediate teardown (use sparingly).
-     *
-     * If LiteRtLM.forceCleanUp does not exist, falls back to cleanUp().
-     */
     fun forceCleanUp(model: Model, onDone: () -> Unit) {
         d { "forceCleanUp: model='${model.name}'" }
 
@@ -1033,13 +924,6 @@ object SLM {
         }
     }
 
-    /**
-     * Low-level callback-based streaming API.
-     *
-     * Contract (aligned with LiteRtLM):
-     * - resultListener(done=true) is logical completion for UI.
-     * - cleanUpListener() is invoked ONLY after native termination.
-     */
     fun runInference(
         model: Model,
         input: String,
@@ -1066,14 +950,6 @@ object SLM {
         }
     }
 
-    /**
-     * High-level suspend API:
-     * - Returns full aggregated text.
-     *
-     * Strategy:
-     * 1) Try reflection suspend call to LiteRtLM.generateText.
-     * 2) If unavailable, fallback to streaming runInference() aggregation.
-     */
     suspend fun generateText(
         model: Model,
         input: String,
@@ -1085,7 +961,6 @@ object SLM {
             "generateText: model='${model.name}' textLen=${input.length} images=${images.size} audio=${audioClips.size}"
         }
 
-        /** Try reflection suspend call first. */
         try {
             val res = invokeLiteRtLmBestEffortSuspend(
                 methodName = "generateText",
@@ -1095,7 +970,6 @@ object SLM {
             if (res.invoked) {
                 val s = res.value as? String
                 if (s != null) return s
-                // invoked=true but no String => signature drift; fallback to streaming.
             }
         } catch (ce: CancellationException) {
             throw ce
@@ -1103,12 +977,10 @@ object SLM {
             w(t) { "generateText: reflection failed err=${t.message}" }
         }
 
-        /** Fallback: aggregate via streaming with delta normalization. */
         return suspendCancellableCoroutine { cont ->
             val buffer = StringBuilder()
             val normalizer = StreamDeltaNormalizer(StreamDeltaNormalizer.PartialMode.AUTO)
 
-            /** Terminal guard for done/error/invoke-failure races. */
             val terminal = AtomicBoolean(false)
 
             val resultListener: ResultListener = result@{ partial, done ->
@@ -1149,7 +1021,6 @@ object SLM {
                 }
             }
 
-            /** Prefer notifying cancel as error for suspend semantics. */
             val ok = invokeLiteRtLmBestEffortUnit(
                 methodName = "runInference",
                 args = arrayOf(model, input, resultListener, { /* no-op */ }, onError, images, audioClips, true),
@@ -1173,9 +1044,6 @@ object SLM {
         }
     }
 
-    /**
-     * Best-effort logical cancellation.
-     */
     fun cancel(model: Model) {
         d { "cancel: model='${model.name}'" }
 
@@ -1204,14 +1072,6 @@ object SLM {
 
 /* ────────────────────────── TestTag Sanitizer ────────────────────────── */
 
-/**
- * Sanitize strings for use in test tags.
- *
- * Notes:
- * - Allow only [A-Za-z0-9_.-]
- * - Replace other characters with underscore.
- * - Truncate to [maxLen].
- */
 private fun safeTestTagTokenInternal(src: String, maxLen: Int): String {
     val cleaned = buildString(src.length) {
         for (ch in src) {
@@ -1222,13 +1082,6 @@ private fun safeTestTagTokenInternal(src: String, maxLen: Int): String {
     return if (cleaned.length <= maxLen) cleaned else cleaned.take(maxLen)
 }
 
-/**
- * Sanitize strings for use in test tags.
- *
- * NOTE:
- * - This wrapper preserves the original extension-style call sites.
- * - The internal implementation does not reference `this` at all.
- */
 private fun String.safeTestTagToken(maxLen: Int): String {
     return safeTestTagTokenInternal(src = this, maxLen = maxLen)
 }
