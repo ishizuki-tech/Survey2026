@@ -49,9 +49,12 @@ import java.util.concurrent.atomic.AtomicLong
  *
  * Ring logs:
  * - Install AppRingLogStore as early as possible to reliably retain "pre-crash" context across restarts.
+ * - On app start, enqueue a WorkManager job to upload the ring "segments" (seg_XX.log) to GitHub.
  *
  * Startup upload:
- * - On app start, enqueue a WorkManager job to upload any remaining RuntimeLogStore logs to GitHub.
+ * - On app start, enqueue WorkManager jobs to upload:
+ *   1) RuntimeLogStore logs bundle (plain session folder)
+ *   2) AppRingLogStore ring segments (full ring body)
  * - Config retrieval is best-effort via reflection to avoid hard coupling.
  */
 class SurveyApp : Application(), Configuration.Provider {
@@ -148,6 +151,9 @@ class SurveyApp : Application(), Configuration.Provider {
 
         // Startup: enqueue runtime log upload (best-effort, main process only).
         safeEnqueueStartupRuntimeLogsUploadOnce(appCtx)
+
+        // Startup: enqueue ring segment upload (best-effort, main process only).
+        safeEnqueueStartupRingLogsUploadOnce(appCtx)
 
         // Re-wrap default handler in case any SDK replaced it after attachBaseContext().
         safeCrashInstall(where = "onCreate(rewrap)", context = appCtx)
@@ -275,6 +281,49 @@ class SurveyApp : Application(), Configuration.Provider {
             RuntimeLogStore.d(TAG, "Startup runtime logs: enqueue requested.")
         }.onFailure { t ->
             RuntimeLogStore.w(TAG, "Startup runtime logs: enqueue failed: ${t.confirmedMsg()}", t)
+        }
+    }
+
+    /**
+     * On app start, upload AppRingLogStore ring segments (seg_XX.log) to GitHub.
+     *
+     * Notes:
+     * - The ring is a safety buffer for "pre-crash context", so we DO NOT delete segments on device.
+     * - Upload is best-effort and requires GitHub config to be available.
+     */
+    private fun safeEnqueueStartupRingLogsUploadOnce(context: Context) {
+        if (!startupRingLogsOnce.compareAndSet(false, true)) {
+            RuntimeLogStore.d(TAG, "Startup ring logs enqueue already executed; skipping.")
+            return
+        }
+
+        val appCtx = context.applicationContext ?: context
+
+        // WM must be ready before enqueue.
+        ensureWorkManagerInitialized(where = "startupRingLogs", ctx = appCtx)
+
+        val cfg = runCatching { tryLoadGitHubConfigBestEffort(appCtx) }
+            .onFailure { t ->
+                RuntimeLogStore.w(TAG, "Startup ring logs: config lookup failed: ${t.message}", t)
+            }
+            .getOrNull()
+
+        if (cfg == null || cfg.owner.isBlank() || cfg.repo.isBlank() || cfg.token.isBlank()) {
+            RuntimeLogStore.d(TAG, "Startup ring logs: GitHub config not available; skip enqueue.")
+            return
+        }
+
+        runCatching {
+            GitHubUploadWorker.enqueueStartupRingLogsUpload(
+                context = appCtx,
+                cfg = cfg,
+                remoteDir = "diagnostics/applog_ring",
+                addDateSubdir = true,
+                reason = "app_start"
+            )
+            RuntimeLogStore.d(TAG, "Startup ring logs: enqueue requested.")
+        }.onFailure { t ->
+            RuntimeLogStore.w(TAG, "Startup ring logs: enqueue failed: ${t.confirmedMsg()}", t)
         }
     }
 
@@ -558,6 +607,9 @@ class SurveyApp : Application(), Configuration.Provider {
 
         // Startup runtime logs enqueue guard (per process).
         private val startupRtLogsOnce = AtomicBoolean(false)
+
+        // Startup ring logs enqueue guard (per process).
+        private val startupRingLogsOnce = AtomicBoolean(false)
 
         // WorkManager init guards.
         private val workManagerInitAttempted = AtomicBoolean(false)

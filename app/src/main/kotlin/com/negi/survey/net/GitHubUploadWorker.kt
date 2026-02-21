@@ -5,20 +5,22 @@
  *  File: GitHubUploadWorker.kt
  *  Author: Shu Ishizuki (石附 支)
  *  License: MIT License
- *  © 2025 IshizukiTech LLC. All rights reserved.
+ *  © 2026 IshizukiTech LLC. All rights reserved.
  * =====================================================================
  *
  *  Summary:
  *  ---------------------------------------------------------------------
  *  WorkManager coroutine worker that uploads:
- *   - payload file, or
- *   - logcat snapshot (gzip), or
- *   - RuntimeLogStore plain .log files (deduped) + optional device cleanup.
+ *   - payload file, OR
+ *   - logcat snapshot (gzip), OR
+ *   - RuntimeLogStore plain .log files (deduped) + optional device cleanup, OR
+ *   - AppRingLogStore ring segments (seg_XX.log) as full ring body (no deletion).
  *
  *  Key behavior:
- *   - Dedupe via local SHA-256 ledger.
+ *   - Dedupe via local SHA-256 ledger (runtime logs).
  *   - After successful upload (or dedupe-skip), optionally deletes SOURCE .log on device.
  *   - Active (currently written) log is never deleted.
+ *   - Ring segments are never deleted (ring is a retention buffer).
  * =====================================================================
  */
 
@@ -49,6 +51,7 @@ import androidx.work.WorkInfo
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
 import androidx.work.workDataOf
+import com.negi.survey.AppRingLogStore
 import com.negi.survey.BuildConfig
 import com.negi.survey.R
 import java.io.ByteArrayOutputStream
@@ -84,6 +87,7 @@ class GitHubUploadWorker(
             MODE_LOGCAT -> "Uploading logcat"
             MODE_RUNTIME_LOGS -> "Uploading runtime logs"
             MODE_STARTUP_RUNTIME_LOGS -> "Uploading startup runtime logs"
+            MODE_RING_LOGS -> "Uploading ring logs"
             else -> "Uploading payload"
         }
 
@@ -133,6 +137,7 @@ class GitHubUploadWorker(
             MODE_LOGCAT -> "Uploading logcat"
             MODE_RUNTIME_LOGS -> "Uploading runtime logs"
             MODE_STARTUP_RUNTIME_LOGS -> "Uploading startup runtime logs"
+            MODE_RING_LOGS -> "Uploading ring logs"
             else -> "Uploading payload"
         }
 
@@ -180,6 +185,8 @@ class GitHubUploadWorker(
             MODE_LOGCAT -> doLogcatUpload(cfg, notifId, progressCallback, currentPct)
             MODE_RUNTIME_LOGS, MODE_STARTUP_RUNTIME_LOGS ->
                 doRuntimeLogsUpload(mode, cfg, notifId, progressCallback, currentPct)
+            MODE_RING_LOGS, MODE_STARTUP_RING_LOGS ->
+                doRingLogsUpload(mode, cfg, notifId, progressCallback, currentPct)
             else -> doFileUpload(cfg, notifId, progressCallback, currentPct)
         }
     }
@@ -674,6 +681,133 @@ class GitHubUploadWorker(
         }
     }
 
+    // ---------------------------------------------------------------------
+    // Ring logs (AppRingLogStore segments) upload mode
+    // ---------------------------------------------------------------------
+
+    private suspend fun doRingLogsUpload(
+        mode: String,
+        cfg: GitHubUploader.GitHubConfig,
+        notifId: Int,
+        onProgress: (Int) -> Unit,
+        currentPct: () -> Int,
+    ): Result {
+        val remoteDir = inputData.getString(KEY_RING_REMOTE_DIR) ?: "diagnostics/applog_ring"
+        val addDate = inputData.getBoolean(KEY_RING_ADD_DATE, true)
+        val reason = inputData.getString(KEY_RING_REASON)?.takeIf { it.isNotBlank() } ?: "wm"
+
+        onProgress(3)
+
+        if (mode == MODE_STARTUP_RING_LOGS) {
+            runCatching { delay(STARTUP_RING_PRE_DELAY_MS) }
+        }
+
+        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        val pid = Process.myPid()
+        val safeReason = safeFileSegment(reason)
+
+        val dir = runCatching { AppRingLogStore.ringDir(applicationContext) }.getOrNull()
+        if (dir == null || !dir.exists()) {
+            Log.d(TAG, "doRingLogsUpload: ringDir not available; no-op success.")
+            return Result.success(
+                workDataOf(
+                    OUT_MODE to MODE_RING_LOGS,
+                    OUT_REMOTE_PATH to "",
+                    OUT_RING_FILE_COUNT to 0,
+                    OUT_RING_TOTAL_BYTES to 0L
+                )
+            )
+        }
+
+        val segs = dir.listFiles()?.filter { f ->
+            f.isFile && f.name.startsWith("seg_", ignoreCase = true) && f.name.endsWith(".log", ignoreCase = true)
+        }.orEmpty().sortedBy { it.name }
+
+        if (segs.isEmpty()) {
+            Log.d(TAG, "doRingLogsUpload: no ring segments found; no-op success. dir=${dir.absolutePath}")
+            return Result.success(
+                workDataOf(
+                    OUT_MODE to MODE_RING_LOGS,
+                    OUT_REMOTE_PATH to "",
+                    OUT_RING_FILE_COUNT to 0,
+                    OUT_RING_TOTAL_BYTES to 0L
+                )
+            )
+        }
+
+        val dateSegment = if (addDate) utcDateFolder() else ""
+        val sessionDirName = "applog_ring_${stamp}_pid${pid}_${safeReason}"
+        val remoteBaseDir = listOf(
+            cfg.pathPrefix.trim('/'),
+            remoteDir.trim('/'),
+            dateSegment,
+            sessionDirName
+        ).filter { it.isNotBlank() }.joinToString("/")
+
+        val totalBytes = segs.sumOf { runCatching { it.length() }.getOrNull() ?: 0L }
+
+        Log.d(TAG, "doRingLogsUpload: remoteBaseDir=$remoteBaseDir segs=${segs.size} bytes=$totalBytes dir=${dir.absolutePath}")
+
+        return try {
+            val startPct = 10
+            val endPct = 100
+            val n = segs.size.coerceAtLeast(1)
+
+            for ((i, file) in segs.withIndex()) {
+                val fileStart = startPct + ((endPct - startPct) * i) / n
+                val fileEnd = startPct + ((endPct - startPct) * (i + 1)) / n
+                val mapped = mapProgressRange(start = fileStart, end = fileEnd, sink = onProgress)
+
+                val remotePath = "$remoteBaseDir/${file.name}"
+
+                GitHubUploader.uploadFileAtPath(
+                    cfg = cfg,
+                    path = remotePath,
+                    file = file,
+                    message = "Upload ring logs (segments) ($reason)",
+                    onProgress = mapped
+                )
+            }
+
+            runCatching {
+                setForegroundAsync(
+                    foregroundInfo(
+                        notificationId = notifId,
+                        pct = 100,
+                        title = "Uploaded ring logs",
+                        finished = true
+                    )
+                )
+            }
+
+            Result.success(
+                workDataOf(
+                    OUT_MODE to MODE_RING_LOGS,
+                    OUT_REMOTE_PATH to remoteBaseDir,
+                    OUT_RING_FILE_COUNT to segs.size,
+                    OUT_RING_TOTAL_BYTES to totalBytes
+                )
+            )
+        } catch (t: Throwable) {
+            Log.w(TAG, "doRingLogsUpload: upload failed", t)
+
+            runCatching {
+                setForegroundAsync(
+                    foregroundInfo(
+                        notificationId = notifId,
+                        pct = currentPct(),
+                        title = "Ring log upload failed",
+                        error = true
+                    )
+                )
+            }
+
+            val failData = workDataOf(ERROR_MESSAGE to (t.message ?: "Unknown error"))
+            if (shouldRetry(t) && runAttemptCount < MAX_ATTEMPTS) Result.retry()
+            else Result.failure(failData)
+        }
+    }
+
     /**
      * Extract original runtime log file name from prepared cache file name.
      *
@@ -1115,6 +1249,8 @@ class GitHubUploadWorker(
         private const val STARTUP_RTLOG_PRE_DELAY_MS = 1200L
         private const val DEFAULT_RTLOG_PLAIN_LIMIT_FILES = 12
 
+        private const val STARTUP_RING_PRE_DELAY_MS = 700L
+
         private const val LEDGER_MAX_ITEMS = 4000
 
         // Modes
@@ -1122,6 +1258,8 @@ class GitHubUploadWorker(
         private const val MODE_LOGCAT = "logcat"
         private const val MODE_RUNTIME_LOGS = "runtime_logs"
         private const val MODE_STARTUP_RUNTIME_LOGS = "startup_runtime_logs"
+        private const val MODE_RING_LOGS = "ring_logs"
+        private const val MODE_STARTUP_RING_LOGS = "startup_ring_logs"
 
         // Progress keys
         const val PROGRESS_PCT = "pct"
@@ -1175,6 +1313,11 @@ class GitHubUploadWorker(
         const val KEY_RTLOG_LOGCAT_INCLUDE_CRASH = "rtlog.logcat.includeCrash"
         const val KEY_RTLOG_LOGCAT_MAX_UNCOMPRESSED = "rtlog.logcat.maxUncompressed"
 
+        // Ring logs input keys
+        const val KEY_RING_REMOTE_DIR = "ring.remoteDir"
+        const val KEY_RING_ADD_DATE = "ring.addDate"
+        const val KEY_RING_REASON = "ring.reason"
+
         // Output keys
         const val OUT_MODE = "out.mode"
         const val OUT_FILE_NAME = "out.fileName"
@@ -1189,6 +1332,10 @@ class GitHubUploadWorker(
         const val OUT_PLAIN_TOTAL_BYTES = "out.plainTotalBytes"
         const val OUT_PLAIN_PREVIEW = "out.plainPreview"
         const val OUT_PLAIN_SOURCE_DELETED_COUNT = "out.plainSourceDeletedCount"
+
+        // Ring logs outputs
+        const val OUT_RING_FILE_COUNT = "out.ringFileCount"
+        const val OUT_RING_TOTAL_BYTES = "out.ringTotalBytes"
 
         const val ERROR_MESSAGE = "error"
 
@@ -1318,6 +1465,58 @@ class GitHubUploadWorker(
             val policy = choosePolicyForUniqueName(appCtx, uniqueName)
 
             Log.d(TAG, "enqueueStartupRuntimeLogsUpload: uniqueName=$uniqueName policy=$policy")
+
+            WorkManager.getInstance(appCtx)
+                .enqueueUniqueWork(uniqueName, policy, req)
+        }
+
+        /**
+         * Enqueue a stable startup ring logs upload (AppRingLogStore segments).
+         *
+         * Notes:
+         * - Ring segments are uploaded as-is (seg_XX.log).
+         * - Segments are never deleted on device.
+         */
+        fun enqueueStartupRingLogsUpload(
+            context: Context,
+            cfg: GitHubUploader.GitHubConfig,
+            remoteDir: String = "diagnostics/applog_ring",
+            addDateSubdir: Boolean = true,
+            reason: String = "app_start",
+        ) {
+            val uniqueName = "upload_ring_logs_startup"
+
+            val req: OneTimeWorkRequest =
+                OneTimeWorkRequestBuilder<GitHubUploadWorker>()
+                    .setInputData(
+                        workDataOf(
+                            KEY_MODE to MODE_STARTUP_RING_LOGS,
+                            KEY_OWNER to cfg.owner,
+                            KEY_REPO to cfg.repo,
+                            KEY_TOKEN to cfg.token,
+                            KEY_BRANCH to cfg.branch,
+                            KEY_PATH_PREFIX to cfg.pathPrefix,
+
+                            KEY_RING_REMOTE_DIR to remoteDir,
+                            KEY_RING_ADD_DATE to addDateSubdir,
+                            KEY_RING_REASON to reason,
+                        )
+                    )
+                    .setConstraints(
+                        Constraints.Builder()
+                            .setRequiredNetworkType(NetworkType.CONNECTED)
+                            .build()
+                    )
+                    .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
+                    .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
+                    .addTag(TAG)
+                    .addTag("$TAG:ring_logs")
+                    .build()
+
+            val appCtx = context.applicationContext
+            val policy = choosePolicyForUniqueName(appCtx, uniqueName)
+
+            Log.d(TAG, "enqueueStartupRingLogsUpload: uniqueName=$uniqueName policy=$policy")
 
             WorkManager.getInstance(appCtx)
                 .enqueueUniqueWork(uniqueName, policy, req)
