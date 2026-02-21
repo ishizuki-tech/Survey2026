@@ -28,6 +28,13 @@
  *   • Validate nextId references (fail fast at init)
  *   • Normalize NavBackStack root to match start node key
  *   • Warn on unknown node types
+ *
+ *  2026-02 Update:
+ *   • Add session-level free text note (stored in VM; intended for exports metadata).
+ *
+ *  2026-02 Fix:
+ *   • Do NOT carry Home free text into a different run UUID.
+ *   • Treat Home text as "draft"; lock it to the current run when a new run starts.
  * =====================================================================
  */
 
@@ -146,6 +153,12 @@ open class SurveyViewModel(
         private const val KEY_EVAL_JSON = "EVAL_JSON"
 
         private const val KEY_PREVIEW_LIMIT = 64
+
+        /** Export metadata key for the home screen free text. */
+        private const val EXPORT_META_SESSION_FREE_TEXT = "session_free_text"
+
+        /** Safety cap for session free text to keep exports stable. */
+        private const val SESSION_FREE_TEXT_MAX_CHARS: Int = 20_000
     }
 
     /**
@@ -182,6 +195,98 @@ open class SurveyViewModel(
     /** Stable UUID for the active survey run. */
     private val _surveyUuid = MutableStateFlow(UUID.randomUUID().toString())
     val surveyUuid: StateFlow<String> = _surveyUuid.asStateFlow()
+
+    /* ───────────────────────────── Session Free Text ───────────────────────────── */
+
+    /**
+     * Home screen "draft" free text.
+     *
+     * IMPORTANT:
+     * - This is UI-only draft state.
+     * - It must NOT automatically carry into a different run UUID.
+     */
+    private val _sessionFreeTextDraft = MutableStateFlow("")
+    val sessionFreeText: StateFlow<String> = _sessionFreeTextDraft.asStateFlow()
+
+    /**
+     * Run-locked free text stored for exports.
+     *
+     * IMPORTANT:
+     * - This is the ONLY source used by [exportExtraMeta].
+     * - Cleared when a new run UUID is generated.
+     */
+    private val _sessionFreeTextRun = MutableStateFlow("")
+    val sessionFreeTextRun: StateFlow<String> = _sessionFreeTextRun.asStateFlow()
+
+    /**
+     * Normalize session free text.
+     *
+     * Notes:
+     * - Avoid platform-dependent CRLF.
+     * - Apply a conservative cap to keep exports stable.
+     */
+    private fun normalizeSessionFreeText(text: String): String {
+        return text
+            .replace("\r\n", "\n")
+            .replace("\r", "\n")
+            .take(SESSION_FREE_TEXT_MAX_CHARS)
+    }
+
+    /**
+     * Set the Home screen draft free text.
+     *
+     * @param text User-provided free-form note (may be blank).
+     */
+    fun setSessionFreeText(text: String) {
+        _sessionFreeTextDraft.value = normalizeSessionFreeText(text)
+    }
+
+    /**
+     * Clear the Home screen draft free text.
+     *
+     * Note:
+     * - This does NOT clear the run-locked note.
+     */
+    fun resetSessionFreeText() {
+        _sessionFreeTextDraft.value = ""
+    }
+
+    /**
+     * Lock the current draft into the current run metadata and clear the draft.
+     *
+     * Recommended usage:
+     * - Call when the user starts a new run from Home.
+     */
+    fun commitSessionFreeTextToRun() {
+        val note = normalizeSessionFreeText(_sessionFreeTextDraft.value).trim()
+        _sessionFreeTextRun.value = note
+        _sessionFreeTextDraft.value = ""
+        RuntimeLogStore.d(TAG, "commitSessionFreeTextToRun -> len=${note.length}")
+    }
+
+    /**
+     * Clear both draft + run note.
+     *
+     * Use when you want to wipe any session note state explicitly.
+     */
+    fun resetSessionFreeTextAll() {
+        _sessionFreeTextDraft.value = ""
+        _sessionFreeTextRun.value = ""
+        RuntimeLogStore.d(TAG, "resetSessionFreeTextAll -> cleared")
+    }
+
+    /**
+     * Export-friendly extra metadata.
+     *
+     * IMPORTANT:
+     * - Uses the run-locked note (NOT the Home draft).
+     * - Returns only non-blank values.
+     */
+    fun exportExtraMeta(): Map<String, String> {
+        val t = _sessionFreeTextRun.value.trim()
+        if (t.isBlank()) return emptyMap()
+        return linkedMapOf(EXPORT_META_SESSION_FREE_TEXT to t.take(SESSION_FREE_TEXT_MAX_CHARS))
+    }
 
     /** Regenerate the survey UUID for a brand-new run. */
     private fun regenerateSurveyUuid() {
@@ -731,8 +836,19 @@ open class SurveyViewModel(
         RuntimeLogStore.d(TAG, "resetNavToStart -> key=$startKey, navSize=${nav.size}")
     }
 
+    /**
+     * Reset to start node and begin a new run UUID.
+     *
+     * IMPORTANT:
+     * - A new run UUID means a new run. The Home draft must NOT carry into that run by default.
+     * - If [preserveSessionFreeText] is true, the current draft is LOCKED to the new run (export meta),
+     *   and the draft UI is cleared (so it won't be reused for the next run).
+     */
     @Synchronized
-    fun resetToStart() {
+    fun resetToStart(preserveSessionFreeText: Boolean = false) {
+        val draft = normalizeSessionFreeText(_sessionFreeTextDraft.value).trim()
+        val runNote = if (preserveSessionFreeText) draft else ""
+
         regenerateSurveyUuid()
 
         resetQuestions()
@@ -740,6 +856,12 @@ open class SurveyViewModel(
         resetFollowups()
         resetAudioRefs()
         clearSelections()
+
+        // New run boundary:
+        // - Lock note for this run only (optional).
+        // - Always clear draft so it never auto-carries to a different run.
+        _sessionFreeTextRun.value = runNote
+        _sessionFreeTextDraft.value = ""
 
         nodeStack.clear()
 
@@ -754,7 +876,11 @@ open class SurveyViewModel(
         updateCanGoBack()
         _sessionId.update { it + 1 }
 
-        RuntimeLogStore.d(TAG, "resetToStart -> ${start.id}, session=${_sessionId.value}, uuid=${_surveyUuid.value}")
+        RuntimeLogStore.d(
+            TAG,
+            "resetToStart -> ${start.id}, session=${_sessionId.value}, uuid=${_surveyUuid.value}, " +
+                    "preserveFreeText=$preserveSessionFreeText draftLen=${draft.length} runLen=${runNote.length}"
+        )
     }
 
     @Synchronized

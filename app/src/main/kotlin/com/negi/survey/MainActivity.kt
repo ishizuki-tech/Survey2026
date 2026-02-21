@@ -61,6 +61,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.SnackbarResult
@@ -135,6 +136,7 @@ import com.negi.survey.vm.FlowText
 import com.negi.survey.vm.SurveyViewModel
 import com.negi.survey.vm.WhisperSpeechController
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -1007,11 +1009,21 @@ fun SurveyNavHost(
             backStack = backStack,
             entryDecorators = listOf(rememberSaveableStateHolderNavEntryDecorator()),
             entryProvider = entryProvider {
+
                 entry<FlowHome> {
                     HomeScreen(
+                        vmSurvey = vmSurvey,
                         onStart = {
-                            Log.d(MainActivity.TAG, "Home -> Start survey. session=$sessionId")
-                            vmSurvey.resetToStart()
+                            // Debug: Home draft note is run-scoped, never auto-carried to a new run UUID.
+                            val draftLen = vmSurvey.sessionFreeText.value.length
+                            Log.d(
+                                MainActivity.TAG,
+                                "Home -> Start survey. session=$sessionId freeTextDraftLen=$draftLen (run-scoped)"
+                            )
+
+                            // Creates a NEW run UUID; draft is locked for THIS run only and cleared as draft.
+                            vmSurvey.resetToStart(preserveSessionFreeText = true)
+
                             vmAI.resetStates(keepError = false)
                             vmSurvey.advanceToNext()
                         }
@@ -1148,11 +1160,6 @@ private fun buildGitHubConfigOrNull(): GitHubUploader.GitHubConfig? {
 
 /* ───────────────────────────── Minimal Node Screens ───────────────────────────── */
 
-/**
- * Minimal TEXT node UI.
- *
- * This prevents runtime crashes when YAML contains TEXT nodes but the host has no entry.
- */
 @Composable
 private fun TextNodeScreen(
     title: String,
@@ -1209,11 +1216,6 @@ private fun TextNodeScreen(
     }
 }
 
-/**
- * Minimal SINGLE_CHOICE node UI.
- *
- * Stores selection in SurveyViewModel.single via callbacks supplied by the host.
- */
 @Composable
 private fun SingleChoiceNodeScreen(
     title: String,
@@ -1296,11 +1298,6 @@ private fun SingleChoiceNodeScreen(
     }
 }
 
-/**
- * Minimal MULTI_CHOICE node UI.
- *
- * Stores selection set in SurveyViewModel.multi via callbacks supplied by the host.
- */
 @Composable
 private fun MultiChoiceNodeScreen(
     title: String,
@@ -1383,9 +1380,6 @@ private fun MultiChoiceNodeScreen(
     }
 }
 
-/**
- * Shared two-button row (kept simple: column-aligned for readability).
- */
 @Composable
 private fun RowButtons(
     primaryLabel: String,
@@ -1404,12 +1398,13 @@ private fun RowButtons(
 }
 
 /* ───────────────────────────── Home Screen ───────────────────────────── */
-
 @Composable
 private fun HomeScreen(
+    vmSurvey: SurveyViewModel,
     onStart: () -> Unit
 ) {
     val backplate = appBackplate()
+    val freeText by vmSurvey.sessionFreeText.collectAsState()
 
     Box(
         modifier = Modifier
@@ -1425,24 +1420,34 @@ private fun HomeScreen(
             shape = MaterialTheme.shapes.large,
             color = MaterialTheme.colorScheme.surface.copy(alpha = 0.97f),
             modifier = Modifier
+                .fillMaxWidth()
+                .widthIn(max = 520.dp)
                 .wrapContentWidth()
                 .neonEdgeThin()
         ) {
             Column(
                 modifier = Modifier.padding(horizontal = 24.dp, vertical = 20.dp),
-                horizontalAlignment = Alignment.CenterHorizontally
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                Text(
-                    text = "Survey ready",
-                    style = MaterialTheme.typography.titleLarge
-                )
-                Spacer(Modifier.height(6.dp))
+                Text(text = "Survey ready", style = MaterialTheme.typography.titleLarge)
                 Text(
                     text = "Tap Start to begin answering the configured survey.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
-                Spacer(Modifier.height(16.dp))
+
+                /** Optional run-scoped note captured before starting the survey. */
+                OutlinedTextField(
+                    value = freeText,
+                    onValueChange = { vmSurvey.setSessionFreeText(it) },
+                    label = { Text("Free text (optional)") },
+                    placeholder = { Text("Saved only for this run (not carried to the next run)") },
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                Spacer(Modifier.height(4.dp))
+
                 OutlinedButton(onClick = onStart) {
                     Text("Start survey")
                 }

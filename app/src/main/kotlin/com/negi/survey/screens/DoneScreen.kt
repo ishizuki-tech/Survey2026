@@ -158,6 +158,10 @@ fun DoneScreen(
     val recordedAudioRefs by vm.recordedAudioRefs.collectAsState(initial = emptyMap())
     val surveyUuid by vm.surveyUuid.collectAsState()
 
+    // NEW: session-level free text (Survey Ready screen note)
+    val sessionFreeText by vm.sessionFreeText.collectAsState(initial = "")
+    val exportMeta = remember(sessionFreeText) { vm.exportExtraMeta() }
+
     val exportedAtStamp = remember(surveyUuid) {
         val fmt = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.US)
         fmt.format(Date())
@@ -221,7 +225,8 @@ fun DoneScreen(
         flatAudioRefsForRun,
         surveyUuid,
         exportedAtStamp,
-        answerOwnerIds
+        answerOwnerIds,
+        exportMeta
     ) {
         val sortedFollowups = followups.toSortedMap()
 
@@ -234,6 +239,24 @@ fun DoneScreen(
             append("  \"exported_at\": \"")
                 .append(escapeJson(exportedAtStamp))
                 .append("\",\n")
+
+            // NEW: session-level metadata (includes session_free_text when present)
+            if (exportMeta.isEmpty()) {
+                append("  \"meta\": {},\n")
+            } else {
+                append("  \"meta\": {\n")
+                val entries = exportMeta.entries.toList()
+                entries.forEachIndexed { i, (k, v) ->
+                    append("    \"")
+                        .append(escapeJson(k))
+                        .append("\": \"")
+                        .append(escapeJson(v))
+                        .append("\"")
+                    if (i != entries.lastIndex) append(",")
+                    append("\n")
+                }
+                append("  },\n")
+            }
 
             append("  \"answers\": {\n")
             answerOwnerIds.forEachIndexed { idx, id ->
