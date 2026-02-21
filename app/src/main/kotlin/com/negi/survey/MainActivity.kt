@@ -135,7 +135,6 @@ import com.negi.survey.vm.FlowText
 import com.negi.survey.vm.SurveyViewModel
 import com.negi.survey.vm.WhisperSpeechController
 import java.util.Locale
-import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -162,8 +161,8 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Install crash capture BEFORE any heavy init to catch early failures.
-        bootstrapCrashCaptureOnce(applicationContext)
+        // CrashCapture + startup uploads are centralized in SurveyApp for stability.
+        // Keep MainActivity focused on UI/session wiring.
 
         // Use application context to avoid accidentally retaining Activity.
         LiteRtLM.setApplicationContext(applicationContext)
@@ -183,23 +182,6 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
-    }
-
-    /**
-     * Install crash capture and enqueue pending crash uploads only once per process.
-     *
-     * This avoids repeated directory scans and redundant WorkManager enqueue calls when:
-     * - Activity is recreated (rotation, configuration changes)
-     * - Activity is restarted by the system while process stays alive
-     */
-    private fun bootstrapCrashCaptureOnce(appContext: Context) {
-        if (!crashBootstrapOnce.compareAndSet(false, true)) return
-
-        runCatching { CrashCapture.install(appContext) }
-            .onFailure { Log.w(TAG, "CrashCapture.install failed: ${it.message}", it) }
-
-        runCatching { CrashCapture.enqueuePendingCrashUploadsIfPossible(appContext) }
-            .onFailure { Log.w(TAG, "CrashCapture.enqueuePendingCrashUploads failed: ${it.message}", it) }
     }
 
     /**
@@ -238,9 +220,6 @@ class MainActivity : ComponentActivity() {
 
     companion object {
         const val TAG = "MainActivity"
-
-        /** Process-level guard for crash bootstrap. */
-        private val crashBootstrapOnce = AtomicBoolean(false)
     }
 }
 
