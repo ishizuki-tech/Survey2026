@@ -532,8 +532,6 @@ object LiteRtLM {
         throw IllegalStateException("Unable to construct Contents for current LiteRT-LM SDK.")
     }
 
-    // ---- (extractRenderedText / delta logic) ----
-
     /**
      * Best-effort parse for debug strings like:
      * - Text(text=...)
@@ -1359,12 +1357,6 @@ object LiteRtLM {
         }
     }
 
-    /**
-     * Internal suspend reset that is lifecycle-serialized via session lock.
-     *
-     * Contract:
-     * - Must not run while native stream is active.
-     */
     private suspend fun resetConversationInternal(
         key: String,
         model: Model,
@@ -1782,12 +1774,6 @@ object LiteRtLM {
                     scheduleDeferredActions()
                 }
 
-                /**
-                 * Cancel the current process in a race-tolerant way.
-                 *
-                 * NOTE:
-                 * - Do not use a captured local Conversation reference, because reset/recovery may swap it.
-                 */
                 fun cancelProcessBestEffort(stage: String) {
                     ioScope.launch {
                         val convNow = stateMutex.withLock { instances[key]?.conversation }
@@ -1852,7 +1838,7 @@ object LiteRtLM {
                 rs.logicalTerminator.set { requestLogicalCancel("Cancelled") }
 
                 if (rs.cancelRequested.get()) {
-                    RuntimeLogStore.i(TAG, "LiteRT-LM start cancelled before sendMessageAsync: key='$key'")
+                    RuntimeLogStore.d(TAG, "LiteRT-LM start cancelled before sendMessageAsync: key='$key'")
                     markNativeDoneOnce(errorMessage = "Cancelled", isCancel = true)
                     return@withSessionLock
                 }
@@ -1953,7 +1939,7 @@ object LiteRtLM {
 
                         val cancelled = rs.cancelRequested.get() || isCancellationThrowable(throwable, msg)
                         if (cancelled) {
-                            RuntimeLogStore.i(TAG, "LiteRT-LM inference cancelled: key='$key' runId=$myRunId")
+                            RuntimeLogStore.d(TAG, "LiteRT-LM inference cancelled: key='$key' runId=$myRunId")
                             markNativeDoneOnce(errorMessage = "Cancelled", isCancel = true)
                             return
                         }
@@ -1964,21 +1950,19 @@ object LiteRtLM {
                     }
                 }
 
-                // Attempt sendMessageAsync under the session lock.
-                // If the conversation was closed by a just-finished reset, recover once by recreating conversation.
                 try {
                     if (!hasMm) {
                         if (BuildConfig.DEBUG) {
-                            RuntimeLogStore.i(
+                            RuntimeLogStore.d(
                                 TAG,
                                 "LiteRT-LM sendMessageAsync(text): key='$key' runId=$myRunId len=${trimmed.length} preview='${safeLogPreview(trimmed)}'"
                             )
                         } else {
-                            RuntimeLogStore.i(TAG, "LiteRT-LM sendMessageAsync(text): key='$key' runId=$myRunId len=${trimmed.length}")
+                            RuntimeLogStore.d(TAG, "LiteRT-LM sendMessageAsync(text): key='$key' runId=$myRunId len=${trimmed.length}")
                         }
                         conv.sendMessageAsync(trimmed, callback)
                     } else {
-                        RuntimeLogStore.i(
+                        RuntimeLogStore.d(
                             TAG,
                             "LiteRT-LM sendMessageAsync(mm): key='$key' runId=$myRunId textLen=${trimmed.length} images=${images.size} audio=${audioClips.size}"
                         )
@@ -1994,7 +1978,6 @@ object LiteRtLM {
                     if (recoverable) {
                         RuntimeLogStore.w(TAG, "Recovering from not-alive conversation: key='$key' runId=$myRunId")
 
-                        // Release active before recovery, but keep session lock held so no other lifecycle op can interleave.
                         stateMutex.withLock {
                             rs.active.set(false)
                             rs.logicalTerminator.set(null)
@@ -2020,7 +2003,6 @@ object LiteRtLM {
                         }.isSuccess
 
                         if (ok) {
-                            // Re-acquire active and retry exactly once.
                             val reacquired = stateMutex.withLock {
                                 val acquired2 = rs.active.compareAndSet(false, true)
                                 if (acquired2) {
@@ -2127,7 +2109,7 @@ object LiteRtLM {
             try {
                 doneSignal.await()
             } catch (e: CancellationException) {
-                RuntimeLogStore.i(TAG, "generateText cancelled: key='$key'")
+                RuntimeLogStore.d(TAG, "generateText cancelled: key='$key'")
                 cancel(model)
                 throw e
             }
