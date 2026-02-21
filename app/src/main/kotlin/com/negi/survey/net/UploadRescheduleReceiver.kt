@@ -24,6 +24,9 @@
  *  - For LOCKED_BOOT_COMPLETED (Direct Boot), WorkManager enqueue may be unreliable
  *    if its database lives in credential-protected storage. We defer enqueue until
  *    USER_UNLOCKED / BOOT_COMPLETED whenever possible.
+ *
+ *  Added:
+ *  - Enqueue startup runtime logs upload (files/diagnostics/runtime_logs) on relevant actions.
  * =====================================================================
  */
 
@@ -37,9 +40,20 @@ import android.content.Intent
 import android.os.Build
 import android.os.UserManager
 import android.util.Log
+import androidx.work.BackoffPolicy
+import androidx.work.Constraints
+import androidx.work.ExistingWorkPolicy
+import androidx.work.NetworkType
+import androidx.work.OneTimeWorkRequest
+import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.OutOfQuotaPolicy
+import androidx.work.WorkInfo
+import androidx.work.WorkManager
+import androidx.work.workDataOf
 import com.negi.survey.BuildConfig
 import java.io.File
 import java.util.Locale
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -98,7 +112,8 @@ class UploadRescheduleReceiver : BroadcastReceiver() {
                     }
 
                     rescheduleGitHub(contextsForScan, action)
-                    rescheduleSupabase(contextsForScan, action)
+                    // Also enqueue runtime logs bundle upload (best-effort).
+                    rescheduleRuntimeLogsUpload(contextsForScan, action)
                 }
             } catch (t: Throwable) {
                 Log.w(TAG, "Reschedule failed action=$action: ${t.message}", t)
@@ -139,80 +154,134 @@ class UploadRescheduleReceiver : BroadcastReceiver() {
 
         Log.d(TAG, "Rescheduling ${allFiles.size} GitHub pending uploads for action=$action")
 
-        val appCtx = contexts.first().applicationContext
+        val appCtx = contexts.first().applicationContext ?: contexts.first()
 
         allFiles.forEach { file ->
             runCatching {
-                GitHubUploadWorker.enqueueExistingPayload(appCtx, cfg, file)
+                enqueueGitHubFileUpload(appCtx, cfg, file)
             }.onFailure { t ->
-                Log.w(TAG, "GitHub enqueue failed file=${file.name}: ${t.message}")
+                Log.w(TAG, "GitHub enqueue failed file=${file.name}: ${t.message}", t)
             }
         }
     }
 
-    private fun rescheduleSupabase(contexts: List<Context>, action: String) {
-        val sbUrl = BuildConfig.SUPABASE_URL.trim()
-        val sbAnon = BuildConfig.SUPABASE_ANON_KEY.trim()
-        val sbBucket = BuildConfig.SUPABASE_LOG_BUCKET.trim()
-        val sbPrefix = BuildConfig.SUPABASE_LOG_PATH_PREFIX.trim()
+    /**
+     * Enqueue a GitHubUploadWorker in MODE=file without relying on a companion convenience API.
+     *
+     * Rationale:
+     * - GitHubUploadWorker.enqueueExistingPayload(...) may not exist depending on branch/version.
+     * - This receiver must compile against the currently integrated Worker API.
+     */
+    private fun enqueueGitHubFileUpload(
+        context: Context,
+        cfg: GitHubUploader.GitHubConfig,
+        file: File
+    ) {
+        val name = file.name
+        val bytes = file.length().coerceAtLeast(0L)
+        val mtime = file.lastModified()
 
-        val cfg = SupabaseUploader.SupabaseConfig(
-            supabaseUrl = sbUrl,
-            anonKey = sbAnon,
-            bucket = sbBucket,
-            pathPrefix = sbPrefix.ifBlank { "surveyapp" },
-            maxRawBytesHint = 20_000_000L
-        )
+        // Include size+mtime to avoid suppressing uploads for "same name but different content".
+        val uniqueName = "upload_gh_${name}_${bytes}_${mtime}"
 
-        if (cfg.supabaseUrl.isBlank() || cfg.anonKey.isBlank() || cfg.bucket.isBlank()) {
-            Log.d(TAG, "Skip Supabase reschedule: missing configuration.")
-            return
-        }
-
-        val sbRoots = listOf(
-            PENDING_DIR_SB_V2,          // "pending_uploads_supabase"
-            PENDING_DIR_SB_V1,          // "pending_uploads_sb"
-            PENDING_DIR_SB_NESTED_ROOT  // "pending_uploads/supabase"
-        )
-
-        val allFiles = sbRoots
-            .flatMap { dirName ->
-                contexts.flatMap { ctx -> listPendingFiles(ctx, dirName, walk = true) }
-            }
-            .distinctBy { stableKey(it) }
-            .asSequence()
-            .filter { it.isFile && it.length() > 0L }
-            .filterNot { shouldIgnorePendingFile(it) }
-            .take(MAX_SCAN_FILES)
-            .toList()
-
-        if (allFiles.isEmpty()) {
-            Log.d(TAG, "No Supabase pending files for action=$action")
-            return
-        }
-
-        Log.d(TAG, "Rescheduling ${allFiles.size} Supabase pending uploads for action=$action")
-
-        val appCtx = contexts.first().applicationContext
-
-        allFiles.forEach { file ->
-            val remoteDir = guessSupabaseRemoteDir(file)
-            val contentType = guessContentType(file)
-
-            runCatching {
-                SupabaseUploadWorker.enqueueExistingPayload(
-                    context = appCtx,
-                    cfg = cfg,
-                    file = file,
-                    remoteDir = remoteDir,
-                    contentType = contentType,
-                    upsert = false,
-                    userJwt = null,
-                    maxBytesHint = cfg.maxRawBytesHint
+        val req: OneTimeWorkRequest =
+            OneTimeWorkRequestBuilder<GitHubUploadWorker>()
+                .setInputData(
+                    workDataOf(
+                        GitHubUploadWorker.KEY_MODE to "file",
+                        GitHubUploadWorker.KEY_OWNER to cfg.owner,
+                        GitHubUploadWorker.KEY_REPO to cfg.repo,
+                        GitHubUploadWorker.KEY_TOKEN to cfg.token,
+                        GitHubUploadWorker.KEY_BRANCH to cfg.branch,
+                        GitHubUploadWorker.KEY_PATH_PREFIX to cfg.pathPrefix,
+                        GitHubUploadWorker.KEY_FILE_PATH to file.absolutePath,
+                        GitHubUploadWorker.KEY_FILE_NAME to name,
+                        GitHubUploadWorker.KEY_FILE_MAX_BYTES_HINT to cfg.maxRawBytesHint.toLong(),
+                        GitHubUploadWorker.KEY_FILE_MAX_REQUEST_BYTES_HINT to cfg.maxRequestBytesHint
+                    )
                 )
-            }.onFailure { t ->
-                Log.w(TAG, "Supabase enqueue failed file=${file.name}: ${t.message}")
+                .setConstraints(
+                    Constraints.Builder()
+                        .setRequiredNetworkType(NetworkType.CONNECTED)
+                        .build()
+                )
+                .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
+                .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
+                .addTag(GitHubUploadWorker.TAG)
+                .addTag("${GitHubUploadWorker.TAG}:file:$name")
+                .build()
+
+        val policy = choosePolicyForUniqueName(context, uniqueName)
+
+        Log.d(TAG, "enqueueGitHubFileUpload: uniqueName=$uniqueName policy=$policy file=${file.absolutePath} bytes=$bytes mtime=$mtime")
+
+        WorkManager.getInstance(context)
+            .enqueueUniqueWork(uniqueName, policy, req)
+    }
+
+    /**
+     * Choose ExistingWorkPolicy based on current unique work state.
+     *
+     * Rationale:
+     * - KEEP prevents duplicates while a work is in-flight.
+     * - REPLACE allows re-enqueue after FAILED/SUCCEEDED/CANCELLED chains,
+     *   which is critical when config was fixed later.
+     */
+    private fun choosePolicyForUniqueName(context: Context, uniqueName: String): ExistingWorkPolicy {
+        return try {
+            val infos = WorkManager.getInstance(context)
+                .getWorkInfosForUniqueWork(uniqueName)
+                .get(350, TimeUnit.MILLISECONDS)
+
+            val states = infos.joinToString(",") { it.state.name }
+            val inFlight = infos.any {
+                it.state == WorkInfo.State.RUNNING ||
+                        it.state == WorkInfo.State.ENQUEUED ||
+                        it.state == WorkInfo.State.BLOCKED
             }
+
+            val policy = if (inFlight) ExistingWorkPolicy.KEEP else ExistingWorkPolicy.REPLACE
+            Log.d(TAG, "choosePolicy: uniqueName=$uniqueName policy=$policy states=[$states]")
+            policy
+        } catch (t: Throwable) {
+            Log.w(TAG, "choosePolicy: fallback KEEP (query failed). uniqueName=$uniqueName err=${t.message}")
+            ExistingWorkPolicy.KEEP
+        }
+    }
+
+    private fun rescheduleRuntimeLogsUpload(contexts: List<Context>, action: String) {
+        val cfg = GitHubUploader.GitHubConfig(
+            owner = BuildConfig.GH_OWNER,
+            repo = BuildConfig.GH_REPO,
+            token = BuildConfig.GH_TOKEN,
+            branch = BuildConfig.GH_BRANCH,
+            pathPrefix = BuildConfig.GH_PATH_PREFIX
+        )
+
+        if (cfg.owner.isBlank() || cfg.repo.isBlank() || cfg.token.isBlank()) {
+            Log.d(TAG, "Skip runtime logs upload: missing GitHub credentials.")
+            return
+        }
+
+        val appCtx = contexts.first().applicationContext ?: contexts.first()
+
+        // Make sure store can start even from restricted contexts (best-effort).
+        runCatching { RuntimeLogStore.start(appCtx) }
+
+        val reason = "receiver_" + action.lowercase(Locale.US).substringAfterLast(".").take(24)
+
+        runCatching {
+            GitHubUploadWorker.enqueueStartupRuntimeLogsUpload(
+                context = appCtx,
+                cfg = cfg,
+                remoteDir = "diagnostics/runtime_logs",
+                addDateSubdir = true,
+                reason = reason,
+                deleteZipAfter = true
+            )
+            Log.d(TAG, "Enqueued runtime logs upload for action=$action reason=$reason")
+        }.onFailure { t ->
+            Log.w(TAG, "Runtime logs enqueue failed action=$action: ${t.message}", t)
         }
     }
 
@@ -241,7 +310,7 @@ class UploadRescheduleReceiver : BroadcastReceiver() {
                     ?: emptyList()
             }
         } catch (t: Throwable) {
-            Log.w(TAG, "listPendingFiles failed dir=${dir.absolutePath}: ${t.message}")
+            Log.w(TAG, "listPendingFiles failed dir=${dir.absolutePath}: ${t.message}", t)
             emptyList()
         }
 
@@ -356,22 +425,13 @@ class UploadRescheduleReceiver : BroadcastReceiver() {
         /** Directory under `/files/` containing pending GitHub upload payloads. */
         private const val PENDING_DIR_GH = "pending_uploads"
 
-        /**
-         * Directory under `/files/` containing pending Supabase upload payloads.
-         * (Newer DoneScreen uses this.)
-         */
+        /** Directory under `/files/` containing pending Supabase upload payloads. */
         private const val PENDING_DIR_SB_V2 = "pending_uploads_supabase"
 
-        /**
-         * Directory under `/files/` containing pending Supabase upload payloads.
-         * (Older variant.)
-         */
+        /** Directory under `/files/` containing pending Supabase upload payloads. */
         private const val PENDING_DIR_SB_V1 = "pending_uploads_sb"
 
-        /**
-         * Nested pending root used by crash/log stores:
-         * e.g. /files/pending_uploads/supabase/crashlogs/...
-         */
+        /** Nested pending root used by crash/log stores. */
         private const val PENDING_DIR_SB_NESTED_ROOT = "pending_uploads/supabase"
 
         /** String constant for locked boot action to avoid API gated references. */

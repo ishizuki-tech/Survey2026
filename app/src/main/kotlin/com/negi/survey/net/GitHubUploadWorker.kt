@@ -10,14 +10,15 @@
  *
  *  Summary:
  *  ---------------------------------------------------------------------
- *  Foreground-capable WorkManager coroutine worker that uploads either:
- *   - one local payload file (text/binary) using GitHubUploader, OR
- *   - a collected logcat snapshot (gzip) using GitHubUploader, OR
- *   - app-owned runtime logs bundle (zip) using RuntimeLogStore + GitHubUploader.
+ *  WorkManager coroutine worker that uploads:
+ *   - payload file, or
+ *   - logcat snapshot (gzip), or
+ *   - RuntimeLogStore plain .log files (deduped) + optional device cleanup.
  *
- *  Notes:
- *   - GitHubLogUploader is intentionally NOT used.
- *   - Logcat snapshot is collected inside this Worker and uploaded via GitHubUploader.
+ *  Key behavior:
+ *   - Dedupe via local SHA-256 ledger.
+ *   - After successful upload (or dedupe-skip), optionally deletes SOURCE .log on device.
+ *   - Active (currently written) log is never deleted.
  * =====================================================================
  */
 
@@ -48,52 +49,54 @@ import androidx.work.WorkInfo
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
 import androidx.work.workDataOf
+import com.negi.survey.BuildConfig
 import com.negi.survey.R
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
 import java.io.IOException
 import java.io.InputStream
+import java.io.RandomAccessFile
+import java.security.MessageDigest
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
 import java.util.concurrent.TimeUnit
 import java.util.zip.GZIPOutputStream
+import kotlinx.coroutines.delay
+import org.json.JSONArray
+import org.json.JSONObject
 
-/**
- * Coroutine-based [WorkManager] worker responsible for uploading either:
- *  - a local file, or
- *  - a logcat snapshot (collected here), or
- *  - app-owned runtime logs bundle (zip).
- */
 class GitHubUploadWorker(
     appContext: Context,
     params: WorkerParameters
 ) : CoroutineWorker(appContext, params) {
 
-    /**
-     * WorkManager may require ForegroundInfo *before* calling doWork() for expedited work.
-     *
-     * IMPORTANT:
-     * - In CoroutineWorker, getForegroundInfoAsync() is a final bridge.
-     * - Override this suspend function instead.
-     */
+    private val ledgerLock = Any()
+
     override suspend fun getForegroundInfo(): ForegroundInfo {
         val mode = inputData.getString(KEY_MODE)?.lowercase(Locale.US) ?: MODE_FILE
         ensureChannel()
 
-        val titleBase = notifTitleBase(mode)
-        val notifId = stableNotificationId(mode = mode, key = id.toString())
+        val notifTitleBase = when (mode) {
+            MODE_LOGCAT -> "Uploading logcat"
+            MODE_RUNTIME_LOGS -> "Uploading runtime logs"
+            MODE_STARTUP_RUNTIME_LOGS -> "Uploading startup runtime logs"
+            else -> "Uploading payload"
+        }
+
+        val notifId = stableNotificationId(mode, id.toString())
 
         return foregroundInfo(
             notificationId = notifId,
             pct = 0,
-            title = "$titleBase…"
+            title = "$notifTitleBase…"
         )
     }
 
     override suspend fun doWork(): Result {
-        // Keep Worker-side hint and Uploader-side hint consistent.
         val maxFileBytesHint =
             inputData.getLong(KEY_FILE_MAX_BYTES_HINT, DEFAULT_MAX_RAW_BYTES_HINT)
                 .coerceAtLeast(1L)
@@ -124,16 +127,17 @@ class GitHubUploadWorker(
         }
 
         val mode = inputData.getString(KEY_MODE)?.lowercase(Locale.US) ?: MODE_FILE
-
         ensureChannel()
 
-        val notifTitleBase = notifTitleBase(mode)
+        val notifTitleBase = when (mode) {
+            MODE_LOGCAT -> "Uploading logcat"
+            MODE_RUNTIME_LOGS -> "Uploading runtime logs"
+            MODE_STARTUP_RUNTIME_LOGS -> "Uploading startup runtime logs"
+            else -> "Uploading payload"
+        }
 
-        // Stable notification id for this Work (must match getForegroundInfo()).
-        val notifId = stableNotificationId(mode = mode, key = id.toString())
+        val notifId = stableNotificationId(mode, id.toString())
 
-        // Best-effort foreground. If the app lacks required FGS permissions/types,
-        // we still try to continue as a normal background worker.
         runCatching {
             setForeground(
                 foregroundInfo(
@@ -159,7 +163,6 @@ class GitHubUploadWorker(
                 )
             )
 
-            // Do not block progress callback; best-effort notification update.
             runCatching {
                 setForegroundAsync(
                     foregroundInfo(
@@ -175,22 +178,16 @@ class GitHubUploadWorker(
 
         return when (mode) {
             MODE_LOGCAT -> doLogcatUpload(cfg, notifId, progressCallback, currentPct)
-            MODE_RUNTIME_LOGS -> doRuntimeLogsUpload(cfg, notifId, progressCallback, currentPct)
+            MODE_RUNTIME_LOGS, MODE_STARTUP_RUNTIME_LOGS ->
+                doRuntimeLogsUpload(mode, cfg, notifId, progressCallback, currentPct)
             else -> doFileUpload(cfg, notifId, progressCallback, currentPct)
         }
     }
 
-    private fun notifTitleBase(mode: String): String {
-        return when (mode) {
-            MODE_LOGCAT -> "Uploading logcat"
-            MODE_RUNTIME_LOGS -> "Uploading runtime logs"
-            else -> "Uploading payload"
-        }
-    }
+    // ---------------------------------------------------------------------
+    // File upload mode
+    // ---------------------------------------------------------------------
 
-    /**
-     * Execute file upload mode.
-     */
     private suspend fun doFileUpload(
         cfg: GitHubUploader.GitHubConfig,
         notifId: Int,
@@ -201,19 +198,13 @@ class GitHubUploadWorker(
         val filePath = inputData.getString(KEY_FILE_PATH).orEmpty()
         val fileName = inputData.getString(KEY_FILE_NAME) ?: File(filePath).name
 
-        if (filePath.isBlank()) {
-            return Result.failure(workDataOf(ERROR_MESSAGE to "Missing file path."))
-        }
+        if (filePath.isBlank()) return Result.failure(workDataOf(ERROR_MESSAGE to "Missing file path."))
 
         val pendingFile = File(filePath)
-        if (!pendingFile.exists()) {
-            return Result.failure(workDataOf(ERROR_MESSAGE to "Pending file not found: $filePath"))
-        }
+        if (!pendingFile.exists()) return Result.failure(workDataOf(ERROR_MESSAGE to "Pending file not found: $filePath"))
 
         val fileSize = pendingFile.length()
-        if (fileSize <= 0L) {
-            return Result.failure(workDataOf(ERROR_MESSAGE to "Pending file is empty: $filePath"))
-        }
+        if (fileSize <= 0L) return Result.failure(workDataOf(ERROR_MESSAGE to "Pending file is empty: $filePath"))
 
         val maxBytesHint = inputData.getLong(KEY_FILE_MAX_BYTES_HINT, DEFAULT_MAX_RAW_BYTES_HINT)
         if (fileSize > maxBytesHint) {
@@ -223,7 +214,6 @@ class GitHubUploadWorker(
             return Result.failure(workDataOf(ERROR_MESSAGE to msg))
         }
 
-        // Fail-fast guardrail: raw bytes can fit, but request bytes may exceed limits due to base64 expansion.
         val estRequestBytes = estimateBase64RequestBytes(fileSize)
         if (estRequestBytes > cfg.maxRequestBytesHint.toLong()) {
             val msg =
@@ -232,15 +222,7 @@ class GitHubUploadWorker(
             return Result.failure(workDataOf(ERROR_MESSAGE to msg))
         }
 
-        // UI path should match GitHubUploader.buildPath() behavior (UTC yyyy-MM-dd).
         val remotePathForUi = buildDatedRemotePathUtc(cfg.pathPrefix, fileName)
-
-        Log.d(
-            TAG,
-            "doFileUpload: owner=${cfg.owner} repo=${cfg.repo} branch=${cfg.branch} " +
-                    "prefix='${cfg.pathPrefix}' filePath=$filePath fileName=$fileName size=$fileSize " +
-                    "maxBytesHint=$maxBytesHint rawHint=${cfg.maxRawBytesHint} reqHint=${cfg.maxRequestBytesHint}"
-        )
 
         return try {
             val extension = pendingFile.extension.lowercase(Locale.US)
@@ -248,9 +230,7 @@ class GitHubUploadWorker(
 
             val result = if (isText) {
                 val text = runCatching { pendingFile.readText(Charsets.UTF_8) }.getOrElse {
-                    return Result.failure(
-                        workDataOf(ERROR_MESSAGE to "Failed to read text file: ${it.message}")
-                    )
+                    return Result.failure(workDataOf(ERROR_MESSAGE to "Failed to read text file: ${it.message}"))
                 }
 
                 GitHubUploader.uploadJson(
@@ -261,7 +241,6 @@ class GitHubUploadWorker(
                     onProgress = onProgress
                 )
             } else {
-                // Stream upload to avoid loading the entire binary into memory.
                 GitHubUploader.uploadFile(
                     cfg = cfg,
                     relativePath = fileName,
@@ -308,17 +287,15 @@ class GitHubUploadWorker(
             }
 
             val failData = workDataOf(ERROR_MESSAGE to (t.message ?: "Unknown error"))
-
             if (shouldRetry(t) && runAttemptCount < MAX_ATTEMPTS) Result.retry()
             else Result.failure(failData)
         }
     }
 
-    /**
-     * Execute logcat upload mode.
-     *
-     * GitHubLogUploader is NOT used. Collection happens here and we upload via GitHubUploader.
-     */
+    // ---------------------------------------------------------------------
+    // Logcat upload mode
+    // ---------------------------------------------------------------------
+
     private suspend fun doLogcatUpload(
         cfg: GitHubUploader.GitHubConfig,
         notifId: Int,
@@ -333,7 +310,6 @@ class GitHubUploadWorker(
         val maxBytes = inputData.getInt(KEY_LOG_MAX_UNCOMPRESSED, 850_000)
 
         return try {
-            // Phase A: collect + gzip (0..20)
             onProgress(3)
 
             val snap = collectLogcatSnapshotGz(
@@ -345,8 +321,6 @@ class GitHubUploadWorker(
 
             onProgress(20)
 
-            // Remote path:
-            //   pathPrefix / remoteDir / (yyyy-MM-dd)? / logcat_<stamp>_pid<pid>.log.gz
             val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
             val pid = Process.myPid()
             val dateSegment = if (addDate) utcDateFolder() else ""
@@ -358,7 +332,6 @@ class GitHubUploadWorker(
                 remoteName
             ).filter { it.isNotBlank() }.joinToString("/")
 
-            // Phase B: upload (20..100) without regressing progress.
             val mappedProgress = mapProgressRange(start = 20, end = 100, sink = onProgress)
 
             val result = GitHubUploader.uploadBytesAtPath(
@@ -405,22 +378,17 @@ class GitHubUploadWorker(
             }
 
             val failData = workDataOf(ERROR_MESSAGE to (t.message ?: "Unknown error"))
-
             if (shouldRetry(t) && runAttemptCount < MAX_ATTEMPTS) Result.retry()
             else Result.failure(failData)
         }
     }
 
-    /**
-     * Execute runtime logs upload mode (app-owned logs, zipped).
-     *
-     * This uploads RuntimeLogStore rolling files as a single ZIP bundle.
-     *
-     * Important:
-     * - GitHubUploader starts progress from 0. If we already advanced progress (zip phase),
-     *   we must map uploader progress to a later progress range to avoid "progress going backwards".
-     */
+    // ---------------------------------------------------------------------
+    // Runtime logs (plain) upload mode + device cleanup
+    // ---------------------------------------------------------------------
+
     private suspend fun doRuntimeLogsUpload(
+        mode: String,
         cfg: GitHubUploader.GitHubConfig,
         notifId: Int,
         onProgress: (Int) -> Unit,
@@ -429,68 +397,232 @@ class GitHubUploadWorker(
         val remoteDir = inputData.getString(KEY_RTLOG_REMOTE_DIR) ?: "diagnostics/runtime_logs"
         val addDate = inputData.getBoolean(KEY_RTLOG_ADD_DATE, true)
         val reason = inputData.getString(KEY_RTLOG_REASON)?.takeIf { it.isNotBlank() } ?: "wm"
-        val deleteZipAfter = inputData.getBoolean(KEY_RTLOG_DELETE_ZIP_AFTER, true)
 
-        // Optional size guards.
-        val maxZipBytes = inputData.getLong(KEY_RTLOG_MAX_ZIP_BYTES, DEFAULT_MAX_RAW_BYTES_HINT)
+        val deletePreparedAfter = inputData.getBoolean(KEY_RTLOG_DELETE_ZIP_AFTER, true)
+        val dedupeEnabled = inputData.getBoolean(KEY_RTLOG_DEDUPE_ENABLE, true)
+
+        // NEW: delete SOURCE logs from device after upload/dedupe-skip
+        val deleteSourceAfterUpload = inputData.getBoolean(
+            KEY_RTLOG_DELETE_SOURCE_AFTER_UPLOAD,
+            !BuildConfig.DEBUG
+        )
+
+        val isRelease = !BuildConfig.DEBUG
+        val limitFiles = inputData.getInt(
+            KEY_RTLOG_PLAIN_LIMIT_FILES,
+            if (isRelease) 200 else DEFAULT_RTLOG_PLAIN_LIMIT_FILES
+        ).coerceIn(1, 200)
+
+        val includeActive = inputData.getBoolean(KEY_RTLOG_PLAIN_INCLUDE_ACTIVE, false)
+        val rotateSnapshot = inputData.getBoolean(KEY_RTLOG_PLAIN_ROTATE_SNAPSHOT, !includeActive)
+        val writeManifest = inputData.getBoolean(KEY_RTLOG_PLAIN_WRITE_MANIFEST, isRelease)
+
+        // Legacy: treated as per-file max bytes hint for plain logs.
+        val legacyMaxBytesHint = inputData.getLong(KEY_RTLOG_MAX_ZIP_BYTES, cfg.maxRawBytesHint.toLong())
+        val maxPerFileBytes = minOf(cfg.maxRawBytesHint.toLong(), legacyMaxBytesHint).coerceAtLeast(50_000L)
+
+        // Optional: attach logcat snapshot into the same session folder (Release default true)
+        val includeLogcat = inputData.getBoolean(KEY_RTLOG_INCLUDE_LOGCAT, isRelease)
+        val logcatIncludeHeader = inputData.getBoolean(KEY_RTLOG_LOGCAT_INCLUDE_HEADER, true)
+        val logcatIncludeCrash = inputData.getBoolean(KEY_RTLOG_LOGCAT_INCLUDE_CRASH, true)
+        val logcatMaxUncompressed = inputData.getInt(KEY_RTLOG_LOGCAT_MAX_UNCOMPRESSED, 850_000)
+
+        onProgress(3)
+
+        if (mode == MODE_STARTUP_RUNTIME_LOGS) {
+            runCatching { delay(STARTUP_RTLOG_PRE_DELAY_MS) }
+        }
+
+        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        val pid = Process.myPid()
+        val safeReason = safeFileSegment(reason)
+        val appCtx = applicationContext.applicationContext ?: applicationContext
+        val outDir = File(appCtx.cacheDir, "diagnostics_upload").apply { mkdirs() }
+
+        val preparedLogs: List<File> = runCatching {
+            RuntimeLogStore.start(appCtx)
+            RuntimeLogStore.prepareLogsForUploadPlain(
+                reason = safeReason,
+                limitFiles = limitFiles,
+                includeActive = includeActive,
+                rotateSnapshot = rotateSnapshot,
+                writeManifest = writeManifest
+            )
+        }.getOrElse { t ->
+            RuntimeLogStore.w(TAG, "doRuntimeLogsUpload: prepareLogsForUploadPlain failed: ${t.message}", t)
+            emptyList()
+        }
+
+        val manifest: File? = if (writeManifest) findLatestPlainManifest(outDir, safeReason) else null
+
+        val candidates = ArrayList<File>()
+        if (manifest != null && manifest.exists() && manifest.isFile) candidates.add(manifest)
+        candidates.addAll(preparedLogs.filter { it.exists() && it.isFile })
+
+        if (candidates.isEmpty() && !includeLogcat) {
+            RuntimeLogStore.d(TAG, "doRuntimeLogsUpload: no files to upload; no-op success.")
+            return Result.success(
+                workDataOf(
+                    OUT_MODE to MODE_RUNTIME_LOGS,
+                    OUT_REMOTE_PATH to "",
+                    OUT_FILE_NAME to "",
+                    OUT_COMMIT_SHA to "",
+                    OUT_FILE_URL to "",
+                    OUT_PLAIN_FILE_COUNT to 0,
+                    OUT_PLAIN_TOTAL_BYTES to 0L,
+                    OUT_PLAIN_PREVIEW to "",
+                    OUT_PLAIN_SOURCE_DELETED_COUNT to 0
+                )
+            )
+        }
+
+        // Enforce per-file size guard using tail truncation.
+        val sizedFiles = candidates.mapNotNull { f ->
+            val len = runCatching { f.length() }.getOrNull() ?: 0L
+            if (len <= 0L) return@mapNotNull null
+            if (len <= maxPerFileBytes) return@mapNotNull f
+
+            val trimmed = File(f.parentFile ?: outDir, "trimmed_${f.name}")
+            runCatching { copyTailOrFull(src = f, dst = trimmed, maxBytes = maxPerFileBytes) }
+                .getOrElse {
+                    RuntimeLogStore.w(TAG, "tail trim failed; skipping. file=${f.name} err=${it.message}", it)
+                    return@mapNotNull null
+                }
+            trimmed
+        }
+
+        val ledger: LinkedHashSet<String> = if (dedupeEnabled) loadLedger(appCtx) else LinkedHashSet()
+
+        val toUpload = ArrayList<File>()
+        val dupPrepared = ArrayList<File>()
+        if (dedupeEnabled) {
+            for (f in sizedFiles) {
+                val fp = runCatching { "sha256:" + sha256HexOfFile(f) }.getOrNull()
+                if (fp == null) {
+                    toUpload.add(f)
+                    continue
+                }
+                if (ledger.contains(fp)) dupPrepared.add(f) else toUpload.add(f)
+            }
+        } else {
+            toUpload.addAll(sizedFiles)
+        }
+
+        // If dupPrepared exists, optionally delete their SOURCE logs immediately.
+        var deletedSourceCount = 0
+        if (deleteSourceAfterUpload && dupPrepared.isNotEmpty()) {
+            val srcNames = dupPrepared.mapNotNull { extractSourceLogNameFromPrepared(it.name) }.distinct()
+            if (srcNames.isNotEmpty()) {
+                deletedSourceCount += RuntimeLogStore.deleteRolledLogFiles(srcNames, excludeActive = true)
+            }
+        }
+
+        if (toUpload.isEmpty() && !includeLogcat) {
+            RuntimeLogStore.d(TAG, "doRuntimeLogsUpload: all candidates already uploaded; no-op. deletedSource=$deletedSourceCount")
+            if (deletePreparedAfter) {
+                runCatching { manifest?.delete() }
+                preparedLogs.forEach { runCatching { it.delete() } }
+                sizedFiles.forEach { f -> if (f.name.startsWith("trimmed_")) runCatching { f.delete() } }
+            }
+            return Result.success(
+                workDataOf(
+                    OUT_MODE to MODE_RUNTIME_LOGS,
+                    OUT_REMOTE_PATH to "",
+                    OUT_FILE_NAME to "",
+                    OUT_COMMIT_SHA to "",
+                    OUT_FILE_URL to "",
+                    OUT_PLAIN_FILE_COUNT to 0,
+                    OUT_PLAIN_TOTAL_BYTES to 0L,
+                    OUT_PLAIN_PREVIEW to "",
+                    OUT_PLAIN_SOURCE_DELETED_COUNT to deletedSourceCount
+                )
+            )
+        }
+
+        val dateSegment = if (addDate) utcDateFolder() else ""
+        val sessionDirName = "runtime_logs_${stamp}_pid${pid}_${safeReason}"
+        val remoteBaseDir = listOf(
+            cfg.pathPrefix.trim('/'),
+            remoteDir.trim('/'),
+            dateSegment,
+            sessionDirName
+        ).filter { it.isNotBlank() }.joinToString("/")
+
+        val totalBytes = toUpload.sumOf { runCatching { it.length() }.getOrNull() ?: 0L }
+        val preview = toUpload.take(10).joinToString("|") { it.name }
+
+        Log.d(
+            TAG,
+            "doRuntimeLogsUpload: remoteBaseDir=$remoteBaseDir toUpload=${toUpload.size} bytes=$totalBytes " +
+                    "dedupe=$dedupeEnabled deleteSource=$deleteSourceAfterUpload deletedSourcePre=$deletedSourceCount " +
+                    "preview='$preview'"
+        )
 
         return try {
-            // Ensure store is started (idempotent).
-            runCatching { RuntimeLogStore.start(applicationContext) }
+            val startPct = 10
+            val endPctLogs = if (includeLogcat) 90 else 100
+            val n = toUpload.size.coerceAtLeast(1)
+            var lastResult: GitHubUploader.UploadResult? = null
 
-            // Phase A: build snapshot zip (0..15)
-            onProgress(3)
+            for ((i, file) in toUpload.withIndex()) {
+                val fileStart = startPct + ((endPctLogs - startPct) * i) / n
+                val fileEnd = startPct + ((endPctLogs - startPct) * (i + 1)) / n
+                val mapped = mapProgressRange(start = fileStart, end = fileEnd, sink = onProgress)
 
-            val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-            val pid = Process.myPid()
-            val safeReason = safeFileSegment(reason)
-            val zip = RuntimeLogStore.zipForUpload(reason = safeReason)
+                val remotePath = "$remoteBaseDir/${file.name}"
 
-            onProgress(15)
+                lastResult = GitHubUploader.uploadFileAtPath(
+                    cfg = cfg,
+                    path = remotePath,
+                    file = file,
+                    message = "Upload runtime logs (plain) ($reason)",
+                    onProgress = mapped
+                )
 
-            val zipBytes = zip.length().coerceAtLeast(0L)
-            if (zipBytes <= 0L) {
-                return Result.failure(workDataOf(ERROR_MESSAGE to "Runtime log zip is empty."))
+                if (dedupeEnabled) {
+                    val fp = runCatching { "sha256:" + sha256HexOfFile(file) }.getOrNull()
+                    if (fp != null) {
+                        ledger.add(fp)
+                        trimLedgerInPlace(ledger, LEDGER_MAX_ITEMS)
+                        saveLedger(appCtx, ledger)
+                    }
+                }
+
+                if (deleteSourceAfterUpload) {
+                    val srcName = extractSourceLogNameFromPrepared(file.name)
+                    if (srcName != null) {
+                        deletedSourceCount += RuntimeLogStore.deleteRolledLogFiles(listOf(srcName), excludeActive = true)
+                    }
+                }
             }
 
-            if (zipBytes > maxZipBytes) {
-                val msg =
-                    "Runtime log zip too large (size=$zipBytes, limit~$maxZipBytes). " +
-                            "Consider lowering RuntimeLogStore retention or splitting bundles."
-                return Result.failure(workDataOf(ERROR_MESSAGE to msg))
+            // Optional attached logcat snapshot
+            var logcatResult: GitHubUploader.UploadResult? = null
+            if (includeLogcat) {
+                val snap = runCatching {
+                    collectLogcatSnapshotGz(
+                        context = applicationContext,
+                        includeDeviceHeader = logcatIncludeHeader,
+                        includeCrashBuffer = logcatIncludeCrash,
+                        maxUncompressedBytes = logcatMaxUncompressed
+                    )
+                }.getOrNull()
+
+                if (snap != null && snap.gzBytes.isNotEmpty()) {
+                    val remotePath = "$remoteBaseDir/logcat_${stamp}_pid${pid}.log.gz"
+                    val mapped = mapProgressRange(start = 90, end = 100, sink = onProgress)
+
+                    logcatResult = GitHubUploader.uploadBytesAtPath(
+                        cfg = cfg,
+                        path = remotePath,
+                        bytes = snap.gzBytes,
+                        message = "Upload logcat (attached) ($reason)",
+                        onProgress = mapped
+                    )
+                } else {
+                    onProgress(100)
+                }
             }
-
-            // Remote path:
-            //   pathPrefix / remoteDir / (yyyy-MM-dd)? / runtime_logs_<stamp>_pid<pid>_<reason>.zip
-            val dateSegment = if (addDate) utcDateFolder() else ""
-            val remoteName = "runtime_logs_${stamp}_pid${pid}_${safeReason}.zip"
-            val remotePath = listOf(
-                cfg.pathPrefix.trim('/'),
-                remoteDir.trim('/'),
-                dateSegment,
-                remoteName
-            ).filter { it.isNotBlank() }.joinToString("/")
-
-            Log.d(
-                TAG,
-                "doRuntimeLogsUpload: owner=${cfg.owner} repo=${cfg.repo} branch=${cfg.branch} " +
-                        "remotePath=$remotePath zip=${zip.absolutePath} bytes=$zipBytes"
-            )
-
-            // Phase B: upload (15..100) without regressing progress.
-            val mappedProgress = mapProgressRange(
-                start = 15,
-                end = 100,
-                sink = onProgress
-            )
-
-            val result = GitHubUploader.uploadFileAtPath(
-                cfg = cfg,
-                path = remotePath,
-                file = zip,
-                message = "Upload runtime logs ($reason)",
-                onProgress = mappedProgress
-            )
 
             runCatching {
                 setForegroundAsync(
@@ -503,16 +635,23 @@ class GitHubUploadWorker(
                 )
             }
 
-            if (deleteZipAfter) runCatching { zip.delete() }
+            if (deletePreparedAfter) {
+                runCatching { manifest?.delete() }
+                preparedLogs.forEach { runCatching { it.delete() } }
+                sizedFiles.forEach { f -> if (f.name.startsWith("trimmed_")) runCatching { f.delete() } }
+            }
 
             Result.success(
                 workDataOf(
                     OUT_MODE to MODE_RUNTIME_LOGS,
-                    OUT_REMOTE_PATH to remotePath,
-                    OUT_FILE_NAME to zip.name,
-                    OUT_COMMIT_SHA to (result.commitSha ?: ""),
-                    OUT_FILE_URL to (result.fileUrl ?: ""),
-                    OUT_BYTES_RAW to zipBytes,
+                    OUT_REMOTE_PATH to remoteBaseDir,
+                    OUT_FILE_NAME to sessionDirName,
+                    OUT_COMMIT_SHA to (logcatResult?.commitSha ?: lastResult?.commitSha ?: ""),
+                    OUT_FILE_URL to (logcatResult?.fileUrl ?: lastResult?.fileUrl ?: ""),
+                    OUT_PLAIN_FILE_COUNT to toUpload.size,
+                    OUT_PLAIN_TOTAL_BYTES to totalBytes,
+                    OUT_PLAIN_PREVIEW to preview,
+                    OUT_PLAIN_SOURCE_DELETED_COUNT to deletedSourceCount
                 )
             )
         } catch (t: Throwable) {
@@ -530,157 +669,161 @@ class GitHubUploadWorker(
             }
 
             val failData = workDataOf(ERROR_MESSAGE to (t.message ?: "Unknown error"))
-
             if (shouldRetry(t) && runAttemptCount < MAX_ATTEMPTS) Result.retry()
             else Result.failure(failData)
         }
     }
 
     /**
-     * Build a date-based remote path consistent with GitHubUploader:
-     *   prefix + yyyy-MM-dd + fileName
+     * Extract original runtime log file name from prepared cache file name.
      *
-     * Uses UTC date to keep paths stable across timezones.
-     */
-    private fun buildDatedRemotePathUtc(prefix: String, fileName: String): String {
-        val date = SimpleDateFormat("yyyy-MM-dd", Locale.US).apply {
-            timeZone = TimeZone.getTimeZone("UTC")
-        }.format(Date())
-
-        return listOf(prefix.trim('/'), date, fileName.trim('/'))
-            .filter { it.isNotEmpty() }
-            .joinToString("/")
-    }
-
-    /**
-     * Returns UTC yyyy-MM-dd for stable storage paths across devices/timezones.
-     */
-    private fun utcDateFolder(): String =
-        SimpleDateFormat("yyyy-MM-dd", Locale.US).apply {
-            timeZone = TimeZone.getTimeZone("UTC")
-        }.format(Date())
-
-    /**
-     * Map progress from 0..100 into [start]..[end] and keep it monotonic.
-     */
-    private fun mapProgressRange(
-        start: Int,
-        end: Int,
-        sink: (Int) -> Unit
-    ): (Int) -> Unit {
-        val s = start.coerceIn(0, 100)
-        val e = end.coerceIn(0, 100)
-        val lo = minOf(s, e)
-        val hi = maxOf(s, e)
-
-        var last = lo
-        return { p ->
-            val clamped = p.coerceIn(0, 100)
-            val mapped = lo + ((clamped / 100.0) * (hi - lo)).toInt()
-            val mono = maxOf(last, mapped.coerceIn(lo, hi))
-            last = mono
-            sink(mono)
-        }
-    }
-
-    /**
-     * Sanitize a string to be safe as a repo path segment / filename fragment.
-     */
-    private fun safeFileSegment(s: String): String {
-        val t = s.trim().ifBlank { "wm" }
-        return t.replace(Regex("""[^A-Za-z0-9_\-\.]+"""), "_").take(24)
-    }
-
-    /**
-     * Determine if the throwable should be treated as transient.
-     */
-    private fun shouldRetry(t: Throwable): Boolean {
-        val msg = t.message.orEmpty()
-
-        // If uploader labeled it transient, allow retry even for 403/429 (rate limit).
-        if (msg.startsWith("Transient HTTP ", ignoreCase = true)) return true
-
-        // Avoid retrying obvious auth/permanent failures.
-        val httpCode = Regex("""\((\d{3})\)""").find(msg)?.groupValues?.getOrNull(1)?.toIntOrNull()
-        if (httpCode != null) {
-            // Retry only 429 in the 4xx family. Other 4xx are usually permanent for this request.
-            if (httpCode in 400..499 && httpCode != 429) return false
-        }
-
-        if (msg.contains("too large", ignoreCase = true)) return false
-        if (msg.contains("invalid github configuration", ignoreCase = true)) return false
-        if (msg.contains("bad credentials", ignoreCase = true)) return false
-        if (msg.contains("requires authentication", ignoreCase = true)) return false
-
-        // Conservative: 403 is ambiguous, but if it wasn't labeled transient, treat as permanent.
-        if (msg.contains("403")) return false
-
-        return t is IOException || msg.contains("timeout", ignoreCase = true)
-    }
-
-    /**
-     * Build [ForegroundInfo] with an upload progress notification.
-     */
-    private fun foregroundInfo(
-        notificationId: Int,
-        pct: Int,
-        title: String,
-        finished: Boolean = false,
-        error: Boolean = false
-    ): ForegroundInfo {
-        val builder = NotificationCompat.Builder(applicationContext, CHANNEL_ID)
-            .setSmallIcon(R.drawable.ic_upload)
-            .setContentTitle(title)
-            .setOnlyAlertOnce(true)
-            .setOngoing(!finished && !error)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
-            .setCategory(NotificationCompat.CATEGORY_PROGRESS)
-
-        if (finished || error) {
-            builder.setProgress(0, 0, false)
-        } else {
-            builder.setProgress(100, pct.coerceIn(0, 100), false)
-        }
-
-        val notification = builder.build()
-
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            ForegroundInfo(
-                notificationId,
-                notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
-            )
-        } else {
-            @Suppress("DEPRECATION")
-            ForegroundInfo(notificationId, notification)
-        }
-    }
-
-    /**
-     * Ensure the notification channel for upload progress exists.
-     */
-    private fun ensureChannel() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
-
-        val nm = applicationContext.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        val channel = NotificationChannel(
-            CHANNEL_ID,
-            "Background Uploads",
-            NotificationManager.IMPORTANCE_LOW
-        ).apply {
-            description = "Displays progress for ongoing uploads to GitHub."
-            setShowBadge(false)
-        }
-        nm.createNotificationChannel(channel)
-    }
-
-    /**
-     * Collect logcat snapshot and gzip it.
+     * Expected patterns:
+     * - runtime_log_...__rtlog_....log
+     * - trimmed_runtime_log_...__rtlog_....log
      *
-     * Note:
-     * - Some devices/ROMs restrict logcat. This returns best-effort output.
-     * - PID-filtered logcat may be unsupported; fallback is used automatically.
+     * Returns null for manifest/session files (no "__" marker).
      */
+    private fun extractSourceLogNameFromPrepared(preparedName: String): String? {
+        val base = preparedName.removePrefix("trimmed_")
+        val marker = "__"
+        if (!base.contains(marker)) return null
+        val tail = base.substringAfterLast(marker).trim()
+        if (tail.isBlank()) return null
+        if (!tail.endsWith(".log", ignoreCase = true)) return null
+        return tail
+    }
+
+    // ---------------------------------------------------------------------
+    // Ledger + hashing
+    // ---------------------------------------------------------------------
+
+    private fun ledgerFile(ctx: Context): File {
+        val dir = File(ctx.filesDir, "diagnostics/runtime_logs").apply { mkdirs() }
+        return File(dir, "upload_ledger.json")
+    }
+
+    private fun loadLedger(ctx: Context): LinkedHashSet<String> = synchronized(ledgerLock) {
+        val f = ledgerFile(ctx)
+        if (!f.exists()) return@synchronized LinkedHashSet()
+
+        return@synchronized runCatching {
+            val obj = JSONObject(f.readText(Charsets.UTF_8))
+            val arr = obj.optJSONArray("items") ?: JSONArray()
+            val out = LinkedHashSet<String>(arr.length().coerceAtLeast(16))
+            for (i in 0 until arr.length()) {
+                val s = arr.optString(i).takeIf { it.isNotBlank() } ?: continue
+                out.add(s)
+            }
+            out
+        }.getOrElse { LinkedHashSet() }
+    }
+
+    private fun saveLedger(ctx: Context, set: LinkedHashSet<String>) = synchronized(ledgerLock) {
+        val f = ledgerFile(ctx)
+        val obj = JSONObject()
+        obj.put("v", 1)
+        obj.put("updated_utc", SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US).apply {
+            timeZone = TimeZone.getTimeZone("UTC")
+        }.format(Date()))
+        obj.put("max", LEDGER_MAX_ITEMS)
+
+        val arr = JSONArray()
+        set.forEach { arr.put(it) }
+        obj.put("items", arr)
+
+        runCatching { f.writeText(obj.toString(2), Charsets.UTF_8) }
+    }
+
+    private fun trimLedgerInPlace(set: LinkedHashSet<String>, maxItems: Int) {
+        while (set.size > maxItems) {
+            val it = set.iterator()
+            if (!it.hasNext()) return
+            it.next()
+            it.remove()
+        }
+    }
+
+    private fun sha256HexOfFile(file: File): String {
+        val md = MessageDigest.getInstance("SHA-256")
+        FileInputStream(file).use { ins ->
+            val buf = ByteArray(32 * 1024)
+            while (true) {
+                val n = ins.read(buf)
+                if (n <= 0) break
+                md.update(buf, 0, n)
+            }
+        }
+        return md.digest().joinToString("") { b -> "%02x".format(b) }
+    }
+
+    // ---------------------------------------------------------------------
+    // Manifest helper (plain)
+    // ---------------------------------------------------------------------
+
+    private fun findLatestPlainManifest(outDir: File, safeReason: String): File? {
+        val list = outDir.listFiles()?.filter {
+            it.isFile &&
+                    it.name.startsWith("plain_logs_manifest_", ignoreCase = true) &&
+                    it.name.contains("_${safeReason}.json")
+        }.orEmpty()
+        return list.maxByOrNull { it.lastModified() }
+    }
+
+    // ---------------------------------------------------------------------
+    // Tail copy
+    // ---------------------------------------------------------------------
+
+    private fun copyTailOrFull(src: File, dst: File, maxBytes: Long) {
+        dst.parentFile?.mkdirs()
+        val limit = maxBytes.coerceAtLeast(50_000L)
+        val len = runCatching { src.length() }.getOrNull() ?: 0L
+
+        if (len <= 0L) {
+            FileOutputStream(dst).use { it.fd.sync() }
+            return
+        }
+
+        if (len <= limit) {
+            FileInputStream(src).use { ins ->
+                FileOutputStream(dst).use { outs ->
+                    val buf = ByteArray(16 * 1024)
+                    while (true) {
+                        val n = ins.read(buf)
+                        if (n <= 0) break
+                        outs.write(buf, 0, n)
+                    }
+                    outs.fd.sync()
+                }
+            }
+            return
+        }
+
+        RandomAccessFile(src, "r").use { raf ->
+            raf.seek((len - limit).coerceAtLeast(0L))
+            FileOutputStream(dst).use { outs ->
+                val header = "=== TRUNCATED TAIL COPY ===\noriginal_bytes=$len copied_tail_bytes=$limit\n\n"
+                outs.write(header.toByteArray(Charsets.UTF_8))
+
+                val buf = ByteArray(16 * 1024)
+                var remaining = limit
+                while (remaining > 0) {
+                    val toRead = minOf(buf.size.toLong(), remaining).toInt()
+                    val n = raf.read(buf, 0, toRead)
+                    if (n <= 0) break
+                    outs.write(buf, 0, n)
+                    remaining -= n.toLong()
+                }
+                outs.fd.sync()
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Logcat snapshot utils
+    // ---------------------------------------------------------------------
+
+    private data class LogcatSnapshot(val rawBytes: Int, val gzBytes: ByteArray)
+
     private fun collectLogcatSnapshotGz(
         context: Context,
         includeDeviceHeader: Boolean,
@@ -712,17 +855,8 @@ class GitHubUploadWorker(
 
         val trimmed = trimToTail(combined, maxUncompressedBytes.coerceAtLeast(50_000))
         val gz = gzip(trimmed)
-
-        return LogcatSnapshot(
-            rawBytes = trimmed.size,
-            gzBytes = gz
-        )
+        return LogcatSnapshot(rawBytes = trimmed.size, gzBytes = gz)
     }
-
-    private data class LogcatSnapshot(
-        val rawBytes: Int,
-        val gzBytes: ByteArray
-    )
 
     private fun buildDeviceHeader(context: Context, pid: Int): String {
         val pkg = context.packageName
@@ -874,25 +1008,103 @@ class GitHubUploadWorker(
         return bos.toByteArray()
     }
 
-    companion object {
+    // ---------------------------------------------------------------------
+    // Foreground + helpers
+    // ---------------------------------------------------------------------
 
+    private fun foregroundInfo(
+        notificationId: Int,
+        pct: Int,
+        title: String,
+        finished: Boolean = false,
+        error: Boolean = false
+    ): ForegroundInfo {
+        val builder = NotificationCompat.Builder(applicationContext, CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_upload)
+            .setContentTitle(title)
+            .setOnlyAlertOnce(true)
+            .setOngoing(!finished && !error)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setCategory(NotificationCompat.CATEGORY_PROGRESS)
+
+        if (finished || error) builder.setProgress(0, 0, false)
+        else builder.setProgress(100, pct.coerceIn(0, 100), false)
+
+        val notification = builder.build()
+
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            ForegroundInfo(notificationId, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+        } else {
+            @Suppress("DEPRECATION")
+            ForegroundInfo(notificationId, notification)
+        }
+    }
+
+    private fun ensureChannel() {
+        val nm = applicationContext.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        val channel = NotificationChannel(
+            CHANNEL_ID,
+            "Background Uploads",
+            NotificationManager.IMPORTANCE_LOW
+        ).apply {
+            description = "Displays progress for ongoing uploads to GitHub."
+            setShowBadge(false)
+        }
+        nm.createNotificationChannel(channel)
+    }
+
+    private fun utcDateFolder(): String =
+        SimpleDateFormat("yyyy-MM-dd", Locale.US).apply { timeZone = TimeZone.getTimeZone("UTC") }.format(Date())
+
+    private fun buildDatedRemotePathUtc(prefix: String, fileName: String): String {
+        val date = utcDateFolder()
+        return listOf(prefix.trim('/'), date, fileName.trim('/'))
+            .filter { it.isNotEmpty() }
+            .joinToString("/")
+    }
+
+    private fun mapProgressRange(start: Int, end: Int, sink: (Int) -> Unit): (Int) -> Unit {
+        val lo = minOf(start.coerceIn(0, 100), end.coerceIn(0, 100))
+        val hi = maxOf(start.coerceIn(0, 100), end.coerceIn(0, 100))
+        var last = lo
+        return { p ->
+            val clamped = p.coerceIn(0, 100)
+            val mapped = lo + ((clamped / 100.0) * (hi - lo)).toInt()
+            val mono = maxOf(last, mapped.coerceIn(lo, hi))
+            last = mono
+            sink(mono)
+        }
+    }
+
+    private fun safeFileSegment(s: String): String =
+        s.trim().ifBlank { "wm" }
+            .replace(Regex("""[^A-Za-z0-9_\-\.]+"""), "_")
+            .take(24)
+
+    private fun shouldRetry(t: Throwable): Boolean {
+        val msg = t.message.orEmpty()
+
+        if (msg.startsWith("Transient HTTP ", ignoreCase = true)) return true
+
+        val httpCode = Regex("""\((\d{3})\)""").find(msg)?.groupValues?.getOrNull(1)?.toIntOrNull()
+        if (httpCode != null && httpCode in 400..499 && httpCode != 429) return false
+
+        if (msg.contains("too large", ignoreCase = true)) return false
+        if (msg.contains("bad credentials", ignoreCase = true)) return false
+        if (msg.contains("requires authentication", ignoreCase = true)) return false
+        if (msg.contains("403")) return false
+
+        return t is IOException || msg.contains("timeout", ignoreCase = true)
+    }
+
+    companion object {
         const val TAG = "github_upload"
 
         private const val CHANNEL_ID = "uploads"
         private const val NOTIF_BASE = 3200
         private const val MAX_ATTEMPTS = 5
 
-        /**
-         * Default (conservative) guardrail for Contents API workflows.
-         *
-         * GitHub docs note that the "Get repository content" endpoint fully supports features
-         * for files 1 MB or smaller; larger sizes can be problematic for tooling and APIs.
-         */
         private const val DEFAULT_MAX_RAW_BYTES_HINT = 1_000_000L
-
-        /**
-         * Soft guardrail for command output read.
-         */
         private const val COMMAND_STDOUT_MAX_BYTES = 700_000
 
         private const val LOGCAT_TAIL_LINES = 1200
@@ -900,10 +1112,16 @@ class GitHubUploadWorker(
 
         private val TEXT_EXTENSIONS = setOf("json", "jsonl", "txt", "csv")
 
+        private const val STARTUP_RTLOG_PRE_DELAY_MS = 1200L
+        private const val DEFAULT_RTLOG_PLAIN_LIMIT_FILES = 12
+
+        private const val LEDGER_MAX_ITEMS = 4000
+
         // Modes
         private const val MODE_FILE = "file"
         private const val MODE_LOGCAT = "logcat"
         private const val MODE_RUNTIME_LOGS = "runtime_logs"
+        private const val MODE_STARTUP_RUNTIME_LOGS = "startup_runtime_logs"
 
         // Progress keys
         const val PROGRESS_PCT = "pct"
@@ -920,17 +1138,7 @@ class GitHubUploadWorker(
         // File input keys
         const val KEY_FILE_PATH = "filePath"
         const val KEY_FILE_NAME = "fileName"
-
-        /**
-         * Optional per-request override for the raw file size hint.
-         */
         const val KEY_FILE_MAX_BYTES_HINT = "file.maxBytesHint"
-
-        /**
-         * Optional per-request override for the estimated request bytes hint.
-         *
-         * If omitted, we estimate from [KEY_FILE_MAX_BYTES_HINT].
-         */
         const val KEY_FILE_MAX_REQUEST_BYTES_HINT = "file.maxRequestBytesHint"
 
         // Logcat input keys
@@ -940,12 +1148,32 @@ class GitHubUploadWorker(
         const val KEY_LOG_INCLUDE_CRASH = "log.includeCrash"
         const val KEY_LOG_MAX_UNCOMPRESSED = "log.maxUncompressed"
 
-        // Runtime logs (app-owned) input keys
+        // Runtime logs input keys
         const val KEY_RTLOG_REMOTE_DIR = "rtlog.remoteDir"
         const val KEY_RTLOG_ADD_DATE = "rtlog.addDate"
         const val KEY_RTLOG_REASON = "rtlog.reason"
+
+        // Legacy keys (kept)
         const val KEY_RTLOG_DELETE_ZIP_AFTER = "rtlog.deleteZipAfter"
         const val KEY_RTLOG_MAX_ZIP_BYTES = "rtlog.maxZipBytes"
+
+        // Plain runtime logs controls
+        const val KEY_RTLOG_PLAIN_LIMIT_FILES = "rtlog.plain.limitFiles"
+        const val KEY_RTLOG_PLAIN_INCLUDE_ACTIVE = "rtlog.plain.includeActive"
+        const val KEY_RTLOG_PLAIN_ROTATE_SNAPSHOT = "rtlog.plain.rotateSnapshot"
+        const val KEY_RTLOG_PLAIN_WRITE_MANIFEST = "rtlog.plain.writeManifest"
+
+        // Dedupe control
+        const val KEY_RTLOG_DEDUPE_ENABLE = "rtlog.dedupe.enable"
+
+        // NEW: delete uploaded source logs from device
+        const val KEY_RTLOG_DELETE_SOURCE_AFTER_UPLOAD = "rtlog.deleteSourceAfterUpload"
+
+        // Attach logcat to runtime logs session
+        const val KEY_RTLOG_INCLUDE_LOGCAT = "rtlog.includeLogcat"
+        const val KEY_RTLOG_LOGCAT_INCLUDE_HEADER = "rtlog.logcat.includeHeader"
+        const val KEY_RTLOG_LOGCAT_INCLUDE_CRASH = "rtlog.logcat.includeCrash"
+        const val KEY_RTLOG_LOGCAT_MAX_UNCOMPRESSED = "rtlog.logcat.maxUncompressed"
 
         // Output keys
         const val OUT_MODE = "out.mode"
@@ -956,13 +1184,14 @@ class GitHubUploadWorker(
         const val OUT_BYTES_RAW = "out.bytesRaw"
         const val OUT_BYTES_GZ = "out.bytesGz"
 
+        // Plain runtime logs outputs
+        const val OUT_PLAIN_FILE_COUNT = "out.plainFileCount"
+        const val OUT_PLAIN_TOTAL_BYTES = "out.plainTotalBytes"
+        const val OUT_PLAIN_PREVIEW = "out.plainPreview"
+        const val OUT_PLAIN_SOURCE_DELETED_COUNT = "out.plainSourceDeletedCount"
+
         const val ERROR_MESSAGE = "error"
 
-        /**
-         * Estimate base64-encoded request bytes from raw bytes.
-         *
-         * Note: This is a coarse guardrail used to fail fast before attempting a large request.
-         */
         private fun estimateBase64RequestBytes(rawBytes: Long): Long {
             val raw = rawBytes.coerceAtLeast(1L)
             val b64 = ((raw + 2L) / 3L) * 4L
@@ -970,11 +1199,6 @@ class GitHubUploadWorker(
             return b64 + overhead
         }
 
-        /**
-         * Estimate a reasonable request-bytes guard from raw-bytes hint.
-         *
-         * Base64 size (ceil(n/3)*4) + overhead, with a minimum floor.
-         */
         private fun estimateRequestBytesHint(rawBytesHint: Int): Int {
             val est = estimateBase64RequestBytes(rawBytesHint.toLong())
             val floor = 2_800_000L
@@ -982,159 +1206,17 @@ class GitHubUploadWorker(
             return out.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
         }
 
-        /**
-         * Deterministic notification id that never goes negative.
-         *
-         * Important:
-         * - Must be stable for the lifetime of this Work instance so that
-         *   getForegroundInfo() and doWork() refer to the same notification id.
-         */
         private fun stableNotificationId(mode: String, key: String): Int {
-            val h = (mode + ":" + key).hashCode().toLong()
+            val h = (mode + key).hashCode().toLong()
             val nonNeg = h and 0x7fffffffL
             return NOTIF_BASE + (nonNeg % 8000L).toInt()
         }
 
         /**
-         * Choose ExistingWorkPolicy based on current unique work state.
+         * Enqueue a work request to upload app-owned runtime logs (plain).
          *
-         * Rationale:
-         * - KEEP prevents duplicates while a work is in-flight.
-         * - REPLACE allows re-enqueue after FAILED/SUCCEEDED/CANCELLED chains,
-         *   which is critical when config (token) was fixed later.
-         */
-        private fun choosePolicyForUniqueName(context: Context, uniqueName: String): ExistingWorkPolicy {
-            return try {
-                val infos = WorkManager.getInstance(context)
-                    .getWorkInfosForUniqueWork(uniqueName)
-                    .get(350, TimeUnit.MILLISECONDS)
-
-                val states = infos.joinToString(",") { it.state.name }
-                val inFlight = infos.any {
-                    it.state == WorkInfo.State.RUNNING ||
-                            it.state == WorkInfo.State.ENQUEUED ||
-                            it.state == WorkInfo.State.BLOCKED
-                }
-
-                val policy = if (inFlight) ExistingWorkPolicy.KEEP else ExistingWorkPolicy.REPLACE
-                Log.d(TAG, "choosePolicy: uniqueName=$uniqueName policy=$policy states=[$states]")
-                policy
-            } catch (t: Throwable) {
-                Log.w(TAG, "choosePolicy: fallback KEEP (query failed). uniqueName=$uniqueName err=${t.message}")
-                ExistingWorkPolicy.KEEP
-            }
-        }
-
-        /**
-         * Enqueue a work request to upload an existing file.
-         */
-        fun enqueueExistingPayload(
-            context: Context,
-            cfg: GitHubUploader.GitHubConfig,
-            file: File,
-            maxBytesHint: Long = DEFAULT_MAX_RAW_BYTES_HINT,
-            maxRequestBytesHint: Int = estimateRequestBytesHint(
-                maxBytesHint.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
-            )
-        ) {
-            val name = file.name
-
-            // Include size+mtime to avoid suppressing uploads for "same name but different content".
-            val uniqueName = "upload_${name}_${file.length()}_${file.lastModified()}"
-
-            val req: OneTimeWorkRequest =
-                OneTimeWorkRequestBuilder<GitHubUploadWorker>()
-                    .setInputData(
-                        workDataOf(
-                            KEY_MODE to MODE_FILE,
-                            KEY_OWNER to cfg.owner,
-                            KEY_REPO to cfg.repo,
-                            KEY_TOKEN to cfg.token,
-                            KEY_BRANCH to cfg.branch,
-                            KEY_PATH_PREFIX to cfg.pathPrefix,
-                            KEY_FILE_PATH to file.absolutePath,
-                            KEY_FILE_NAME to name,
-                            KEY_FILE_MAX_BYTES_HINT to maxBytesHint,
-                            KEY_FILE_MAX_REQUEST_BYTES_HINT to maxRequestBytesHint
-                        )
-                    )
-                    .setConstraints(
-                        Constraints.Builder()
-                            .setRequiredNetworkType(NetworkType.CONNECTED)
-                            .build()
-                    )
-                    .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
-                    .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
-                    .addTag(TAG)
-                    .addTag("$TAG:file:$name")
-                    .build()
-
-            val appCtx = context.applicationContext
-            val policy = choosePolicyForUniqueName(appCtx, uniqueName)
-
-            Log.d(
-                TAG,
-                "enqueueExistingPayload: uniqueName=$uniqueName policy=$policy file=${file.absolutePath} bytes=${file.length()} mtime=${file.lastModified()}"
-            )
-
-            WorkManager.getInstance(appCtx)
-                .enqueueUniqueWork(uniqueName, policy, req)
-        }
-
-        /**
-         * Enqueue a work request to collect and upload logcat (snapshot gzip).
-         *
-         * Note: We use a timestamped unique name so each request is distinct.
-         */
-        fun enqueueLogcatUpload(
-            context: Context,
-            cfg: GitHubUploader.GitHubConfig,
-            remoteDir: String = "diagnostics/logs",
-            addDateSubdir: Boolean = true,
-            includeDeviceHeader: Boolean = true,
-            includeCrashBuffer: Boolean = true,
-            maxUncompressedBytes: Int = 850_000,
-        ) {
-            val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-            val uniqueName = "upload_logcat_$stamp"
-
-            val req: OneTimeWorkRequest =
-                OneTimeWorkRequestBuilder<GitHubUploadWorker>()
-                    .setInputData(
-                        workDataOf(
-                            KEY_MODE to MODE_LOGCAT,
-                            KEY_OWNER to cfg.owner,
-                            KEY_REPO to cfg.repo,
-                            KEY_TOKEN to cfg.token,
-                            KEY_BRANCH to cfg.branch,
-                            KEY_PATH_PREFIX to cfg.pathPrefix,
-
-                            KEY_LOG_REMOTE_DIR to remoteDir,
-                            KEY_LOG_ADD_DATE to addDateSubdir,
-                            KEY_LOG_INCLUDE_HEADER to includeDeviceHeader,
-                            KEY_LOG_INCLUDE_CRASH to includeCrashBuffer,
-                            KEY_LOG_MAX_UNCOMPRESSED to maxUncompressedBytes,
-                        )
-                    )
-                    .setConstraints(
-                        Constraints.Builder()
-                            .setRequiredNetworkType(NetworkType.CONNECTED)
-                            .build()
-                    )
-                    .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
-                    .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
-                    .addTag(TAG)
-                    .addTag("$TAG:logcat")
-                    .build()
-
-            WorkManager.getInstance(context.applicationContext)
-                .enqueueUniqueWork(uniqueName, ExistingWorkPolicy.KEEP, req)
-        }
-
-        /**
-         * Enqueue a work request to upload app-owned runtime logs bundle (zip).
-         *
-         * This uploads what RuntimeLogStore has collected during app execution.
+         * Note:
+         * - maxZipBytes is kept for backward compatibility, now treated as per-file max bytes hint.
          */
         fun enqueueRuntimeLogsUpload(
             context: Context,
@@ -1144,6 +1226,7 @@ class GitHubUploadWorker(
             reason: String = "manual",
             deleteZipAfter: Boolean = true,
             maxZipBytes: Long = DEFAULT_MAX_RAW_BYTES_HINT,
+            deleteSourceAfterUpload: Boolean = true
         ) {
             val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
             val uniqueName = "upload_runtime_logs_$stamp"
@@ -1164,6 +1247,9 @@ class GitHubUploadWorker(
                             KEY_RTLOG_REASON to reason,
                             KEY_RTLOG_DELETE_ZIP_AFTER to deleteZipAfter,
                             KEY_RTLOG_MAX_ZIP_BYTES to maxZipBytes,
+
+                            KEY_RTLOG_DEDUPE_ENABLE to true,
+                            KEY_RTLOG_DELETE_SOURCE_AFTER_UPLOAD to deleteSourceAfterUpload,
                         )
                     )
                     .setConstraints(
@@ -1179,6 +1265,84 @@ class GitHubUploadWorker(
 
             WorkManager.getInstance(context.applicationContext)
                 .enqueueUniqueWork(uniqueName, ExistingWorkPolicy.KEEP, req)
+        }
+
+        /**
+         * Enqueue a stable startup runtime logs upload.
+         */
+        fun enqueueStartupRuntimeLogsUpload(
+            context: Context,
+            cfg: GitHubUploader.GitHubConfig,
+            remoteDir: String = "diagnostics/runtime_logs",
+            addDateSubdir: Boolean = true,
+            reason: String = "app_start",
+            deleteZipAfter: Boolean = true,
+            maxZipBytes: Long = DEFAULT_MAX_RAW_BYTES_HINT,
+            deleteSourceAfterUpload: Boolean = true
+        ) {
+            val uniqueName = "upload_runtime_logs_startup"
+
+            val req: OneTimeWorkRequest =
+                OneTimeWorkRequestBuilder<GitHubUploadWorker>()
+                    .setInputData(
+                        workDataOf(
+                            KEY_MODE to MODE_STARTUP_RUNTIME_LOGS,
+                            KEY_OWNER to cfg.owner,
+                            KEY_REPO to cfg.repo,
+                            KEY_TOKEN to cfg.token,
+                            KEY_BRANCH to cfg.branch,
+                            KEY_PATH_PREFIX to cfg.pathPrefix,
+
+                            KEY_RTLOG_REMOTE_DIR to remoteDir,
+                            KEY_RTLOG_ADD_DATE to addDateSubdir,
+                            KEY_RTLOG_REASON to reason,
+                            KEY_RTLOG_DELETE_ZIP_AFTER to deleteZipAfter,
+                            KEY_RTLOG_MAX_ZIP_BYTES to maxZipBytes,
+
+                            KEY_RTLOG_DEDUPE_ENABLE to true,
+                            KEY_RTLOG_DELETE_SOURCE_AFTER_UPLOAD to deleteSourceAfterUpload,
+                        )
+                    )
+                    .setConstraints(
+                        Constraints.Builder()
+                            .setRequiredNetworkType(NetworkType.CONNECTED)
+                            .build()
+                    )
+                    .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
+                    .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
+                    .addTag(TAG)
+                    .addTag("$TAG:startup_runtime_logs")
+                    .build()
+
+            val appCtx = context.applicationContext
+            val policy = choosePolicyForUniqueName(appCtx, uniqueName)
+
+            Log.d(TAG, "enqueueStartupRuntimeLogsUpload: uniqueName=$uniqueName policy=$policy")
+
+            WorkManager.getInstance(appCtx)
+                .enqueueUniqueWork(uniqueName, policy, req)
+        }
+
+        private fun choosePolicyForUniqueName(context: Context, uniqueName: String): ExistingWorkPolicy {
+            return try {
+                val infos = WorkManager.getInstance(context)
+                    .getWorkInfosForUniqueWork(uniqueName)
+                    .get(350, TimeUnit.MILLISECONDS)
+
+                val states = infos.joinToString(",") { it.state.name }
+                val inFlight = infos.any {
+                    it.state == WorkInfo.State.RUNNING ||
+                            it.state == WorkInfo.State.ENQUEUED ||
+                            it.state == WorkInfo.State.BLOCKED
+                }
+
+                val policy = if (inFlight) ExistingWorkPolicy.KEEP else ExistingWorkPolicy.REPLACE
+                Log.d(TAG, "choosePolicy: uniqueName=$uniqueName policy=$policy states=[$states]")
+                policy
+            } catch (t: Throwable) {
+                Log.w(TAG, "choosePolicy: fallback KEEP (query failed). uniqueName=$uniqueName err=${t.message}")
+                ExistingWorkPolicy.KEEP
+            }
         }
     }
 }

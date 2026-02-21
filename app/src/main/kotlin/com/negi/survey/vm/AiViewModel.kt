@@ -13,6 +13,7 @@
 
 package com.negi.survey.vm
 
+import android.os.SystemClock
 import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -22,6 +23,8 @@ import com.negi.survey.slm.FollowupExtractor
 import com.negi.survey.slm.PromptPhase
 import com.negi.survey.slm.Repository
 import java.security.MessageDigest
+import java.util.Collections
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.min
@@ -53,6 +56,12 @@ import kotlinx.coroutines.withTimeout
  * - Step1 (EVAL) remains in primary UI state flows: raw/score/followups.
  * - Step2 (FOLLOWUP) is appended to [stepHistory] without overwriting Step1.
  * - UI can render both Step1 + Step2 from [stepHistory] while keeping Step1 pinned.
+ *
+ * Persistent chat model (B plan, 2026-02):
+ * - Chat history + conversation state are stored per contextKey:
+ *   e.g. "sid=<surveySessionId>|nid=<nodeId>".
+ * - Survives navigation/back while this ViewModel instance is alive.
+ * - Does NOT survive process death (use DB/files if needed).
  */
 class AiViewModel(
     private val repo: Repository,
@@ -73,6 +82,12 @@ class AiViewModel(
 
         /** Prevent unbounded memory growth in UI history. */
         private const val MAX_STEP_HISTORY = 12
+
+        /** Persisted chat max items per context key. */
+        private const val MAX_CHAT_ITEMS = 260
+
+        /** Upper bound for number of context keys to keep (best-effort LRU). */
+        private const val MAX_CONTEXT_KEYS = 24
 
         /**
          * Reduce UI churn / O(n^2) string concatenation.
@@ -192,6 +207,281 @@ class AiViewModel(
         }
     }
 
+    // ─────────────────────── Persistent chat (B plan) ───────────────────────
+
+    /** Sender for persisted chat items. */
+    enum class ChatSender {
+        USER,
+        AI
+    }
+
+    /**
+     * Persisted chat item (UI-agnostic).
+     *
+     * @param id Stable id for upsert/dedup.
+     * @param sender Sender type.
+     * @param text Plain text payload.
+     * @param json JSON payload (pretty string).
+     * @param isTyping True when this is a streaming typing placeholder.
+     * @param createdAtUptimeMs Monotonic timestamp for ordering/diagnostics.
+     */
+    data class ChatItem(
+        val id: String,
+        val sender: ChatSender,
+        val text: String? = null,
+        val json: String? = null,
+        val isTyping: Boolean = false,
+        val createdAtUptimeMs: Long = SystemClock.uptimeMillis()
+    )
+
+    /** Composer role per conversation context. */
+    enum class ComposerRole {
+        MAIN,
+        FOLLOWUP
+    }
+
+    /**
+     * Persisted conversation state per context key.
+     *
+     * @param role Current composer role.
+     * @param activePromptQuestion The question that should be answered next.
+     * @param composerDraft Draft text for restoration after navigation.
+     */
+    data class ConversationState(
+        val role: ComposerRole,
+        val activePromptQuestion: String,
+        val composerDraft: String
+    )
+
+    private val chatStore = ConcurrentHashMap<String, MutableStateFlow<List<ChatItem>>>()
+    private val conversationStore = ConcurrentHashMap<String, MutableStateFlow<ConversationState>>()
+    private val followupSeen = ConcurrentHashMap<String, MutableSet<String>>()
+
+    /** Best-effort LRU of context keys to prevent runaway memory usage. */
+    private val contextKeyOrder = ArrayDeque<String>()
+
+    private val msgSeq = AtomicLong(0L)
+
+    /**
+     * Return persisted chat history flow for [contextKey].
+     */
+    fun chatHistoryFlow(contextKey: String): StateFlow<List<ChatItem>> {
+        touchContextKey(contextKey)
+        return chatStore.getOrPut(contextKey) { MutableStateFlow(emptyList()) }.asStateFlow()
+    }
+
+    /**
+     * Return persisted conversation state flow for [contextKey].
+     */
+    fun conversationStateFlow(contextKey: String): StateFlow<ConversationState> {
+        touchContextKey(contextKey)
+        return conversationStore.getOrPut(contextKey) {
+            MutableStateFlow(
+                ConversationState(
+                    role = ComposerRole.MAIN,
+                    activePromptQuestion = "",
+                    composerDraft = ""
+                )
+            )
+        }.asStateFlow()
+    }
+
+    /**
+     * Ensure a conversation context exists and is initialized.
+     *
+     * Notes:
+     * - This is safe to call multiple times.
+     * - It only seeds missing fields; it won't clobber existing role/draft.
+     */
+    fun ensureConversationContext(
+        contextKey: String,
+        rootQuestion: String,
+        initialDraft: String
+    ) {
+        touchContextKey(contextKey)
+
+        conversationStore.computeIfAbsent(contextKey) {
+            MutableStateFlow(
+                ConversationState(
+                    role = ComposerRole.MAIN,
+                    activePromptQuestion = rootQuestion,
+                    composerDraft = initialDraft
+                )
+            )
+        }
+
+        conversationStore[contextKey]?.update { cur ->
+            val apq = cur.activePromptQuestion.ifBlank { rootQuestion }
+            val draft = if (cur.composerDraft.isBlank() && initialDraft.isNotBlank()) initialDraft else cur.composerDraft
+            cur.copy(activePromptQuestion = apq, composerDraft = draft)
+        }
+    }
+
+    /**
+     * If the role is MAIN, ensure activePromptQuestion points to [rootQuestion].
+     */
+    fun ensureActivePromptIfMain(contextKey: String, rootQuestion: String) {
+        conversationStore[contextKey]?.update { cur ->
+            if (cur.role != ComposerRole.MAIN) cur
+            else cur.copy(activePromptQuestion = rootQuestion)
+        }
+    }
+
+    /**
+     * Update draft text for [contextKey].
+     */
+    fun updateComposerDraft(contextKey: String, draft: String) {
+        conversationStore[contextKey]?.update { cur ->
+            if (cur.composerDraft == draft) cur else cur.copy(composerDraft = draft)
+        }
+    }
+
+    /**
+     * Switch to FOLLOWUP mode and set active prompt question.
+     */
+    fun setFollowupMode(contextKey: String, followupQuestion: String) {
+        val q = followupQuestion.trim()
+        if (q.isBlank()) return
+        conversationStore[contextKey]?.update { cur ->
+            cur.copy(role = ComposerRole.FOLLOWUP, activePromptQuestion = q)
+        }
+    }
+
+    /**
+     * Ensure the root question message exists and stays current.
+     */
+    fun ensureRootQuestionMessage(contextKey: String, nodeId: String, rootQuestion: String) {
+        val id = "qroot-$nodeId"
+        upsertChatItem(
+            contextKey = contextKey,
+            item = ChatItem(
+                id = id,
+                sender = ChatSender.AI,
+                text = rootQuestion
+            )
+        )
+    }
+
+    /**
+     * Append a user message to the persisted chat.
+     */
+    fun appendUserMessage(contextKey: String, text: String): String {
+        val id = "u-${msgSeq.incrementAndGet()}"
+        appendChatItem(
+            contextKey = contextKey,
+            item = ChatItem(
+                id = id,
+                sender = ChatSender.USER,
+                text = text
+            )
+        )
+        return id
+    }
+
+    /**
+     * Upsert the typing bubble for a node.
+     */
+    fun upsertTypingMessage(contextKey: String, nodeId: String, text: String) {
+        val id = "typing-$nodeId"
+        upsertChatItem(
+            contextKey = contextKey,
+            item = ChatItem(
+                id = id,
+                sender = ChatSender.AI,
+                text = text,
+                isTyping = true
+            )
+        )
+    }
+
+    /**
+     * Remove the typing bubble for a node.
+     */
+    fun removeTypingMessage(contextKey: String, nodeId: String) {
+        val id = "typing-$nodeId"
+        removeChatItem(contextKey, id)
+    }
+
+    /**
+     * Upsert a chat item by id.
+     */
+    fun upsertChatItem(contextKey: String, item: ChatItem) {
+        touchContextKey(contextKey)
+        val flow = chatStore.getOrPut(contextKey) { MutableStateFlow(emptyList()) }
+        flow.update { cur ->
+            val idx = cur.indexOfFirst { it.id == item.id }
+            val next = if (idx == -1) {
+                cur + item
+            } else {
+                cur.toMutableList().also { it[idx] = item }.toList()
+            }
+            next.takeLast(MAX_CHAT_ITEMS)
+        }
+    }
+
+    /**
+     * Append a chat item (always adds; no dedup).
+     */
+    fun appendChatItem(contextKey: String, item: ChatItem) {
+        touchContextKey(contextKey)
+        val flow = chatStore.getOrPut(contextKey) { MutableStateFlow(emptyList()) }
+        flow.update { cur ->
+            (cur + item).takeLast(MAX_CHAT_ITEMS)
+        }
+    }
+
+    /**
+     * Remove a chat item by id.
+     */
+    fun removeChatItem(contextKey: String, id: String) {
+        val flow = chatStore[contextKey] ?: return
+        flow.update { cur -> cur.filterNot { it.id == id } }
+    }
+
+    /**
+     * Mark follow-up question as seen. Returns true if it is newly added.
+     */
+    fun markFollowupSeen(contextKey: String, followupQuestion: String): Boolean {
+        val norm = followupQuestion.trim()
+        if (norm.isBlank()) return false
+        val set = followupSeen.getOrPut(contextKey) { Collections.synchronizedSet(mutableSetOf()) }
+        return set.add(norm)
+    }
+
+    /**
+     * Clear one persisted conversation (chat + state) for [contextKey].
+     */
+    fun clearConversation(contextKey: String) {
+        chatStore.remove(contextKey)
+        conversationStore.remove(contextKey)
+        followupSeen.remove(contextKey)
+        synchronized(contextKeyOrder) {
+            contextKeyOrder.remove(contextKey)
+        }
+    }
+
+    /**
+     * Best-effort LRU maintenance of context keys.
+     */
+    private fun touchContextKey(contextKey: String) {
+        synchronized(contextKeyOrder) {
+            if (contextKeyOrder.contains(contextKey)) {
+                contextKeyOrder.remove(contextKey)
+            }
+            contextKeyOrder.addLast(contextKey)
+
+            while (contextKeyOrder.size > MAX_CONTEXT_KEYS) {
+                val evict = if (contextKeyOrder.isEmpty()) null else contextKeyOrder.removeFirst()
+                if (evict != null) {
+                    chatStore.remove(evict)
+                    conversationStore.remove(evict)
+                    followupSeen.remove(evict)
+                    if (DEBUG_LOGS) RuntimeLogStore.d(TAG, "chatStore evicted contextKey='$evict'")
+                }
+            }
+        }
+    }
+
     // ─────────────────────── Execution control ───────────────────────
 
     private var evalJob: Job? = null
@@ -221,12 +511,6 @@ class AiViewModel(
         val timedOut: Boolean
     )
 
-    /**
-     * Evaluate the given [prompt] and return the parsed score (0..100) or null.
-     *
-     * Single-flight:
-     * - If already running, returns the current score.
-     */
     suspend fun evaluate(prompt: String, timeoutMs: Long = defaultTimeoutMs): Int? {
         if (prompt.isBlank()) {
             RuntimeLogStore.i(TAG, "evaluate: blank prompt -> reset states and return null")
@@ -263,12 +547,6 @@ class AiViewModel(
         return _score.value
     }
 
-    /**
-     * Fire-and-forget variant of [evaluate].
-     *
-     * Single-flight:
-     * - If already running, returns the current [evalJob] without starting a new run.
-     */
     fun evaluateAsync(prompt: String, timeoutMs: Long = defaultTimeoutMs): Job {
         if (prompt.isBlank()) {
             resetStates(keepError = false)
@@ -299,93 +577,6 @@ class AiViewModel(
         return job
     }
 
-    /**
-     * Two-step chaining:
-     * 1) Evaluate [firstPrompt] using phase=EVAL.
-     * 2) Build prompt2 from step1 result via [buildSecondPrompt], then evaluate it using phase=FOLLOWUP.
-     *
-     * This keeps both steps in [stepHistory].
-     */
-    fun evaluateTwoStepFromFirstAsync(
-        firstPrompt: String,
-        timeoutMs: Long = defaultTimeoutMs,
-        proceedOnTimeout: Boolean = true,
-        buildSecondPrompt: (EvalResult) -> String
-    ): Job {
-        val p1 = firstPrompt.trim()
-        if (p1.isEmpty()) {
-            resetStates(keepError = false)
-            return viewModelScope.launch { }
-        }
-
-        if (!running.compareAndSet(false, true)) {
-            RuntimeLogStore.w(TAG, "evaluateTwoStepFromFirstAsync: already running -> returning existing job")
-            return evalJob ?: viewModelScope.launch { }
-        }
-
-        cancelDanglingJobIfAny(reason = "dangling_before_new_chain")
-
-        prepareUiForNewChain(clearHistory = true)
-
-        val chainJob = viewModelScope.launch(ioDispatcher) {
-            try {
-                if (DEBUG_LOGS) RuntimeLogStore.d(TAG, "chain2: timeoutMs=$timeoutMs")
-
-                // --- step 1 ---
-                val runId1 = runSeq.incrementAndGet()
-                activeRunId.set(runId1)
-
-                val r1 = runEvaluationCore(
-                    runId = runId1,
-                    userPrompt = p1,
-                    timeoutMs = timeoutMs,
-                    mode = EvalMode.EVAL_JSON,
-                    phase = PromptPhase.EVAL,
-                    commitToPrimaryState = true
-                )
-
-                if (!proceedOnTimeout && r1.timedOut) {
-                    if (DEBUG_LOGS) RuntimeLogStore.w(TAG, "chain2: step1 timed out -> skipping step2 (proceedOnTimeout=false)")
-                    return@launch
-                }
-
-                // --- step 2 (derived) ---
-                val p2 = runCatching { buildSecondPrompt(r1).trim() }
-                    .onFailure { t -> RuntimeLogStore.e(TAG, "chain2: buildSecondPrompt failed", t) }
-                    .getOrElse { "" }
-
-                if (p2.isEmpty()) {
-                    if (DEBUG_LOGS) RuntimeLogStore.w(TAG, "chain2: step2 prompt is blank -> done")
-                    return@launch
-                }
-
-                prepareUiForNextStep()
-
-                val runId2 = runSeq.incrementAndGet()
-                activeRunId.set(runId2)
-
-                runEvaluationCore(
-                    runId = runId2,
-                    userPrompt = p2,
-                    timeoutMs = timeoutMs,
-                    mode = EvalMode.FOLLOWUP_JSON_OR_TEXT,
-                    phase = PromptPhase.FOLLOWUP,
-                    commitToPrimaryState = false
-                )
-            } finally {
-                finalizeChainFlags()
-            }
-        }
-
-        evalJob = chainJob
-        return chainJob
-    }
-
-    /**
-     * Conditional two-step:
-     * 1) Run step1 with phase=EVAL.
-     * 2) Only if [shouldRunSecond] returns true, build prompt2 from step1 result and run step2 with phase=FOLLOWUP.
-     */
     fun evaluateConditionalTwoStepAsync(
         firstPrompt: String,
         timeoutMs: Long = defaultTimeoutMs,
@@ -474,11 +665,6 @@ class AiViewModel(
         return chainJob
     }
 
-    /**
-     * Cancel the ongoing evaluation if any.
-     *
-     * This is a user-driven cancellation path.
-     */
     fun cancel() {
         RuntimeLogStore.i(TAG, "cancel: invoked (isRunning=${running.get()}, loading=${_loading.value})")
         stopCurrentRunInternal(reason = "cancelled", emitCancelledEvent = true, setCancelledError = true)
@@ -487,8 +673,9 @@ class AiViewModel(
     /**
      * Reset transient AI-related states.
      *
-     * NOTE:
-     * - Also clears [stepHistory] because the UI expects a clean slate.
+     * Notes:
+     * - Clears stepHistory/stream/raw/score/etc (inference UI state).
+     * - DOES NOT clear persisted chat/conversation state (B plan).
      */
     fun resetStates(keepError: Boolean = false) {
         stopCurrentRunInternal(reason = "reset", emitCancelledEvent = false, setCancelledError = false)
@@ -508,14 +695,6 @@ class AiViewModel(
         RuntimeLogStore.i(TAG, "onCleared: ViewModel is being cleared -> stopCurrentRunInternal()")
         super.onCleared()
         stopCurrentRunInternal(reason = "cleared", emitCancelledEvent = false, setCancelledError = false)
-    }
-
-    @Deprecated(
-        message = "Use resetStates(keepError) instead.",
-        replaceWith = ReplaceWith("resetStates(keepError = keepError)")
-    )
-    fun resetAll(keepError: Boolean = false) {
-        resetStates(keepError = keepError)
     }
 
     // ───────────────────────── Internal evaluation core ─────────────────────────
@@ -542,13 +721,6 @@ class AiViewModel(
         }
     }
 
-    /**
-     * Run one inference call and parse its output according to [mode].
-     *
-     * Key behavior:
-     * - Always appends a [StepSnapshot] to [stepHistory].
-     * - If [commitToPrimaryState] is false, Step1 primary state (score/raw/followups) is NOT overwritten.
-     */
     private suspend fun runEvaluationCore(
         runId: Long,
         userPrompt: String,
@@ -563,7 +735,7 @@ class AiViewModel(
         var timedOut = false
         var lastStreamEmitLen = 0
 
-        val enableFullLogs = BuildConfig.DEBUG && DEBUG_LOGS
+        val enableFullLogs = true //BuildConfig.DEBUG && DEBUG_LOGS
 
         fun isActiveRun(): Boolean = activeRunId.get() == runId
 
@@ -574,19 +746,16 @@ class AiViewModel(
             _stream.value = buf.toString()
         }
 
-        /** Return true if the output is a trivial empty JSON object (optionally with whitespace). */
         fun isEmptyJsonObject(text: String): Boolean {
             val t = text.trim()
             return t == "{}" || t == "{ }"
         }
 
-        /** Return true if the string starts like JSON. */
         fun isJsonLike(text: String): Boolean {
             val t = text.trim()
             return t.startsWith("{") || t.startsWith("[")
         }
 
-        /** Filter out garbage follow-up candidates. */
         fun sanitizeFollowups(list: List<String>): List<String> {
             return list
                 .asSequence()
@@ -599,7 +768,6 @@ class AiViewModel(
                 .toList()
         }
 
-        /** Extract a plausible follow-up question from raw text output (non-JSON fallback). */
         fun extractFollowupFromPlainText(rawText: String): String? {
             val t = rawText.trim()
             if (t.isBlank()) return null
@@ -642,11 +810,6 @@ class AiViewModel(
             try {
                 withTimeout(timeoutMs) {
                     repo.request(fullPrompt).collect { part ->
-                        /**
-                         * IMPORTANT:
-                         * If this run is no longer active, cancel collection immediately.
-                         * This ensures the upstream callbackFlow sees cancellation and triggers SLM.cancel().
-                         */
                         if (!isActiveRun()) {
                             throw CancellationException("stale-run")
                         }

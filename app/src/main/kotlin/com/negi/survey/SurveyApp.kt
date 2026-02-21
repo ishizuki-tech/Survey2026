@@ -22,6 +22,8 @@ import android.os.Looper
 import android.util.Log
 import androidx.work.Configuration
 import androidx.work.WorkManager
+import com.negi.survey.net.GitHubUploadWorker
+import com.negi.survey.net.GitHubUploader
 import com.negi.survey.net.RuntimeLogStore
 import com.negi.survey.slm.LiteRtLM
 import java.io.File
@@ -39,11 +41,18 @@ import java.util.concurrent.atomic.AtomicLong
  * Notes:
  * - WorkManagerInitializer may be disabled in the manifest; initialize WorkManager manually.
  * - WorkManager may not be ready early on some devices/entry points; always guard getInstance().
- * - Prefer enqueue from onCreate, but initialize WM in attachBaseContext to protect CrashCapture.
+ * - Prefer enqueue from onCreate, but initialize WM in onCreate to avoid attachBaseContext edge crashes.
  *
  * Runtime logs:
  * - Start RuntimeLogStore early to capture app-owned logs to files (uploadable).
  * - Use RuntimeLogStore.* for logs that must be included in runtime log bundles.
+ *
+ * Ring logs:
+ * - Install AppRingLogStore as early as possible to reliably retain "pre-crash" context across restarts.
+ *
+ * Startup upload:
+ * - On app start, enqueue a WorkManager job to upload any remaining RuntimeLogStore logs to GitHub.
+ * - Config retrieval is best-effort via reflection to avoid hard coupling.
  */
 class SurveyApp : Application(), Configuration.Provider {
 
@@ -60,10 +69,18 @@ class SurveyApp : Application(), Configuration.Provider {
             return
         }
 
+        val appCtx = base.applicationContext ?: base
+
         // Start runtime log capture as early as possible (main process only).
-        runCatching { RuntimeLogStore.start(base.applicationContext ?: base) }
+        runCatching { RuntimeLogStore.start(appCtx) }
             .onFailure { t ->
                 Log.w(TAG, "RuntimeLogStore.start failed in attachBaseContext: ${t.message}", t)
+            }
+
+        // Install ring log store as early as possible to retain pre-crash context across restarts.
+        runCatching { AppRingLogStore.install(appCtx) }
+            .onFailure { t ->
+                RuntimeLogStore.w(TAG, "AppRingLogStore.install failed in attachBaseContext: ${t.message}", t)
             }
 
         logBoot("attachBaseContext", pid, pn, isMain)
@@ -82,7 +99,7 @@ class SurveyApp : Application(), Configuration.Provider {
 
         // Install as early as possible to catch crashes during Application startup.
         // Do NOT force-enqueue pending uploads here; enqueue is done in onCreate.
-        safeCrashInstall(where = "attachBaseContext", context = base)
+        safeCrashInstall(where = "attachBaseContext", context = appCtx)
     }
 
     override fun onCreate() {
@@ -98,10 +115,18 @@ class SurveyApp : Application(), Configuration.Provider {
             return
         }
 
+        val appCtx = applicationContext ?: this
+
         // Ensure runtime log capture is running (idempotent).
-        runCatching { RuntimeLogStore.start(applicationContext ?: this) }
+        runCatching { RuntimeLogStore.start(appCtx) }
             .onFailure { t ->
                 Log.w(TAG, "RuntimeLogStore.start failed in onCreate: ${t.message}", t)
+            }
+
+        // Ensure ring log store is installed (idempotent).
+        runCatching { AppRingLogStore.install(appCtx) }
+            .onFailure { t ->
+                RuntimeLogStore.w(TAG, "AppRingLogStore.install failed in onCreate: ${t.message}", t)
             }
 
         logBoot("onCreate", pid, pn, isMain)
@@ -119,17 +144,20 @@ class SurveyApp : Application(), Configuration.Provider {
             }
 
         // Ensure WorkManager is initialized (idempotent).
-        ensureWorkManagerInitialized(where = "onCreate", ctx = this)
+        ensureWorkManagerInitialized(where = "onCreate", ctx = appCtx)
+
+        // Startup: enqueue runtime log upload (best-effort, main process only).
+        safeEnqueueStartupRuntimeLogsUploadOnce(appCtx)
 
         // Re-wrap default handler in case any SDK replaced it after attachBaseContext().
-        safeCrashInstall(where = "onCreate(rewrap)", context = this)
+        safeCrashInstall(where = "onCreate(rewrap)", context = appCtx)
 
         // Optional: self-heal if another SDK overwrites the handler later in runtime.
         safeRegisterSelfHealingOnce(this)
 
         // Enqueue pending crash uploads from previous run (best-effort).
-        // A-Plan: schedule delayed retry ONLY if the immediate call fails.
-        safeEnqueuePendingUploadsWithRetryOnce(this)
+        // A-Plan: schedule delayed retry ONLY if WorkManager isn't ready yet.
+        safeEnqueuePendingUploadsWithRetryOnce(appCtx)
     }
 
     /**
@@ -154,7 +182,6 @@ class SurveyApp : Application(), Configuration.Provider {
      * - Safe to call multiple times.
      * - Protects against concurrent init attempts using a lock.
      * - Re-attempts init if WorkManager is still not accessible.
-     * - NEVER assumes Application.getApplicationContext() is non-null during attachBaseContext().
      */
     private fun ensureWorkManagerInitialized(where: String, ctx: Context) {
         val appCtx = ctx.applicationContext ?: ctx
@@ -173,7 +200,6 @@ class SurveyApp : Application(), Configuration.Provider {
                 return
             }
 
-            // Record that we attempted initialization at least once (debug/guard).
             if (workManagerInitAttempted.compareAndSet(false, true)) {
                 RuntimeLogStore.d(TAG, "WorkManager init attempt begins. where=$where")
             } else {
@@ -188,7 +214,6 @@ class SurveyApp : Application(), Configuration.Provider {
                 RuntimeLogStore.w(TAG, "WorkManager manual init failed: where=$where msg=${t.message}", t)
             }
 
-            // Final check (best-effort).
             if (!isWorkManagerReady(appCtx)) {
                 RuntimeLogStore.w(TAG, "WorkManager still not ready after init attempt. where=$where")
             }
@@ -210,13 +235,167 @@ class SurveyApp : Application(), Configuration.Provider {
     }
 
     /**
+     * On app start, upload remaining RuntimeLogStore logs to GitHub.
+     */
+    private fun safeEnqueueStartupRuntimeLogsUploadOnce(context: Context) {
+        if (!startupRtLogsOnce.compareAndSet(false, true)) {
+            RuntimeLogStore.d(TAG, "Startup runtime logs enqueue already executed; skipping.")
+            return
+        }
+
+        val appCtx = context.applicationContext ?: context
+
+        // WM must be ready before enqueue.
+        ensureWorkManagerInitialized(where = "startupRtLogs", ctx = appCtx)
+
+        val cfg = runCatching { tryLoadGitHubConfigBestEffort(appCtx) }
+            .onFailure { t ->
+                RuntimeLogStore.w(TAG, "Startup runtime logs: config lookup failed: ${t.message}", t)
+            }
+            .getOrNull()
+
+        if (cfg == null || cfg.owner.isBlank() || cfg.repo.isBlank() || cfg.token.isBlank()) {
+            RuntimeLogStore.d(TAG, "Startup runtime logs: GitHub config not available; skip enqueue.")
+            return
+        }
+
+        runCatching {
+            GitHubUploadWorker.enqueueStartupRuntimeLogsUpload(
+                context = appCtx,
+                cfg = cfg,
+                remoteDir = "diagnostics/runtime_logs",
+                addDateSubdir = true,
+                reason = "app_start",
+                deleteZipAfter = true,
+                // NOTE: maxZipBytes is treated as per-file max bytes hint in plain mode.
+                maxZipBytes = 1_000_000L,
+                // NEW: delete uploaded source .log files from device (excluding active).
+                deleteSourceAfterUpload = true
+            )
+            RuntimeLogStore.d(TAG, "Startup runtime logs: enqueue requested.")
+        }.onFailure { t ->
+            RuntimeLogStore.w(TAG, "Startup runtime logs: enqueue failed: ${t.confirmedMsg()}", t)
+        }
+    }
+
+    /**
+     * Best-effort GitHub config retrieval without hard dependency on a config store implementation.
+     */
+    private fun tryLoadGitHubConfigBestEffort(context: Context): GitHubUploader.GitHubConfig? {
+        val candidates = listOf(
+            "com.negi.survey.net.GitHubDiagnosticsConfigStore",
+            "com.negi.survey.net.GitHubDiagnosticsConfig",
+            "com.negi.survey.net.GitHubConfigStore"
+        )
+
+        val methodNames = listOf(
+            "getGitHubConfig",
+            "loadGitHubConfig",
+            "readGitHubConfig",
+            "getConfig",
+            "load",
+            "get",
+            "read"
+        )
+
+        for (className in candidates) {
+            val cls = runCatching { Class.forName(className) }.getOrNull() ?: continue
+
+            // Try Kotlin object INSTANCE first.
+            val receiver: Any? = runCatching {
+                cls.getDeclaredField("INSTANCE").apply { isAccessible = true }.get(null)
+            }.getOrNull()
+
+            // 1) Try methods that accept (Context)
+            for (mn in methodNames) {
+                val m = runCatching { cls.methods.firstOrNull { it.name == mn && it.parameterTypes.size == 1 } }.getOrNull()
+                if (m != null) {
+                    val pt = m.parameterTypes[0]
+                    if (Context::class.java.isAssignableFrom(pt)) {
+                        val out = runCatching { m.invoke(receiver, context) }.getOrNull()
+                        parseGitHubConfigFromAny(out)?.let { return it }
+                    }
+                }
+            }
+
+            // 2) Try parameterless methods
+            for (mn in methodNames) {
+                val m = runCatching { cls.methods.firstOrNull { it.name == mn && it.parameterTypes.isEmpty() } }.getOrNull()
+                if (m != null) {
+                    val out = runCatching { m.invoke(receiver) }.getOrNull()
+                    parseGitHubConfigFromAny(out)?.let { return it }
+                }
+            }
+        }
+
+        return null
+    }
+
+    /**
+     * Convert unknown shapes into GitHubUploader.GitHubConfig if possible.
+     */
+    private fun parseGitHubConfigFromAny(any: Any?): GitHubUploader.GitHubConfig? {
+        if (any == null) return null
+        if (any is GitHubUploader.GitHubConfig) return any
+
+        // Map-like (java.util.Map)
+        if (any is Map<*, *>) {
+            val owner = any["owner"]?.toString().orEmpty()
+            val repo = any["repo"]?.toString().orEmpty()
+            val token = any["token"]?.toString().orEmpty()
+            val branch = any["branch"]?.toString().takeIf { !it.isNullOrBlank() } ?: "main"
+            val pathPrefix = any["pathPrefix"]?.toString().orEmpty()
+            if (owner.isBlank() || repo.isBlank() || token.isBlank()) return null
+            return GitHubUploader.GitHubConfig(
+                owner = owner,
+                repo = repo,
+                token = token,
+                branch = branch,
+                pathPrefix = pathPrefix
+            )
+        }
+
+        // Plain object with fields/getters.
+        fun readProp(name: String): String? {
+            val getter = runCatching {
+                any.javaClass.methods.firstOrNull {
+                    it.parameterTypes.isEmpty() && (it.name.equals(name, true) ||
+                            it.name.equals("get${name.replaceFirstChar { c -> c.uppercaseChar() }}", true))
+                }
+            }.getOrNull()
+
+            val gv = runCatching { getter?.invoke(any)?.toString() }.getOrNull()
+            if (!gv.isNullOrBlank()) return gv
+
+            val fv = runCatching {
+                any.javaClass.declaredFields.firstOrNull { it.name.equals(name, true) }
+                    ?.apply { isAccessible = true }
+                    ?.get(any)
+                    ?.toString()
+            }.getOrNull()
+
+            return fv
+        }
+
+        val owner = readProp("owner").orEmpty()
+        val repo = readProp("repo").orEmpty()
+        val token = readProp("token").orEmpty()
+        val branch = readProp("branch")?.takeIf { it.isNotBlank() } ?: "main"
+        val pathPrefix = readProp("pathPrefix").orEmpty()
+
+        if (owner.isBlank() || repo.isBlank() || token.isBlank()) return null
+
+        return GitHubUploader.GitHubConfig(
+            owner = owner,
+            repo = repo,
+            token = token,
+            branch = branch,
+            pathPrefix = pathPrefix
+        )
+    }
+
+    /**
      * Best-effort current process name.
-     *
-     * Priority:
-     * 1) API 28+ Application.getProcessName()
-     * 2) ActivityThread.currentProcessName() via reflection
-     * 3) /proc/self/cmdline
-     * 4) ActivityManager.runningAppProcesses (legacy fallback)
      */
     private fun currentProcessName(context: Context): String? {
         // 1) API 28+
@@ -268,8 +447,6 @@ class SurveyApp : Application(), Configuration.Provider {
 
     /**
      * Returns true if running in the main app process.
-     *
-     * If process name is unavailable, default to "main" to avoid breaking app startup.
      */
     private fun isMainProcess(context: Context, processName: String?): Boolean {
         val pn = processName?.trim().orEmpty()
@@ -304,17 +481,6 @@ class SurveyApp : Application(), Configuration.Provider {
         }
     }
 
-    /**
-     * Enqueue pending crash uploads once.
-     *
-     * A-plan change:
-     * - Do the immediate enqueue.
-     * - Schedule the delayed retry ONLY if the immediate call fails (throws).
-     *
-     * Rationale:
-     * - Avoid noisy double-enqueue on healthy boots.
-     * - Still recover from "WM not ready / early cooldown / transient" failures.
-     */
     private fun safeEnqueuePendingUploadsWithRetryOnce(context: Context) {
         if (!enqueuePendingOnce.compareAndSet(false, true)) {
             RuntimeLogStore.d(TAG, "CrashCapture pending enqueue already executed; skipping.")
@@ -326,31 +492,23 @@ class SurveyApp : Application(), Configuration.Provider {
         // Ensure WM is initialized before enqueue (idempotent).
         ensureWorkManagerInitialized(where = "enqueuePending(immediate)", ctx = appCtx)
 
-        // 1) Immediate attempt
-        val immediateOk = runCatching {
-            CrashCapture.enqueuePendingCrashUploadsIfPossible(appCtx, where = "SurveyApp:enqueuePending(immediate)")
-        }.onSuccess {
-            RuntimeLogStore.d(TAG, "CrashCapture pending uploads enqueued (immediate).")
-            lastEnqueueAtUptimeMs.set(android.os.SystemClock.uptimeMillis())
-        }.onFailure { t ->
-            RuntimeLogStore.w(TAG, "CrashCapture.enqueuePendingCrashUploads(immediate) failed: ${t.message}", t)
-        }.isSuccess
+        // If WM isn't ready yet, schedule delayed retry (do NOT rely on exceptions from CrashCapture).
+        if (!isWorkManagerReady(appCtx)) {
+            RuntimeLogStore.w(TAG, "WorkManager not ready yet; scheduling delayed enqueue retry.")
 
-        // 2) Delayed retry ONLY if immediate failed
-        if (!immediateOk) {
             if (enqueueRetryScheduled.compareAndSet(false, true)) {
-                val now = android.os.SystemClock.uptimeMillis()
-                val last = lastEnqueueAtUptimeMs.get()
-                val dt = if (last > 0L) now - last else -1L
-                RuntimeLogStore.d(TAG, "Scheduling delayed enqueue retry because immediate failed. dtSinceLastAttemptMs=$dt")
-
                 Handler(Looper.getMainLooper()).postDelayed(
                     {
                         ensureWorkManagerInitialized(where = "enqueuePending(delayed)", ctx = appCtx)
 
+                        if (!isWorkManagerReady(appCtx)) {
+                            RuntimeLogStore.w(TAG, "WorkManager still not ready in delayed retry; skipping enqueue.")
+                            return@postDelayed
+                        }
+
                         runCatching {
                             CrashCapture.enqueuePendingCrashUploadsIfPossible(appCtx, where = "SurveyApp:enqueuePending(delayed)")
-                            RuntimeLogStore.d(TAG, "CrashCapture pending uploads enqueued (delayed retry).")
+                            RuntimeLogStore.d(TAG, "CrashCapture pending uploads requested (delayed retry).")
                             lastEnqueueAtUptimeMs.set(android.os.SystemClock.uptimeMillis())
                         }.onFailure { t ->
                             RuntimeLogStore.w(TAG, "CrashCapture.enqueuePendingCrashUploads(delayed) failed: ${t.message}", t)
@@ -361,20 +519,34 @@ class SurveyApp : Application(), Configuration.Provider {
             } else {
                 RuntimeLogStore.d(TAG, "Delayed enqueue retry already scheduled; skipping.")
             }
-        } else {
-            RuntimeLogStore.d(TAG, "Delayed enqueue retry not scheduled (immediate succeeded).")
+            return
+        }
+
+        // Immediate attempt (WM ready).
+        runCatching {
+            CrashCapture.enqueuePendingCrashUploadsIfPossible(appCtx, where = "SurveyApp:enqueuePending(immediate)")
+            RuntimeLogStore.d(TAG, "CrashCapture pending uploads requested (immediate).")
+            lastEnqueueAtUptimeMs.set(android.os.SystemClock.uptimeMillis())
+        }.onFailure { t ->
+            RuntimeLogStore.w(TAG, "CrashCapture.enqueuePendingCrashUploads(immediate) failed: ${t.message}", t)
         }
     }
 
     private fun logBoot(stage: String, pid: Int, processName: String?, isMain: Boolean) {
         val pn = processName?.takeIf { it.isNotBlank() } ?: "<unknown>"
-        RuntimeLogStore.d(TAG, "$stage: pid=$pid process=$pn isMain=$isMain sdk=${Build.VERSION.SDK_INT}")
+        val msg = "$stage: pid=$pid process=$pn isMain=$isMain sdk=${Build.VERSION.SDK_INT}"
+        RuntimeLogStore.d(TAG, msg)
+
+        // Also send boot markers into the ring log store (reliable "pre-crash" context).
+        runCatching { AppRingLogStore.log("D", TAG, msg) }
     }
+
+    private fun Throwable.confirmedMsg(): String = message ?: "Unknown error"
 
     companion object {
         private const val TAG = "SurveyApp"
 
-        // A-plan: retry exists but only used on immediate failure.
+        // A-plan: retry exists but only used when WorkManager isn't ready yet.
         private const val ENQUEUE_RETRY_DELAY_MS = 1600L
 
         // Process-level guards. These are static per-process.
@@ -383,6 +555,9 @@ class SurveyApp : Application(), Configuration.Provider {
         private val selfHealOnce = AtomicBoolean(false)
         private val enqueuePendingOnce = AtomicBoolean(false)
         private val enqueueRetryScheduled = AtomicBoolean(false)
+
+        // Startup runtime logs enqueue guard (per process).
+        private val startupRtLogsOnce = AtomicBoolean(false)
 
         // WorkManager init guards.
         private val workManagerInitAttempted = AtomicBoolean(false)

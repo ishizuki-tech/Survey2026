@@ -90,8 +90,6 @@ import androidx.work.workDataOf
 import com.negi.survey.BuildConfig
 import com.negi.survey.net.GitHubUploadWorker
 import com.negi.survey.net.GitHubUploader
-import com.negi.survey.net.SupabaseStorageUploader
-import com.negi.survey.net.SupabaseUploadWorker
 import com.negi.survey.net.VoiceUploadCompletionStore
 import com.negi.survey.utils.ExportUtils
 import com.negi.survey.utils.buildSurveyFileName
@@ -169,8 +167,6 @@ fun DoneScreen(
     val scope = rememberCoroutineScope()
     var uploading by remember { mutableStateOf(false) }
     val context = LocalContext.current
-
-    val supabaseCfg = remember { SupabaseStorageUploader.configFromBuildConfig() }
 
     val audioRefsForRun = remember(recordedAudioRefs, surveyUuid) {
         vm.getAudioRefsForRun(surveyUuid)
@@ -537,7 +533,7 @@ fun DoneScreen(
                                                     context = context,
                                                     file = file,
                                                     requireGitHub = canGh,
-                                                    requireSupabase = (supabaseCfg != null)
+                                                    requireSupabase = false
                                                 )
 
                                                 if (!canGh) {
@@ -651,141 +647,6 @@ fun DoneScreen(
                     }
                 }
 
-                // -------------------- Supabase (immediate) --------------------
-                if (supabaseCfg != null) {
-                    Button(
-                        onClick = {
-                            if (uploading) return@Button
-                            scope.launch {
-                                uploading = true
-                                try {
-                                    val cfg = supabaseCfg
-                                    val fileName = buildSurveyFileName(
-                                        surveyId = surveyUuid,
-                                        prefix = "survey",
-                                        stamp = exportedAtStamp
-                                    )
-
-                                    val (voicesUploaded, didUploadLog) = withContext(Dispatchers.IO) {
-                                        val jsonRemote = "$REMOTE_EXPORT_DIR/$fileName"
-                                        val jsonRes = SupabaseStorageUploader.uploadBytes(
-                                            cfg = cfg,
-                                            remotePath = jsonRemote,
-                                            bytes = jsonText.toByteArray(Charsets.UTF_8),
-                                            contentType = "application/json; charset=utf-8",
-                                            upsert = false
-                                        )
-                                        if (jsonRes.isFailure) {
-                                            throw (jsonRes.exceptionOrNull()
-                                                ?: IllegalStateException("Supabase JSON upload failed"))
-                                        }
-
-                                        // Include shared pending voice (for cross-button / deferred interactions).
-                                        val currentVoiceFiles =
-                                            scanVoiceFilesForUploadAnyLocation(
-                                                context = context,
-                                                expectedNames = expectedVoiceFileNames,
-                                                surveyUuid = surveyUuid
-                                            )
-
-                                        Log.d(
-                                            LOG_TAG,
-                                            "Supabase immediate voice: expected=${expectedVoiceFileNames.size} found=${currentVoiceFiles.size}"
-                                        )
-
-                                        var uploadedVoices = 0
-                                        currentVoiceFiles.forEach { file ->
-                                            Log.d(LOG_TAG, "Supabase voice upload: name=${file.name} bytes=${file.length()}")
-
-                                            // Require GitHub only if feasible; otherwise deletion will never happen.
-                                            val canGh = canUploadToGitHubContentsApi(file)
-
-                                            // Require both when both are configured AND feasible, to prevent ordering races.
-                                            VoiceUploadCompletionStore.requireDestinations(
-                                                context = context,
-                                                file = file,
-                                                requireGitHub = (gitHubConfig != null && canGh),
-                                                requireSupabase = true
-                                            )
-
-                                            val r = SupabaseStorageUploader.uploadFile(
-                                                cfg = cfg,
-                                                remotePath = "$REMOTE_VOICE_DIR/${file.name}",
-                                                file = file,
-                                                contentType = "audio/wav",
-                                                upsert = false
-                                            )
-                                            if (r.isSuccess) {
-                                                val st = VoiceUploadCompletionStore.markSupabaseUploaded(context, file)
-                                                Log.d(
-                                                    LOG_TAG,
-                                                    "Voice flag (Supabase immediate): name=${file.name} reqGh=${st.requireGitHub} reqSb=${st.requireSupabase} " +
-                                                            "ghDone=${st.githubUploaded} sbDone=${st.supabaseUploaded} complete=${st.isComplete}"
-                                                )
-
-                                                if (VoiceUploadCompletionStore.shouldDeleteNow(context, file)) {
-                                                    Log.d(LOG_TAG, "Voice delete eligible (Supabase immediate): ${file.name}")
-                                                    runCatching { deleteVoiceSidecars(file) }
-                                                    runCatching { file.delete() }
-                                                    VoiceUploadCompletionStore.clear(context, file)
-                                                } else {
-                                                    Log.d(LOG_TAG, "Voice kept (Supabase immediate): waiting other required destination: ${file.name}")
-                                                }
-
-                                                uploadedVoices++
-                                            } else {
-                                                throw (r.exceptionOrNull()
-                                                    ?: IllegalStateException("Supabase voice upload failed: ${file.name}"))
-                                            }
-                                        }
-
-                                        val logFile = captureSessionLogcatToPendingFile(
-                                            context = context,
-                                            surveyUuid = surveyUuid,
-                                            exportedAtStamp = exportedAtStamp,
-                                            maxBytes = MAX_LOGCAT_BYTES,
-                                            pendingDirName = sbPendingDirForSurvey(surveyUuid, "diagnostics/logcat")
-                                        )
-
-                                        val logRes = SupabaseStorageUploader.uploadFile(
-                                            cfg = cfg,
-                                            remotePath = "$REMOTE_LOG_DIR/${logFile.name}",
-                                            file = logFile,
-                                            contentType = "application/gzip",
-                                            upsert = false
-                                        )
-
-                                        val didLog = logRes.isSuccess
-                                        if (didLog) runCatching { logFile.delete() }
-
-                                        Pair(uploadedVoices, didLog)
-                                    }
-
-                                    val logMsg = if (didUploadLog) " + logs" else ""
-                                    if (voicesUploaded > 0) {
-                                        snackbar.showOnce("Supabase: Uploaded JSON + $voicesUploaded voice file(s)$logMsg")
-                                    } else {
-                                        snackbar.showOnce("Supabase: Uploaded JSON$logMsg")
-                                    }
-
-                                    val remaining = withContext(Dispatchers.IO) {
-                                        scanVoiceFilesByNames(context, expectedVoiceFileNames)
-                                    }
-                                    voiceFilesState.value = remaining
-                                } catch (e: Exception) {
-                                    Log.e(LOG_TAG, "Supabase upload failed (immediate)", e)
-                                    snackbar.showOnce("Supabase upload failed: ${e.message}")
-                                } finally {
-                                    uploading = false
-                                }
-                            }
-                        },
-                        enabled = !uploading
-                    ) {
-                        Text("Supabase: Upload now")
-                    }
-                }
-
                 Spacer(Modifier.weight(1f))
             }
 
@@ -858,7 +719,7 @@ fun DoneScreen(
                                                 context = context,
                                                 file = stagedFile,
                                                 requireGitHub = canGh,
-                                                requireSupabase = (supabaseCfg != null)
+                                                requireSupabase = false
                                             )
 
                                             if (!canGh) {
@@ -930,124 +791,6 @@ fun DoneScreen(
                     }
                 }
 
-                // -------------------- Supabase (deferred) --------------------
-                if (supabaseCfg != null) {
-                    Button(
-                        onClick = {
-                            if (uploading) return@Button
-                            scope.launch {
-                                uploading = true
-                                try {
-                                    val cfg = supabaseCfg
-                                    val fileName = buildSurveyFileName(
-                                        surveyId = surveyUuid,
-                                        prefix = "survey",
-                                        stamp = exportedAtStamp
-                                    )
-                                    val jsonRemote = "$REMOTE_EXPORT_DIR/$fileName"
-
-                                    runCatching {
-                                        val pendingJson = withContext(Dispatchers.IO) {
-                                            writePendingTextFile(
-                                                context = context,
-                                                fileName = fileName,
-                                                content = jsonText,
-                                                pendingDirName = sbPendingDirForSurvey(surveyUuid, "exports")
-                                            )
-                                        }
-                                        enqueueSupabaseWorkerFileUpload(
-                                            context = context,
-                                            cfg = cfg,
-                                            localFile = pendingJson,
-                                            remotePath = jsonRemote,
-                                            contentType = "application/json; charset=utf-8",
-                                            upsert = false
-                                        )
-                                    }.onSuccess {
-                                        snackbar.showOnce("Supabase: Upload scheduled (JSON, will run when online).")
-                                    }.onFailure { e ->
-                                        snackbar.showOnce("Supabase: Failed to schedule JSON upload: ${e.message}")
-                                    }
-
-                                    // Stage voice to a shared pending directory (prevents cross-backend races).
-                                    val staged = runCatching {
-                                        withContext(Dispatchers.IO) {
-                                            stageVoiceFilesToSharedPendingForRun(
-                                                context = context,
-                                                expectedNames = expectedVoiceFileNames,
-                                                surveyUuid = surveyUuid
-                                            )
-                                        }
-                                    }.getOrElse { e ->
-                                        snackbar.showOnce("Supabase: Failed to stage voice files: ${e.message}")
-                                        emptyList()
-                                    }
-
-                                    if (staged.isNotEmpty()) {
-                                        staged.forEach { stagedFile ->
-                                            val canGh = canUploadToGitHubContentsApi(stagedFile)
-
-                                            // Require GitHub only if feasible; otherwise deletion will never happen.
-                                            VoiceUploadCompletionStore.requireDestinations(
-                                                context = context,
-                                                file = stagedFile,
-                                                requireGitHub = (gitHubConfig != null && canGh),
-                                                requireSupabase = true
-                                            )
-
-                                            runCatching {
-                                                enqueueSupabaseWorkerFileUpload(
-                                                    context = context,
-                                                    cfg = cfg,
-                                                    localFile = stagedFile,
-                                                    remotePath = "$REMOTE_VOICE_DIR/${stagedFile.name}",
-                                                    contentType = "audio/wav",
-                                                    upsert = false
-                                                )
-                                            }
-                                        }
-                                        snackbar.showOnce("Supabase: Upload scheduled (${staged.size} voice file(s)).")
-                                    }
-
-                                    runCatching {
-                                        val pendingLog = withContext(Dispatchers.IO) {
-                                            captureSessionLogcatToPendingFile(
-                                                context = context,
-                                                surveyUuid = surveyUuid,
-                                                exportedAtStamp = exportedAtStamp,
-                                                maxBytes = MAX_LOGCAT_BYTES,
-                                                pendingDirName = sbPendingDirForSurvey(surveyUuid, "diagnostics/logcat")
-                                            )
-                                        }
-                                        enqueueSupabaseWorkerFileUpload(
-                                            context = context,
-                                            cfg = cfg,
-                                            localFile = pendingLog,
-                                            remotePath = "$REMOTE_LOG_DIR/${pendingLog.name}",
-                                            contentType = "application/gzip",
-                                            upsert = false
-                                        )
-                                    }.onSuccess {
-                                        snackbar.showOnce("Supabase: Upload scheduled (logs, will run when online).")
-                                    }.onFailure { e ->
-                                        snackbar.showOnce("Supabase: Failed to schedule logs: ${e.message}")
-                                    }
-
-                                    val remaining = withContext(Dispatchers.IO) {
-                                        scanVoiceFilesByNames(context, expectedVoiceFileNames)
-                                    }
-                                    voiceFilesState.value = remaining
-                                } finally {
-                                    uploading = false
-                                }
-                            }
-                        },
-                        enabled = !uploading
-                    ) {
-                        Text("Supabase: Upload later")
-                    }
-                }
-
                 Spacer(Modifier.weight(1f))
             }
 
@@ -1113,58 +856,6 @@ private fun enqueueGitHubWorkerFileUpload(
             .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
             .addTag(GitHubUploadWorker.TAG)
             .addTag("${GitHubUploadWorker.TAG}:file:$safeUnique")
-            .build()
-
-    // REPLACE avoids "KEEP stuck forever" when a previous work exists in FAILED/BLOCKED state.
-    WorkManager.getInstance(context)
-        .enqueueUniqueWork(uniqueName, ExistingWorkPolicy.REPLACE, req)
-}
-
-private fun enqueueSupabaseWorkerFileUpload(
-    context: Context,
-    cfg: SupabaseStorageUploader.SupabaseConfig,
-    localFile: File,
-    remotePath: String,
-    contentType: String,
-    upsert: Boolean = false
-) {
-    val safeUnique = sanitizeWorkName(remotePath)
-    val uniqueName = "sb_upload_$safeUnique"
-
-    val trimmed = remotePath.trim().trim('/')
-    val remoteDir = trimmed.substringBeforeLast('/', missingDelimiterValue = "").ifBlank { "regular" }
-    val remoteName = trimmed.substringAfterLast('/')
-
-    val req: OneTimeWorkRequest =
-        OneTimeWorkRequestBuilder<SupabaseUploadWorker>()
-            .setInputData(
-                workDataOf(
-                    SupabaseUploadWorker.KEY_MODE to "file",
-                    SupabaseUploadWorker.KEY_URL to cfg.supabaseUrl,
-                    SupabaseUploadWorker.KEY_ANON_KEY to cfg.anonKey,
-                    SupabaseUploadWorker.KEY_BUCKET to cfg.bucket,
-                    SupabaseUploadWorker.KEY_PATH_PREFIX to cfg.pathPrefix,
-                    SupabaseUploadWorker.KEY_FILE_PATH to localFile.absolutePath,
-                    SupabaseUploadWorker.KEY_FILE_NAME to remoteName,
-                    SupabaseUploadWorker.KEY_REMOTE_DIR to remoteDir,
-                    SupabaseUploadWorker.KEY_CONTENT_TYPE to contentType,
-                    SupabaseUploadWorker.KEY_UPSERT to upsert,
-                    SupabaseUploadWorker.KEY_USER_JWT to ""
-                )
-            )
-            .setConstraints(
-                Constraints.Builder()
-                    .setRequiredNetworkType(NetworkType.CONNECTED)
-                    .build()
-            )
-            .setBackoffCriteria(
-                BackoffPolicy.EXPONENTIAL,
-                30,
-                TimeUnit.SECONDS
-            )
-            .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
-            .addTag(SupabaseUploadWorker.TAG)
-            .addTag("${SupabaseUploadWorker.TAG}:file:$safeUnique")
             .build()
 
     // REPLACE avoids "KEEP stuck forever" when a previous work exists in FAILED/BLOCKED state.

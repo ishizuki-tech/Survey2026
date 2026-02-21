@@ -68,8 +68,7 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 private const val TAG = "SLM"
 
 /** Toggle facade logs (safe to keep enabled in dev builds). */
-private const val DEBUG_SLM: Boolean = BuildConfig.DEBUG
-
+private val DEBUG_SLM: Boolean = BuildConfig.DEBUG
 /**
  * Hardware accelerator options for inference (CPU or GPU).
  */

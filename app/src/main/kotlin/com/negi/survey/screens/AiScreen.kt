@@ -5,7 +5,7 @@
  *  File: AiScreen.kt
  *  Author: Shu Ishizuki (石附 支)
  *  License: MIT License
- *  © 2025 IshizukiTech LLC. All rights reserved.
+ *  © 2026 IshizukiTech LLC. All rights reserved.
  * =====================================================================
  *
  *  Summary:
@@ -13,29 +13,19 @@
  *  AI evaluation screen that renders a monotone, glass-like chat UI on
  *  top of the Survey + SLM pipeline.
  *
- *  Responsibilities:
- *   • Bind SurveyViewModel + AiViewModel to a single AI question node.
- *   • Render chat-style history with user messages and AI JSON responses.
- *   • Manage IME, focus, and auto-scroll during streaming.
- *   • Persist answers and follow-up questions back into SurveyViewModel.
- *   • Optionally accept a SpeechController to integrate speech-to-text
- *     (e.g., Whisper.cpp) into the answer composer.
- *
- *  Notes:
- *   • All comments use KDoc-style English descriptions.
- *   • No business logic is embedded; this screen only orchestrates VMs.
- *
- *  Update (2026-01-29):
+ *  Update (2026-02-20):
  *  ---------------------------------------------------------------------
- *   • Adapted to AiViewModel stepHistory/StepSnapshot as the source of truth.
- *   • Removed dependency on vmAI.chatFlow / ChatMsgVm / chatAppend APIs.
- *   • Local chat list now receives user bubbles + rendered step snapshots.
+ *   • Migrate chat history to AiViewModel (B plan):
+ *     - Chat history persists across navigation/back within the same session VM store.
+ *     - Screen renders vmAI.chatHistoryFlow(contextKey).
+ *     - Conversation state (role, activePromptQuestion, draft) is persisted in vmAI.
  *
- *  Update (2026-01-29 hotfix):
+ *  Fix (2026-02-20 hotfix):
  *  ---------------------------------------------------------------------
- *   • Prevent main answer overwrite while answering follow-ups.
- *   • Follow-up question becomes the next "active prompt question" (UI main).
- *   • Two-step step2 trigger uses followup_needed from EVAL JSON (not score threshold).
+ *   • Avoid duplicate follow-up bubbles:
+ *     - Persist/display follow-up question ONLY from Step2 (phase=FOLLOWUP) for TWO_STEP nodes.
+ *     - For ONE_STEP nodes, persist/display follow-up from Step1 (phase=ONE_STEP).
+ *     - If a step already displays follow-up as plain text bubble, do NOT add a second "fuq" bubble.
  * =====================================================================
  */
 
@@ -44,7 +34,6 @@
 package com.negi.survey.screens
 
 import android.os.SystemClock
-import android.content.ClipData
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.LinearEasing
@@ -111,7 +100,6 @@ import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
-import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -130,18 +118,20 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.platform.LocalClipboard
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.platform.ClipEntry
+import com.negi.survey.BuildConfig
 import com.negi.survey.net.RuntimeLogStore
 import com.negi.survey.slm.FollowupExtractor
+import com.negi.survey.slm.PromptPhase
 import com.negi.survey.vm.AiViewModel
 import com.negi.survey.vm.SurveyViewModel
 import java.security.MessageDigest
@@ -160,66 +150,15 @@ import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 
-/* =============================================================================
- * AI Evaluation Screen — Monotone × Glass × Chat
- * ============================================================================= */
-
 private const val TAG = "AiScreen"
 private const val TYPING_UPDATE_THROTTLE_MS = 90L
 private const val AUTO_SCROLL_THROTTLE_MS = 40L
 
-/**
- * UI sender type for local chat state.
- */
-private enum class ChatSenderUi {
-    USER,
-    AI
-}
-
-/**
- * Which kind of input the composer is currently collecting.
- *
- * MAIN:
- *  - The first user answer to the root question.
- *  - This may be persisted into SurveyViewModel via setAnswer().
- *
- * FOLLOWUP:
- *  - Answers to follow-up questions.
- *  - Must NOT overwrite the main answer in SurveyViewModel.
- */
-private enum class InputRole {
-    MAIN,
-    FOLLOWUP
-}
-
-/**
- * Local chat message model scoped to this screen.
- *
- * This avoids depending on AiViewModel chat APIs that may not exist.
- *
- * @param id Stable identifier.
- * @param sender Sender type.
- * @param text Plain text payload.
- * @param json JSON payload (pretty-printed).
- * @param isTyping True when this is a streaming "typing" bubble.
- */
-private data class ChatMsgUi(
-    val id: String,
-    val sender: ChatSenderUi,
-    val text: String? = null,
-    val json: String? = null,
-    val isTyping: Boolean = false
-)
+/** Debug-only crash button visibility. */
+private val SHOW_DEBUG_CRASH_BUTTON: Boolean = BuildConfig.DEBUG
 
 /**
  * Simple abstraction for a speech-to-text controller (e.g., Whisper.cpp).
- *
- * Implementations are expected to:
- *  - Expose recording state, transcription state, and latest recognized text
- *    as [StateFlow]s.
- *  - Provide [startRecording] and [stopRecording] controls.
- *  - Optionally rely on [toggleRecording] as a convenience entry point.
- *  - Accept optional context for export naming/correlation.
  */
 interface SpeechController {
 
@@ -238,18 +177,10 @@ interface SpeechController {
     /**
      * Update the context used for correlating speech with the survey run.
      *
-     * Implementations that export voice files may embed these values into
-     * file names or sidecar metadata.
-     *
-     * Default implementation is a no-op so non-export controllers remain valid.
-     *
      * @param surveyId UUID of the active survey run.
      * @param questionId Node ID for the current question.
      */
-    fun updateContext(
-        surveyId: String?,
-        questionId: String?
-    ) {
+    fun updateContext(surveyId: String?, questionId: String?) {
         // no-op
     }
 
@@ -261,29 +192,12 @@ interface SpeechController {
 
     /**
      * Convenience toggle that switches between start/stop.
-     *
-     * This method reads [isRecording.value] directly. Implementations should
-     * ensure their [StateFlow] values are updated promptly to avoid UI drift.
      */
     fun toggleRecording() {
         if (isRecording.value) stopRecording() else startRecording()
     }
 }
 
-/**
- * Full-screen AI evaluation screen bound to a single survey node.
- *
- * IME handling policy:
- * - The Activity should use SOFT_INPUT_ADJUST_NOTHING.
- * - This composable uses [Modifier.imePadding] to avoid double-resize.
- *
- * @param nodeId Graph node identifier for the current AI question.
- * @param vmSurvey Survey-level ViewModel providing questions and answers.
- * @param vmAI AI-specific ViewModel for streaming and step history.
- * @param onNext Callback invoked when the user presses the "Next" button.
- * @param onBack Callback invoked when the user presses the "Back" button.
- * @param speechController Optional speech controller backing the composer mic.
- */
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalSerializationApi::class)
 @Composable
 fun AiScreen(
@@ -306,26 +220,27 @@ fun AiScreen(
     // Survey state
     // ---------------------------------------------------------------------
 
-    /**
-     * Root question text stream for this node.
-     *
-     * We default the initial state to the ViewModel snapshot to avoid a
-     * transient blank state when the Flow is still cold.
-     */
     val rootQuestion by remember(vmSurvey, nid) {
         vmSurvey.questions.map { it[nid].orEmpty() }
     }.collectAsState(initial = vmSurvey.getQuestion(nid))
 
-    /** Session id increments when the survey is reset. */
-    val sessionId by vmSurvey.sessionId.collectAsState()
-
-    /** Stable UUID for the active survey run. */
+    val surveySessionId by vmSurvey.sessionId.collectAsState()
     val surveyUuid by vmSurvey.surveyUuid.collectAsState()
 
+    val contextKey = remember(nid, surveySessionId) { "sid=$surveySessionId|nid=$nid" }
+
     /**
-     * Keep speech controller context in sync with the active survey run + node.
+     * Determine if this node is configured as TWO_STEP.
+     *
+     * This is used to decide which step is allowed to persist/display follow-up question:
+     * - TWO_STEP: only Step2 (phase=FOLLOWUP)
+     * - ONE_STEP: Step1 (phase=ONE_STEP)
      */
-    LaunchedEffect(nid, sessionId, surveyUuid, speechController) {
+    val isTwoStepNode = remember(vmSurvey, nid, surveySessionId) {
+        vmSurvey.hasTwoStepPrompt(nid)
+    }
+
+    LaunchedEffect(nid, surveySessionId, surveyUuid, speechController) {
         speechController?.updateContext(
             surveyId = surveyUuid,
             questionId = nid
@@ -346,9 +261,6 @@ fun AiScreen(
     val speechPartial by partialFlow.collectAsState(initial = "")
     val speechError by errFlow.collectAsState(initial = null)
 
-    /**
-     * Text field should be disabled while recording or transcribing.
-     */
     val textFieldEnabled = !speechRecording && !speechTranscribing
 
     val speechStatusText: String? = when {
@@ -367,14 +279,32 @@ fun AiScreen(
     val stream by vmAI.stream.collectAsState()
     val error by vmAI.error.collectAsState()
 
-    /**
-     * Step history is the source of truth for "Step1 + Step2 both remain visible".
-     */
     val stepHistory by vmAI.stepHistory.collectAsState()
 
     // ---------------------------------------------------------------------
-    // Local UI state (chat + composer)
+    // Persistent chat + conversation state (B plan)
     // ---------------------------------------------------------------------
+
+    LaunchedEffect(contextKey, rootQuestion) {
+        vmAI.ensureConversationContext(
+            contextKey = contextKey,
+            rootQuestion = rootQuestion,
+            initialDraft = vmSurvey.getAnswer(nid)
+        )
+        vmAI.ensureRootQuestionMessage(contextKey, nid, rootQuestion)
+        vmAI.ensureActivePromptIfMain(contextKey, rootQuestion)
+    }
+
+    val conv by vmAI.conversationStateFlow(contextKey)
+        .collectAsState(
+            initial = AiViewModel.ConversationState(
+                role = AiViewModel.ComposerRole.MAIN,
+                activePromptQuestion = rootQuestion,
+                composerDraft = vmSurvey.getAnswer(nid)
+            )
+        )
+
+    val chatItems by vmAI.chatHistoryFlow(contextKey).collectAsState(initial = emptyList())
 
     val prettyJson = remember {
         Json {
@@ -384,46 +314,9 @@ fun AiScreen(
         }
     }
 
-    /**
-     * Composer text.
-     *
-     * IMPORTANT:
-     * - While answering FOLLOWUP, we must not call vmSurvey.setAnswer() on every keystroke.
-     */
-    var composer by remember(nid, sessionId) {
-        mutableStateOf(vmSurvey.getAnswer(nid))
-    }
-
-    /**
-     * Current input role.
-     *
-     * - Starts in MAIN.
-     * - Switches to FOLLOWUP when a follow-up question is persisted.
-     */
-    var inputRole by remember(nid, sessionId) { mutableStateOf(InputRole.MAIN) }
-
-    /**
-     * The "active prompt question" shown to the user conceptually.
-     * - Starts as rootQuestion.
-     * - Updated to the latest follow-up question when generated.
-     */
-    var activePromptQuestion by remember(nid, sessionId) { mutableStateOf(rootQuestion) }
-
-    /**
-     * Local chat state (nodeId, sessionId scoped).
-     *
-     * This does not require AiViewModel chat persistence APIs.
-     */
-    val chat = remember(nid, sessionId) { mutableStateListOf<ChatMsgUi>() }
-
     val focusRequester = remember { FocusRequester() }
     val scroll = rememberScrollState()
 
-    /**
-     * Scroll policy:
-     *  - Only auto-scroll while user is pinned to bottom.
-     *  - If user scrolls up, show a "Jump to bottom" affordance.
-     */
     val bottomThresholdPx = remember(density) { with(density) { 28.dp.roundToPx() } }
     val isPinnedToBottom by remember {
         derivedStateOf {
@@ -433,91 +326,29 @@ fun AiScreen(
         }
     }
 
-    var lastAutoScrollMs by remember(nid, sessionId) { mutableLongStateOf(0L) }
-    var lastTypingUpdateMs by remember(nid, sessionId) { mutableLongStateOf(0L) }
-    var lastTypingLen by remember(nid, sessionId) { mutableIntStateOf(0) }
+    var lastAutoScrollMs by remember(contextKey) { mutableLongStateOf(0L) }
+    var lastTypingUpdateMs by remember(contextKey) { mutableLongStateOf(0L) }
+    var lastTypingLen by remember(contextKey) { mutableIntStateOf(0) }
 
-    /**
-     * Track which steps have already been rendered into chat bubbles.
-     */
-    var renderedStepCount by remember(nid, sessionId) { mutableIntStateOf(0) }
+    /** Track which steps have already been consumed to avoid reprocessing. */
+    var renderedStepCount by remember(contextKey) { mutableIntStateOf(0) }
 
-    /**
-     * Track follow-up persistence to avoid duplicates.
-     */
-    var lastFollowupLocal by remember(nid, sessionId) { mutableStateOf<String?>(null) }
-
-    /**
-     * Ensure root question bubble exists and stays current.
-     *
-     * NOTE:
-     * - Root question should remain visible (conversation context).
-     * - Follow-up questions are appended as additional AI bubbles,
-     *   and also become activePromptQuestion.
-     */
-    LaunchedEffect(nid, sessionId, rootQuestion) {
-        val qid = "qroot-$nid"
-        val idx = chat.indexOfFirst { it.id == qid }
-        if (idx == -1) {
-            chat.add(
-                ChatMsgUi(
-                    id = qid,
-                    sender = ChatSenderUi.AI,
-                    text = rootQuestion
-                )
-            )
-        } else {
-            val cur = chat[idx]
-            if (cur.text != rootQuestion) {
-                chat[idx] = cur.copy(text = rootQuestion)
-            }
-        }
-
-        // Only update activePromptQuestion if we are still on root.
-        if (inputRole == InputRole.MAIN && (activePromptQuestion.isBlank() || activePromptQuestion == curTextOrBlank(chat, qid))) {
-            activePromptQuestion = rootQuestion
-        }
-    }
-
-    /**
-     * Sync composer with persisted Survey answers at node/session boundaries.
-     */
-    LaunchedEffect(nid, sessionId) {
-        composer = vmSurvey.getAnswer(nid)
-        inputRole = InputRole.MAIN
-        activePromptQuestion = rootQuestion
-        renderedStepCount = 0
-        lastFollowupLocal = null
-        // Keep chat as-is for the current node/session.
-    }
-
-    /**
-     * Request focus and show IME only once per node/session.
-     */
-    LaunchedEffect(nid, sessionId) {
+    LaunchedEffect(contextKey) {
         delay(30)
         focusRequester.requestFocus()
         keyboard?.show()
     }
 
-    /**
-     * Surface AI errors as snackbars.
-     */
     LaunchedEffect(error) {
         val msg = error ?: return@LaunchedEffect
         snack.showSnackbar(msg)
-        removeTypingBubble(chat, nid)
+        vmAI.removeTypingMessage(contextKey, nid)
     }
 
     // ---------------------------------------------------------------------
-    // Typing bubble orchestration (throttled)
+    // Typing bubble orchestration (persisted)
     // ---------------------------------------------------------------------
 
-    /**
-     * Maintain/update typing bubble during streaming.
-     *
-     * This update is throttled to avoid updating the chat list on every token.
-     */
     LaunchedEffect(loading, stream) {
         if (!loading) return@LaunchedEffect
 
@@ -533,145 +364,145 @@ fun AiScreen(
         lastTypingUpdateMs = now
         lastTypingLen = len
 
-        val txt = stream.ifBlank { "…" }
-
-        upsertTypingBubble(
-            chat = chat,
-            nid = nid,
-            text = txt
-        )
+        vmAI.upsertTypingMessage(contextKey, nid, stream.ifBlank { "…" })
     }
 
-    /**
-     * Render Step snapshots into local chat.
-     *
-     * Core behavior:
-     * - stepHistory always receives Step1 + Step2 results.
-     * - Replace typing bubble with each Step result bubble.
-     * - Resolve/persist follow-up questions per step.
-     * - When a follow-up question is persisted:
-     *    • append it (if not already shown)
-     *    • set activePromptQuestion to it
-     *    • switch inputRole to FOLLOWUP (prevents main overwrite)
-     */
-    LaunchedEffect(stepHistory.size) {
-        // History got reset (new chain). Reset step cursor only.
+    LaunchedEffect(loading) {
+        if (!loading) {
+            vmAI.removeTypingMessage(contextKey, nid)
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Step snapshots -> persisted chat
+    // ---------------------------------------------------------------------
+
+    LaunchedEffect(stepHistory.size, contextKey) {
         if (stepHistory.size < renderedStepCount) {
             renderedStepCount = 0
-            lastFollowupLocal = null
         }
-
         if (stepHistory.size <= renderedStepCount) return@LaunchedEffect
 
         val newSteps = stepHistory.subList(renderedStepCount, stepHistory.size)
 
-        newSteps.forEachIndexed { idx, step ->
+        newSteps.forEach { step ->
             val stepRaw = step.raw
             val stripped = stripCodeFence(stepRaw).trim()
 
             val parsed = parseJsonLenient(prettyJson, stripped)
             val showAsJson = (step.mode == AiViewModel.EvalMode.EVAL_JSON) || (parsed != null)
 
-            val resultMsg = if (showAsJson) {
-                val pretty = prettyOrRaw(prettyJson, stepRaw)
-                ChatMsgUi(
-                    id = "step-${step.runId}-$nid",
-                    sender = ChatSenderUi.AI,
-                    json = pretty
-                )
-            } else {
-                val text = resolveFollowupFromStep(prettyJson, step)
+            vmAI.removeTypingMessage(contextKey, nid)
+
+            val stepMsgId = "step-${step.runId}-$nid"
+            val stepPlainText: String? = if (!showAsJson) {
+                resolveFollowupFromStep(prettyJson, step)
                     ?: extractPlainFollowup(stepRaw)
                     ?: stripped.ifBlank { "…" }
+            } else {
+                null
+            }
 
-                ChatMsgUi(
-                    id = "step-${step.runId}-$nid",
-                    sender = ChatSenderUi.AI,
-                    text = text
+            if (showAsJson) {
+                val pretty = prettyOrRaw(prettyJson, stepRaw)
+                vmAI.upsertChatItem(
+                    contextKey,
+                    AiViewModel.ChatItem(
+                        id = stepMsgId,
+                        sender = AiViewModel.ChatSender.AI,
+                        json = pretty
+                    )
+                )
+            } else {
+                vmAI.upsertChatItem(
+                    contextKey,
+                    AiViewModel.ChatItem(
+                        id = stepMsgId,
+                        sender = AiViewModel.ChatSender.AI,
+                        text = stepPlainText
+                    )
                 )
             }
 
-            // First new step likely replaces the typing bubble; subsequent ones append.
-            if (idx == 0) {
-                replaceTypingWith(chat, nid, resultMsg)
-            } else {
-                chat.add(resultMsg)
-            }
-
-            // Follow-up resolution & persistence (dedup).
-            val fu = resolveFollowupFromStep(prettyJson, step)
-                ?: (if (!showAsJson) extractPlainFollowup(stepRaw) else null)
-
-            val fuNorm = fu?.trim()?.takeIf { it.isNotBlank() }
-            if (fuNorm != null && fuNorm != lastFollowupLocal) {
-                lastFollowupLocal = fuNorm
-
-                // If this step bubble already displayed the same follow-up as plain text, do not append again.
-                val displayedAsPlain = (!showAsJson) && (resultMsg.text?.trim() == fuNorm)
-
-                if (!displayedAsPlain) {
-                    chat.add(
-                        ChatMsgUi(
-                            id = "fuq-$nid-${step.runId}-${System.nanoTime()}",
-                            sender = ChatSenderUi.AI,
-                            text = fuNorm
-                        )
-                    )
+            /**
+             * IMPORTANT:
+             * Follow-up question persist/display policy:
+             * - TWO_STEP nodes: ONLY Step2 (phase=FOLLOWUP) may persist/display follow-up question.
+             * - ONE_STEP nodes: Step1 (phase=ONE_STEP) may persist/display follow-up question.
+             */
+            val shouldPersistFollowup =
+                if (isTwoStepNode) {
+                    step.phase == PromptPhase.FOLLOWUP
+                } else {
+                    step.phase == PromptPhase.ONE_STEP
                 }
 
-                // Persist follow-up question in Survey VM.
-                vmSurvey.addFollowupQuestion(nid, fuNorm)
+            if (shouldPersistFollowup) {
+                val fu = resolveFollowupFromStep(prettyJson, step)
+                    ?: (if (!showAsJson) extractPlainFollowup(stepRaw) else null)
 
-                // This follow-up becomes the next "active prompt question".
-                activePromptQuestion = fuNorm
-                inputRole = InputRole.FOLLOWUP
+                val fuNorm = fu?.trim()?.takeIf { it.isNotBlank() }
+                if (fuNorm != null) {
+                    val isNew = vmAI.markFollowupSeen(contextKey, fuNorm)
 
-                RuntimeLogStore.i(
-                    TAG,
-                    "Follow-up persisted (node=$nid runId=${step.runId} mode=${step.mode} len=${fuNorm.length} preview=${clipForLog(fuNorm, 120)})"
-                )
+                    /**
+                     * If the step already displays the follow-up as plain text,
+                     * do NOT add a second "fuq" bubble.
+                     */
+                    val displayedAsPlain =
+                        (!showAsJson) && (stepPlainText?.trim() == fuNorm)
 
-                // Bring IME back for the next answer (do not overwrite draft).
-                scope.launch {
-                    delay(40)
-                    focusRequester.requestFocus()
-                    keyboard?.show()
+                    if (isNew) {
+                        if (!displayedAsPlain) {
+                            val fuqId = "fuq-$nid-${step.runId}"
+                            vmAI.upsertChatItem(
+                                contextKey,
+                                AiViewModel.ChatItem(
+                                    id = fuqId,
+                                    sender = AiViewModel.ChatSender.AI,
+                                    text = fuNorm
+                                )
+                            )
+                        }
+
+                        vmSurvey.addFollowupQuestion(nid, fuNorm)
+                        vmAI.setFollowupMode(contextKey, fuNorm)
+
+                        RuntimeLogStore.i(
+                            TAG,
+                            "Follow-up persisted (context=$contextKey node=$nid runId=${step.runId} " +
+                                    "phase=${step.phase} mode=${step.mode} twoStep=$isTwoStepNode " +
+                                    "len=${fuNorm.length} preview=${clipForLog(fuNorm, 120)} displayedAsPlain=$displayedAsPlain)"
+                        )
+
+                        scope.launch {
+                            delay(40)
+                            focusRequester.requestFocus()
+                            keyboard?.show()
+                        }
+                    }
                 }
             }
 
             RuntimeLogStore.d(
                 TAG,
-                "Step rendered (node=$nid runId=${step.runId} mode=${step.mode} showJson=$showAsJson rawLen=${stepRaw.length} followups=${step.followups.size} timedOut=${step.timedOut})"
+                "Step rendered (context=$contextKey node=$nid runId=${step.runId} phase=${step.phase} " +
+                        "mode=${step.mode} showJson=$showAsJson twoStep=$isTwoStepNode " +
+                        "rawLen=${stepRaw.length} followups=${step.followups.size} timedOut=${step.timedOut})"
             )
         }
 
         renderedStepCount = stepHistory.size
     }
 
-    /**
-     * If streaming stops without step snapshots (cancel/error), ensure typing bubble is removed.
-     */
-    LaunchedEffect(loading) {
-        if (!loading) {
-            removeTypingBubble(chat, nid)
-        }
-    }
-
     // ---------------------------------------------------------------------
-    // Speech → Composer commit logic (edge-aware)
+    // Speech → Draft commit
     // ---------------------------------------------------------------------
 
-    var wasRecording by remember(nid, sessionId) { mutableStateOf(false) }
-    var wasTranscribing by remember(nid, sessionId) { mutableStateOf(false) }
-    var lastCommitted by remember(nid, sessionId) { mutableStateOf<String?>(null) }
+    var wasRecording by remember(contextKey) { mutableStateOf(false) }
+    var wasTranscribing by remember(contextKey) { mutableStateOf(false) }
+    var lastCommitted by remember(contextKey) { mutableStateOf<String?>(null) }
 
-    /**
-     * Commit recognized speech only when an utterance finishes.
-     *
-     * IMPORTANT:
-     * - While answering FOLLOWUP, do not clear or overwrite the main Survey answer.
-     * - We still update the composer UI text.
-     */
     LaunchedEffect(speechRecording, speechTranscribing, speechPartial) {
         if (speechController == null) return@LaunchedEffect
 
@@ -679,15 +510,14 @@ fun AiScreen(
             (!wasRecording && !wasTranscribing) && (speechRecording || speechTranscribing)
 
         if (startedThisUtterance) {
-            composer = ""
+            vmAI.updateComposerDraft(contextKey, "")
             lastCommitted = null
 
-            // Only clear persisted main answer when collecting MAIN input.
-            if (inputRole == InputRole.MAIN) {
+            if (conv.role == AiViewModel.ComposerRole.MAIN) {
                 vmSurvey.clearAnswer(nid)
             }
 
-            RuntimeLogStore.d(TAG, "Speech started (node=$nid role=$inputRole)")
+            RuntimeLogStore.d(TAG, "Speech started (node=$nid role=${conv.role})")
         }
 
         val finishedThisUtterance =
@@ -696,17 +526,16 @@ fun AiScreen(
         if (finishedThisUtterance) {
             val text = speechPartial.trim()
             if (text.isNotEmpty() && text != lastCommitted) {
-                composer = text
+                vmAI.updateComposerDraft(contextKey, text)
                 lastCommitted = text
 
-                // Persist draft only for MAIN role (FOLLOWUP must not overwrite main answer).
-                if (inputRole == InputRole.MAIN) {
+                if (conv.role == AiViewModel.ComposerRole.MAIN) {
                     vmSurvey.setAnswer(text, nid)
                 }
 
-                RuntimeLogStore.d(TAG, "Speech committed (node=$nid role=$inputRole len=${text.length})")
+                RuntimeLogStore.d(TAG, "Speech committed (node=$nid role=${conv.role} len=${text.length})")
             } else {
-                RuntimeLogStore.d(TAG, "Speech finished with empty/no-change (node=$nid role=$inputRole)")
+                RuntimeLogStore.d(TAG, "Speech finished with empty/no-change (node=$nid role=${conv.role})")
             }
         }
 
@@ -718,10 +547,7 @@ fun AiScreen(
     // Auto-scroll (pinned-to-bottom only)
     // ---------------------------------------------------------------------
 
-    /**
-     * Auto-scroll to bottom when chat size changes, but only when pinned.
-     */
-    LaunchedEffect(chat.size) {
+    LaunchedEffect(chatItems.size) {
         if (!isPinnedToBottom) return@LaunchedEffect
         val now = SystemClock.uptimeMillis()
         if ((now - lastAutoScrollMs) < AUTO_SCROLL_THROTTLE_MS) return@LaunchedEffect
@@ -731,9 +557,6 @@ fun AiScreen(
         scroll.animateScrollTo(scroll.maxValue)
     }
 
-    /**
-     * Keep view pinned to the bottom while streaming grows, only when pinned.
-     */
     LaunchedEffect(stream, loading) {
         if (!loading || !isPinnedToBottom) return@LaunchedEffect
         val now = SystemClock.uptimeMillis()
@@ -745,21 +568,9 @@ fun AiScreen(
     }
 
     // ---------------------------------------------------------------------
-    // Submit logic
+    // Submit logic (ALWAYS TWO-STEP if configured)
     // ---------------------------------------------------------------------
 
-    /**
-     * Submit current answer and trigger AI evaluation.
-     *
-     * IMPORTANT:
-     * - MAIN answer is persisted via vmSurvey.setAnswer().
-     * - FOLLOWUP answers must NOT overwrite main answer.
-     *   -> only vmSurvey.answerLastFollowup() is called for FOLLOWUP.
-     *
-     * Prompt rules:
-     * - Step1 (EVAL): always use rootQuestion + mainAnswer (stable)
-     * - Step2 (FOLLOWUP): run iff followup_needed==true in EVAL JSON
-     */
     fun submit() {
         if (loading) return
         if (speechRecording || speechTranscribing) {
@@ -767,167 +578,80 @@ fun AiScreen(
             return
         }
 
-        val input = composer.trim()
+        val input = conv.composerDraft.trim()
         if (input.isBlank()) return
 
-        val existingMain = vmSurvey.getAnswer(nid).trim()
-        val isSubmittingMain = (inputRole == InputRole.MAIN)
+        val isSubmittingMain = (conv.role == AiViewModel.ComposerRole.MAIN)
 
-        // Persist answer depending on role.
         if (isSubmittingMain) {
             vmSurvey.setAnswer(input, nid)
         } else {
             vmSurvey.answerLastFollowup(nid, input)
         }
 
-        // Append user bubble.
-        chat.add(
-            ChatMsgUi(
-                id = "u-$nid-${System.nanoTime()}",
-                sender = ChatSenderUi.USER,
-                text = input
-            )
-        )
+        vmAI.appendUserMessage(contextKey, input)
 
-        // Stable main answer for prompt building (do not use follow-up input as main).
-        val mainAnswerStable = if (isSubmittingMain) input else existingMain
+        val questionForTurn = if (isSubmittingMain) rootQuestion else conv.activePromptQuestion.ifBlank { rootQuestion }
+        val answerForTurn = input
 
         scope.launch {
             val runId = "ai-${nid}-${SystemClock.uptimeMillis()}-${System.nanoTime()}"
             val t0 = SystemClock.uptimeMillis()
 
-            val q = rootQuestion
             val isTwoStep = vmSurvey.hasTwoStepPrompt(nid)
 
             RuntimeLogStore.i(
                 TAG,
-                "Submit begin runId=$runId node=$nid role=$inputRole isTwoStep=$isTwoStep " +
+                "Submit begin runId=$runId node=$nid role=${conv.role} isTwoStep=$isTwoStep " +
                         "sessionId=${runSafe { vmSurvey.sessionId.value }} surveyUuid=${runSafe { vmSurvey.surveyUuid.value }} " +
-                        "qLen=${q.length} mainAnsLen=${mainAnswerStable.length} inputLen=${input.length} " +
-                        "loading=$loading streamLen=${stream.length}"
+                        "qLen=${questionForTurn.length} aLen=${answerForTurn.length} " +
+                        "qPreview=${clipForLog(questionForTurn, 96)} aPreview=${clipForLog(answerForTurn, 96)}"
             )
 
             runCatching {
                 if (!isTwoStep) {
-                    RuntimeLogStore.d(TAG, "ONE_STEP prompt build start runId=$runId node=$nid")
-
-                    val prompt = vmSurvey.getPrompt(nid, q, mainAnswerStable)
-                    RuntimeLogStore.i(
-                        TAG,
-                        "ONE_STEP prompt build ok runId=$runId node=$nid " +
-                                "promptLen=${prompt.length} promptHash=${shortHash(prompt)} " +
-                                "promptPreview=${clipForLog(prompt, 120)}"
-                    )
-
-                    RuntimeLogStore.d(TAG, "ONE_STEP evaluateAsync call runId=$runId node=$nid elapsed=${SystemClock.uptimeMillis() - t0}ms")
+                    val prompt = vmSurvey.getPrompt(nid, questionForTurn, answerForTurn)
                     vmAI.evaluateAsync(prompt)
-                    RuntimeLogStore.d(TAG, "ONE_STEP evaluateAsync returned runId=$runId node=$nid elapsed=${SystemClock.uptimeMillis() - t0}ms")
-                } else {
-                    RuntimeLogStore.d(TAG, "TWO_STEP step1 prompt build start runId=$runId node=$nid")
-
-                    val prompt1 = vmSurvey.getEvalPrompt(nid, q, mainAnswerStable)
-                    RuntimeLogStore.i(
-                        TAG,
-                        "TWO_STEP step1 prompt build ok runId=$runId node=$nid " +
-                                "prompt1Len=${prompt1.length} prompt1Hash=${shortHash(prompt1)} " +
-                                "prompt1Preview=${clipForLog(prompt1, 120)}"
-                    )
-
-                    RuntimeLogStore.d(TAG, "TWO_STEP evaluateConditionalTwoStepAsync call runId=$runId node=$nid elapsed=${SystemClock.uptimeMillis() - t0}ms")
-
-                    vmAI.evaluateConditionalTwoStepAsync(
-                        firstPrompt = prompt1,
-                        proceedOnTimeout = true,
-
-                        /**
-                         * Run step2 iff followup_needed == true in step1 EVAL JSON.
-                         *
-                         * This avoids suppressing follow-ups when score is high
-                         * but clarification is still required.
-                         */
-                        shouldRunSecond = { step1 ->
-                            val needed = extractFollowupNeeded(prettyJson, step1.raw) ?: false
-                            RuntimeLogStore.i(
-                                TAG,
-                                "TWO_STEP shouldRunSecond runId=$runId node=$nid " +
-                                        "followup_needed=$needed timedOut=${step1.timedOut} rawLen=${step1.raw.length}"
-                            )
-                            needed
-                        },
-
-                        buildSecondPrompt = { step1 ->
-                            val step1Raw = step1.raw
-                            RuntimeLogStore.d(
-                                TAG,
-                                "TWO_STEP step2 prompt build start runId=$runId node=$nid " +
-                                        "step1TimedOut=${step1.timedOut} step1RawLen=${step1Raw.length}"
-                            )
-
-                            val prompt2 = runCatching {
-                                vmSurvey.getFollowupPrompt(
-                                    nodeId = nid,
-                                    question = q,
-                                    answer = mainAnswerStable,
-                                    evalJsonRaw = step1Raw
-                                )
-                            }.onSuccess { built ->
-                                RuntimeLogStore.i(
-                                    TAG,
-                                    "TWO_STEP step2 prompt build ok runId=$runId node=$nid " +
-                                            "prompt2Len=${built.length} prompt2Hash=${shortHash(built)} " +
-                                            "prompt2Preview=${clipForLog(built, 120)}"
-                                )
-                            }.getOrElse { err ->
-                                RuntimeLogStore.e(
-                                    TAG,
-                                    "TWO_STEP step2 prompt build failed runId=$runId node=$nid " +
-                                            "errType=${err::class.java.simpleName} errMsg=${err.message}",
-                                    err
-                                )
-                                buildString {
-                                    append("Generate ONE follow-up question.\n")
-                                    append("Return plain text only.\n\n")
-                                    append("=== EVAL_JSON ===\n")
-                                    append(step1Raw)
-                                    append("\n")
-                                }.also { fallback ->
-                                    RuntimeLogStore.w(
-                                        TAG,
-                                        "TWO_STEP step2 prompt fallback used runId=$runId node=$nid " +
-                                                "fallbackLen=${fallback.length} fallbackHash=${shortHash(fallback)}"
-                                    )
-                                }
-                            }
-
-                            RuntimeLogStore.d(TAG, "TWO_STEP step2 prompt build end runId=$runId node=$nid prompt2Len=${prompt2.length}")
-                            prompt2
-                        }
-                    )
-
-                    RuntimeLogStore.d(
-                        TAG,
-                        "TWO_STEP evaluateConditionalTwoStepAsync returned runId=$runId node=$nid " +
-                                "elapsed=${SystemClock.uptimeMillis() - t0}ms"
-                    )
+                    return@runCatching
                 }
+
+                val prompt1 = vmSurvey.getEvalPrompt(nid, questionForTurn, answerForTurn)
+
+                vmAI.evaluateConditionalTwoStepAsync(
+                    firstPrompt = prompt1,
+                    proceedOnTimeout = true,
+                    shouldRunSecond = { step1 ->
+                        val needed = extractFollowupNeeded(prettyJson, step1.raw) ?: false
+                        RuntimeLogStore.i(
+                            TAG,
+                            "TWO_STEP shouldRunSecond runId=$runId node=$nid role=${conv.role} " +
+                                    "followup_needed=$needed timedOut=${step1.timedOut} rawLen=${step1.raw.length}"
+                        )
+                        needed
+                    },
+                    buildSecondPrompt = { step1 ->
+                        vmSurvey.getFollowupPrompt(
+                            nodeId = nid,
+                            question = questionForTurn,
+                            answer = answerForTurn,
+                            evalJsonRaw = step1.raw
+                        )
+                    }
+                )
             }.onFailure { err ->
                 RuntimeLogStore.e(
                     TAG,
-                    "Submit failed runId=$runId node=$nid " +
-                            "errType=${err::class.java.simpleName} errMsg=${err.message} " +
-                            "elapsed=${SystemClock.uptimeMillis() - t0}ms " +
-                            "loading=$loading streamLen=${stream.length}",
+                    "Submit failed runId=$runId node=$nid role=${conv.role} errType=${err::class.java.simpleName} errMsg=${err.message}",
                     err
                 )
-
                 snack.showSnackbar("Submit failed: ${err.message ?: "unknown error"}")
-                removeTypingBubble(chat, nid)
+                vmAI.removeTypingMessage(contextKey, nid)
             }.also {
                 RuntimeLogStore.i(TAG, "Submit end runId=$runId node=$nid elapsed=${SystemClock.uptimeMillis() - t0}ms")
             }
         }
 
-        composer = ""
+        vmAI.updateComposerDraft(contextKey, "")
         keyboard?.hide()
         focusManager.clearFocus(force = true)
     }
@@ -937,15 +661,11 @@ fun AiScreen(
     // ---------------------------------------------------------------------
 
     val bgBrush = animatedMonotoneBackplate()
-    val title = if (inputRole == InputRole.FOLLOWUP) "Follow-up • $nid" else "Question • $nid"
+    val title = if (conv.role == AiViewModel.ComposerRole.FOLLOWUP) "Follow-up • $nid" else "Question • $nid"
 
     Scaffold(
         topBar = { CompactTopBar(title = title) },
         snackbarHost = { SnackbarHost(snack) },
-        /**
-         * Keep Scaffold from auto-applying IME/system insets.
-         * We handle insets explicitly to avoid double-resize.
-         */
         contentWindowInsets = zeroInsetsSafe()
     ) { pad ->
         Box(
@@ -953,10 +673,6 @@ fun AiScreen(
                 .padding(pad)
                 .fillMaxSize()
                 .background(bgBrush)
-                /**
-                 * Critical: IME padding applied exactly once at the root content.
-                 * This assumes Activity is using SOFT_INPUT_ADJUST_NOTHING.
-                 */
                 .imePadding()
                 .pointerInput(Unit) {
                     detectTapGestures {
@@ -981,8 +697,8 @@ fun AiScreen(
                             .verticalScroll(scroll),
                         verticalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
-                        chat.forEach { m ->
-                            val isAi = m.sender == ChatSenderUi.AI
+                        chatItems.forEach { m ->
+                            val isAi = m.sender == AiViewModel.ChatSender.AI
                             androidx.compose.foundation.layout.Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = if (isAi) Arrangement.Start else Arrangement.End
@@ -1000,20 +716,14 @@ fun AiScreen(
                         }
                     }
 
-                    /**
-                     * Jump-to-bottom affordance:
-                     * Visible only when user is not pinned and chat has content.
-                     */
                     androidx.compose.animation.AnimatedVisibility(
-                        visible = !isPinnedToBottom && chat.isNotEmpty(),
+                        visible = !isPinnedToBottom && chatItems.isNotEmpty(),
                         modifier = Modifier
                             .align(Alignment.BottomCenter)
                             .padding(bottom = 8.dp)
                     ) {
                         JumpToBottomPill(
-                            onClick = {
-                                scope.launch { scroll.animateScrollTo(scroll.maxValue) }
-                            }
+                            onClick = { scope.launch { scroll.animateScrollTo(scroll.maxValue) } }
                         )
                     }
                 }
@@ -1032,14 +742,18 @@ fun AiScreen(
                             .fillMaxWidth()
                             .padding(top = 6.dp)
                     ) {
-                        ChatComposer(
-                            value = composer,
-                            onValueChange = {
-                                composer = it
+                        if (SHOW_DEBUG_CRASH_BUTTON) {
+                            OutlinedButton(onClick = { throw RuntimeException("Debug crash button pressed") }) {
+                                Text("Crash now (debug)")
+                            }
+                        }
 
-                                // Persist drafts only for MAIN. FOLLOWUP must not overwrite main answer.
-                                if (inputRole == InputRole.MAIN) {
-                                    vmSurvey.setAnswer(it, nid)
+                        ChatComposer(
+                            value = conv.composerDraft,
+                            onValueChange = { t ->
+                                vmAI.updateComposerDraft(contextKey, t)
+                                if (conv.role == AiViewModel.ComposerRole.MAIN) {
+                                    vmSurvey.setAnswer(t, nid)
                                 }
                             },
                             onSend = ::submit,
@@ -1069,9 +783,7 @@ fun AiScreen(
                                     vmAI.resetStates()
                                     onBack()
                                 }
-                            ) {
-                                Text("Back")
-                            }
+                            ) { Text("Back") }
 
                             androidx.compose.foundation.layout.Spacer(Modifier.weight(1f))
 
@@ -1080,9 +792,7 @@ fun AiScreen(
                                     vmAI.resetStates()
                                     onNext()
                                 }
-                            ) {
-                                Text("Next")
-                            }
+                            ) { Text("Next") }
                         }
                     }
                 }
@@ -1090,10 +800,7 @@ fun AiScreen(
         }
     }
 
-    /**
-     * Stop speech capture and clear transient AI state when leaving this screen.
-     */
-    DisposableEffect(nid, sessionId) {
+    DisposableEffect(contextKey) {
         onDispose {
             runCatching {
                 if (speechController?.isRecording?.value == true) {
@@ -1101,167 +808,13 @@ fun AiScreen(
                 }
             }
             vmAI.resetStates()
+            vmAI.removeTypingMessage(contextKey, nid)
         }
     }
-}
-
-/* ───────────────────────────── Chat list helpers ───────────────────────────── */
-
-private fun curTextOrBlank(chat: List<ChatMsgUi>, id: String): String {
-    return chat.firstOrNull { it.id == id }?.text.orEmpty()
-}
-
-/**
- * Upsert a typing bubble for the current node.
- *
- * @param chat Local chat list.
- * @param nid Node id.
- * @param text Current streaming text (already throttled).
- */
-private fun upsertTypingBubble(
-    chat: MutableList<ChatMsgUi>,
-    nid: String,
-    text: String
-) {
-    val id = "typing-$nid"
-    val idx = chat.indexOfFirst { it.id == id }
-    val msg = ChatMsgUi(
-        id = id,
-        sender = ChatSenderUi.AI,
-        text = text,
-        isTyping = true
-    )
-    if (idx == -1) chat.add(msg) else chat[idx] = msg
-}
-
-/**
- * Remove typing bubble if present.
- *
- * @param chat Local chat list.
- * @param nid Node id.
- */
-private fun removeTypingBubble(
-    chat: MutableList<ChatMsgUi>,
-    nid: String
-) {
-    val id = "typing-$nid"
-    val idx = chat.indexOfFirst { it.id == id }
-    if (idx != -1) chat.removeAt(idx)
-}
-
-/**
- * Replace typing bubble with a final AI message.
- *
- * If typing bubble is missing, this will append instead.
- *
- * @param chat Local chat list.
- * @param nid Node id.
- * @param msg Final message.
- */
-private fun replaceTypingWith(
-    chat: MutableList<ChatMsgUi>,
-    nid: String,
-    msg: ChatMsgUi
-) {
-    val id = "typing-$nid"
-    val idx = chat.indexOfFirst { it.id == id }
-    if (idx != -1) chat[idx] = msg else chat.add(msg)
-}
-
-/* ───────────────────────────── Step helpers ─────────────────────────────── */
-
-/**
- * Resolve a follow-up question candidate from a step snapshot.
- *
- * Priority:
- *  1) step.followups.first()
- *  2) JSON keys (follow_up_question, followup_question, follow-ups arrays)
- *  3) Plain-text heuristic (for step2 text output)
- *
- * @param json Json instance for parsing.
- * @param step Step snapshot.
- */
-private fun resolveFollowupFromStep(
-    json: Json,
-    step: AiViewModel.StepSnapshot
-): String? {
-    val fromList = step.followups.firstOrNull()?.trim()?.takeIf { it.isNotBlank() }
-    if (fromList != null) return fromList
-
-    val fromJson = extractFollowupCandidate(json, step.raw)?.trim()?.takeIf { it.isNotBlank() }
-    if (fromJson != null) return fromJson
-
-    val fromText = extractPlainFollowup(step.raw)?.trim()?.takeIf { it.isNotBlank() }
-    if (fromText != null) return fromText
-
-    return null
-}
-
-/**
- * Extract followup_needed from EVAL JSON (step1).
- *
- * @return true/false if found, null if JSON can't be parsed or key missing.
- */
-private fun extractFollowupNeeded(json: Json, rawText: String): Boolean? {
-    val stripped = stripCodeFence(rawText).trim()
-    if (stripped.isEmpty()) return null
-    val element = parseJsonLenient(json, stripped) as? JsonObject ?: return null
-
-    fun normKey(k: String): String =
-        k.lowercase().replace("_", " ").replace("-", " ").trim()
-
-    for ((k, v) in element) {
-        val nk = normKey(k)
-        if (nk == "followup needed" || nk == "follow up needed") {
-            val prim = v as? JsonPrimitive ?: return null
-            return prim.contentOrNull()?.trim()?.lowercase()?.let { it == "true" || it == "1" }
-        }
-    }
-    return null
-}
-
-/* ───────────────────────────── Log helpers ─────────────────────────────── */
-
-/**
- * Clip a string for logs to avoid leaking full prompt contents.
- *
- * @param s Input string.
- * @param maxChars Max characters to keep.
- */
-private fun clipForLog(s: String, maxChars: Int): String {
-    val t = s.replace("\n", "\\n").replace("\r", "\\r").trim()
-    if (t.length <= maxChars) return "\"$t\""
-    return "\"${t.take(maxChars)}…\""
-}
-
-/**
- * Create a short stable hash for correlating prompts without logging the full text.
- *
- * @param s Input string.
- */
-private fun shortHash(s: String): String {
-    val md = MessageDigest.getInstance("SHA-256")
-    val bytes = md.digest(s.toByteArray(Charsets.UTF_8))
-    return bytes.take(6).joinToString("") { b -> "%02x".format(b) }
-}
-
-/**
- * Run a lambda safely for log-only reads (never throw from logging).
- *
- * @param block Read operation.
- */
-private inline fun <T> runSafe(block: () -> T): T? {
-    return runCatching { block() }.getOrNull()
 }
 
 /* ───────────────────────────── Top bar ─────────────────────────────────── */
 
-/**
- * Minimal top bar for the AI screen.
- *
- * @param title Display title for the current node.
- * @param height Height of the bar content area.
- */
 @Composable
 private fun CompactTopBar(
     title: String,
@@ -1294,11 +847,6 @@ private fun CompactTopBar(
     }
 }
 
-/**
- * Minimal "jump to bottom" pill shown when the user scrolls up.
- *
- * @param onClick Callback to scroll to the bottom.
- */
 @Composable
 private fun JumpToBottomPill(
     onClick: () -> Unit
@@ -1427,77 +975,27 @@ private fun BubbleMono(
             }
     ) {
         Box(Modifier.padding(horizontal = padH, vertical = padV)) {
-            if (isTyping && text.isBlank()) {
-                TypingDots(color = textColor)
-            } else {
-                Text(
-                    text = text,
-                    color = textColor,
-                    style = MaterialTheme.typography.bodyMedium.copy(lineHeight = 18.sp)
-                )
-            }
+            Text(
+                text = if (isTyping && text.isBlank()) "…" else text,
+                color = textColor,
+                style = MaterialTheme.typography.bodyMedium.copy(lineHeight = 18.sp)
+            )
         }
     }
 }
 
-@Composable
-private fun TypingDots(color: Color) {
-    val t = rememberInfiniteTransition(label = "typing")
-    val a1 by t.animateFloat(
-        initialValue = 0.2f,
-        targetValue = 1f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 900, delayMillis = 0, easing = LinearEasing)
-        ),
-        label = "a1"
-    )
-    val a2 by t.animateFloat(
-        initialValue = 0.2f,
-        targetValue = 1f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 900, delayMillis = 150, easing = LinearEasing)
-        ),
-        label = "a2"
-    )
-    val a3 by t.animateFloat(
-        initialValue = 0.2f,
-        targetValue = 1f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 900, delayMillis = 300, easing = LinearEasing)
-        ),
-        label = "a3"
-    )
-    androidx.compose.foundation.layout.Row(
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Dot(alpha = a1, color = color)
-        Dot(alpha = a2, color = color)
-        Dot(alpha = a3, color = color)
-    }
-}
-
-@Composable
-private fun Dot(alpha: Float, color: Color) {
-    Box(
-        modifier = Modifier
-            .size(8.dp)
-            .background(color.copy(alpha = alpha), CircleShape)
-    )
-}
-
 /* ───────────────────────────── JSON bubble ──────────────────────────────── */
+
 @Composable
 private fun JsonBubbleMono(
     pretty: String,
     collapsedMaxHeight: Dp = 92.dp,
     snack: SnackbarHostState? = null
 ) {
-    /** Reset expansion whenever the JSON changes. */
     var expanded by remember(pretty) { mutableStateOf(false) }
 
     val cs = MaterialTheme.colorScheme
-    val clipboard = LocalClipboard.current
+    val clipboard = LocalClipboardManager.current
     val scope = rememberCoroutineScope()
     val clip = RoundedCornerShape(10.dp)
 
@@ -1515,7 +1013,6 @@ private fun JsonBubbleMono(
             .neutralEdge(alpha = 0.16f, corner = 10.dp, stroke = 1.dp)
     ) {
         Column {
-            // Make only the header row togglable (avoids copy button toggling expansion).
             androidx.compose.foundation.layout.Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -1550,9 +1047,7 @@ private fun JsonBubbleMono(
                 IconButton(
                     onClick = {
                         scope.launch {
-                            // Use LocalClipboard (suspend) instead of deprecated LocalClipboardManager.
-                            val clipData = ClipData.newPlainText("Result JSON", pretty)
-                            clipboard.setClipEntry(ClipEntry(clipData))
+                            clipboard.setText(AnnotatedString(pretty))
                             snack?.showSnackbar("JSON copied")
                         }
                     },
@@ -1567,7 +1062,6 @@ private fun JsonBubbleMono(
             }
 
             if (expanded) {
-                // Expanded: allow selection; do NOT add clickable here to avoid fighting selection gestures.
                 SelectionContainer {
                     Text(
                         text = pretty,
@@ -1582,7 +1076,6 @@ private fun JsonBubbleMono(
                     )
                 }
             } else {
-                // Collapsed: allow tap to expand on the preview area too.
                 Text(
                     text = previewText,
                     color = cs.onSurfaceVariant,
@@ -1665,11 +1158,6 @@ private fun ChatComposer(
 
             if (speechEnabled && onToggleSpeech != null) {
                 val tint = cs.onSurfaceVariant
-
-                /**
-                 * Mic button is disabled while transcribing to avoid overlapping
-                 * utterance sessions in controllers that do not support re-entrancy.
-                 */
                 val micEnabled = (enabled || speechRecording) && !speechTranscribing
 
                 IconButton(
@@ -1776,9 +1264,7 @@ private fun Modifier.neutralEdge(
     }
 )
 
-private fun zeroInsetsSafe(): WindowInsets {
-    return WindowInsets(0, 0, 0, 0)
-}
+private fun zeroInsetsSafe(): WindowInsets = WindowInsets(0, 0, 0, 0)
 
 /* ───────────────────────────── JSON helpers ─────────────────────────────── */
 
@@ -1823,6 +1309,60 @@ private fun buildJsonPreview(pretty: String): String {
     val t = stripped.trim()
     return if (t.length <= 180) t else t.take(180).trimEnd() + "…"
 }
+
+/* ───────────────────────────── Step helpers ─────────────────────────────── */
+
+private fun resolveFollowupFromStep(
+    json: Json,
+    step: AiViewModel.StepSnapshot
+): String? {
+    val fromList = step.followups.firstOrNull()?.trim()?.takeIf { it.isNotBlank() }
+    if (fromList != null) return fromList
+
+    val fromJson = extractFollowupCandidate(json, step.raw)?.trim()?.takeIf { it.isNotBlank() }
+    if (fromJson != null) return fromJson
+
+    val fromText = extractPlainFollowup(step.raw)?.trim()?.takeIf { it.isNotBlank() }
+    if (fromText != null) return fromText
+
+    return null
+}
+
+private fun extractFollowupNeeded(json: Json, rawText: String): Boolean? {
+    val stripped = stripCodeFence(rawText).trim()
+    if (stripped.isEmpty()) return null
+    val element = parseJsonLenient(json, stripped) as? JsonObject ?: return null
+
+    fun normKey(k: String): String =
+        k.lowercase().replace("_", " ").replace("-", " ").trim()
+
+    for ((k, v) in element) {
+        val nk = normKey(k)
+        if (nk == "followup needed" || nk == "follow up needed") {
+            val prim = v as? JsonPrimitive ?: return null
+            return prim.contentOrNull()?.trim()?.lowercase()?.let { it == "true" || it == "1" }
+        }
+    }
+    return null
+}
+
+/* ───────────────────────────── Log helpers ─────────────────────────────── */
+
+private fun clipForLog(s: String, maxChars: Int): String {
+    val t = s.replace("\n", "\\n").replace("\r", "\\r").trim()
+    if (t.length <= maxChars) return "\"$t\""
+    return "\"${t.take(maxChars)}…\""
+}
+
+private fun shortHash(s: String): String {
+    val md = MessageDigest.getInstance("SHA-256")
+    val bytes = md.digest(s.toByteArray(Charsets.UTF_8))
+    return bytes.take(6).joinToString("") { b -> "%02x".format(b) }
+}
+
+private inline fun <T> runSafe(block: () -> T): T? = runCatching { block() }.getOrNull()
+
+/* ───────────────────────────── JSON extraction ───────────────────────────── */
 
 private fun extractFollowupCandidate(json: Json, rawText: String): String? {
     val stripped = stripCodeFence(rawText).trim()
@@ -1926,9 +1466,7 @@ private fun extractPlainFollowup(rawText: String): String? {
     return line
 }
 
-private fun JsonPrimitive.contentOrNull(): String? {
-    return runCatching { this.content }.getOrNull()
-}
+private fun JsonPrimitive.contentOrNull(): String? = runCatching { this.content }.getOrNull()
 
 private fun parseJsonLenient(json: Json, text: String): JsonElement? {
     val trimmed = text.trim()

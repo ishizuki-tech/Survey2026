@@ -34,7 +34,6 @@ import androidx.work.workDataOf
 import com.negi.survey.net.GitHubDiagnosticsConfigStore
 import com.negi.survey.net.GitHubUploadWorker
 import com.negi.survey.net.GitHubUploader
-import com.negi.survey.net.SupabaseCrashUploadWorker
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
@@ -46,7 +45,6 @@ import java.util.TimeZone
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
-import java.util.zip.GZIPOutputStream
 import kotlin.math.min
 import kotlin.system.exitProcess
 
@@ -54,35 +52,47 @@ object CrashCapture {
 
     private const val TAG = "CrashCapture"
 
-    /** Local directory for staged crash artifacts (.gz). */
+    /** Local directory for staged crash artifacts (.log). */
     private const val CRASH_DIR_REL = "diagnostics/crash"
 
     /** Local directory for GitHub mirror copies (Supabase may delete originals). */
     private const val CRASH_GH_MIRROR_DIR_REL = "diagnostics/crash_github_mirror"
 
-    private const val MAX_LOGCAT_BYTES = 850_000
-    private const val LOGCAT_MAX_MS = 700L
+    /** Remote subdir name for uploading AppRingLogStore "raw ring body". */
+    private const val REMOTE_RING_SUBDIR = "ring_store"
 
-    private const val LOGCAT_TAIL_LINES_FALLBACK = "3000"
-    private const val LOGCAT_TAIL_LINES_SINCE = "6000"
+    private const val MAX_LOGCAT_BYTES = 1_400_000
+    private const val LOGCAT_MAX_MS = 900L
 
-    private const val MAX_FILES_TO_KEEP = 80
-    private const val MAX_FILES_TO_ENQUEUE = 20
+    private const val LOGCAT_TAIL_LINES_FALLBACK = "5000"
+    private const val LOGCAT_TAIL_LINES_SINCE = "12000"
 
-    /** Supabase object prefix for crash uploads (must match Storage policies). */
-    private const val SUPABASE_CRASH_PREFIX = "surveyapp/crash"
+    private const val MAX_FILES_TO_KEEP = 120
+    private const val MAX_FILES_TO_ENQUEUE = 30
+
+    /**
+     * Limit ring uploads to avoid enqueue storms.
+     * Increase if your ring is intentionally large.
+     */
+    private const val MAX_RING_FILES_TO_ENQUEUE = 300
+
+    /**
+     * Hard cap for ring total bytes uploaded per enqueue call.
+     * This prevents a runaway directory from generating hundreds of MB of uploads.
+     */
+    private const val MAX_RING_TOTAL_BYTES_TO_ENQUEUE = 90_000_000L // 90MB
 
     /** Prevent re-enqueue storms on rapid app restarts / multiple entry points. */
     private const val ENQUEUE_COOLDOWN_MS = 1200L
 
     /** Try to force logcat process shutdown quickly (best-effort). */
-    private const val LOGCAT_WAITFOR_MS = 80L
+    private const val LOGCAT_WAITFOR_MS = 90L
 
     /** Prevent ensure storms (handler re-wrap). */
     private const val ENSURE_COOLDOWN_MS = 800L
 
     /** SharedPreferences for previous-session staging state. */
-    private const val STATE_PREF_NAME = "crash_capture_state_v2"
+    private const val STATE_PREF_NAME = "crash_capture_state_v3"
     private const val KEY_LAST_EXIT_TS = "last_exit_ts"
     private const val KEY_LAST_EXIT_PID = "last_exit_pid"
     private const val KEY_LAST_LOGCAT_MARKER = "last_logcat_marker"
@@ -90,6 +100,7 @@ object CrashCapture {
     /** Stage guards (once per current process). */
     private val stagedPrevSessionThisProcess = AtomicBoolean(false)
     private val stagedExitInfoThisProcess = AtomicBoolean(false)
+    private val stagedRingUploadThisProcess = AtomicBoolean(false)
 
     private val capturing = AtomicBoolean(false)
     private val enqueueing = AtomicBoolean(false)
@@ -206,7 +217,9 @@ object CrashCapture {
      * Strategy:
      * - Stage previous-process exit info (API30+) into crash dir (native crash / signaled).
      * - Stage previous-session logcat into crash dir using `logcat -T <marker>`.
-     * - Then enqueue all files under crash dir to Supabase + GitHub (mirror-first).
+     * - Then enqueue all files under crash dir to GitHub (mirror-first).
+     * - Additionally: upload the raw AppRingLogStore ring directory ("ring body") as-is (files),
+     *   placed under a timestamped remote directory to avoid WorkManager unique-name collisions.
      *
      * IMPORTANT:
      * - This method touches WorkManager. Call it only after WorkManager is initialized
@@ -285,7 +298,6 @@ object CrashCapture {
                 .onFailure { e -> Log.w(TAG, "persistCurrentLogcatMarker failed: ${e.message}", e) }
 
             // 1) WorkManager availability check.
-            // Treat "not initialized yet" as a normal situation depending on init strategy.
             val wmOk = runCatching { WorkManager.getInstance(appCtx) }
                 .onFailure { e ->
                     Log.w(
@@ -300,82 +312,60 @@ object CrashCapture {
             val ghMirrorDir = crashGitHubMirrorDir(root).apply { mkdirs() }
 
             purgeOldFiles(dir, MAX_FILES_TO_KEEP)
-            purgeOldFiles(ghMirrorDir, MAX_FILES_TO_KEEP)
 
             val files = dir.listFiles { f ->
                 f.isFile && f.length() > 0L && !f.name.startsWith(".")
             }?.toList().orEmpty()
 
-            if (files.isEmpty()) return
+            if (files.isEmpty()) {
+                Log.d(TAG, "No crash artifacts found; skipping enqueue. where=$where")
+                return
+            }
 
-            val supabaseConfigured = SupabaseCrashUploadWorker.isConfigured()
             val ghCfg = buildCrashGitHubConfigOrNull(appCtx)
+            if (ghCfg == null) {
+                Log.d(TAG, "No upload config found; crash artifacts will remain local. where=$where")
+                return
+            }
 
-            Log.d(
-                TAG,
-                "Pending crash artifacts=${files.size} dir=${dir.absolutePath} " +
-                        "supabaseConfigured=$supabaseConfigured githubConfigured=${ghCfg != null} where=$where"
-            )
-
-            Log.d(
-                TAG,
-                "Supabase hints: urlSet=${BuildConfig.SUPABASE_URL.isNotBlank()} urlLen=${BuildConfig.SUPABASE_URL.length} " +
-                        "anonKeySet=${BuildConfig.SUPABASE_ANON_KEY.isNotBlank()} anonKeyLen=${BuildConfig.SUPABASE_ANON_KEY.length} " +
-                        "bucket=${BuildConfig.SUPABASE_LOG_BUCKET}"
-            )
             Log.d(
                 TAG,
                 "GitHub hints: owner=${BuildConfig.GH_OWNER} repo=${BuildConfig.GH_REPO} " +
-                        "branch=${BuildConfig.GH_BRANCH} pathPrefix=${ghCfg?.pathPrefix}"
+                        "branch=${BuildConfig.GH_BRANCH} pathPrefix=${ghCfg.pathPrefix}"
             )
 
             val targets = files
                 .sortedByDescending { it.lastModified() }
                 .take(MAX_FILES_TO_ENQUEUE)
 
-            if (!supabaseConfigured && ghCfg == null) {
-                Log.d(TAG, "No upload config found; crash artifacts will remain local. where=$where")
-                return
-            }
+            Log.d(TAG, "Enqueuing GitHub crash uploads… (mirror-first) where=$where")
+            targets.forEach { file ->
+                val mirror = runCatching { makeGitHubMirrorCopy(file, ghMirrorDir) }
+                    .onFailure { e -> Log.w(TAG, "GitHub mirror copy failed: ${file.name} err=${e.message}", e) }
+                    .getOrNull()
 
-            // 2) GitHub mirror upload (copy files first to avoid Supabase delete race).
-            if (ghCfg != null) {
-                Log.d(TAG, "Enqueuing GitHub crash uploads… (mirror-first) where=$where")
-                targets.forEach { file ->
-                    val mirror = runCatching { makeGitHubMirrorCopy(file, ghMirrorDir) }
-                        .onFailure { e -> Log.w(TAG, "GitHub mirror copy failed: ${file.name} err=${e.message}", e) }
-                        .getOrNull()
+                if (mirror != null) {
+                    val remoteRelativePath = mirror.name
+                    Log.d(
+                        TAG,
+                        "GitHub enqueue(crash file): name=${mirror.name} bytes=${mirror.length()} remote=$remoteRelativePath where=$where"
+                    )
 
-                    if (mirror != null) {
-                        val remoteRelativePath = mirror.name
-                        Log.d(
-                            TAG,
-                            "GitHub enqueue(file): name=${mirror.name} bytes=${mirror.length()} remote=$remoteRelativePath where=$where"
-                        )
-
-                        enqueueGitHubWorkerFileUpload(
-                            context = appCtx,
-                            cfg = ghCfg,
-                            localFile = mirror,
-                            remoteRelativePath = remoteRelativePath
-                        )
-                    }
-                }
-            }
-
-            // 3) Supabase upload for originals (preferred for cloud storage).
-            if (supabaseConfigured) {
-                Log.d(TAG, "Enqueuing Supabase crash uploads… prefix=$SUPABASE_CRASH_PREFIX where=$where")
-                targets.forEach { file ->
-                    Log.d(TAG, "Supabase enqueue: name=${file.name} bytes=${file.length()} mtime=${file.lastModified()} where=$where")
-                    SupabaseCrashUploadWorker.enqueueExistingCrash(
+                    enqueueGitHubWorkerFileUpload(
                         context = appCtx,
-                        file = file,
-                        objectPrefix = SUPABASE_CRASH_PREFIX,
-                        addDateSubdir = true
+                        cfg = ghCfg,
+                        localFile = mirror,
+                        remoteRelativePath = remoteRelativePath,
+                        kindTag = "crash"
                     )
                 }
             }
+
+            // 2) Additionally upload raw ring body (AppRingLogStore directory) under a timestamped remote dir.
+            //    This avoids WorkManager unique-name collisions because ring segment filenames are usually stable.
+            runCatching { stageAndEnqueueRingStoreUploads(appCtx, root, ghMirrorDir, ghCfg, where) }
+                .onFailure { e -> Log.w(TAG, "Ring store upload staging failed: ${e.message}", e) }
+
         } finally {
             enqueueing.set(false)
         }
@@ -481,7 +471,7 @@ object CrashCapture {
 
         val traceText = runCatching {
             val ins = crashLike.traceInputStream ?: return@runCatching ""
-            ins.bufferedReader().use { it.readText().take(240_000) }
+            ins.bufferedReader().use { it.readText().take(320_000) }
         }.getOrDefault("")
 
         val text = buildString {
@@ -506,14 +496,12 @@ object CrashCapture {
         }.toByteArray(Charsets.UTF_8)
 
         val dir = crashDir(filesDir).apply { mkdirs() }
-        val name = "exit_${stampUtc}_pid${pid}_r${reason}.log.gz"
+        val name = "exit_${stampUtc}_pid${pid}_r${reason}.log"
         val outFile = File(dir, name)
 
         FileOutputStream(outFile).use { fos ->
-            GZIPOutputStream(fos).use { gz ->
-                gz.write(text)
-                gz.flush()
-            }
+            fos.write(text)
+            fos.flush()
             runCatching { fos.fd.sync() }
         }
 
@@ -565,19 +553,17 @@ object CrashCapture {
             marker = marker,
             preferredPid = pid,
             maxBytes = MAX_LOGCAT_BYTES,
-            maxMs = 650L
+            maxMs = LOGCAT_MAX_MS
         )
 
         val dir = crashDir(filesDir).apply { mkdirs() }
-        val name = "prevlog_${stampUtc}_pid${Process.myPid()}.log.gz"
+        val name = "prevlog_${stampUtc}_pid${Process.myPid()}.log"
         val outFile = File(dir, name)
 
         FileOutputStream(outFile).use { fos ->
-            GZIPOutputStream(fos).use { gz ->
-                gz.write(header)
-                gz.write(logBytes)
-                gz.flush()
-            }
+            fos.write(header)
+            fos.write(logBytes)
+            fos.flush()
             runCatching { fos.fd.sync() }
         }
 
@@ -594,6 +580,219 @@ object CrashCapture {
         if (marker.isBlank()) return
         prefs.edit().putString(KEY_LAST_LOGCAT_MARKER, marker).apply()
         Log.d(TAG, "Persisted logcat marker for next run: $marker")
+    }
+
+    // -----------------------------------------------------------------------------
+    // Ring store upload (raw directory)
+    // -----------------------------------------------------------------------------
+
+    /**
+     * Upload AppRingLogStore "ring body" (raw files) as-is.
+     *
+     * Implementation:
+     * - Discover ring directory using reflection first (if AppRingLogStore provides it),
+     *   then fall back to common candidate paths under filesDir.
+     * - Recursively enumerate files.
+     * - Copy each file into a timestamped mirror subdir under CRASH_GH_MIRROR_DIR_REL.
+     * - Enqueue GitHubUploadWorker per file using a timestamped remote path:
+     *     <cfg.pathPrefix>/<REMOTE_RING_SUBDIR>/<stampUtc>/<relativePath>
+     *
+     * Why timestamped remote path:
+     * - Ring segment filenames are typically stable (segment_0001.log, index.json, ...).
+     * - WorkManager enqueueUniqueWork(KEEP) uses the work name; if the remote path is stable,
+     *   it would only upload once forever. Timestamp makes it unique per capture.
+     */
+    private fun stageAndEnqueueRingStoreUploads(
+        context: Context,
+        filesDir: File,
+        ghMirrorDir: File,
+        cfg: GitHubUploader.GitHubConfig,
+        where: String
+    ) {
+        if (!stagedRingUploadThisProcess.compareAndSet(false, true)) {
+            Log.d(TAG, "Ring store upload already staged in this process; skipping. where=$where")
+            return
+        }
+
+        val ringDir = findRingDirectoryBestEffort(context, filesDir)
+        if (ringDir == null || !ringDir.exists() || !ringDir.isDirectory) {
+            Log.d(TAG, "Ring store dir not found; skipping ring upload. where=$where")
+            return
+        }
+
+        val all = listFilesRecursively(ringDir)
+            .filter { it.isFile && it.length() > 0L && !it.name.startsWith(".") }
+
+        if (all.isEmpty()) {
+            Log.d(TAG, "Ring store dir empty; skipping ring upload. dir=${ringDir.absolutePath} where=$where")
+            return
+        }
+
+        // Prefer newest-first so we keep the most relevant context if capped.
+        val sorted = all.sortedByDescending { it.lastModified() }
+
+        val now = Date()
+        val stampUtc = FILE_TS_UTC.format(now)
+
+        val remoteBase = "${REMOTE_RING_SUBDIR}/${stampUtc}"
+        val mirrorBaseDir = File(ghMirrorDir, remoteBase).apply { mkdirs() }
+
+        var uploadedCount = 0
+        var uploadedBytes = 0L
+
+        for (src in sorted) {
+            if (uploadedCount >= MAX_RING_FILES_TO_ENQUEUE) break
+            if (uploadedBytes >= MAX_RING_TOTAL_BYTES_TO_ENQUEUE) break
+
+            val rel = safeRelativePathOrNull(root = ringDir, file = src) ?: continue
+            val relNorm = rel.replace('\\', '/').trimStart('/')
+
+            // Mirror path preserves the ring directory structure.
+            val mirror = runCatching { mirrorCopyPreserveRelPath(src, mirrorBaseDir, relNorm) }
+                .onFailure { e -> Log.w(TAG, "Ring mirror copy failed: ${src.name} err=${e.message}", e) }
+                .getOrNull() ?: continue
+
+            val remoteRelativePath = "${remoteBase}/${relNorm}"
+
+            Log.d(
+                TAG,
+                "GitHub enqueue(ring file): bytes=${mirror.length()} remote=$remoteRelativePath src=${src.name} where=$where"
+            )
+
+            enqueueGitHubWorkerFileUpload(
+                context = context,
+                cfg = cfg,
+                localFile = mirror,
+                remoteRelativePath = remoteRelativePath,
+                kindTag = "ring"
+            )
+
+            uploadedCount++
+            uploadedBytes += mirror.length()
+        }
+
+        Log.d(
+            TAG,
+            "Ring store enqueue done. dir=${ringDir.absolutePath} files=$uploadedCount bytes=$uploadedBytes " +
+                    "capFiles=$MAX_RING_FILES_TO_ENQUEUE capBytes=$MAX_RING_TOTAL_BYTES_TO_ENQUEUE where=$where"
+        )
+    }
+
+    /**
+     * Discover ring directory best-effort.
+     *
+     * Reflection candidates (if AppRingLogStore provides APIs):
+     * - getRingDir(Context)
+     * - getDir(Context)
+     * - ringDir(Context)
+     * - getRootDir(Context)
+     * - getBaseDir(Context)
+     *
+     * Fallback path candidates (common patterns):
+     * - filesDir/diagnostics/ring
+     * - filesDir/diagnostics/ring_store
+     * - filesDir/diagnostics/app_ring
+     * - filesDir/diagnostics/ring_logs
+     */
+    private fun findRingDirectoryBestEffort(context: Context, filesDir: File): File? {
+        val appCtx = safeAppContext(context)
+
+        // 1) Reflection on AppRingLogStore methods.
+        val cls = runCatching { Class.forName("${appCtx.packageName}.AppRingLogStore") }.getOrNull()
+            ?: runCatching { Class.forName("com.negi.survey.AppRingLogStore") }.getOrNull()
+
+        if (cls != null) {
+            val receiver: Any? = runCatching {
+                cls.getDeclaredField("INSTANCE").apply { isAccessible = true }.get(null)
+            }.getOrNull()
+
+            val methodNames = listOf(
+                "getRingDir",
+                "getDir",
+                "ringDir",
+                "getRootDir",
+                "getBaseDir",
+                "dir",
+                "rootDir",
+                "baseDir"
+            )
+
+            for (mn in methodNames) {
+                val m = runCatching {
+                    cls.methods.firstOrNull { it.name == mn && it.parameterTypes.size == 1 && Context::class.java.isAssignableFrom(it.parameterTypes[0]) }
+                }.getOrNull()
+
+                if (m != null) {
+                    val out = runCatching { m.invoke(receiver, appCtx) }.getOrNull()
+                    when (out) {
+                        is File -> return out
+                        is String -> if (out.isNotBlank()) return File(out)
+                    }
+                }
+            }
+        }
+
+        // 2) Fallback candidates.
+        val candidates = listOf(
+            File(filesDir, "diagnostics/ring"),
+            File(filesDir, "diagnostics/ring_store"),
+            File(filesDir, "diagnostics/app_ring"),
+            File(filesDir, "diagnostics/ring_logs"),
+            File(filesDir, "diagnostics/ringlog"),
+            File(filesDir, "diagnostics/appring")
+        )
+
+        return candidates.firstOrNull { it.exists() && it.isDirectory }
+            ?: candidates.firstOrNull { it.parentFile?.exists() == true } // best-effort even if not yet created
+    }
+
+    private fun listFilesRecursively(dir: File): List<File> {
+        val out = ArrayList<File>(64)
+        val stack = ArrayDeque<File>()
+        stack.add(dir)
+
+        while (stack.isNotEmpty()) {
+            val cur = stack.removeLast()
+            val children = cur.listFiles() ?: continue
+            for (c in children) {
+                if (c.isDirectory) stack.add(c) else out.add(c)
+            }
+        }
+        return out
+    }
+
+    private fun safeRelativePathOrNull(root: File, file: File): String? {
+        return runCatching {
+            val rootPath = root.canonicalFile.toPath()
+            val filePath = file.canonicalFile.toPath()
+            if (!filePath.startsWith(rootPath)) return null
+            rootPath.relativize(filePath).toString()
+        }.getOrNull()
+    }
+
+    private fun mirrorCopyPreserveRelPath(src: File, mirrorBaseDir: File, relNorm: String): File {
+        val dst = File(mirrorBaseDir, relNorm)
+        dst.parentFile?.mkdirs()
+
+        // Reuse existing mirror if identical.
+        if (dst.exists() && dst.length() == src.length() && dst.lastModified() == src.lastModified()) {
+            return dst
+        }
+
+        FileInputStream(src).use { input ->
+            FileOutputStream(dst).use { output ->
+                val buf = ByteArray(64 * 1024)
+                while (true) {
+                    val n = input.read(buf)
+                    if (n <= 0) break
+                    output.write(buf, 0, n)
+                }
+                output.flush()
+            }
+        }
+
+        dst.setLastModified(src.lastModified())
+        return dst
     }
 
     // -----------------------------------------------------------------------------
@@ -630,20 +829,20 @@ object CrashCapture {
     }
 
     private fun makeUniqueLike(srcName: String, dir: File): File {
-        if (srcName.endsWith(".log.gz")) {
-            val base = srcName.removeSuffix(".log.gz")
+        if (srcName.endsWith(".log")) {
+            val base = srcName.removeSuffix(".log")
             var index = 2
             while (true) {
-                val candidate = File(dir, "$base-$index.log.gz")
+                val candidate = File(dir, "$base-$index.log")
                 if (!candidate.exists()) return candidate
                 index++
             }
         }
 
-        val base = srcName.removeSuffix(".gz")
+        val base = srcName
         var index = 2
         while (true) {
-            val candidate = File(dir, "$base-$index.gz")
+            val candidate = File(dir, "$base-$index")
             if (!candidate.exists()) return candidate
             index++
         }
@@ -661,41 +860,39 @@ object CrashCapture {
         val tid = Process.myTid()
         val uptimeTail = (SystemClock.elapsedRealtime() % 1_000_000L)
 
-        val name = "crash_${stampUtc}_pid${pid}_tid${tid}_u${uptimeTail}.log.gz"
+        val name = "crash_${stampUtc}_pid${pid}_tid${tid}_u${uptimeTail}.log"
         val outFile = File(dir, name)
 
         FileOutputStream(outFile).use { fos ->
-            GZIPOutputStream(fos).use { gz ->
-                val header = buildString {
-                    appendLine("=== Crash Report ===")
-                    appendLine("time_utc=$stampUtc")
-                    appendLine("time_local=$stampLocal")
-                    appendLine("pid=$pid")
-                    appendLine("tid=$tid")
-                    appendLine("thread=${thread.name}")
-                    appendLine("sdk=${Build.VERSION.SDK_INT}")
-                    appendLine("device=${Build.MANUFACTURER} ${Build.MODEL}")
-                    appendLine("appId=${BuildConfig.APPLICATION_ID}")
-                    appendLine("versionName=${BuildConfig.VERSION_NAME}")
-                    appendLine("versionCode=${BuildConfig.VERSION_CODE}")
-                    appendLine()
-                    appendLine("=== Exception ===")
-                    appendLine(Log.getStackTraceString(throwable))
-                    appendLine()
-                    appendLine("=== Logcat (best-effort) ===")
-                }.toByteArray(Charsets.UTF_8)
+            val header = buildString {
+                appendLine("=== Crash Report ===")
+                appendLine("time_utc=$stampUtc")
+                appendLine("time_local=$stampLocal")
+                appendLine("pid=$pid")
+                appendLine("tid=$tid")
+                appendLine("thread=${thread.name}")
+                appendLine("sdk=${Build.VERSION.SDK_INT}")
+                appendLine("device=${Build.MANUFACTURER} ${Build.MODEL}")
+                appendLine("appId=${BuildConfig.APPLICATION_ID}")
+                appendLine("versionName=${BuildConfig.VERSION_NAME}")
+                appendLine("versionCode=${BuildConfig.VERSION_CODE}")
+                appendLine()
+                appendLine("=== Exception ===")
+                appendLine(Log.getStackTraceString(throwable))
+                appendLine()
+                appendLine("=== Logcat (best-effort) ===")
+            }.toByteArray(Charsets.UTF_8)
 
-                gz.write(header)
+            fos.write(header)
 
-                val logBytes = collectLogcatBytesCurrentPid(
-                    pid = pid,
-                    maxBytes = MAX_LOGCAT_BYTES,
-                    maxMs = LOGCAT_MAX_MS
-                )
-                gz.write(logBytes)
-                gz.flush()
-            }
+            val logBytes = collectLogcatBytesCurrentPid(
+                pid = pid,
+                maxBytes = MAX_LOGCAT_BYTES,
+                maxMs = LOGCAT_MAX_MS
+            )
+            fos.write(logBytes)
 
+            fos.flush()
             runCatching { fos.fd.sync() }
         }
 
@@ -725,7 +922,7 @@ object CrashCapture {
             "-v", "threadtime",
             "-b", "main", "-b", "system", "-b", "crash",
             "--pid=$pid",
-            "-t", "2000"
+            "-t", "4000"
         )
 
         val fallback = listOf(
@@ -871,10 +1068,11 @@ object CrashCapture {
         context: Context,
         cfg: GitHubUploader.GitHubConfig,
         localFile: File,
-        remoteRelativePath: String
+        remoteRelativePath: String,
+        kindTag: String
     ) {
         val safeUnique = sanitizeWorkName("${cfg.pathPrefix}/$remoteRelativePath")
-        val uniqueName = "gh_crash_upload_$safeUnique"
+        val uniqueName = "gh_upload_$safeUnique"
 
         val req: OneTimeWorkRequest =
             OneTimeWorkRequestBuilder<GitHubUploadWorker>()
@@ -887,6 +1085,7 @@ object CrashCapture {
                         GitHubUploadWorker.KEY_BRANCH to cfg.branch,
                         GitHubUploadWorker.KEY_PATH_PREFIX to cfg.pathPrefix,
                         GitHubUploadWorker.KEY_FILE_PATH to localFile.absolutePath,
+                        // IMPORTANT: allow path separators in "file name" so worker can upload into subdirs.
                         GitHubUploadWorker.KEY_FILE_NAME to remoteRelativePath
                     )
                 )
@@ -898,7 +1097,7 @@ object CrashCapture {
                 .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
                 .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
                 .addTag(GitHubUploadWorker.TAG)
-                .addTag("${GitHubUploadWorker.TAG}:crash:$safeUnique")
+                .addTag("${GitHubUploadWorker.TAG}:$kindTag:$safeUnique")
                 .build()
 
         WorkManager.getInstance(context)
