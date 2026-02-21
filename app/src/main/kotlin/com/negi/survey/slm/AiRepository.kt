@@ -5,7 +5,7 @@
  *  File: AiRepository.kt
  *  Author: Shu Ishizuki (石附 支)
  *  License: MIT License
- *  © 2025 IshizukiTech LLC. All rights reserved.
+ *  © 2026 IshizukiTech LLC. All rights reserved.
  * =====================================================================
  */
 
@@ -248,24 +248,29 @@ private object AiTrace {
     // Ring-safe meta logging (NO full prompt/output).
     // ------------------------------------------------------------------
 
-    fun ringD(tag: String, message: String) {
+    private inline fun safeRing(block: () -> Unit) {
         if (!ringEnabled) return
-        AppRingLogStore.log("D", tag, message)
+        runCatching { block() }
+            .onFailure { e ->
+                // Never let ring logging crash the app.
+                RuntimeLogStore.w(TAG, "ring logging failed (ignored): ${e.message}", e)
+            }
+    }
+
+    fun ringD(tag: String, message: String) {
+        safeRing { AppRingLogStore.log("D", tag, message) }
     }
 
     fun ringI(tag: String, message: String) {
-        if (!ringEnabled) return
-        AppRingLogStore.log("I", tag, message)
+        safeRing { AppRingLogStore.log("I", tag, message) }
     }
 
     fun ringW(tag: String, message: String, tr: Throwable? = null) {
-        if (!ringEnabled) return
-        AppRingLogStore.log("W", tag, message, tr)
+        safeRing { AppRingLogStore.log("W", tag, message, tr) }
     }
 
     fun ringE(tag: String, message: String, tr: Throwable? = null) {
-        if (!ringEnabled) return
-        AppRingLogStore.log("E", tag, message, tr)
+        safeRing { AppRingLogStore.log("E", tag, message, tr) }
     }
 }
 
@@ -297,13 +302,15 @@ private object PromptDefaults {
  * - True deltas (only newly generated text)
  * - Snapshots (accumulated prefix, i.e., full text so far)
  *
- * AUTO strategy:
- * - If incoming starts with lastSnapshot => treat as snapshot and emit suffix delta.
- * - Else treat as delta and append.
+ * AUTO strategy (robust):
+ * - Primary: if incoming startsWith(emitted) => snapshot extension; emit suffix.
+ * - Rewind: if emitted startsWith(incoming) => snapshot rewind; emit empty (no new text).
+ * - Otherwise: choose between "delta" vs "divergent snapshot" using prefix overlap.
  *
  * Safety:
- * - If snapshot "rewinds" (incoming shorter or unrelated), reset snapshot to incoming
- *   and emit incoming as delta (best-effort recovery).
+ * - If incoming diverges but shares a meaningful prefix, treat it as a snapshot and emit the suffix
+ *   from the common prefix (best-effort).
+ * - If overlap is weak, treat incoming as a delta and append it.
  */
 private class LocalDeltaNormalizer(
     private val mode: Mode = Mode.AUTO
@@ -314,12 +321,21 @@ private class LocalDeltaNormalizer(
         DELTA,
         /** Always treat incoming as snapshot (accumulated) and compute suffix. */
         SNAPSHOT,
-        /** Detect snapshot vs delta at runtime. */
+        /** Detect snapshot vs delta at runtime (best-effort). */
         AUTO
     }
 
     private val lock = Any()
-    private var lastSnapshot: String = ""
+
+    /** Tracks what we've logically emitted so far (used for snapshot detection). */
+    private var emitted: String = ""
+
+    private fun commonPrefixLen(a: String, b: String): Int {
+        val n = kotlin.math.min(a.length, b.length)
+        var i = 0
+        while (i < n && a[i] == b[i]) i++
+        return i
+    }
 
     fun toDelta(incomingRaw: String): String {
         val incoming = incomingRaw
@@ -328,28 +344,63 @@ private class LocalDeltaNormalizer(
         return synchronized(lock) {
             when (mode) {
                 Mode.DELTA -> {
-                    lastSnapshot += incoming
+                    emitted += incoming
                     incoming
                 }
 
                 Mode.SNAPSHOT -> {
-                    val delta = if (incoming.startsWith(lastSnapshot)) {
-                        incoming.substring(lastSnapshot.length)
-                    } else {
-                        incoming
+                    when {
+                        incoming.startsWith(emitted) -> {
+                            val delta = incoming.substring(emitted.length)
+                            emitted = incoming
+                            delta
+                        }
+                        emitted.startsWith(incoming) -> {
+                            // Snapshot rewind: no new text.
+                            ""
+                        }
+                        else -> {
+                            // Divergent snapshot: reset and emit full (best-effort).
+                            emitted = incoming
+                            incoming
+                        }
                     }
-                    lastSnapshot = incoming
-                    delta
                 }
 
                 Mode.AUTO -> {
-                    if (incoming.startsWith(lastSnapshot) && incoming.length >= lastSnapshot.length) {
-                        val delta = incoming.substring(lastSnapshot.length)
-                        lastSnapshot = incoming
-                        delta
-                    } else {
-                        lastSnapshot += incoming
-                        incoming
+                    when {
+                        emitted.isEmpty() -> {
+                            emitted = incoming
+                            incoming
+                        }
+                        incoming.startsWith(emitted) -> {
+                            // Snapshot extension.
+                            val delta = incoming.substring(emitted.length)
+                            emitted = incoming
+                            delta
+                        }
+                        emitted.startsWith(incoming) -> {
+                            // Snapshot rewind: do not shrink emitted to avoid duplicating later.
+                            ""
+                        }
+                        else -> {
+                            val lcp = commonPrefixLen(emitted, incoming)
+
+                            // Heuristic: treat as snapshot if there's a decent shared prefix.
+                            // This helps when the backend returns slightly "drifty" snapshots.
+                            val minMeaningful = 32
+                            val isMeaningfulOverlap = lcp >= minMeaningful || (lcp >= incoming.length / 2 && incoming.length >= 64)
+
+                            if (isMeaningfulOverlap) {
+                                val delta = incoming.substring(lcp)
+                                emitted = incoming
+                                delta
+                            } else {
+                                // Treat as true delta.
+                                emitted += incoming
+                                incoming
+                            }
+                        }
                     }
                 }
             }
@@ -398,12 +449,32 @@ class LiteRtRepository(
         private val FORCE_REINIT = AtomicBoolean(false)
 
         /**
-         * Single-thread dispatcher for ALL SLM/JNI calls.
-         * This often reduces native instability caused by cross-thread entry.
+         * Single-thread dispatcher for core SLM/JNI calls.
+         *
+         * IMPORTANT:
+         * - runInference can be a blocking call depending on backend.
+         * - If runInference blocks this dispatcher, control calls (cancel) may be starved.
          */
         private val SLM_DISPATCHER by lazy {
             Executors.newSingleThreadExecutor { r ->
                 Thread(r, "slm-jni").apply { isDaemon = true }
+            }.asCoroutineDispatcher()
+        }
+
+        /**
+         * Dedicated dispatcher ONLY for cancellation.
+         *
+         * Rationale:
+         * - If SLM.runInference blocks the main SLM dispatcher thread, cancel requests would never run.
+         * - Using a separate single thread allows best-effort abort even during a blocked inference call.
+         *
+         * Notes:
+         * - This intentionally trades some "single-thread JNI purity" for survivability.
+         * - If backend requires same-thread cancellation, this can be rolled back easily.
+         */
+        private val SLM_CANCEL_DISPATCHER by lazy {
+            Executors.newSingleThreadExecutor { r ->
+                Thread(r, "slm-cancel").apply { isDaemon = true }
             }.asCoroutineDispatcher()
         }
     }
@@ -413,7 +484,7 @@ class LiteRtRepository(
      *
      * Rationale:
      * - callbackFlow scope is cancelled immediately when collector cancels.
-     * - We still want a best-effort SLM.cancel() / resetConversation() to run on the SLM thread.
+     * - We still want a best-effort SLM.cancel() / resetConversation() to run.
      */
     private val repoScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
@@ -466,10 +537,17 @@ class LiteRtRepository(
     }
 
     /**
-     * Runs SLM/JNI calls on a dedicated single thread.
+     * Runs core SLM/JNI calls on a dedicated single thread.
      */
     private suspend fun <T> runOnSlmThread(block: suspend () -> T): T {
         return withContext(SLM_DISPATCHER) { block() }
+    }
+
+    /**
+     * Runs ONLY cancellation on a separate thread so it can run even if the main SLM thread is blocked.
+     */
+    private suspend fun runCancelOnSlmThread(block: suspend () -> Unit) {
+        withContext(SLM_CANCEL_DISPATCHER) { block() }
     }
 
     /**
@@ -654,7 +732,7 @@ class LiteRtRepository(
                             // Use repoScope so cancellation survives driverJob cancellation.
                             repoScope.launch {
                                 runCatchingSuspend {
-                                    runOnSlmThread { SLM.cancel(model) }
+                                    runCancelOnSlmThread { SLM.cancel(model) }
                                 }.onFailure { e ->
                                     RuntimeLogStore.w(TAG, "[$requestId] cancel failed ($tag): ${e.message}", e)
                                     AiTrace.ringW(TAG, "[$requestId] cancel failed tag='$tag' err=${e.message}", e)
@@ -1006,17 +1084,18 @@ class LiteRtRepository(
                     // Collector cancellation path.
                     cancelTag.compareAndSet(null, "collector-cancelled")
 
-                    if (gateActive.get() && cancelIssued.compareAndSet(false, true)) {
+                    // Best-effort: even if gateActive is false (e.g., waiting), cancel is cheap and can prevent stuck runs.
+                    if (cancelIssued.compareAndSet(false, true)) {
                         repoScope.launch {
                             runCatchingSuspend {
-                                runOnSlmThread { SLM.cancel(model) }
+                                runCancelOnSlmThread { SLM.cancel(model) }
                             }.onFailure { e ->
                                 RuntimeLogStore.w(TAG, "[$requestId] cancel failed (collector-cancelled): ${e.message}", e)
                                 AiTrace.ringW(TAG, "[$requestId] cancel failed tag='collector-cancelled' err=${e.message}", e)
                             }
                         }
-                        RuntimeLogStore.w(TAG, "[$requestId] awaitClose: collector cancelled -> SLM.cancel requested")
-                        AiTrace.ringW(TAG, "[$requestId] awaitClose: collector cancelled -> SLM.cancel requested")
+                        RuntimeLogStore.w(TAG, "[$requestId] awaitClose: collector cancelled -> SLM.cancel requested (gateActive=${gateActive.get()})")
+                        AiTrace.ringW(TAG, "[$requestId] awaitClose: collector cancelled -> SLM.cancel requested (gateActive=${gateActive.get()})")
                     }
 
                     driverJob.cancel(CancellationException("callbackFlow closed"))
