@@ -158,9 +158,8 @@ fun DoneScreen(
     val recordedAudioRefs by vm.recordedAudioRefs.collectAsState(initial = emptyMap())
     val surveyUuid by vm.surveyUuid.collectAsState()
 
-    // NEW: session-level free text (Survey Ready screen note)
-    val sessionFreeText by vm.sessionFreeText.collectAsState(initial = "")
-    val exportMeta = remember(sessionFreeText) { vm.exportExtraMeta() }
+    val runFreeText by vm.runFreeText.collectAsState(initial = "")
+    val exportMeta = remember(runFreeText) { vm.exportExtraMeta() }
 
     val exportedAtStamp = remember(surveyUuid) {
         val fmt = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.US)
@@ -240,7 +239,7 @@ fun DoneScreen(
                 .append(escapeJson(exportedAtStamp))
                 .append("\",\n")
 
-            // NEW: session-level metadata (includes session_free_text when present)
+            // Session-level metadata (includes session_free_text when present)
             if (exportMeta.isEmpty()) {
                 append("  \"meta\": {},\n")
             } else {
@@ -395,6 +394,18 @@ fun DoneScreen(
                 text = "Survey ID: $surveyUuid",
                 style = MaterialTheme.typography.labelLarge
             )
+
+            // NEW: show Free Text (session-level note) on Done screen
+            val note = runFreeText.trim()
+            if (note.isNotBlank()) {
+                Spacer(Modifier.height(10.dp))
+                Text("■ Session note", style = MaterialTheme.typography.titleMedium)
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    text = note,
+                    style = MaterialTheme.typography.bodyMedium
+                )
+            }
 
             Spacer(Modifier.height(16.dp))
 
@@ -655,7 +666,6 @@ fun DoneScreen(
                                     }
                                     voiceFilesState.value = remaining
                                 } catch (e: Exception) {
-                                    // English comments only.
                                     /** Log full stacktrace to identify the failing step (JSON/voice/logcat). */
                                     Log.e(LOG_TAG, "GitHub upload failed (immediate)", e)
                                     snackbar.showOnce("GitHub upload failed: ${e.message}")
@@ -848,7 +858,6 @@ private fun enqueueGitHubWorkerFileUpload(
     val safeUnique = sanitizeWorkName(remoteRelativePath)
     val uniqueName = "gh_upload_$safeUnique"
 
-    // English comments only.
     /** Normalize repo in case it is provided as "owner/repo". */
     val repoName = normalizeRepoNameForWork(cfg.repo)
 

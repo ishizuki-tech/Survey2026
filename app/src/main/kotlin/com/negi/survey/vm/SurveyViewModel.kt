@@ -12,29 +12,12 @@
  *  ---------------------------------------------------------------------
  *  Main ViewModel responsible for managing survey navigation and state.
  *
- *  Key upgrade points in this version:
- *   • Two-step prompt support via SurveyConfig resolvers:
- *       - one-step: resolveOneStepPrompt(nodeId)
- *       - two-step: resolveEvalPrompt(nodeId) + resolveFollowupPrompt(nodeId)
- *   • Backward compatible: getPrompt() still works for legacy configs
- *   • Debug upgrades:
- *       - Prompt source counts (legacy vs split) on init
- *       - Missing AI prompt coverage warnings on init
- *       - Detailed exception messages for missing prompt definitions
- *
- *  Robustness upgrades (this revision):
- *   • Validate graph node IDs (blank / duplicates after trim)
- *   • Validate startId exists
- *   • Validate nextId references (fail fast at init)
- *   • Normalize NavBackStack root to match start node key
- *   • Warn on unknown node types
- *
  *  2026-02 Update:
- *   • Add session-level free text note (stored in VM; intended for exports metadata).
- *
- *  2026-02 Fix:
- *   • Do NOT carry Home free text into a different run UUID.
- *   • Treat Home text as "draft"; lock it to the current run when a new run starts.
+ *   • Add session-level free text note:
+ *       - Draft note editable on Home screen (NOT exported directly).
+ *       - Run note is snapshotted at run start (exported + shown on Done).
+ *   • Run UUID is regenerated in resetToStart(), so draft must NOT be carried
+ *     automatically to a different run.
  * =====================================================================
  */
 
@@ -62,11 +45,6 @@ private const val TAG = "SurveyVM"
 
 /* ───────────────────────────── Graph Model ───────────────────────────── */
 
-/**
- * Survey node types used by the runtime flow.
- *
- * These values represent the logical type of nodes in the survey graph.
- */
 enum class NodeType {
     START,
     TEXT,
@@ -77,19 +55,6 @@ enum class NodeType {
     DONE
 }
 
-/**
- * Runtime node model built from survey configuration.
- *
- * This is the in-memory representation of a survey node that the
- * ViewModel manipulates during the flow.
- *
- * @property id Unique identifier of the node.
- * @property type Node type that determines which screen to show.
- * @property title Optional title used in the UI.
- * @property question Primary question text for this node.
- * @property options List of answer options for choice-based nodes.
- * @property nextId ID of the next node in the graph, or null if none.
- */
 data class Node(
     val id: String,
     val type: NodeType,
@@ -111,26 +76,13 @@ data class Node(
 
 /* ───────────────────────────── UI Events ───────────────────────────── */
 
-/**
- * Events emitted by the ViewModel for one-off UI feedback.
- *
- * Typical usages include snackbars, dialogs, and other transient messages.
- */
 sealed interface UiEvent {
-
-    /** Simple snackbar-like message. */
     data class Snack(val message: String) : UiEvent
-
-    /** Dialog event that carries a title and message. */
-    data class Dialog(
-        val title: String,
-        val message: String
-    ) : UiEvent
+    data class Dialog(val title: String, val message: String) : UiEvent
 }
 
 /* ───────────────────────────── Prompt Mode ───────────────────────────── */
 
-/** Prompt mode resolved per node. */
 enum class PromptMode {
     ONE_STEP,
     TWO_STEP
@@ -154,169 +106,78 @@ open class SurveyViewModel(
 
         private const val KEY_PREVIEW_LIMIT = 64
 
-        /** Export metadata key for the home screen free text. */
+        /** Export metadata key for the run-level free text note. */
         private const val EXPORT_META_SESSION_FREE_TEXT = "session_free_text"
 
-        /** Safety cap for session free text to keep exports stable. */
+        /** Safety cap for free text to keep exports stable. */
         private const val SESSION_FREE_TEXT_MAX_CHARS: Int = 20_000
     }
 
-    /**
-     * Survey graph as a map from node ID to [Node].
-     *
-     * IMPORTANT:
-     * - Keys are normalized (trimmed) to avoid hidden whitespace bugs.
-     */
     private val graph: Map<String, Node>
-
-    /** Read-only view of the runtime survey graph, keyed by node ID. */
     val nodes: Map<String, Node>
         get() = graph
 
-    /**
-     * ID of the starting node defined in [SurveyConfig.graph.startId].
-     *
-     * IMPORTANT:
-     * - Normalized (trimmed) to match graph keys.
-     */
     private val startId: String = config.graph.startId.trim()
-
-    /**
-     * Internal stack that tracks the sequence of visited node IDs.
-     *
-     * The last element corresponds to the currently active node.
-     */
     private val nodeStack = ArrayDeque<String>()
 
-    /** Monotonically increasing survey session ID. */
     private val _sessionId = MutableStateFlow(0L)
     val sessionId: StateFlow<Long> = _sessionId.asStateFlow()
 
-    /** Stable UUID for the active survey run. */
     private val _surveyUuid = MutableStateFlow(UUID.randomUUID().toString())
     val surveyUuid: StateFlow<String> = _surveyUuid.asStateFlow()
 
-    /* ───────────────────────────── Session Free Text ───────────────────────────── */
+    private val _runFreeText = MutableStateFlow("")
+    val runFreeText: StateFlow<String> = _runFreeText.asStateFlow()
 
-    /**
-     * Home screen "draft" free text.
-     *
-     * IMPORTANT:
-     * - This is UI-only draft state.
-     * - It must NOT automatically carry into a different run UUID.
-     */
-    private val _sessionFreeTextDraft = MutableStateFlow("")
-    val sessionFreeText: StateFlow<String> = _sessionFreeTextDraft.asStateFlow()
-
-    /**
-     * Run-locked free text stored for exports.
-     *
-     * IMPORTANT:
-     * - This is the ONLY source used by [exportExtraMeta].
-     * - Cleared when a new run UUID is generated.
-     */
-    private val _sessionFreeTextRun = MutableStateFlow("")
-    val sessionFreeTextRun: StateFlow<String> = _sessionFreeTextRun.asStateFlow()
-
-    /**
-     * Normalize session free text.
-     *
-     * Notes:
-     * - Avoid platform-dependent CRLF.
-     * - Apply a conservative cap to keep exports stable.
-     */
-    private fun normalizeSessionFreeText(text: String): String {
+    private fun normalizeRunFreeText(text: String): String {
         return text
             .replace("\r\n", "\n")
             .replace("\r", "\n")
             .take(SESSION_FREE_TEXT_MAX_CHARS)
     }
 
-    /**
-     * Set the Home screen draft free text.
-     *
-     * @param text User-provided free-form note (may be blank).
-     */
-    fun setSessionFreeText(text: String) {
-        _sessionFreeTextDraft.value = normalizeSessionFreeText(text)
+    fun setRunFreeText(text: String) {
+        _runFreeText.value = normalizeRunFreeText(text)
     }
 
-    /**
-     * Clear the Home screen draft free text.
-     *
-     * Note:
-     * - This does NOT clear the run-locked note.
-     */
+
+    fun resetRunFreeText() {
+        _runFreeText.value = ""
+    }
+
+    @Deprecated("Use resetRunFreeText()", ReplaceWith("resetRunFreeText()"))
     fun resetSessionFreeText() {
-        _sessionFreeTextDraft.value = ""
+        resetRunFreeText()
     }
 
-    /**
-     * Lock the current draft into the current run metadata and clear the draft.
-     *
-     * Recommended usage:
-     * - Call when the user starts a new run from Home.
-     */
-    fun commitSessionFreeTextToRun() {
-        val note = normalizeSessionFreeText(_sessionFreeTextDraft.value).trim()
-        _sessionFreeTextRun.value = note
-        _sessionFreeTextDraft.value = ""
-        RuntimeLogStore.d(TAG, "commitSessionFreeTextToRun -> len=${note.length}")
-    }
-
-    /**
-     * Clear both draft + run note.
-     *
-     * Use when you want to wipe any session note state explicitly.
-     */
-    fun resetSessionFreeTextAll() {
-        _sessionFreeTextDraft.value = ""
-        _sessionFreeTextRun.value = ""
-        RuntimeLogStore.d(TAG, "resetSessionFreeTextAll -> cleared")
-    }
-
-    /**
-     * Export-friendly extra metadata.
-     *
-     * IMPORTANT:
-     * - Uses the run-locked note (NOT the Home draft).
-     * - Returns only non-blank values.
-     */
     fun exportExtraMeta(): Map<String, String> {
-        val t = _sessionFreeTextRun.value.trim()
+        val t = runFreeText.value.trim()
         if (t.isBlank()) return emptyMap()
         return linkedMapOf(EXPORT_META_SESSION_FREE_TEXT to t.take(SESSION_FREE_TEXT_MAX_CHARS))
     }
 
-    /** Regenerate the survey UUID for a brand-new run. */
     private fun regenerateSurveyUuid() {
         _surveyUuid.value = UUID.randomUUID().toString()
     }
 
-    /** StateFlow representing the currently active [Node]. */
     private val _currentNode = MutableStateFlow(
         Node(id = "Loading", type = NodeType.START)
     )
     val currentNode: StateFlow<Node> = _currentNode.asStateFlow()
 
-    /** Convenience accessor for the current node ID. */
     val currentNodeId: String
         get() = _currentNode.value.id
 
-    /** Whether backwards navigation is currently possible. */
     private val _canGoBack = MutableStateFlow(false)
     val canGoBack: StateFlow<Boolean> = _canGoBack.asStateFlow()
 
-    /** UI-level event stream (snackbars, dialogs, etc.). */
     private val _events = MutableSharedFlow<UiEvent>(extraBufferCapacity = 8)
     val events: SharedFlow<UiEvent> = _events.asSharedFlow()
 
-    /** Emit a snackbar-like UI event. */
     fun emitSnack(message: String) {
         _events.tryEmit(UiEvent.Snack(message))
     }
 
-    /** Emit a dialog UI event. */
     fun emitDialog(title: String, message: String) {
         _events.tryEmit(UiEvent.Dialog(title, message))
     }
@@ -326,17 +187,14 @@ open class SurveyViewModel(
     private val _questions = MutableStateFlow<Map<String, String>>(LinkedHashMap())
     val questions: StateFlow<Map<String, String>> = _questions.asStateFlow()
 
-    /** Update or insert a question text for the given key (node ID). */
     fun setQuestion(text: String, key: String) {
         _questions.update { old ->
             old.mutableLinked().apply { put(key.trim(), text) }
         }
     }
 
-    /** Retrieve a question text by key (node ID) or return an empty string. */
     fun getQuestion(key: String): String = questions.value[key.trim()].orEmpty()
 
-    /** Clear all stored questions. */
     fun resetQuestions() {
         _questions.value = LinkedHashMap()
     }
@@ -346,24 +204,20 @@ open class SurveyViewModel(
     private val _answers = MutableStateFlow<Map<String, String>>(LinkedHashMap())
     val answers: StateFlow<Map<String, String>> = _answers.asStateFlow()
 
-    /** Update or insert an answer text for the given key (node ID). */
     fun setAnswer(text: String, key: String) {
         _answers.update { old ->
             old.mutableLinked().apply { put(key.trim(), text) }
         }
     }
 
-    /** Retrieve an answer by key (node ID) or return an empty string. */
     fun getAnswer(key: String): String = answers.value[key.trim()].orEmpty()
 
-    /** Remove an answer associated with the given key (node ID). */
     fun clearAnswer(key: String) {
         _answers.update { old ->
             old.mutableLinked().apply { remove(key.trim()) }
         }
     }
 
-    /** Clear all stored answers. */
     fun resetAnswers() {
         _answers.value = LinkedHashMap()
     }
@@ -373,7 +227,6 @@ open class SurveyViewModel(
     private val _single = MutableStateFlow<String?>(null)
     val single: StateFlow<String?> = _single.asStateFlow()
 
-    /** Set the current single-choice selection, or null to clear. */
     fun setSingleChoice(opt: String?) {
         _single.value = opt
     }
@@ -381,7 +234,6 @@ open class SurveyViewModel(
     private val _multi = MutableStateFlow<Set<String>>(emptySet())
     val multi: StateFlow<Set<String>> = _multi.asStateFlow()
 
-    /** Toggle the presence of a multi-choice option in the selection set. */
     fun toggleMultiChoice(opt: String) {
         _multi.update { cur ->
             cur.toMutableSet().apply {
@@ -390,7 +242,6 @@ open class SurveyViewModel(
         }
     }
 
-    /** Clear both single- and multi-choice selections for the current node. */
     fun clearSelections() {
         _single.value = null
         _multi.value = emptySet()
@@ -398,7 +249,6 @@ open class SurveyViewModel(
 
     /* ───────────────────────────── Follow-ups ───────────────────────────── */
 
-    /** Follow-up entry used to track AI-generated questions and answers. */
     data class FollowupEntry(
         val question: String,
         val answer: String? = null,
@@ -409,7 +259,6 @@ open class SurveyViewModel(
     private val _followups = MutableStateFlow<Map<String, List<FollowupEntry>>>(LinkedHashMap())
     val followups: StateFlow<Map<String, List<FollowupEntry>>> = _followups.asStateFlow()
 
-    /** Add a follow-up question for a given node ID. */
     fun addFollowupQuestion(
         nodeId: String,
         question: String,
@@ -427,7 +276,6 @@ open class SurveyViewModel(
         }
     }
 
-    /** Answer the last unanswered follow-up for the given node ID. */
     fun answerLastFollowup(nodeId: String, answer: String) {
         val k = nodeId.trim()
         _followups.update { old ->
@@ -443,7 +291,6 @@ open class SurveyViewModel(
         }
     }
 
-    /** Answer a follow-up at a specific index for the given node ID. */
     fun answerFollowupAt(nodeId: String, index: Int, answer: String) {
         val k = nodeId.trim()
         _followups.update { old ->
@@ -458,7 +305,6 @@ open class SurveyViewModel(
         }
     }
 
-    /** Remove all follow-ups associated with the given node ID. */
     fun clearFollowups(nodeId: String) {
         val k = nodeId.trim()
         _followups.update { old ->
@@ -468,7 +314,6 @@ open class SurveyViewModel(
         }
     }
 
-    /** Clear all follow-ups for all nodes. */
     fun resetFollowups() {
         _followups.value = LinkedHashMap()
     }
@@ -837,17 +682,21 @@ open class SurveyViewModel(
     }
 
     /**
-     * Reset to start node and begin a new run UUID.
+     * Start a brand-new run (new UUID).
      *
-     * IMPORTANT:
-     * - A new run UUID means a new run. The Home draft must NOT carry into that run by default.
-     * - If [preserveSessionFreeText] is true, the current draft is LOCKED to the new run (export meta),
-     *   and the draft UI is cleared (so it won't be reused for the next run).
+     * preserveSessionFreeText:
+     * - true  -> snapshot Home draft into run note, then clear draft.
+     * - false -> clear both run note and draft.
+     *
+     * This prevents draft carryover across different run UUIDs.
      */
     @Synchronized
     fun resetToStart(preserveSessionFreeText: Boolean = false) {
-        val draft = normalizeSessionFreeText(_sessionFreeTextDraft.value).trim()
-        val runNote = if (preserveSessionFreeText) draft else ""
+        val keepFreeText = if (preserveSessionFreeText) {
+            normalizeRunFreeText(_runFreeText.value)
+        } else {
+            ""
+        }
 
         regenerateSurveyUuid()
 
@@ -857,14 +706,10 @@ open class SurveyViewModel(
         resetAudioRefs()
         clearSelections()
 
-        // New run boundary:
-        // - Lock note for this run only (optional).
-        // - Always clear draft so it never auto-carries to a different run.
-        _sessionFreeTextRun.value = runNote
-        _sessionFreeTextDraft.value = ""
+        // Preserve only within this new run when explicitly requested.
+        _runFreeText.value = keepFreeText
 
         nodeStack.clear()
-
         val start = nodeOf(startId)
         ensureQuestion(start.id)
 
@@ -878,8 +723,7 @@ open class SurveyViewModel(
 
         RuntimeLogStore.d(
             TAG,
-            "resetToStart -> ${start.id}, session=${_sessionId.value}, uuid=${_surveyUuid.value}, " +
-                    "preserveFreeText=$preserveSessionFreeText draftLen=${draft.length} runLen=${runNote.length}"
+            "resetToStart -> ${start.id}, session=${_sessionId.value}, uuid=${_surveyUuid.value}, preserveFreeText=$preserveSessionFreeText"
         )
     }
 
@@ -957,7 +801,6 @@ open class SurveyViewModel(
 
     /* ───────────────────────────── DTO Mapping ───────────────────────────── */
 
-    /** Convert a config DTO node into a runtime node. */
     private fun NodeDTO.toVmNode(): Node {
         val rawType = this.type.trim()
         val t = when (rawType.uppercase()) {
@@ -969,7 +812,6 @@ open class SurveyViewModel(
             "REVIEW" -> NodeType.REVIEW
             "DONE", "FINISH", "FINAL" -> NodeType.DONE
             else -> {
-                // Unknown types are treated as TEXT to keep the flow robust.
                 RuntimeLogStore.w(TAG, "Unknown node type '$rawType' for id='${this.id}'. Defaulting to TEXT.")
                 NodeType.TEXT
             }
@@ -1063,8 +905,6 @@ open class SurveyViewModel(
         nodeStack.clear()
         nodeStack.addLast(start.id)
 
-        // Normalize the nav root so Compose always renders the correct entry for start node.
-        // This prevents mismatch when AppNav creates backStack with FlowHome but config start node differs.
         val startKey = navKeyFor(start)
         val needsReset = (nav.size != 1) || (nav.getOrNull(0) != startKey)
         if (needsReset) {
@@ -1072,6 +912,8 @@ open class SurveyViewModel(
         }
 
         updateCanGoBack()
+
+        _runFreeText.value = ""
 
         RuntimeLogStore.d(
             TAG,
