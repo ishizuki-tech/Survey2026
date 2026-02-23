@@ -644,12 +644,34 @@ jobs:
           MAP_TMP="_link-map.txt"
           : > "$MAP_TMP"
 
-          LIST=$(
-            find . -maxdepth 1 -type f -name '*.md' ! -name 'Home.md' -printf '%T@ %P\n' \
-              | sort -nr \
-              | head -n 20 \
-              | awk '{ $1=""; sub(/^ /,""); print }'
-          )
+          # ------------------------------------------------------------
+          # FIX: Do NOT use filesystem mtime from a fresh clone.
+          # Instead, sort by git commit time per page (robust "latest").
+          # New/untracked pages (like this run's TAG.md) get "now" timestamp
+          # so they always appear at the top.
+          # ------------------------------------------------------------
+          TMP_SORT="_home-sort.tmp"
+          : > "$TMP_SORT"
+
+          FILES="$(ls -1 *.md 2>/dev/null | grep -v '^Home\.md$' || true)"
+          if [ -n "$FILES" ]; then
+            while IFS= read -r f; do
+              [ -n "$f" ] || continue
+
+              ts="0"
+              if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then
+                ts="$(git log -1 --format=%ct -- "$f" 2>/dev/null || echo 0)"
+              fi
+
+              if [ "${ts}" = "0" ] || [ -z "${ts}" ]; then
+                ts="$(date +%s)"
+              fi
+
+              printf '%s %s\n' "$ts" "$f" >> "$TMP_SORT"
+            done <<< "$FILES"
+          fi
+
+          LIST="$(sort -nr "$TMP_SORT" 2>/dev/null | head -n 20 | awk '{ $1=""; sub(/^ /,""); print }' || true)"
 
           if [ -z "$LIST" ]; then
             echo "_No builds yet._" >> Home.md
