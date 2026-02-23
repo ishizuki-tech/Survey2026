@@ -1,10 +1,13 @@
-# Survey2026
+# Survey2026 (SurveyApp)
 
-**Survey2026** is an Android (Kotlin) + NDK (C/CMake) project aimed at building an **offline-first survey app** with **on-device speech-to-text** via **whisper.cpp**.
+**Survey2026** is an Android Studio multi-module project (**Android/Kotlin + NDK/C/CMake**) for an **offline-first survey app** with:
 
-This repo is intentionally structured to keep the Android app layer clean while isolating native inference code in a dedicated module.
+* **On-device speech-to-text** via **whisper.cpp** (NDK/JNI)
+* **On-device SLM (Small Language Model) inference** via **LiteRT-LM** (and related on-device inference APIs)
 
-> Status note: This README is written to be *implementation-friendly* even while the code is evolving. Sections marked **TODO** should be updated as the project crystallizes.
+The repo is structured to keep the Android app layer clean while isolating native inference code (whisper.cpp) in a dedicated module, and keeping SLM orchestration/testability on the Kotlin side.
+
+> Maintainer: [ishizuki.tech@gmail.com](mailto:shu.ishizuki@gmail.com)
 
 ---
 
@@ -15,13 +18,16 @@ This repo is intentionally structured to keep the Android app layer clean while 
 * [Repository layout](#repository-layout)
 * [Build prerequisites](#build-prerequisites)
 * [Getting started](#getting-started)
+* [On-device SLM integration](#on-device-slm-integration)
 * [Native build (NDK/CMake) details](#native-build-ndkcmake-details)
-* [Model files (Whisper)](#model-files-whisper)
+* [Model files](#model-files)
 * [Run-time permissions and I/O](#run-time-permissions-and-io)
-* [Troubleshooting](#troubleshooting)
+* [Diagnostics & logging (reliability-first)](#diagnostics--logging-reliability-first)
 * [CI / workflows](#ci--workflows)
 * [Security and repo hygiene](#security-and-repo-hygiene)
+* [Troubleshooting](#troubleshooting)
 * [License](#license)
+* [Roadmap](#roadmap)
 
 ---
 
@@ -29,38 +35,80 @@ This repo is intentionally structured to keep the Android app layer clean while 
 
 This repository is a **multi-module Android Studio project**:
 
-* `app/` contains the Android application (UI, navigation, storage, orchestration).
-* `nativelib/` contains NDK + JNI code to build and expose native functionality.
-* `whisper.cpp/` is included as a **Git submodule**.
+* `app/` — Android application module (UI, navigation, storage, orchestration)
+* `nativelib/` — Android library module that builds native code via **NDK + CMake** and exposes it via **JNI**
+* `whisper.cpp/` — **Git submodule** (pinned to a specific commit)
 
-The design goal is to enable **fast iteration** on native inference while keeping the Kotlin side stable and testable.
+Design goals:
+
+* **Offline-first**: core features work without network.
+* **On-device AI** is a first-class requirement:
+
+    * Whisper STT runs locally via NDK/JNI.
+    * SLM inference runs locally (Kotlin orchestration, on-device engine).
+* **Reliability-first**: persistent logs + crash capture + optional diagnostic upload.
 
 ---
 
 ## Key capabilities
 
-* **Offline voice capture** (microphone) and local file persistence.
-* **On-device speech-to-text** powered by `whisper.cpp` (native library).
-* **Multi-ABI builds** (typical Android ABIs; exact set depends on Gradle/CMake config).
-* **Repository hygiene**:
+### Offline survey app core
 
-    * model files (`*.bin`, `*.gguf`) and large media are ignored by default
-    * keystores and Google services config are ignored
+* Offline-first survey flow (navigation + state managed in Kotlin)
+* Local persistence for runs/drafts (implementation owned by `app/`)
 
-**TODO:** list actual supported languages / models and current UI flow.
+### On-device speech-to-text (Whisper)
+
+* Microphone capture → local persistence → native transcription
+* `whisper.cpp` built into an Android native library via `nativelib/`
+* JNI boundary kept narrow (Kotlin owns orchestration; native owns inference)
+
+### On-device SLM integration (required)
+
+* On-device SLM inference for:
+
+    * Free-text normalization / intent classification / evaluation
+    * Two-step pipelines (e.g., **EVAL → FOLLOWUP** JSON flows)
+    * Streaming generation with cancellation/timeout handling
+
+This repo includes or references SLM components such as:
+
+* `AiRepository.kt` — SLM orchestration (streaming, cancellation, logging, prompt hashing, etc.)
+* `LiteRtLM` — SLM engine wrapper (LiteRT-LM bindings)
+* `SurveyConfig` — prompt/config resolvers (one-step / two-step)
+
+> The SLM path is not optional in this project: it is part of the primary product surface.
+
+### Diagnostics-first (developer reliability)
+
+* Early crash capture during app startup (`CrashCapture`)
+* Persistent runtime logging (e.g., `RuntimeLogStore`, ring logs)
+* Optional background upload pipeline via WorkManager:
+
+    * `GitHubUploadWorker`, `GitHubUploader`, and config store(s)
 
 ---
 
 ## Repository layout
 
-Top-level structure (high-level):
+High-level layout:
 
-* `.github/workflows/` — CI workflows (Gradle build/test, etc.)
+* `.github/workflows/` — GitHub Actions workflows
 * `app/` — Android application module
-* `nativelib/` — Android library module that builds native code via CMake
+* `nativelib/` — Native/JNI Android library module
 * `scripts/` — helper scripts (model download/build helpers)
-* `whisper.cpp/` — whisper.cpp submodule (pinned to a specific commit)
+* `whisper.cpp/` — whisper.cpp submodule
 * `images/` — documentation images/screenshots
+
+Some Details: 
+
+* `MainActivity.kt` — app entry, permissions, UI routing
+* `SurveyApp.kt` — Application bootstrap (WorkManager + crash capture wiring often lives here)
+* `CrashCapture.kt` — crash capture + exit info collection (if present)
+* `GitHubUploadWorker.kt` / `GitHubUploader.kt` — diagnostics upload pipeline
+* `RuntimeLogStore.kt` / `AppRingLogStore.kt` — persistent logs
+* `SurveyViewModel.kt` — survey state + prompt resolution integration
+* `AiRepository.kt` — SLM streaming orchestration + guards
 
 ---
 
@@ -68,21 +116,27 @@ Top-level structure (high-level):
 
 ### Required
 
-* **Android Studio** (latest stable recommended)
-* **Android SDK** (installed via Android Studio)
-* **NDK (Side by side)** (installed via Android Studio)
-* **CMake** (installed via Android Studio)
+* Android Studio (latest stable recommended)
+* Android SDK (via Android Studio)
+* NDK (Side by side)
+* CMake
 
-### Install NDK/CMake via Android Studio
+Install NDK/CMake:
 
 1. `Tools` → `SDK Manager`
-2. `SDK Tools` tab
+2. `SDK Tools`
 3. Install:
 
     * `NDK (Side by side)`
     * `CMake`
 
-> If you see `NDK is not installed`, this is the first thing to fix.
+> If you see `NDK is not installed`, fix this first.
+
+**TODO (pin toolchain):**
+
+* Prefer pinning `ndkVersion` and documenting the CMake version.
+
+    * Owner: `app/build.gradle(.kts)` and `nativelib/build.gradle(.kts)`
 
 ---
 
@@ -90,14 +144,14 @@ Top-level structure (high-level):
 
 ### 1) Clone with submodules
 
-This project depends on a Git submodule (`whisper.cpp`). Clone with submodules enabled:
+This repo depends on a submodule (`whisper.cpp`). Clone with submodules enabled:
 
 ```bash
 git clone --recurse-submodules https://github.com/ishizuki-tech/Survey2026.git
 cd Survey2026
 ```
 
-Already cloned without submodules?
+If you already cloned without submodules:
 
 ```bash
 git submodule update --init --recursive
@@ -106,14 +160,14 @@ git submodule update --init --recursive
 ### 2) Open in Android Studio
 
 * Android Studio → **Open** → select the `Survey2026` directory
-* Allow Gradle sync to complete
+* Let Gradle Sync complete
 
-### 3) Build and run
+### 3) Build & run
 
-* Select a device (physical device recommended for audio + performance)
-* `Run` the `app` configuration
+* Choose a device (physical device recommended for audio + on-device inference)
+* Run the `app` configuration
 
-Optional CLI build:
+CLI build:
 
 ```bash
 ./gradlew :app:assembleDebug
@@ -121,44 +175,116 @@ Optional CLI build:
 
 ---
 
+## On-device SLM integration
+
+### Overview
+
+SLM inference is a core feature in Survey2026.
+
+Common responsibilities of the SLM layer:
+
+* Streaming generation (token/segment streaming)
+* Termination handling (exactly-one terminal outcome per run)
+* Cancellation/teardown safety (no late callbacks updating next run)
+* Two-step JSON pipelines (EVAL → FOLLOWUP)
+* Near-context-limit behavior (truncation, end-of-turn loops)
+* Warmup/readiness (cold start / GPU warmup delays)
+
+The implementation is designed to be **defensive** because on-device engines can have:
+
+* long warmups
+* delayed terminal callbacks
+* late events after cancel/close
+* edge cases when prompts approach context limits
+
+### Where it lives in code
+
+Search for these in `app/`:
+
+* `AiRepository.kt`
+* `LiteRtLM` (engine wrapper)
+* `SurveyConfig` prompt resolvers
+
+### Prompting patterns
+
+This repo supports (or is designed to support) both:
+
+* **One-step prompts** (single completion)
+* **Two-step prompts**:
+
+    * Step 1: EVAL (strict JSON)
+    * Step 2: FOLLOWUP (guided by EVAL output)
+
+**TODO (align with implementation):**
+
+* Document the exact prompt resolver APIs and JSON schema enforced.
+
+    * Owner: `SurveyViewModel.kt` + `SurveyConfig` definitions
+
+### Streaming + termination contract (recommended invariants)
+
+Client-side invariants that the app enforces (or should enforce):
+
+* Exactly one terminal callback per run (`done` or `error`)
+* No state updates after cancellation/close
+* No cross-run contamination (previous callbacks must not affect next run)
+
+**TODO (align with implementation):**
+
+* Document the run ID / session ID strategy used for guarding streams.
+
+    * Owner: `AiRepository.kt` + ViewModel(s)
+
+---
+
 ## Native build (NDK/CMake) details
 
 ### Where native build lives
 
-* The native build is owned by the `nativelib` module.
-* CMake entry points are typically under:
+* The native build is owned by `nativelib/`.
+* Find the CMake entry point:
 
-    * `nativelib/src/main/jni/**/CMakeLists.txt`
+```bash
+# macOS / Linux
+find nativelib -name CMakeLists.txt -print
+```
 
-> Exact paths may evolve; search for `CMakeLists.txt` inside `nativelib/` if reorganized.
+Typical (but not guaranteed) location:
+
+* `nativelib/src/main/cpp/CMakeLists.txt`
 
 ### How CMake finds whisper.cpp
 
-`whisper.cpp` is included as a **submodule** at the repo root (`/whisper.cpp`).
+`whisper.cpp` is included as a **submodule** at repo root:
 
-**Recommended practice:** keep a *single canonical location* for whisper.cpp and avoid duplicate copies.
+* `/whisper.cpp`
 
-If you need to make the project resilient across environments, do it explicitly:
+Recommended practice:
 
-* Prefer a single CMake cache variable (example name):
+* Keep one canonical whisper.cpp directory.
+* Pass its path explicitly into CMake via a single variable.
 
-    * `WHISPER_CPP_DIR=/absolute/or/repo-relative/path/to/whisper.cpp`
+Example pattern:
 
-Then pass it from Gradle:
+* `-DWHISPER_CPP_DIR=/absolute/or/repo-relative/path/to/whisper.cpp`
 
-* In `nativelib`’s `build.gradle(.kts)`, via:
+Gradle wiring (example):
 
-    * `externalNativeBuild { cmake { arguments += listOf("-DWHISPER_CPP_DIR=..." ) } }`
+* `nativelib/build.gradle(.kts)`:
 
-**TODO:** document the exact variable name used in this repo once finalized.
+    * `externalNativeBuild { cmake { arguments += listOf("-DWHISPER_CPP_DIR=...") } }`
+
+**TODO (make this exact):**
+
+* Replace the example variable name with what your CMake actually uses.
+
+    * Owner: `nativelib/**/CMakeLists.txt`
 
 ### ABI notes
 
-Android native builds typically target a subset of:
+Common targets:
 
 * `arm64-v8a` (recommended baseline)
-* `armeabi-v7a` (legacy)
-* `x86_64` (emulators)
 
 To reduce build time, restrict ABIs in Gradle (example):
 
@@ -166,105 +292,186 @@ To reduce build time, restrict ABIs in Gradle (example):
 android {
   defaultConfig {
     ndk {
-      abiFilters += listOf("arm64-v8a", "x86_64")
+      abiFilters += listOf("arm64-v8a")
     }
   }
 }
 ```
 
-**TODO:** align this section with the actual ABI filters used in the repo.
+**TODO (align with repo):**
 
-### Typical NDK/CMake debugging workflow
+* Document the actual `abiFilters` used.
+
+    * Owner: `app/build.gradle(.kts)` and/or `nativelib/build.gradle(.kts)`
+
+### Native build debugging workflow
 
 When native build gets weird:
 
-1. **Clean CMake cache**
+1. Clean project (`Build → Clean Project`)
+2. If needed, delete CMake cache:
 
-    * Delete module-level `.cxx/` folders (or use Android Studio: `Build → Clean Project`)
-2. Re-sync Gradle
-3. Rebuild
-
-Native build artifacts are usually under:
-
-* `nativelib/.cxx/` (CMake/Ninja intermediates)
+    * `nativelib/.cxx/`
+3. Re-sync Gradle
+4. Rebuild
 
 ---
 
-## Model files (Whisper)
+## Model files
 
 ### Why models are not in Git
 
-Whisper models are large and frequently change. This repository intentionally ignores:
+Models are large and frequently change. This repo intentionally ignores common model extensions:
 
-* `*.bin`
-* `*.gguf`
-
-…and other large media (see `.gitignore`).
+* Whisper models: `*.bin`, `*.gguf`
+* (SLM model extensions depend on the engine/toolchain)
 
 ### Recommended model placement
 
-Pick a **single consistent location** and make the Kotlin and native layers agree.
+Pick one consistent location and make Kotlin + native agree.
 
 Common choices:
 
-1. `app/src/main/assets/models/` (bundled into APK)
+1. Bundle into APK: `app/src/main/assets/models/`
 
 * ✅ easy distribution
 * ❌ increases APK size
 
-2. App-internal storage (download on first run)
+2. Download into app-internal storage (recommended for production)
 
-* ✅ keeps APK small
+* ✅ keeps APK smaller
 * ✅ supports multiple models
 
-3. External storage (developer convenience)
+3. Developer convenience: external storage
 
-* ✅ easy to swap while developing
-* ❌ permissions / scoped storage concerns
+* ✅ easy to swap
+* ❌ permissions / scoped storage complexity
 
-**Recommended for production:** (2) download into internal storage.
-
-### Suggested directory layout (example)
+Suggested internal layout:
 
 ```text
 <app-internal-files>/models/
-  - whisper-small.bin
-  - whisper-large-v3-turbo.gguf
-  - README.txt
+  - whisper/<whisper-model-files>
+  - slm/<slm-model-files>
+  - SHA256SUMS.txt
 ```
 
-**TODO:** document the actual model naming and loader code expectations.
+**TODO (align with implementation):**
+
+* Document loader behavior for both Whisper and SLM:
+
+    * assets vs internal storage
+    * naming rules and discovery
+    * hash verification behavior (if implemented)
+    * Owner: model loader Kotlin file(s) + `AiRepository.kt` + JNI wrapper contract
 
 ---
 
 ## Run-time permissions and I/O
 
-### Microphone permissions
+### Microphone permission
 
-At runtime, the app must request:
+The app must request:
 
-* `RECORD_AUDIO`
+* `android.permission.RECORD_AUDIO`
 
-Depending on storage strategy, you may also need storage/media permissions.
+Other permissions depend on storage strategy.
+
+**TODO (make this exact):**
+
+* List exact manifest permissions and runtime request behavior.
+
+    * Owner: `app/src/main/AndroidManifest.xml` + permission request code
 
 ### Audio pipeline (typical)
 
-A common flow is:
+1. Capture PCM audio
+2. Persist WAV or raw PCM
+3. Feed data/file into native whisper.cpp wrapper
+4. Return text (optionally timestamps)
 
-1. Capture PCM audio via Android APIs
-2. Persist as WAV (or raw PCM)
-3. Feed file/bytes into native whisper.cpp wrapper
-4. Return text + timing info
+**TODO (align with code):**
 
-**TODO:** document actual file formats used by the app.
+* Document sample rate / channels / format + JNI method signature(s).
+
+    * Owner: Kotlin audio capture + JNI wrapper
+
+---
+
+## Diagnostics & logging (reliability-first)
+
+This repo aims to be **reliability-first**.
+
+### What exists (implementation-driven)
+
+The current codebase references components such as:
+
+* `CrashCapture` — early crash capture and exit info
+* `RuntimeLogStore` / `AppRingLogStore` — persistent logs (ring + file)
+* WorkManager uploader pipeline:
+
+    * `GitHubUploadWorker`
+    * `GitHubUploader`
+    * configuration store(s) such as `GitHubDiagnosticsConfigStore`
+
+### Recommended operating model
+
+* Keep diagnostics collection always-on (low overhead).
+* Keep uploads strictly opt-in (dev builds, debug menu, or explicit user action).
+* Never upload secrets.
+
+**TODO (align with implementation):**
+
+* Document:
+
+    * where logs are stored (files dir paths)
+    * retention policy
+    * how to trigger an upload (if enabled)
+    * where tokens/config live (never commit them)
+    * Owner: `SurveyApp.kt` + `net/` uploader code
+
+---
+
+## CI / workflows
+
+Workflows live in:
+
+* `.github/workflows/`
+
+Typical goals:
+
+* `./gradlew assembleDebug`
+* `./gradlew test`
+
+Some variants of this repo include workflows like **Android CI & Release** (manual dispatch, version/tag handling, artifact publishing).
+
+**TODO (make this exact):**
+
+* List the exact workflow file names and what they do.
+
+    * Owner: `.github/workflows/*.yml`
+
+---
+
+## Security and repo hygiene
+
+This repo avoids common Android accidents:
+
+* Do not commit keystores (`*.jks`) — ignored
+* Do not commit `google-services.json` — ignored
+* Do not commit model files — ignored
+
+Reproducible builds:
+
+* Fetch models via scripts from trusted sources
+* Verify hashes before use
+* Pin toolchains + submodule commits
 
 ---
 
 ## Troubleshooting
 
-### `NDK is not installed`
-
-Fix:
+### NDK not installed
 
 * Android Studio → `Tools → SDK Manager → SDK Tools`
 * Install `NDK (Side by side)`
@@ -273,68 +480,38 @@ Fix:
 
 Common causes:
 
-* missing CMake install
-* stale `.cxx/` build cache
+* missing CMake
+* stale `.cxx/` cache
 * ABI mismatch
 
-Fix checklist:
+Fix:
 
-* install CMake in SDK Manager
-* `Build → Clean Project` then rebuild
-* delete `nativelib/.cxx/` (as last resort)
+* `Build → Clean Project`
+* delete `nativelib/.cxx/` (last resort)
+* re-sync and rebuild
 
 ### whisper.cpp not found / headers missing
 
-This almost always means submodules aren’t initialized:
+Submodule is not initialized:
 
 ```bash
 git submodule update --init --recursive
 ```
 
-Then re-sync Gradle and rebuild.
+### SLM streaming feels “stuck”
 
-### “It builds on my machine” syndrome
+Possible causes:
 
-Native builds are sensitive to:
+* cold start / GPU warmup delays before first token
+* missing/late terminal callbacks
+* cancellation races (late callbacks after cancel/close)
+* near-context-limit truncation breaking strict JSON
 
-* NDK version differences
-* host OS toolchain differences
-* ABI filters / CMake options
+Recommended actions:
 
-Best practice:
-
-* pin NDK version in documentation
-* keep CMake arguments explicit
-* avoid multiple whisper.cpp directories
-
----
-
-## CI / workflows
-
-This repository includes GitHub Actions workflows under `.github/workflows/`.
-
-Typical CI goals:
-
-* `./gradlew assembleDebug`
-* `./gradlew test`
-* (optional) build release artifacts
-
-**TODO:** list exact workflow names and what each does.
-
----
-
-## Security and repo hygiene
-
-This repo is set up to avoid common Android accidents:
-
-* **Do not commit keystores** (`*.jks`) — ignored by default
-* **Do not commit `google-services.json`** — ignored by default
-* **Do not commit model files** (`*.bin`, `*.gguf`) — ignored by default
-
-If you need reproducible builds:
-
-* use scripts to fetch models from a trusted location
-* verify hashes before use
+* enable persistent logs and review run IDs / prompt hashes
+* use conservative timeouts and explicit warmup strategies
+* enforce strict run isolation in the client (ignore late events)
 
 ---
 
@@ -343,13 +520,3 @@ If you need reproducible builds:
 MIT License — see `LICENSE`.
 
 ---
-
-## Roadmap (optional)
-
-**TODO:** add a short roadmap once milestones are defined, e.g.
-
-* [ ] Stable native JNI API surface
-* [ ] Model download + verification
-* [ ] End-to-end transcription UI
-* [ ] Benchmark harness (device + model + latency/memory)
-* [ ] Structured export format for survey + audio + transcript
