@@ -37,7 +37,7 @@ import kotlin.math.min
  *
  * Design:
  * - Writes line-oriented text logs into fixed-size segments (rotating).
- * - Snapshot reads from newest->oldest to build a "last N bytes" view.
+ * - Snapshot reads across segments to build a "last N bytes" view.
  * - Provides crash staging: copy a snapshot into CrashCapture's crash dir.
  */
 object AppRingLogStore {
@@ -162,18 +162,32 @@ object AppRingLogStore {
     }
 
     /**
-     * Build a snapshot of the most recent bytes across segments (newest->oldest).
+     * Build a snapshot of the most recent bytes across segments.
+     *
+     * Implementation notes:
+     * - We collect chunks from newest -> oldest until the cap is reached (keeps newest data).
+     * - Then we reverse the chunk order for readability (older -> newer among included chunks).
      */
     fun snapshotBytes(maxBytes: Int): ByteArray {
         val dir = rootDir ?: return ByteArray(0)
-        val segs = listSegmentsNewestFirst(dir)
-        if (segs.isEmpty()) return ByteArray(0)
+        val segsNewestFirst = listSegmentsNewestFirst(dir)
+        if (segsNewestFirst.isEmpty()) return ByteArray(0)
 
-        val out = ByteArrayOutputStreamCapped(maxBytes)
-        for (f in segs) {
-            if (out.remaining() <= 0) break
-            val chunk = readTailBytes(f, out.remaining())
-            out.write(chunk)
+        val chunks = ArrayList<ByteArray>(segsNewestFirst.size)
+        var remaining = maxBytes.coerceAtLeast(0)
+
+        for (f in segsNewestFirst) {
+            if (remaining <= 0) break
+            val chunk = readTailBytes(f, remaining)
+            if (chunk.isNotEmpty()) {
+                chunks.add(chunk)
+                remaining -= chunk.size
+            }
+        }
+
+        val out = ByteArrayOutputStreamCapped(maxBytes.coerceAtLeast(0))
+        for (i in chunks.indices.reversed()) {
+            out.write(chunks[i])
         }
         return out.toByteArray()
     }
@@ -186,9 +200,7 @@ object AppRingLogStore {
         val dir = rootDir ?: return
         io.execute {
             try {
-                val f = currentSegmentFile(dir, currentIndex)
-                rotateIfNeeded(dir, f)
-
+                val f = resolveWritableSegmentFile(dir)
                 appendLine(f, line)
             } catch (t: Throwable) {
                 Log.w(TAG, "write failed: ${t.message}", t)
@@ -196,15 +208,36 @@ object AppRingLogStore {
         }
     }
 
-    private fun rotateIfNeeded(dir: File, f: File) {
+    /**
+     * Resolve the current writable segment file.
+     *
+     * IMPORTANT:
+     * - If rotation happens, this returns the NEW segment file to write into.
+     * - This avoids a subtle bug where callers capture the old file reference and keep writing to it
+     *   even after updating [currentIndex].
+     */
+    private fun resolveWritableSegmentFile(dir: File): File {
+        var idx = currentIndex
+        var f = currentSegmentFile(dir, idx)
+
         if (f.exists() && f.length() >= SEG_MAX_BYTES) {
-            currentIndex = (currentIndex + 1) % SEG_COUNT
-            val next = currentSegmentFile(dir, currentIndex)
+            idx = (idx + 1) % SEG_COUNT
+            currentIndex = idx
+
+            f = currentSegmentFile(dir, idx)
+
             // Start a fresh segment (truncate).
             runCatching {
-                if (next.exists()) next.writeText("")
+                if (f.exists()) {
+                    f.writeText("")
+                } else {
+                    f.parentFile?.mkdirs()
+                    f.writeText("")
+                }
             }
         }
+
+        return f
     }
 
     private fun appendLine(file: File, line: String) {

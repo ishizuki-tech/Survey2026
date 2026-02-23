@@ -31,6 +31,10 @@
  *   • animateContentSize only while collapsed to reduce jank on huge text.
  *   • Stable meta rendering order (sorted).
  *   • Retry button for failed detail resolution.
+ *
+ *  Fix (2026-02-22):
+ *   • Debug crash button is debug-only again (BuildConfig.DEBUG).
+ *   • Place debug crash button at bottom-end to avoid UI interference.
  * =====================================================================
  */
 
@@ -125,8 +129,6 @@ import com.negi.survey.BuildConfig
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import kotlin.math.max
-import kotlin.math.min
 
 private const val TAG = "IntroScreen"
 private const val BRING_INTO_VIEW_DELAY_MS = 24L
@@ -203,12 +205,14 @@ fun IntroScreen(
                 onResolveConfigDetails = onResolveConfigDetails,
             )
 
-            if (true) //(BuildConfig.DEBUG)
-            {
+            // Debug-only crash button.
+            if (BuildConfig.DEBUG) {
                 OutlinedButton(
-                    onClick = {
-                        throw RuntimeException("Debug crash button pressed")
-                    }
+                    onClick = { throw RuntimeException("Debug crash button pressed") },
+                    modifier = Modifier
+                        .align(Alignment.BottomEnd)
+                        .padding(16.dp)
+                        .testTag("IntroDebugCrashButton")
                 ) {
                     Text("Crash now (debug)")
                 }

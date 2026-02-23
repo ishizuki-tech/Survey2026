@@ -5,7 +5,7 @@
  *  File: AiViewModel.kt
  *  Author: Shu Ishizuki (石附 支)
  *  License: MIT License
- *  © 2025 IshizukiTech LLC. All rights reserved.
+ *  © 2026 IshizukiTech LLC. All rights reserved.
  * =====================================================================
  */
 
@@ -109,9 +109,9 @@ class AiViewModel(
     /**
      * Emit logs both to RuntimeLogStore (existing pipeline) and AppRingLogStore (crash-uploadable ring).
      *
-     * Notes:
-     * - AppRingLogStore is a best-effort sink; if not installed yet, calls are no-ops.
-     * - Full prompt / full raw output logs must be gated by BuildConfig.DEBUG.
+     * IMPORTANT:
+     * - Ring logs MUST remain "ring-safe": do not include full prompts/outputs or large previews.
+     * - Use *RuntimeOnly* logging helpers for anything that may contain user/model content.
      */
     private fun logD(tag: String, msg: String) {
         RuntimeLogStore.d(tag, msg)
@@ -131,6 +131,27 @@ class AiViewModel(
     private fun logE(tag: String, msg: String, tr: Throwable? = null) {
         if (tr != null) RuntimeLogStore.e(tag, msg, tr) else RuntimeLogStore.e(tag, msg)
         AppRingLogStore.log("E", tag, msg, tr)
+    }
+
+    /**
+     * Runtime-only logging (no ring).
+     *
+     * Use this for any content that may include user prompts or model outputs.
+     */
+    private fun logDRuntimeOnly(tag: String, msg: String) {
+        RuntimeLogStore.d(tag, msg)
+    }
+
+    private fun logIRuntimeOnly(tag: String, msg: String) {
+        RuntimeLogStore.i(tag, msg)
+    }
+
+    private fun logWRuntimeOnly(tag: String, msg: String, tr: Throwable? = null) {
+        if (tr != null) RuntimeLogStore.w(tag, msg, tr) else RuntimeLogStore.w(tag, msg)
+    }
+
+    private fun logERuntimeOnly(tag: String, msg: String, tr: Throwable? = null) {
+        if (tr != null) RuntimeLogStore.e(tag, msg, tr) else RuntimeLogStore.e(tag, msg)
     }
 
     // ───────────────────────── UI state ─────────────────────────
@@ -228,8 +249,9 @@ class AiViewModel(
             if (next.size <= MAX_STEP_HISTORY) next else next.takeLast(MAX_STEP_HISTORY)
         }
         if (DEBUG_LOGS) {
+            // Runtime only: follow-up preview may contain user/model content.
             val fu0 = s.followups.firstOrNull()?.let { preview(it) } ?: "<none>"
-            logD(
+            logDRuntimeOnly(
                 TAG,
                 "stepHistory+ runId=${s.runId} phase=${s.phase} mode=${s.mode} " +
                         "raw.len=${s.raw.length} score=${s.score} FU=${s.followups.size} " +
@@ -656,9 +678,11 @@ class AiViewModel(
 
                 if (!doStep2) {
                     if (DEBUG_LOGS) {
-                        logD(
+                        // Runtime only: rawPreview may contain user/model content.
+                        logDRuntimeOnly(
                             TAG,
-                            "chain2: step2 skipped (score=${step1.score}, followups=${step1.followups.size}, timedOut=${step1.timedOut}, rawPreview='${debugVisible(preview(step1.raw))}')"
+                            "chain2: step2 skipped (score=${step1.score}, followups=${step1.followups.size}, timedOut=${step1.timedOut}, " +
+                                    "rawPreview='${debugVisible(preview(step1.raw))}')"
                         )
                     }
                     return@launch
@@ -821,6 +845,7 @@ class AiViewModel(
                 .getOrElse { userPrompt }
 
             if (DEBUG_LOGS) {
+                // Ring-safe: only lengths and hashes.
                 logD(
                     TAG,
                     "run[$runId]: mode=$mode phase=$phase commit=$commitToPrimaryState " +
@@ -830,7 +855,8 @@ class AiViewModel(
             }
 
             if (enableFullLogs) {
-                logLong(
+                // Runtime only: full prompt may contain sensitive user content.
+                logLongRuntimeOnly(
                     tag = FULL_PROMPT_TAG,
                     header = "run[$runId]: phase=$phase FullPrompt",
                     body = fullPrompt,
@@ -854,7 +880,8 @@ class AiViewModel(
                             _events.tryEmit(AiEvent.Stream(part))
 
                             if (DEBUG_LOGS) {
-                                logD(TAG, "run[$runId] chunk[$chunkCount].preview='${debugVisible(preview(part))}'")
+                                // Runtime only: chunk preview may contain model output.
+                                logDRuntimeOnly(TAG, "run[$runId] chunk[$chunkCount].preview='${debugVisible(preview(part))}'")
                             }
                         }
                     }
@@ -888,11 +915,13 @@ class AiViewModel(
             val rawTrim = rawText.trim()
 
             if (DEBUG_LOGS) {
+                // Ring-safe stats only.
                 logD(TAG, "run[$runId] stats: chunks=$chunkCount, chars=$totalChars, raw.len=${rawText.length}")
                 logD(TAG, "run[$runId] sha(raw)=${sha256Hex(rawText)}")
             }
             if (DEBUG_LOGS && DEBUG_WHITESPACE) {
-                logD(TAG, "run[$runId] rawVisible='${debugVisible(preview(rawText))}'")
+                // Runtime only: raw preview may contain model output.
+                logDRuntimeOnly(TAG, "run[$runId] rawVisible='${debugVisible(preview(rawText))}'")
             }
 
             val parsedScore: Int?
@@ -906,7 +935,8 @@ class AiViewModel(
                         top3 = emptyList()
                         q0 = null
                         if (DEBUG_LOGS) {
-                            logW(
+                            // Runtime only: includes output preview.
+                            logWRuntimeOnly(
                                 TAG,
                                 "run[$runId]: EVAL_JSON output is empty/trivial ('${debugVisible(preview(rawTrim))}') -> score=null, followups=0"
                             )
@@ -920,7 +950,8 @@ class AiViewModel(
                         q0 = top3.firstOrNull()
 
                         if (DEBUG_LOGS) {
-                            logD(
+                            // Runtime only: includes follow-up preview.
+                            logDRuntimeOnly(
                                 TAG,
                                 "run[$runId]: EVAL_JSON parsed score=$parsedScore followups=${top3.size} fu0='${debugVisible(preview(q0.orEmpty()))}'"
                             )
@@ -943,7 +974,8 @@ class AiViewModel(
                     q0 = best
 
                     if (DEBUG_LOGS) {
-                        logD(
+                        // Runtime only: includes extracted text.
+                        logDRuntimeOnly(
                             TAG,
                             "run[$runId]: FOLLOWUP parse " +
                                     "extractorQ='${debugVisible(preview(fromExtractor.orEmpty()))}' " +
@@ -982,13 +1014,18 @@ class AiViewModel(
                 _events.tryEmit(AiEvent.Timeout)
             }
 
+            // Ring-safe: do not include follow-up text. Use sha/len only.
+            val q0Len = q0?.length ?: 0
+            val q0Sha = q0?.let { sha256Hex(it).take(16) } ?: "none"
             logI(
                 TAG,
-                "run[$runId] done: phase=$phase mode=$mode score=$parsedScore FU[0]=${q0 ?: "<none>"} commit=$commitToPrimaryState err=${stepError ?: "<none>"}"
+                "run[$runId] done: phase=$phase mode=$mode score=$parsedScore FU0.len=$q0Len FU0.sha16=$q0Sha " +
+                        "commit=$commitToPrimaryState err=${stepError ?: "<none>"}"
             )
 
             if (enableFullLogs) {
-                logLong(
+                // Runtime only: full output may contain sensitive model content.
+                logLongRuntimeOnly(
                     tag = FULL_TEXT_OUT_TAG,
                     header = "run[$runId]: RawTextOut",
                     body = rawText,
@@ -1152,10 +1189,11 @@ class AiViewModel(
     /**
      * Chunked log printer to reduce logcat truncation.
      *
-     * Notes:
-     * - Caller must gate sensitive payloads with BuildConfig.DEBUG.
+     * IMPORTANT:
+     * - This must be runtime-only. Never write full prompt/output into AppRingLogStore.
+     * - Caller must still gate sensitive payloads with BuildConfig.DEBUG.
      */
-    private fun logLong(tag: String, header: String, body: String, level: Int) {
+    private fun logLongRuntimeOnly(tag: String, header: String, body: String, level: Int) {
         val trimmed = if (body.length > MAX_LONG_LOG_CHARS) {
             body.take(MAX_LONG_LOG_CHARS) + "\n... (truncated)"
         } else {
@@ -1174,9 +1212,10 @@ class AiViewModel(
             val slice = full.substring(i, end)
             val prefix = "[part=${part.toString().padStart(3, '0')}] "
             when (level) {
-                Log.ERROR -> logE(tag, prefix + slice)
-                Log.WARN -> logW(tag, prefix + slice)
-                else -> logI(tag, prefix + slice)
+                Log.ERROR -> logERuntimeOnly(tag, prefix + slice)
+                Log.WARN -> logWRuntimeOnly(tag, prefix + slice)
+                Log.INFO -> logIRuntimeOnly(tag, prefix + slice)
+                else -> logDRuntimeOnly(tag, prefix + slice)
             }
             i = end
             part++

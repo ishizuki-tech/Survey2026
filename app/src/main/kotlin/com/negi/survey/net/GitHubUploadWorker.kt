@@ -88,6 +88,7 @@ class GitHubUploadWorker(
             MODE_RUNTIME_LOGS -> "Uploading runtime logs"
             MODE_STARTUP_RUNTIME_LOGS -> "Uploading startup runtime logs"
             MODE_RING_LOGS -> "Uploading ring logs"
+            MODE_STARTUP_RING_LOGS -> "Uploading startup ring logs"
             else -> "Uploading payload"
         }
 
@@ -138,6 +139,7 @@ class GitHubUploadWorker(
             MODE_RUNTIME_LOGS -> "Uploading runtime logs"
             MODE_STARTUP_RUNTIME_LOGS -> "Uploading startup runtime logs"
             MODE_RING_LOGS -> "Uploading ring logs"
+            MODE_STARTUP_RING_LOGS -> "Uploading startup ring logs"
             else -> "Uploading payload"
         }
 
@@ -1175,6 +1177,10 @@ class GitHubUploadWorker(
     }
 
     private fun ensureChannel() {
+        // English comments only.
+        // Notification channels exist only on API 26+.
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+
         val nm = applicationContext.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         val channel = NotificationChannel(
             CHANNEL_ID,

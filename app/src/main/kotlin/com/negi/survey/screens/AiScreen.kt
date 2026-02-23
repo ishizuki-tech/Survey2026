@@ -27,6 +27,12 @@
  *     - ONE_STEP: persist/display follow-up from Step1 (phase=ONE_STEP).
  *     - If the step bubble already displays the follow-up as plain text,
  *       do NOT add a second "fuq" bubble.
+ *
+ *  Fix (2026-02-22):
+ *  ---------------------------------------------------------------------
+ *   • Reduce sensitive payload leakage in logs:
+ *     - Info logs use len + short hash (no previews).
+ *     - Previews are debug-only (BuildConfig.DEBUG) and remain capped.
  * =====================================================================
  */
 
@@ -469,12 +475,22 @@ fun AiScreen(
                         vmSurvey.addFollowupQuestion(nid, fuNorm)
                         vmAI.setFollowupMode(contextKey, fuNorm)
 
+                        // Info log: do not include raw text preview (use len + hash).
                         RuntimeLogStore.i(
                             TAG,
                             "Follow-up persisted (context=$contextKey node=$nid runId=${step.runId} " +
                                     "phase=${step.phase} twoStep=$isTwoStepNode mode=${step.mode} len=${fuNorm.length} " +
-                                    "preview=${clipForLog(fuNorm, 120)} displayedAsPlain=$displayedAsPlain)"
+                                    "sha6=${shortHash(fuNorm)} displayedAsPlain=$displayedAsPlain)"
                         )
+
+                        // Debug-only preview for local iteration.
+                        if (BuildConfig.DEBUG) {
+                            RuntimeLogStore.d(
+                                TAG,
+                                "Follow-up preview (debug) node=$nid runId=${step.runId} " +
+                                        "preview=${clipForLog(fuNorm, 120)}"
+                            )
+                        }
 
                         scope.launch {
                             delay(40)
@@ -602,13 +618,23 @@ fun AiScreen(
 
             val isTwoStep = vmSurvey.hasTwoStepPrompt(nid)
 
+            // Info log: lengths + short hashes only (no previews).
             RuntimeLogStore.i(
                 TAG,
                 "Submit begin runId=$runId node=$nid role=${conv.role} isTwoStep=$isTwoStep " +
                         "sessionId=${runSafe { vmSurvey.sessionId.value }} surveyUuid=${runSafe { vmSurvey.surveyUuid.value }} " +
                         "qLen=${questionForTurn.length} aLen=${answerForTurn.length} " +
-                        "qPreview=${clipForLog(questionForTurn, 96)} aPreview=${clipForLog(answerForTurn, 96)}"
+                        "qSha6=${shortHash(questionForTurn)} aSha6=${shortHash(answerForTurn)}"
             )
+
+            // Debug-only: capped previews for local iteration.
+            if (BuildConfig.DEBUG) {
+                RuntimeLogStore.d(
+                    TAG,
+                    "Submit payload preview (debug) runId=$runId node=$nid " +
+                            "qPreview=${clipForLog(questionForTurn, 96)} aPreview=${clipForLog(answerForTurn, 96)}"
+                )
+            }
 
             runCatching {
                 if (!isTwoStep) {

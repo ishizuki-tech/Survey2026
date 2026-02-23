@@ -689,6 +689,7 @@ object CrashCapture {
      * - getBaseDir(Context)
      *
      * Fallback path candidates (common patterns):
+     * - filesDir/diagnostics/applog_ring  (AppRingLogStore default)
      * - filesDir/diagnostics/ring
      * - filesDir/diagnostics/ring_store
      * - filesDir/diagnostics/app_ring
@@ -734,6 +735,9 @@ object CrashCapture {
 
         // 2) Fallback candidates.
         val candidates = listOf(
+            // AppRingLogStore default location (most important fallback).
+            File(filesDir, "diagnostics/applog_ring"),
+
             File(filesDir, "diagnostics/ring"),
             File(filesDir, "diagnostics/ring_store"),
             File(filesDir, "diagnostics/app_ring"),

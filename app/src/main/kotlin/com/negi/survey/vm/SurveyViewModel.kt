@@ -5,7 +5,7 @@
  *  File: SurveyViewModel.kt
  *  Author: Shu Ishizuki (石附 支)
  *  License: MIT License
- *  © 2025 IshizukiTech LLC. All rights reserved.
+ *  © 2026 IshizukiTech LLC. All rights reserved.
  * =====================================================================
  *
  *  Summary:
@@ -106,7 +106,13 @@ open class SurveyViewModel(
 
         private const val KEY_PREVIEW_LIMIT = 64
 
-        /** Export metadata key for the run-level free text note. */
+        /**
+         * Export metadata key for the run-level free text note.
+         *
+         * IMPORTANT:
+         * - Keep the key stable for backward compatibility across exporters.
+         * - Despite the name, this value is the RUN note (snapshotted at run start).
+         */
         private const val EXPORT_META_SESSION_FREE_TEXT = "session_free_text"
 
         /** Safety cap for free text to keep exports stable. */
@@ -126,8 +132,39 @@ open class SurveyViewModel(
     private val _surveyUuid = MutableStateFlow(UUID.randomUUID().toString())
     val surveyUuid: StateFlow<String> = _surveyUuid.asStateFlow()
 
+    /**
+     * Home draft note (editable on Home only).
+     * This is NOT exported directly.
+     */
+    private val _homeDraftFreeText = MutableStateFlow("")
+    val homeDraftFreeText: StateFlow<String> = _homeDraftFreeText.asStateFlow()
+
+    /**
+     * Run note (snapshotted at run start).
+     * This is exported and should remain stable for the current run.
+     */
+    private val _runNoteFreeText = MutableStateFlow("")
+    val runNoteFreeText: StateFlow<String> = _runNoteFreeText.asStateFlow()
+
+    /**
+     * Public UI binding.
+     *
+     * Behavior:
+     * - Before run activation: mirrors home draft.
+     * - After run activation: mirrors run note (even if user navigates back to Home).
+     *
+     * This keeps existing UI code compatible while fixing "Back to Home clears note".
+     */
     private val _runFreeText = MutableStateFlow("")
     val runFreeText: StateFlow<String> = _runFreeText.asStateFlow()
+
+    /**
+     * Run activation flag:
+     * - false: user is on Home preparing draft (or just reset).
+     * - true : user has started the run (moved past START at least once).
+     */
+    private val _isRunActive = MutableStateFlow(false)
+    val isRunActive: StateFlow<Boolean> = _isRunActive.asStateFlow()
 
     private fun normalizeRunFreeText(text: String): String {
         return text
@@ -136,13 +173,34 @@ open class SurveyViewModel(
             .take(SESSION_FREE_TEXT_MAX_CHARS)
     }
 
+    /**
+     * Update the visible free-text note.
+     *
+     * Rules:
+     * - If run is not active yet, update the Home draft.
+     * - If run is active, update the Run note (so it persists across back navigation).
+     */
     fun setRunFreeText(text: String) {
-        _runFreeText.value = normalizeRunFreeText(text)
+        val normalized = normalizeRunFreeText(text)
+        if (_isRunActive.value) {
+            _runNoteFreeText.value = normalized
+            _runFreeText.value = normalized
+            RuntimeLogStore.d(TAG, "setRunFreeText(run) -> len=${normalized.length}")
+        } else {
+            _homeDraftFreeText.value = normalized
+            _runFreeText.value = normalized
+            RuntimeLogStore.d(TAG, "setRunFreeText(draft) -> len=${normalized.length}")
+        }
     }
 
-
+    /**
+     * Clear both draft and run note.
+     */
     fun resetRunFreeText() {
+        _homeDraftFreeText.value = ""
+        _runNoteFreeText.value = ""
         _runFreeText.value = ""
+        RuntimeLogStore.d(TAG, "resetRunFreeText -> cleared")
     }
 
     @Deprecated("Use resetRunFreeText()", ReplaceWith("resetRunFreeText()"))
@@ -150,8 +208,14 @@ open class SurveyViewModel(
         resetRunFreeText()
     }
 
+    /**
+     * Export extra metadata for this run.
+     *
+     * IMPORTANT:
+     * - Export the RUN note only (not the draft).
+     */
     fun exportExtraMeta(): Map<String, String> {
-        val t = runFreeText.value.trim()
+        val t = _runNoteFreeText.value.trim()
         if (t.isBlank()) return emptyMap()
         return linkedMapOf(EXPORT_META_SESSION_FREE_TEXT to t.take(SESSION_FREE_TEXT_MAX_CHARS))
     }
@@ -629,6 +693,33 @@ open class SurveyViewModel(
             NodeType.DONE -> FlowDone
         }
 
+    /**
+     * Activate the run if we are leaving Home for the first time after a reset.
+     *
+     * Behavior:
+     * - Snapshot Home draft -> Run note.
+     * - Clear Home draft to prevent carryover to future runs.
+     * - Make runFreeText mirror the run note (so back-to-Home keeps the note visible).
+     */
+    @Synchronized
+    private fun activateRunIfNeeded(reason: String) {
+        val cur = _currentNode.value
+        if (_isRunActive.value) return
+        if (cur.type != NodeType.START) return
+        if (nodeStack.size != 1) return
+
+        val snap = normalizeRunFreeText(_homeDraftFreeText.value)
+        _runNoteFreeText.value = snap
+        _homeDraftFreeText.value = ""
+        _runFreeText.value = snap
+        _isRunActive.value = true
+
+        RuntimeLogStore.d(
+            TAG,
+            "activateRunIfNeeded($reason) -> runNoteLen=${snap.length}, draftCleared=true, uuid=${_surveyUuid.value}"
+        )
+    }
+
     @Synchronized
     private fun push(node: Node) {
         _currentNode.value = node
@@ -653,6 +744,7 @@ open class SurveyViewModel(
     @Synchronized
     fun goto(nodeId: String) {
         val k = nodeId.trim()
+        activateRunIfNeeded(reason = "goto:$k")
         val node = nodeOf(k)
         ensureQuestion(node.id)
         push(node)
@@ -661,6 +753,7 @@ open class SurveyViewModel(
     @Synchronized
     fun replaceTo(nodeId: String) {
         val k = nodeId.trim()
+        activateRunIfNeeded(reason = "replaceTo:$k")
         val node = nodeOf(k)
         ensureQuestion(node.id)
 
@@ -682,17 +775,19 @@ open class SurveyViewModel(
     }
 
     /**
-     * Start a brand-new run (new UUID).
+     * Start a brand-new run context (new UUID), returning to START node.
      *
      * preserveSessionFreeText:
-     * - true  -> snapshot Home draft into run note, then clear draft.
-     * - false -> clear both run note and draft.
+     * - true  -> keep the currently visible Home note as a draft for the next run start.
+     * - false -> clear both draft and run note.
      *
-     * This prevents draft carryover across different run UUIDs.
+     * Note:
+     * - Run note will be snapshotted when leaving START for the first time (activateRunIfNeeded()).
+     * - This prevents draft carryover across different run UUIDs unless explicitly requested.
      */
     @Synchronized
     fun resetToStart(preserveSessionFreeText: Boolean = false) {
-        val keepFreeText = if (preserveSessionFreeText) {
+        val keptDraft = if (preserveSessionFreeText) {
             normalizeRunFreeText(_runFreeText.value)
         } else {
             ""
@@ -706,8 +801,13 @@ open class SurveyViewModel(
         resetAudioRefs()
         clearSelections()
 
-        // Preserve only within this new run when explicitly requested.
-        _runFreeText.value = keepFreeText
+        // Reset run lifecycle.
+        _isRunActive.value = false
+        _runNoteFreeText.value = ""
+
+        // Draft for the next run start.
+        _homeDraftFreeText.value = keptDraft
+        _runFreeText.value = keptDraft
 
         nodeStack.clear()
         val start = nodeOf(startId)
@@ -723,7 +823,7 @@ open class SurveyViewModel(
 
         RuntimeLogStore.d(
             TAG,
-            "resetToStart -> ${start.id}, session=${_sessionId.value}, uuid=${_surveyUuid.value}, preserveFreeText=$preserveSessionFreeText"
+            "resetToStart -> ${start.id}, session=${_sessionId.value}, uuid=${_surveyUuid.value}, preserveDraft=$preserveSessionFreeText, draftLen=${keptDraft.length}"
         )
     }
 
@@ -743,7 +843,10 @@ open class SurveyViewModel(
 
         clearSelections()
 
-        RuntimeLogStore.d(TAG, "backToPrevious -> $prevId")
+        RuntimeLogStore.d(
+            TAG,
+            "backToPrevious -> $prevId (runActive=${_isRunActive.value}, uiLen=${_runFreeText.value.length}, runLen=${_runNoteFreeText.value.length}, draftLen=${_homeDraftFreeText.value.length})"
+        )
     }
 
     @Synchronized
@@ -754,6 +857,9 @@ open class SurveyViewModel(
             RuntimeLogStore.d(TAG, "advanceToNext: no nextId from ${cur.id}")
             return
         }
+
+        // Run activation happens exactly when leaving START for the first time.
+        activateRunIfNeeded(reason = "advanceToNext:$nextId")
 
         if (!graph.containsKey(nextId)) {
             throw IllegalStateException(
@@ -913,6 +1019,10 @@ open class SurveyViewModel(
 
         updateCanGoBack()
 
+        // Initialize note state.
+        _isRunActive.value = false
+        _homeDraftFreeText.value = ""
+        _runNoteFreeText.value = ""
         _runFreeText.value = ""
 
         RuntimeLogStore.d(

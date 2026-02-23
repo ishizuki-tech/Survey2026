@@ -31,6 +31,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -564,6 +565,15 @@ class LiteRtRepository(
             val driverJob = launch(Dispatchers.Default) {
                 AI_INFERENCE_GATE.withPermit {
                     gateActive.set(true)
+
+                    /**
+                     * IMPORTANT:
+                     * - LiteRtLM-backed SLM.runInference() is non-blocking (it launches work on its own scope),
+                     *   so without an explicit await, this withPermit block would exit immediately.
+                     * - Exiting early breaks serialization and cancels watchdog coroutines launched in this scope.
+                     */
+                    val completion = CompletableDeferred<String>()
+
                     try {
                         val gateWaitMs = SystemClock.elapsedRealtime() - gateReqAt
 
@@ -587,8 +597,9 @@ class LiteRtRepository(
                         val fullOut = StringBuilder(8 * 1024)
 
                         // IMPORTANT:
-                        // Use the shared StreamDeltaNormalizer from SLM.kt to avoid diverging logic.
-                        val normalizer = StreamDeltaNormalizer(StreamDeltaNormalizer.PartialMode.AUTO)
+                        // LiteRtLM -> SLM contract delivers DELTA chunks (not accumulated snapshots).
+                        // Keeping AUTO here may cause rare false-ACCUMULATED decisions and drop text.
+                        val normalizer = StreamDeltaNormalizer(StreamDeltaNormalizer.PartialMode.DELTA)
 
                         fun appendOutput(delta: String) {
                             if (delta.isEmpty()) return
@@ -717,6 +728,9 @@ class LiteRtRepository(
 
                         fun closeOnce(reason: String, cause: Throwable? = null) {
                             if (!closed.compareAndSet(false, true)) return
+
+                            // Release the permit only after we mark completion (keeps watchdogs alive).
+                            if (!completion.isCompleted) completion.complete(reason)
 
                             internalClose.set(true)
                             finalizeOnce(reason, cause)
@@ -971,6 +985,10 @@ class LiteRtRepository(
                                 closeOnce("exception", t)
                             }
                         }
+
+                        // Hold the permit until closeOnce() fires (or the coroutine is cancelled).
+                        // This keeps watchdog coroutines alive and preserves strict serialization.
+                        completion.await()
                     } finally {
                         gateActive.set(false)
                     }

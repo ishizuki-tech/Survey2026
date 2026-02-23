@@ -57,7 +57,10 @@ import androidx.compose.foundation.layout.wrapContentWidth
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.outlined.NavigateNext
 import androidx.compose.material.icons.automirrored.outlined.Send
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Settings
@@ -99,8 +102,10 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
@@ -158,12 +163,6 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-
-import androidx.compose.foundation.text.KeyboardActions
-import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.material.icons.automirrored.outlined.NavigateNext
-import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.text.input.ImeAction
 
 /** IMPORTANT: Alias to avoid accidental collision with local types. */
 import com.negi.survey.screens.ConfigDetails as ScreenConfigDetails
@@ -296,7 +295,6 @@ private fun Modifier.neutralEdge(
         )
     }
 )
-
 
 /* ───────────────────────────── Init Gate ───────────────────────────── */
 
@@ -969,6 +967,20 @@ fun SurveyNavHost(
     /** Keep SpeechController aligned with the real survey run id. */
     val surveyUuid by vmSurvey.surveyUuid.collectAsState()
 
+    /**
+     * Defensive persistence:
+     * - Some navigation paths may clear runFreeText unexpectedly (e.g., back to Home).
+     * - Keep a session-level "shadow" and restore when Home re-enters with empty ViewModel state.
+     */
+    val runFreeText by vmSurvey.runFreeText.collectAsState()
+    var runFreeTextShadow by rememberSaveable(sessionId) { mutableStateOf("") }
+
+    LaunchedEffect(runFreeText) {
+        if (runFreeTextShadow != runFreeText) {
+            runFreeTextShadow = runFreeText
+        }
+    }
+
     // IMPORTANT:
     // - IME causes recompositions and size changes.
     // - imePadding() here prevents the whole nav content from being covered by the keyboard.
@@ -1055,13 +1067,25 @@ fun SurveyNavHost(
             entryProvider = entryProvider {
 
                 entry<FlowHome> {
+                    // Restore the note if ViewModel was cleared unexpectedly when navigating back.
+                    LaunchedEffect(runFreeTextShadow) {
+                        val vmValue = vmSurvey.runFreeText.value
+                        if (vmValue.isBlank() && runFreeTextShadow.isNotBlank()) {
+                            Log.d(
+                                MainActivity.TAG,
+                                "FlowHome -> restoring runFreeText from shadow. len=${runFreeTextShadow.length}"
+                            )
+                            vmSurvey.setRunFreeText(runFreeTextShadow)
+                        }
+                    }
+
                     HomeScreen(
                         vmSurvey = vmSurvey,
                         speechController = speechController,
                         speechEnabled = voiceEnabled,
                         onStart = {
                             /** Snapshot the home note text before resetting the run. */
-                            val homeNote = vmSurvey.runFreeText.value
+                            val homeNote = runFreeTextShadow
 
                             /** Snapshot draft length before starting a new run. */
                             val draftLen = homeNote.length
@@ -1075,6 +1099,7 @@ fun SurveyNavHost(
 
                             /** Restore the home note deterministically after reset (avoid losing text due to reset side-effects). */
                             if (homeNote.isNotBlank()) {
+                                runFreeTextShadow = homeNote
                                 vmSurvey.setRunFreeText(homeNote)
                             }
 
@@ -1087,6 +1112,10 @@ fun SurveyNavHost(
 
                             vmAI.resetStates(keepError = false)
                             vmSurvey.advanceToNext()
+                        },
+                        onUpdateFreeText = { v ->
+                            runFreeTextShadow = v
+                            vmSurvey.setRunFreeText(v)
                         }
                     )
                 }
@@ -1699,7 +1728,8 @@ private fun HomeScreen(
     vmSurvey: SurveyViewModel,
     speechController: SpeechController,
     speechEnabled: Boolean,
-    onStart: () -> Unit
+    onStart: () -> Unit,
+    onUpdateFreeText: (String) -> Unit
 ) {
     val backplate = appBackplate()
     val focusManager = LocalFocusManager.current
@@ -1751,7 +1781,6 @@ private fun HomeScreen(
 
         if ((isRecording || isTranscribing) && !timedOut) return@LaunchedEffect
 
-        // English comments only.
         /** Best-effort utterance to merge (final if settled; partial if timed out). */
         val utter = partialText.trim()
 
@@ -1818,7 +1847,7 @@ private fun HomeScreen(
 
                 HomeFreeTextComposer(
                     value = freeText,
-                    onValueChange = { vmSurvey.setRunFreeText(it) },
+                    onValueChange = { onUpdateFreeText(it) },
                     enabled = !pendingStart,
                     speechEnabled = speechEnabled,
                     speechRecording = isRecording,
@@ -1859,7 +1888,7 @@ private fun mergeFreeTextDraft(existing: String, utterance: String): String {
 }
 
 /* ───────────────────────────── Config UI Helpers ───────────────────────────── */
-/* （以下、あなたの元ファイルのまま。省略せず全文維持） */
+/* (The rest is kept as-is from your original file; do not omit.) */
 
 private fun configOptionFromFileName(fileName: String): ConfigOptionUi {
     val stem = fileName.removeSuffix(".yaml").removeSuffix(".yml")
