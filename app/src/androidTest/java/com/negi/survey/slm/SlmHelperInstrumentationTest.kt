@@ -241,7 +241,6 @@ class SlmHelperInstrumentationTest {
      * Collects streaming output until completion, reconstructing the final text robustly.
      * Returns meta info, used by some tests.
      *
-     * English comment:
      * - Best-effort checks busy=true/false, but does not hard-fail if the model
      *   short-circuits too quickly (e.g., immediate error or synchronous finish).
      * - Dedicated tests (busy_flag_toggles_correctly, cancel_*) still assert

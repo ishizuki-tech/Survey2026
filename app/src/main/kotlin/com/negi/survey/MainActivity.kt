@@ -21,6 +21,7 @@ import android.content.res.AssetManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.SystemClock
 import android.provider.Settings
 import android.util.Log
 import androidx.activity.ComponentActivity
@@ -30,6 +31,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.Crossfade
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
@@ -40,6 +42,8 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -47,20 +51,30 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.wrapContentWidth
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.outlined.NavigateNext
+import androidx.compose.material.icons.automirrored.outlined.Send
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.SnackbarResult
@@ -72,6 +86,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -81,10 +96,16 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
@@ -135,7 +156,6 @@ import com.negi.survey.vm.FlowText
 import com.negi.survey.vm.SurveyViewModel
 import com.negi.survey.vm.WhisperSpeechController
 import java.util.Locale
-import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -162,8 +182,8 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Install crash capture BEFORE any heavy init to catch early failures.
-        bootstrapCrashCaptureOnce(applicationContext)
+        // CrashCapture + startup uploads are centralized in SurveyApp for stability.
+        // Keep MainActivity focused on UI/session wiring.
 
         // Use application context to avoid accidentally retaining Activity.
         LiteRtLM.setApplicationContext(applicationContext)
@@ -183,23 +203,6 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
-    }
-
-    /**
-     * Install crash capture and enqueue pending crash uploads only once per process.
-     *
-     * This avoids repeated directory scans and redundant WorkManager enqueue calls when:
-     * - Activity is recreated (rotation, configuration changes)
-     * - Activity is restarted by the system while process stays alive
-     */
-    private fun bootstrapCrashCaptureOnce(appContext: Context) {
-        if (!crashBootstrapOnce.compareAndSet(false, true)) return
-
-        runCatching { CrashCapture.install(appContext) }
-            .onFailure { Log.w(TAG, "CrashCapture.install failed: ${it.message}", it) }
-
-        runCatching { CrashCapture.enqueuePendingCrashUploadsIfPossible(appContext) }
-            .onFailure { Log.w(TAG, "CrashCapture.enqueuePendingCrashUploads failed: ${it.message}", it) }
     }
 
     /**
@@ -238,9 +241,6 @@ class MainActivity : ComponentActivity() {
 
     companion object {
         const val TAG = "MainActivity"
-
-        /** Process-level guard for crash bootstrap. */
-        private val crashBootstrapOnce = AtomicBoolean(false)
     }
 }
 
@@ -269,6 +269,29 @@ private fun Modifier.neonEdgeThin(
                 radius = radius
             ),
             cornerRadius = CornerRadius(cr, cr)
+        )
+    }
+)
+
+@Composable
+private fun Modifier.neutralEdge(
+    alpha: Float = 0.16f,
+    corner: Dp = 12.dp,
+    stroke: Dp = 1.dp
+): Modifier = this.then(
+    Modifier.drawBehind {
+        val cr = CornerRadius(corner.toPx(), corner.toPx())
+        val sweep = Brush.sweepGradient(
+            0f to Color(0xFF101010).copy(alpha = alpha),
+            0.25f to Color(0xFF3A3A3A).copy(alpha = alpha),
+            0.5f to Color(0xFF7A7A7A).copy(alpha = alpha * 0.9f),
+            0.75f to Color(0xFF3A3A3A).copy(alpha = alpha),
+            1f to Color(0xFF101010).copy(alpha = alpha)
+        )
+        drawRoundRect(
+            brush = sweep,
+            style = Stroke(width = stroke.toPx()),
+            cornerRadius = cr
         )
     }
 )
@@ -944,6 +967,20 @@ fun SurveyNavHost(
     /** Keep SpeechController aligned with the real survey run id. */
     val surveyUuid by vmSurvey.surveyUuid.collectAsState()
 
+    /**
+     * Defensive persistence:
+     * - Some navigation paths may clear runFreeText unexpectedly (e.g., back to Home).
+     * - Keep a session-level "shadow" and restore when Home re-enters with empty ViewModel state.
+     */
+    val runFreeText by vmSurvey.runFreeText.collectAsState()
+    var runFreeTextShadow by rememberSaveable(sessionId) { mutableStateOf("") }
+
+    LaunchedEffect(runFreeText) {
+        if (runFreeTextShadow != runFreeText) {
+            runFreeTextShadow = runFreeText
+        }
+    }
+
     // IMPORTANT:
     // - IME causes recompositions and size changes.
     // - imePadding() here prevents the whole nav content from being covered by the keyboard.
@@ -1028,13 +1065,57 @@ fun SurveyNavHost(
             backStack = backStack,
             entryDecorators = listOf(rememberSaveableStateHolderNavEntryDecorator()),
             entryProvider = entryProvider {
+
                 entry<FlowHome> {
+                    // Restore the note if ViewModel was cleared unexpectedly when navigating back.
+                    LaunchedEffect(runFreeTextShadow) {
+                        val vmValue = vmSurvey.runFreeText.value
+                        if (vmValue.isBlank() && runFreeTextShadow.isNotBlank()) {
+                            Log.d(
+                                MainActivity.TAG,
+                                "FlowHome -> restoring runFreeText from shadow. len=${runFreeTextShadow.length}"
+                            )
+                            vmSurvey.setRunFreeText(runFreeTextShadow)
+                        }
+                    }
+
                     HomeScreen(
+                        vmSurvey = vmSurvey,
+                        speechController = speechController,
+                        speechEnabled = voiceEnabled,
                         onStart = {
-                            Log.d(MainActivity.TAG, "Home -> Start survey. session=$sessionId")
-                            vmSurvey.resetToStart()
+                            /** Snapshot the home note text before resetting the run. */
+                            val homeNote = runFreeTextShadow
+
+                            /** Snapshot draft length before starting a new run. */
+                            val draftLen = homeNote.length
+                            Log.d(
+                                MainActivity.TAG,
+                                "Home -> Start survey. session=$sessionId freeTextDraftLen=$draftLen (run-scoped)"
+                            )
+
+                            // Creates a NEW run UUID.
+                            vmSurvey.resetToStart(preserveSessionFreeText = true)
+
+                            /** Restore the home note deterministically after reset (avoid losing text due to reset side-effects). */
+                            if (homeNote.isNotBlank()) {
+                                runFreeTextShadow = homeNote
+                                vmSurvey.setRunFreeText(homeNote)
+                            }
+
+                            /** After reset, verify the run note length. */
+                            val runLen = vmSurvey.runFreeText.value.length
+                            Log.d(
+                                MainActivity.TAG,
+                                "Home -> Start survey: runNoteLen=$runLen (restoredAfterReset)"
+                            )
+
                             vmAI.resetStates(keepError = false)
                             vmSurvey.advanceToNext()
+                        },
+                        onUpdateFreeText = { v ->
+                            runFreeTextShadow = v
+                            vmSurvey.setRunFreeText(v)
                         }
                     )
                 }
@@ -1169,11 +1250,6 @@ private fun buildGitHubConfigOrNull(): GitHubUploader.GitHubConfig? {
 
 /* ───────────────────────────── Minimal Node Screens ───────────────────────────── */
 
-/**
- * Minimal TEXT node UI.
- *
- * This prevents runtime crashes when YAML contains TEXT nodes but the host has no entry.
- */
 @Composable
 private fun TextNodeScreen(
     title: String,
@@ -1230,11 +1306,8 @@ private fun TextNodeScreen(
     }
 }
 
-/**
- * Minimal SINGLE_CHOICE node UI.
- *
- * Stores selection in SurveyViewModel.single via callbacks supplied by the host.
- */
+/* (SingleChoiceNodeScreen / MultiChoiceNodeScreen / RowButtons are unchanged below) */
+
 @Composable
 private fun SingleChoiceNodeScreen(
     title: String,
@@ -1317,11 +1390,6 @@ private fun SingleChoiceNodeScreen(
     }
 }
 
-/**
- * Minimal MULTI_CHOICE node UI.
- *
- * Stores selection set in SurveyViewModel.multi via callbacks supplied by the host.
- */
 @Composable
 private fun MultiChoiceNodeScreen(
     title: String,
@@ -1404,9 +1472,6 @@ private fun MultiChoiceNodeScreen(
     }
 }
 
-/**
- * Shared two-button row (kept simple: column-aligned for readability).
- */
 @Composable
 private fun RowButtons(
     primaryLabel: String,
@@ -1427,10 +1492,327 @@ private fun RowButtons(
 /* ───────────────────────────── Home Screen ───────────────────────────── */
 
 @Composable
+private fun HomeFreeTextComposer_OLD(
+    value: String,
+    onValueChange: (String) -> Unit,
+    enabled: Boolean,
+    speechEnabled: Boolean,
+    speechRecording: Boolean,
+    speechTranscribing: Boolean,
+    onToggleSpeech: (() -> Unit)?,
+    onSend: () -> Unit,
+    speechStatusText: String?,
+    speechStatusIsError: Boolean,
+    modifier: Modifier = Modifier
+) {
+    val cs = MaterialTheme.colorScheme
+    val focusRequester = remember { FocusRequester() }
+
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp, vertical = 8.dp)
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .shadow(elevation = 8.dp, shape = CircleShape, clip = false)
+                .background(
+                    brush = Brush.linearGradient(
+                        listOf(
+                            cs.surfaceVariant.copy(alpha = 0.65f),
+                            cs.surface.copy(alpha = 0.65f)
+                        )
+                    ),
+                    shape = CircleShape
+                )
+                .neutralEdge(alpha = 0.14f, corner = 999.dp, stroke = 1.dp)
+                .padding(start = 12.dp, end = 6.dp, top = 6.dp, bottom = 6.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            OutlinedTextField(
+                value = value,
+                onValueChange = onValueChange,
+                modifier = Modifier
+                    .weight(1f)
+                    .focusRequester(focusRequester),
+                placeholder = { Text("Type a note…") },
+                minLines = 1,
+                maxLines = 5,
+                enabled = enabled,
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+                keyboardActions = KeyboardActions(onSend = { onSend() }),
+                colors = OutlinedTextFieldDefaults.colors(
+                    unfocusedContainerColor = Color.Transparent,
+                    focusedContainerColor = Color.Transparent,
+                    disabledContainerColor = Color.Transparent,
+                    focusedBorderColor = Color.Transparent,
+                    unfocusedBorderColor = Color.Transparent
+                ),
+                textStyle = MaterialTheme.typography.bodyMedium
+            )
+
+            if (speechEnabled && onToggleSpeech != null) {
+                val tint = cs.onSurfaceVariant
+                val micEnabled = (enabled || speechRecording) && !speechTranscribing
+
+                IconButton(
+                    onClick = onToggleSpeech,
+                    enabled = micEnabled
+                ) {
+                    Crossfade(
+                        targetState = speechRecording,
+                        label = "mic-toggle-composer"
+                    ) { rec ->
+                        if (rec) {
+                            Icon(
+                                imageVector = Icons.Filled.Stop,
+                                contentDescription = "Stop recording",
+                                tint = tint
+                            )
+                        } else {
+                            Icon(
+                                imageVector = Icons.Filled.Mic,
+                                contentDescription = "Start recording",
+                                tint = tint
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        if (speechStatusText != null) {
+            Spacer(Modifier.height(4.dp))
+            Text(
+                text = speechStatusText,
+                style = MaterialTheme.typography.labelSmall,
+                color = if (speechStatusIsError) cs.error else cs.onSurfaceVariant,
+                modifier = Modifier.padding(start = 4.dp, top = 2.dp)
+            )
+        }
+
+        FilledTonalButton(
+            onClick = onSend,
+            enabled = enabled,
+            shape = CircleShape,
+            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp)
+        ) {
+            Icon(
+                imageVector = Icons.AutoMirrored.Outlined.NavigateNext,
+                contentDescription = "Start"
+            )
+        }
+    }
+}
+
+@Composable
+private fun HomeFreeTextComposer(
+    value: String,
+    onValueChange: (String) -> Unit,
+    enabled: Boolean,
+    speechEnabled: Boolean,
+    speechRecording: Boolean,
+    speechTranscribing: Boolean,
+    onToggleSpeech: (() -> Unit)?,
+    onSend: () -> Unit,
+    speechStatusText: String?,
+    speechStatusIsError: Boolean,
+    modifier: Modifier = Modifier
+) {
+    val cs = MaterialTheme.colorScheme
+    val focusRequester = remember { FocusRequester() }
+
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp, vertical = 8.dp)
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .shadow(elevation = 8.dp, shape = CircleShape, clip = false)
+                .background(
+                    brush = Brush.linearGradient(
+                        listOf(
+                            cs.surfaceVariant.copy(alpha = 0.65f),
+                            cs.surface.copy(alpha = 0.65f)
+                        )
+                    ),
+                    shape = CircleShape
+                )
+                .neutralEdge(alpha = 0.14f, corner = 999.dp, stroke = 1.dp)
+                .padding(start = 12.dp, end = 6.dp, top = 6.dp, bottom = 6.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            OutlinedTextField(
+                value = value,
+                onValueChange = onValueChange,
+                modifier = Modifier
+                    .weight(1f)
+                    .focusRequester(focusRequester),
+                placeholder = { Text("Type a note…") },
+                minLines = 1,
+                maxLines = 5,
+                enabled = enabled,
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+                keyboardActions = KeyboardActions(onSend = { onSend() }),
+                colors = OutlinedTextFieldDefaults.colors(
+                    unfocusedContainerColor = Color.Transparent,
+                    focusedContainerColor = Color.Transparent,
+                    disabledContainerColor = Color.Transparent,
+                    focusedBorderColor = Color.Transparent,
+                    unfocusedBorderColor = Color.Transparent
+                ),
+                textStyle = MaterialTheme.typography.bodyMedium
+            )
+
+            if (speechEnabled && onToggleSpeech != null) {
+                val tint = cs.onSurfaceVariant
+                val micEnabled = (enabled || speechRecording) && !speechTranscribing
+
+                IconButton(
+                    onClick = onToggleSpeech,
+                    enabled = micEnabled
+                ) {
+                    Crossfade(
+                        targetState = speechRecording,
+                        label = "mic-toggle-composer"
+                    ) { rec ->
+                        if (rec) {
+                            Icon(
+                                imageVector = Icons.Filled.Stop,
+                                contentDescription = "Stop recording",
+                                tint = tint
+                            )
+                        } else {
+                            Icon(
+                                imageVector = Icons.Filled.Mic,
+                                contentDescription = "Start recording",
+                                tint = tint
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        if (speechStatusText != null) {
+            Spacer(Modifier.height(4.dp))
+            Text(
+                text = speechStatusText,
+                style = MaterialTheme.typography.labelSmall,
+                color = if (speechStatusIsError) cs.error else cs.onSurfaceVariant,
+                modifier = Modifier.padding(start = 4.dp, top = 2.dp)
+            )
+        }
+
+        FilledTonalButton(
+            onClick = onSend,
+            enabled = enabled,
+            shape = CircleShape,
+            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp)
+        ) {
+            Icon(
+                imageVector = Icons.AutoMirrored.Outlined.NavigateNext,
+                contentDescription = "Start"
+            )
+            Spacer(Modifier.width(8.dp))
+            Text("Start")
+        }
+    }
+}
+
+@Composable
 private fun HomeScreen(
-    onStart: () -> Unit
+    vmSurvey: SurveyViewModel,
+    speechController: SpeechController,
+    speechEnabled: Boolean,
+    onStart: () -> Unit,
+    onUpdateFreeText: (String) -> Unit
 ) {
     val backplate = appBackplate()
+    val focusManager = LocalFocusManager.current
+
+    val surveyUuid by vmSurvey.surveyUuid.collectAsState()
+    val freeText by vmSurvey.runFreeText.collectAsState()
+
+    val isRecording by speechController.isRecording.collectAsState()
+    val isTranscribing by speechController.isTranscribing.collectAsState()
+    val partialText by speechController.partialText.collectAsState()
+    val speechError by speechController.errorMessage.collectAsState()
+
+    /** Latest onStart lambda reference for async completion. */
+    val latestOnStart = rememberUpdatedState(onStart)
+
+    /** Gate: user pressed Start; we must commit pending dictation before leaving Home. */
+    var pendingStart by remember(surveyUuid) { mutableStateOf(false) }
+
+    /** Deadline (elapsedRealtime) to avoid infinite waiting if transcription stalls. */
+    var startDeadlineMs by remember(surveyUuid) { mutableLongStateOf(0L) }
+
+    /** Arm a single "commit" after the user stops recording. */
+    var armCommit by remember(surveyUuid) { mutableStateOf(false) }
+    var prevRecording by remember(surveyUuid) { mutableStateOf(false) }
+    var lastCommittedUtterance by remember(surveyUuid) { mutableStateOf("") }
+
+    LaunchedEffect(isRecording) {
+        if (prevRecording && !isRecording) {
+            // Recording just stopped -> next time transcription settles, commit once.
+            armCommit = true
+        }
+        prevRecording = isRecording
+    }
+
+    /** Commit dictation when ready; if Start is pending, proceed only after commit. */
+    LaunchedEffect(
+        pendingStart,
+        startDeadlineMs,
+        armCommit,
+        isRecording,
+        isTranscribing,
+        partialText,
+        freeText
+    ) {
+        if (!pendingStart && !armCommit) return@LaunchedEffect
+
+        val now = SystemClock.elapsedRealtime()
+        val timedOut = pendingStart && startDeadlineMs != 0L && now >= startDeadlineMs
+
+        if ((isRecording || isTranscribing) && !timedOut) return@LaunchedEffect
+
+        /** Best-effort utterance to merge (final if settled; partial if timed out). */
+        val utter = partialText.trim()
+
+        if (armCommit) {
+            if (utter.isNotBlank() && utter != lastCommittedUtterance) {
+                val merged = mergeFreeTextDraft(existing = freeText, utterance = utter)
+                vmSurvey.setRunFreeText(merged)
+                lastCommittedUtterance = utter
+            }
+            armCommit = false
+        }
+
+        if (pendingStart) {
+            pendingStart = false
+            startDeadlineMs = 0L
+            latestOnStart.value.invoke()
+        }
+    }
+
+    val speechStatusIsError = !speechError.isNullOrBlank()
+    val speechStatusText: String? = when {
+        speechStatusIsError -> speechError
+        pendingStart -> {
+            val live = partialText.trim()
+            if (live.isNotBlank()) "Finalizing… $live" else "Finalizing voice note…"
+        }
+        isRecording || isTranscribing -> {
+            val live = partialText.trim()
+            if (live.isNotBlank()) live else if (isRecording) "(listening…)" else "Transcribing…"
+        }
+        else -> null
+    }
 
     Box(
         modifier = Modifier
@@ -1446,33 +1828,67 @@ private fun HomeScreen(
             shape = MaterialTheme.shapes.large,
             color = MaterialTheme.colorScheme.surface.copy(alpha = 0.97f),
             modifier = Modifier
+                .fillMaxWidth()
+                .widthIn(max = 520.dp)
                 .wrapContentWidth()
                 .neonEdgeThin()
         ) {
             Column(
-                modifier = Modifier.padding(horizontal = 24.dp, vertical = 20.dp),
-                horizontalAlignment = Alignment.CenterHorizontally
+                modifier = Modifier.padding(horizontal = 18.dp, vertical = 18.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
+                Text(text = "Survey ready", style = MaterialTheme.typography.titleLarge)
                 Text(
-                    text = "Survey ready",
-                    style = MaterialTheme.typography.titleLarge
-                )
-                Spacer(Modifier.height(6.dp))
-                Text(
-                    text = "Tap Start to begin answering the configured survey.",
+                    text = "Tap Send to start. You can optionally dictate or type a note for this run.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
-                Spacer(Modifier.height(16.dp))
-                OutlinedButton(onClick = onStart) {
-                    Text("Start survey")
-                }
+
+                HomeFreeTextComposer(
+                    value = freeText,
+                    onValueChange = { onUpdateFreeText(it) },
+                    enabled = !pendingStart,
+                    speechEnabled = speechEnabled,
+                    speechRecording = isRecording,
+                    speechTranscribing = isTranscribing,
+                    onToggleSpeech = if (speechEnabled) {
+                        {
+                            /** Route dictation under a dedicated pseudo questionId for home note. */
+                            runCatching { speechController.updateContext(surveyUuid, HOME_FREE_TEXT_QID) }
+                            runCatching { speechController.toggleRecording() }
+                        }
+                    } else null,
+                    onSend = {
+                        /** Stop dictation; commit pending transcription before starting the survey flow. */
+                        runCatching { speechController.stopRecording() }
+                        focusManager.clearFocus(force = true)
+                        /** Delay navigation until commit completes (avoid losing dictation when Home composable disposes). */
+                        pendingStart = true
+                        startDeadlineMs = SystemClock.elapsedRealtime() + 8_000L
+                    },
+                    speechStatusText = speechStatusText,
+                    speechStatusIsError = speechStatusIsError
+                )
             }
         }
     }
 }
 
+/** Dedicated pseudo question id for Home screen free-text dictation context. */
+private const val HOME_FREE_TEXT_QID: String = "__home_free_text__"
+
+/** Merge an utterance into the existing draft with a stable newline separator. */
+private fun mergeFreeTextDraft(existing: String, utterance: String): String {
+    val a = existing.trimEnd()
+    val b = utterance.trim()
+    if (b.isBlank()) return a
+    if (a.isBlank()) return b
+    return if (a.endsWith("\n")) a + b else "$a\n$b"
+}
+
 /* ───────────────────────────── Config UI Helpers ───────────────────────────── */
+/* (The rest is kept as-is from your original file; do not omit.) */
 
 private fun configOptionFromFileName(fileName: String): ConfigOptionUi {
     val stem = fileName.removeSuffix(".yaml").removeSuffix(".yml")

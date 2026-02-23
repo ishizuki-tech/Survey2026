@@ -31,7 +31,6 @@ import java.util.concurrent.atomic.AtomicBoolean
 /**
  * Base instrumentation test harness for AiViewModel + SLM end-to-end tests.
  *
- * English comment:
  * - Loads SurveyConfig from assets.
  * - Merges SLM runtime config from:
  *   • hard defaults
@@ -228,7 +227,6 @@ open class AiViewModelSurveyBase {
                     if (it.equals(Accelerator.CPU.label, true)) Accelerator.CPU else Accelerator.GPU
                 } ?: defaultAccel()
 
-            // English comment:
             // First attempt: requested accelerator (defaults to GPU).
             model = Model(
                 name = "gemma-3n-E4B-it",
@@ -247,7 +245,6 @@ open class AiViewModelSurveyBase {
                 }
             }
 
-            // English comment:
             // Fallback: if GPU failed and it was requested, retry with CPU.
             if (!initErr.isNullOrEmpty() && firstAccel != Accelerator.CPU) {
                 Logx.w(TAG, "GPU init failed: $initErr → fallback to CPU")
@@ -293,7 +290,6 @@ open class AiViewModelSurveyBase {
 
     @After
     open fun tearDown() {
-        // English comment:
         // Try to politely stop any running inference and reset session.
         runCatching { vm.cancel() }
         val idle = waitUntil(3_000L) { !SLM.isBusy(model) }
@@ -437,7 +433,6 @@ open class AiViewModelSurveyBase {
     /**
      * Low-level helper: run a single SLM generation using [SLM.runInference] directly.
      *
-     * English comment:
      * - Waits until model is idle, then runs inference.
      * - Uses timeouts for first partial chunk and for completion.
      * - Falls back to partial output if completion takes too long.
@@ -783,7 +778,6 @@ open class AiViewModelSurveyBase {
     /**
      * Runs a single prompt through [AiViewModel] and returns the final answer.
      *
-     * English comment:
      * - Starts a new evaluation.
      * - Waits for either a minimal streaming prefix or a final raw answer.
      * - Waits for completion or loading=false.

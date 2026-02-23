@@ -5,7 +5,7 @@
  *  File: FollowupExtractor.kt
  *  Author: Shu Ishizuki (石附 支)
  *  License: MIT License
- *  © 2025 IshizukiTech LLC. All rights reserved.
+ *  © 2026 IshizukiTech LLC. All rights reserved.
  * =====================================================================
  *
  *  Summary:
@@ -23,6 +23,7 @@
  *    - Add extraction APIs for followup_target, followup_needed, weakness
  *      (JSON-first, plain-text best-effort).
  *    - Improve code-fence extraction (inline fences supported).
+ *    - Fix contract field extraction when values are wrapped in JSONObject.
  * =====================================================================
  */
 
@@ -388,7 +389,7 @@ object FollowupExtractor {
      *
      * Strategy:
      * - JSON-first: find first value whose key matches known followup_target keys.
-     *   Supports String or Array-of-Strings.
+     *   Supports String or Array-of-Strings or JSONObject wrappers.
      * - Plain-text fallback: look for a simple "followup_target: ..." line.
      */
     @JvmStatic
@@ -457,7 +458,7 @@ object FollowupExtractor {
      *
      * Strategy:
      * - JSON-first: find first value whose key matches known weakness keys.
-     *   Supports String or Array-of-Strings.
+     *   Supports String or Array-of-Strings or JSONObject wrappers.
      * - Plain-text fallback: look for a "weakness: ..." line.
      */
     @JvmStatic
@@ -752,6 +753,7 @@ object FollowupExtractor {
         val scaled = if (d > 0.0 && d < 1.0) d * 100.0 else d
         return clamp0to100(scaled.roundToInt())
     }
+
     /* ----------------------- Contract fields (recursive JSON) ------------- */
 
     private fun findTextByKeysRecursive(obj: JSONObject, keysNorm: Set<String>): String? {
@@ -763,7 +765,7 @@ object FollowupExtractor {
 
             val v = obj.opt(k)
             val s = extractTextValueBestEffort(v)
-            if (!s.isNullOrBlank()) return s
+            if (!s.isNullOrBlank()) return s.take(MAX_CONTRACT_FIELD_CHARS)
         }
         val it2 = obj.keys()
         while (it2.hasNext()) {
@@ -786,9 +788,17 @@ object FollowupExtractor {
         return null
     }
 
+    /**
+     * Extract a textual value for contract fields (target/weakness/etc).
+     *
+     * IMPORTANT:
+     * - This must NOT reuse question-oriented heuristics.
+     * - Some models wrap contract fields in objects like {"text":"...","lang":"en"}.
+     */
     private fun extractTextValueBestEffort(v: Any?): String? {
         return when (v) {
-            is String -> v.trim().takeIf { it.isNotBlank() }
+            is String -> v.trim().takeIf { it.isNotBlank() }?.take(MAX_CONTRACT_FIELD_CHARS)
+
             is JSONArray -> {
                 val parts = ArrayList<String>()
                 for (i in 0 until v.length()) {
@@ -798,21 +808,80 @@ object FollowupExtractor {
                         if (t.isNotBlank()) parts.add(t)
                     }
                 }
-                parts.joinToString(separator = "; ").trim().takeIf { it.isNotBlank() }
+                parts.joinToString(separator = "; ")
+                    .trim()
+                    .takeIf { it.isNotBlank() }
+                    ?.take(MAX_CONTRACT_FIELD_CHARS)
             }
-            is JSONObject -> {
-                // Some models wrap contract fields inside objects like {"text":"..."}.
-                // Try common question/text fields first.
-                extractQuestionField(v)?.takeIf { it.isNotBlank() }
-                    ?: runCatching {
-                        // Last resort: if it has a single string field, use it.
-                        val keys = collectKeys(v)
-                        val strings = keys.mapNotNull { k -> v.opt(k) as? String }.map { it.trim() }.filter { it.isNotBlank() }
-                        if (strings.size == 1) strings.first() else null
-                    }.getOrNull()
-            }
+
+            is JSONObject -> extractStringFromObjectBestEffort(v)?.take(MAX_CONTRACT_FIELD_CHARS)
+
             else -> null
         }
+    }
+
+    /**
+     * Extract a representative string from a JSONObject wrapper.
+     *
+     * Priority:
+     * 1) Common scalar fields: text/value/content/message/reason/summary/weakness/target
+     * 2) If exactly one non-blank String field exists, return it
+     * 3) Otherwise null
+     */
+    private fun extractStringFromObjectBestEffort(obj: JSONObject): String? {
+        val preferredKeys = listOf(
+            "text",
+            "value",
+            "content",
+            "message",
+            "reason",
+            "summary",
+            "weakness",
+            "target",
+            "followup_target",
+            "followUpTarget"
+        ).map(::normKey)
+
+        val normMap = LinkedHashMap<String, Any?>()
+        val it = obj.keys()
+        while (it.hasNext()) {
+            val k = it.next()
+            normMap[normKey(k)] = obj.opt(k)
+        }
+
+        for (k in preferredKeys) {
+            val v = normMap[k]
+            if (v is String) {
+                val t = v.trim()
+                if (t.isNotBlank() && t.length < HARD_REJECT_QUESTION_CHARS) return t
+            }
+        }
+
+        val strings = normMap.values
+            .mapNotNull { it as? String }
+            .map { it.trim() }
+            .filter { it.isNotBlank() && it.length < HARD_REJECT_QUESTION_CHARS }
+
+        if (strings.size == 1) return strings.first()
+
+        // Last resort: if it has a nested string array under preferred scalar key, join it.
+        for (k in preferredKeys) {
+            val v = normMap[k]
+            if (v is JSONArray) {
+                val parts = ArrayList<String>()
+                for (i in 0 until v.length()) {
+                    val x = v.opt(i)
+                    if (x is String) {
+                        val t = x.trim()
+                        if (t.isNotBlank()) parts.add(t)
+                    }
+                }
+                val joined = parts.joinToString("; ").trim()
+                if (joined.isNotBlank()) return joined
+            }
+        }
+
+        return null
     }
 
     private fun findBooleanByKeysRecursive(obj: JSONObject, keysNorm: Set<String>): Boolean? {

@@ -5,7 +5,7 @@
  *  File: AiViewModel.kt
  *  Author: Shu Ishizuki (石附 支)
  *  License: MIT License
- *  © 2025 IshizukiTech LLC. All rights reserved.
+ *  © 2026 IshizukiTech LLC. All rights reserved.
  * =====================================================================
  */
 
@@ -13,15 +13,19 @@
 
 package com.negi.survey.vm
 
+import android.os.SystemClock
 import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.negi.survey.AppRingLogStore
 import com.negi.survey.BuildConfig
 import com.negi.survey.net.RuntimeLogStore
 import com.negi.survey.slm.FollowupExtractor
 import com.negi.survey.slm.PromptPhase
 import com.negi.survey.slm.Repository
 import java.security.MessageDigest
+import java.util.Collections
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.min
@@ -53,6 +57,12 @@ import kotlinx.coroutines.withTimeout
  * - Step1 (EVAL) remains in primary UI state flows: raw/score/followups.
  * - Step2 (FOLLOWUP) is appended to [stepHistory] without overwriting Step1.
  * - UI can render both Step1 + Step2 from [stepHistory] while keeping Step1 pinned.
+ *
+ * Persistent chat model (B plan, 2026-02):
+ * - Chat history + conversation state are stored per contextKey:
+ *   e.g. "sid=<surveySessionId>|nid=<nodeId>".
+ * - Survives navigation/back while this ViewModel instance is alive.
+ * - Does NOT survive process death (use DB/files if needed).
  */
 class AiViewModel(
     private val repo: Repository,
@@ -65,14 +75,21 @@ class AiViewModel(
         private const val FULL_PROMPT_TAG = "FullPromptReview"
         private const val FULL_TEXT_OUT_TAG = "FullTextOut"
 
-        private const val DEBUG_LOGS = true
-        private const val DEBUG_WHITESPACE = true
+        /** Debug toggles (must NOT be const if referencing BuildConfig). */
+        private val DEBUG_LOGS: Boolean = BuildConfig.DEBUG
+        private val DEBUG_WHITESPACE: Boolean = BuildConfig.DEBUG
         private const val DEBUG_PREVIEW_CHARS = 240
 
         private const val DEFAULT_TIMEOUT_MS = 120_000L
 
         /** Prevent unbounded memory growth in UI history. */
         private const val MAX_STEP_HISTORY = 12
+
+        /** Persisted chat max items per context key. */
+        private const val MAX_CHAT_ITEMS = 260
+
+        /** Upper bound for number of context keys to keep (best-effort LRU). */
+        private const val MAX_CONTEXT_KEYS = 24
 
         /**
          * Reduce UI churn / O(n^2) string concatenation.
@@ -85,6 +102,56 @@ class AiViewModel(
 
         /** Hard cap for long logs to avoid gigantic spam. */
         private const val MAX_LONG_LOG_CHARS = 120_000
+    }
+
+    // ───────────────────────── Logging bridge ─────────────────────────
+
+    /**
+     * Emit logs both to RuntimeLogStore (existing pipeline) and AppRingLogStore (crash-uploadable ring).
+     *
+     * IMPORTANT:
+     * - Ring logs MUST remain "ring-safe": do not include full prompts/outputs or large previews.
+     * - Use *RuntimeOnly* logging helpers for anything that may contain user/model content.
+     */
+    private fun logD(tag: String, msg: String) {
+        RuntimeLogStore.d(tag, msg)
+        AppRingLogStore.log("D", tag, msg)
+    }
+
+    private fun logI(tag: String, msg: String) {
+        RuntimeLogStore.i(tag, msg)
+        AppRingLogStore.log("I", tag, msg)
+    }
+
+    private fun logW(tag: String, msg: String, tr: Throwable? = null) {
+        if (tr != null) RuntimeLogStore.w(tag, msg, tr) else RuntimeLogStore.w(tag, msg)
+        AppRingLogStore.log("W", tag, msg, tr)
+    }
+
+    private fun logE(tag: String, msg: String, tr: Throwable? = null) {
+        if (tr != null) RuntimeLogStore.e(tag, msg, tr) else RuntimeLogStore.e(tag, msg)
+        AppRingLogStore.log("E", tag, msg, tr)
+    }
+
+    /**
+     * Runtime-only logging (no ring).
+     *
+     * Use this for any content that may include user prompts or model outputs.
+     */
+    private fun logDRuntimeOnly(tag: String, msg: String) {
+        RuntimeLogStore.d(tag, msg)
+    }
+
+    private fun logIRuntimeOnly(tag: String, msg: String) {
+        RuntimeLogStore.i(tag, msg)
+    }
+
+    private fun logWRuntimeOnly(tag: String, msg: String, tr: Throwable? = null) {
+        if (tr != null) RuntimeLogStore.w(tag, msg, tr) else RuntimeLogStore.w(tag, msg)
+    }
+
+    private fun logERuntimeOnly(tag: String, msg: String, tr: Throwable? = null) {
+        if (tr != null) RuntimeLogStore.e(tag, msg, tr) else RuntimeLogStore.e(tag, msg)
     }
 
     // ───────────────────────── UI state ─────────────────────────
@@ -182,13 +249,289 @@ class AiViewModel(
             if (next.size <= MAX_STEP_HISTORY) next else next.takeLast(MAX_STEP_HISTORY)
         }
         if (DEBUG_LOGS) {
+            // Runtime only: follow-up preview may contain user/model content.
             val fu0 = s.followups.firstOrNull()?.let { preview(it) } ?: "<none>"
-            RuntimeLogStore.d(
+            logDRuntimeOnly(
                 TAG,
                 "stepHistory+ runId=${s.runId} phase=${s.phase} mode=${s.mode} " +
                         "raw.len=${s.raw.length} score=${s.score} FU=${s.followups.size} " +
                         "FU0='${debugVisible(fu0)}' timeout=${s.timedOut} err=${s.error}"
             )
+        }
+    }
+
+    // ─────────────────────── Persistent chat (B plan) ───────────────────────
+
+    /** Sender for persisted chat items. */
+    enum class ChatSender {
+        USER,
+        AI
+    }
+
+    /**
+     * Persisted chat item (UI-agnostic).
+     *
+     * @param id Stable id for upsert/dedup.
+     * @param sender Sender type.
+     * @param text Plain text payload.
+     * @param json JSON payload (pretty string).
+     * @param isTyping True when this is a streaming typing placeholder.
+     * @param createdAtUptimeMs Monotonic timestamp for ordering/diagnostics.
+     */
+    data class ChatItem(
+        val id: String,
+        val sender: ChatSender,
+        val text: String? = null,
+        val json: String? = null,
+        val isTyping: Boolean = false,
+        val createdAtUptimeMs: Long = SystemClock.uptimeMillis()
+    )
+
+    /** Composer role per conversation context. */
+    enum class ComposerRole {
+        MAIN,
+        FOLLOWUP
+    }
+
+    /**
+     * Persisted conversation state per context key.
+     *
+     * @param role Current composer role.
+     * @param activePromptQuestion The question that should be answered next.
+     * @param composerDraft Draft text for restoration after navigation.
+     */
+    data class ConversationState(
+        val role: ComposerRole,
+        val activePromptQuestion: String,
+        val composerDraft: String
+    )
+
+    private val chatStore = ConcurrentHashMap<String, MutableStateFlow<List<ChatItem>>>()
+    private val conversationStore = ConcurrentHashMap<String, MutableStateFlow<ConversationState>>()
+    private val followupSeen = ConcurrentHashMap<String, MutableSet<String>>()
+
+    /** Best-effort LRU of context keys to prevent runaway memory usage. */
+    private val contextKeyOrder = ArrayDeque<String>()
+
+    private val msgSeq = AtomicLong(0L)
+
+    /**
+     * Return persisted chat history flow for [contextKey].
+     */
+    fun chatHistoryFlow(contextKey: String): StateFlow<List<ChatItem>> {
+        touchContextKey(contextKey)
+        return chatStore.getOrPut(contextKey) { MutableStateFlow(emptyList()) }.asStateFlow()
+    }
+
+    /**
+     * Return persisted conversation state flow for [contextKey].
+     */
+    fun conversationStateFlow(contextKey: String): StateFlow<ConversationState> {
+        touchContextKey(contextKey)
+        return conversationStore.getOrPut(contextKey) {
+            MutableStateFlow(
+                ConversationState(
+                    role = ComposerRole.MAIN,
+                    activePromptQuestion = "",
+                    composerDraft = ""
+                )
+            )
+        }.asStateFlow()
+    }
+
+    /**
+     * Ensure a conversation context exists and is initialized.
+     *
+     * Notes:
+     * - This is safe to call multiple times.
+     * - It only seeds missing fields; it won't clobber existing role/draft.
+     */
+    fun ensureConversationContext(
+        contextKey: String,
+        rootQuestion: String,
+        initialDraft: String
+    ) {
+        touchContextKey(contextKey)
+
+        conversationStore.computeIfAbsent(contextKey) {
+            MutableStateFlow(
+                ConversationState(
+                    role = ComposerRole.MAIN,
+                    activePromptQuestion = rootQuestion,
+                    composerDraft = initialDraft
+                )
+            )
+        }
+
+        conversationStore[contextKey]?.update { cur ->
+            val apq = cur.activePromptQuestion.ifBlank { rootQuestion }
+            val draft = if (cur.composerDraft.isBlank() && initialDraft.isNotBlank()) initialDraft else cur.composerDraft
+            cur.copy(activePromptQuestion = apq, composerDraft = draft)
+        }
+    }
+
+    /**
+     * If the role is MAIN, ensure activePromptQuestion points to [rootQuestion].
+     */
+    fun ensureActivePromptIfMain(contextKey: String, rootQuestion: String) {
+        conversationStore[contextKey]?.update { cur ->
+            if (cur.role != ComposerRole.MAIN) cur
+            else cur.copy(activePromptQuestion = rootQuestion)
+        }
+    }
+
+    /**
+     * Update draft text for [contextKey].
+     */
+    fun updateComposerDraft(contextKey: String, draft: String) {
+        conversationStore[contextKey]?.update { cur ->
+            if (cur.composerDraft == draft) cur else cur.copy(composerDraft = draft)
+        }
+    }
+
+    /**
+     * Switch to FOLLOWUP mode and set active prompt question.
+     */
+    fun setFollowupMode(contextKey: String, followupQuestion: String) {
+        val q = followupQuestion.trim()
+        if (q.isBlank()) return
+        conversationStore[contextKey]?.update { cur ->
+            cur.copy(role = ComposerRole.FOLLOWUP, activePromptQuestion = q)
+        }
+    }
+
+    /**
+     * Ensure the root question message exists and stays current.
+     */
+    fun ensureRootQuestionMessage(contextKey: String, nodeId: String, rootQuestion: String) {
+        val id = "qroot-$nodeId"
+        upsertChatItem(
+            contextKey = contextKey,
+            item = ChatItem(
+                id = id,
+                sender = ChatSender.AI,
+                text = rootQuestion
+            )
+        )
+    }
+
+    /**
+     * Append a user message to the persisted chat.
+     */
+    fun appendUserMessage(contextKey: String, text: String): String {
+        val id = "u-${msgSeq.incrementAndGet()}"
+        appendChatItem(
+            contextKey = contextKey,
+            item = ChatItem(
+                id = id,
+                sender = ChatSender.USER,
+                text = text
+            )
+        )
+        return id
+    }
+
+    /**
+     * Upsert the typing bubble for a node.
+     */
+    fun upsertTypingMessage(contextKey: String, nodeId: String, text: String) {
+        val id = "typing-$nodeId"
+        upsertChatItem(
+            contextKey = contextKey,
+            item = ChatItem(
+                id = id,
+                sender = ChatSender.AI,
+                text = text,
+                isTyping = true
+            )
+        )
+    }
+
+    /**
+     * Remove the typing bubble for a node.
+     */
+    fun removeTypingMessage(contextKey: String, nodeId: String) {
+        val id = "typing-$nodeId"
+        removeChatItem(contextKey, id)
+    }
+
+    /**
+     * Upsert a chat item by id.
+     */
+    fun upsertChatItem(contextKey: String, item: ChatItem) {
+        touchContextKey(contextKey)
+        val flow = chatStore.getOrPut(contextKey) { MutableStateFlow(emptyList()) }
+        flow.update { cur ->
+            val idx = cur.indexOfFirst { it.id == item.id }
+            val next = if (idx == -1) {
+                cur + item
+            } else {
+                cur.toMutableList().also { it[idx] = item }.toList()
+            }
+            next.takeLast(MAX_CHAT_ITEMS)
+        }
+    }
+
+    /**
+     * Append a chat item (always adds; no dedup).
+     */
+    fun appendChatItem(contextKey: String, item: ChatItem) {
+        touchContextKey(contextKey)
+        val flow = chatStore.getOrPut(contextKey) { MutableStateFlow(emptyList()) }
+        flow.update { cur ->
+            (cur + item).takeLast(MAX_CHAT_ITEMS)
+        }
+    }
+
+    /**
+     * Remove a chat item by id.
+     */
+    fun removeChatItem(contextKey: String, id: String) {
+        val flow = chatStore[contextKey] ?: return
+        flow.update { cur -> cur.filterNot { it.id == id } }
+    }
+
+    /**
+     * Mark follow-up question as seen. Returns true if it is newly added.
+     */
+    fun markFollowupSeen(contextKey: String, followupQuestion: String): Boolean {
+        val norm = followupQuestion.trim()
+        if (norm.isBlank()) return false
+        val set = followupSeen.getOrPut(contextKey) { Collections.synchronizedSet(mutableSetOf()) }
+        return set.add(norm)
+    }
+
+    /**
+     * Clear one persisted conversation (chat + state) for [contextKey].
+     */
+    fun clearConversation(contextKey: String) {
+        chatStore.remove(contextKey)
+        conversationStore.remove(contextKey)
+        followupSeen.remove(contextKey)
+        synchronized(contextKeyOrder) {
+            contextKeyOrder.remove(contextKey)
+        }
+    }
+
+    /**
+     * Best-effort LRU maintenance of context keys.
+     */
+    private fun touchContextKey(contextKey: String) {
+        synchronized(contextKeyOrder) {
+            if (contextKeyOrder.contains(contextKey)) {
+                contextKeyOrder.remove(contextKey)
+            }
+            contextKeyOrder.addLast(contextKey)
+
+            while (contextKeyOrder.size > MAX_CONTEXT_KEYS) {
+                val evict = if (contextKeyOrder.isEmpty()) null else contextKeyOrder.removeFirst()
+                if (evict != null) {
+                    chatStore.remove(evict)
+                    conversationStore.remove(evict)
+                    followupSeen.remove(evict)
+                    if (DEBUG_LOGS) logD(TAG, "chatStore evicted contextKey='$evict'")
+                }
+            }
         }
     }
 
@@ -221,21 +564,15 @@ class AiViewModel(
         val timedOut: Boolean
     )
 
-    /**
-     * Evaluate the given [prompt] and return the parsed score (0..100) or null.
-     *
-     * Single-flight:
-     * - If already running, returns the current score.
-     */
     suspend fun evaluate(prompt: String, timeoutMs: Long = defaultTimeoutMs): Int? {
         if (prompt.isBlank()) {
-            RuntimeLogStore.i(TAG, "evaluate: blank prompt -> reset states and return null")
+            logI(TAG, "evaluate: blank prompt -> reset states and return null")
             resetStates(keepError = false)
             return null
         }
 
         if (!running.compareAndSet(false, true)) {
-            RuntimeLogStore.w(TAG, "evaluate: already running -> returning current score=${_score.value}")
+            logW(TAG, "evaluate: already running -> returning current score=${_score.value}")
             return _score.value
         }
 
@@ -259,16 +596,10 @@ class AiViewModel(
             job.join()
         }
 
-        RuntimeLogStore.d(TAG, "evaluate: finished in ${elapsed}ms, score=${_score.value}, err=${_error.value}")
+        logD(TAG, "evaluate: finished in ${elapsed}ms, score=${_score.value}, err=${_error.value}")
         return _score.value
     }
 
-    /**
-     * Fire-and-forget variant of [evaluate].
-     *
-     * Single-flight:
-     * - If already running, returns the current [evalJob] without starting a new run.
-     */
     fun evaluateAsync(prompt: String, timeoutMs: Long = defaultTimeoutMs): Job {
         if (prompt.isBlank()) {
             resetStates(keepError = false)
@@ -276,7 +607,7 @@ class AiViewModel(
         }
 
         if (!running.compareAndSet(false, true)) {
-            RuntimeLogStore.w(TAG, "evaluateAsync: already running -> returning existing job")
+            logW(TAG, "evaluateAsync: already running -> returning existing job")
             return evalJob ?: viewModelScope.launch { }
         }
 
@@ -299,93 +630,6 @@ class AiViewModel(
         return job
     }
 
-    /**
-     * Two-step chaining:
-     * 1) Evaluate [firstPrompt] using phase=EVAL.
-     * 2) Build prompt2 from step1 result via [buildSecondPrompt], then evaluate it using phase=FOLLOWUP.
-     *
-     * This keeps both steps in [stepHistory].
-     */
-    fun evaluateTwoStepFromFirstAsync(
-        firstPrompt: String,
-        timeoutMs: Long = defaultTimeoutMs,
-        proceedOnTimeout: Boolean = true,
-        buildSecondPrompt: (EvalResult) -> String
-    ): Job {
-        val p1 = firstPrompt.trim()
-        if (p1.isEmpty()) {
-            resetStates(keepError = false)
-            return viewModelScope.launch { }
-        }
-
-        if (!running.compareAndSet(false, true)) {
-            RuntimeLogStore.w(TAG, "evaluateTwoStepFromFirstAsync: already running -> returning existing job")
-            return evalJob ?: viewModelScope.launch { }
-        }
-
-        cancelDanglingJobIfAny(reason = "dangling_before_new_chain")
-
-        prepareUiForNewChain(clearHistory = true)
-
-        val chainJob = viewModelScope.launch(ioDispatcher) {
-            try {
-                if (DEBUG_LOGS) RuntimeLogStore.d(TAG, "chain2: timeoutMs=$timeoutMs")
-
-                // --- step 1 ---
-                val runId1 = runSeq.incrementAndGet()
-                activeRunId.set(runId1)
-
-                val r1 = runEvaluationCore(
-                    runId = runId1,
-                    userPrompt = p1,
-                    timeoutMs = timeoutMs,
-                    mode = EvalMode.EVAL_JSON,
-                    phase = PromptPhase.EVAL,
-                    commitToPrimaryState = true
-                )
-
-                if (!proceedOnTimeout && r1.timedOut) {
-                    if (DEBUG_LOGS) RuntimeLogStore.w(TAG, "chain2: step1 timed out -> skipping step2 (proceedOnTimeout=false)")
-                    return@launch
-                }
-
-                // --- step 2 (derived) ---
-                val p2 = runCatching { buildSecondPrompt(r1).trim() }
-                    .onFailure { t -> RuntimeLogStore.e(TAG, "chain2: buildSecondPrompt failed", t) }
-                    .getOrElse { "" }
-
-                if (p2.isEmpty()) {
-                    if (DEBUG_LOGS) RuntimeLogStore.w(TAG, "chain2: step2 prompt is blank -> done")
-                    return@launch
-                }
-
-                prepareUiForNextStep()
-
-                val runId2 = runSeq.incrementAndGet()
-                activeRunId.set(runId2)
-
-                runEvaluationCore(
-                    runId = runId2,
-                    userPrompt = p2,
-                    timeoutMs = timeoutMs,
-                    mode = EvalMode.FOLLOWUP_JSON_OR_TEXT,
-                    phase = PromptPhase.FOLLOWUP,
-                    commitToPrimaryState = false
-                )
-            } finally {
-                finalizeChainFlags()
-            }
-        }
-
-        evalJob = chainJob
-        return chainJob
-    }
-
-    /**
-     * Conditional two-step:
-     * 1) Run step1 with phase=EVAL.
-     * 2) Only if [shouldRunSecond] returns true, build prompt2 from step1 result and run step2 with phase=FOLLOWUP.
-     */
     fun evaluateConditionalTwoStepAsync(
         firstPrompt: String,
         timeoutMs: Long = defaultTimeoutMs,
@@ -400,7 +644,7 @@ class AiViewModel(
         }
 
         if (!running.compareAndSet(false, true)) {
-            RuntimeLogStore.w(TAG, "evaluateConditionalTwoStepAsync: already running -> returning existing job")
+            logW(TAG, "evaluateConditionalTwoStepAsync: already running -> returning existing job")
             return evalJob ?: viewModelScope.launch { }
         }
 
@@ -424,19 +668,21 @@ class AiViewModel(
                 )
 
                 if (step1.timedOut && !proceedOnTimeout) {
-                    if (DEBUG_LOGS) RuntimeLogStore.w(TAG, "chain2: step1 timed out -> skipping step2 (proceedOnTimeout=false)")
+                    if (DEBUG_LOGS) logW(TAG, "chain2: step1 timed out -> skipping step2 (proceedOnTimeout=false)")
                     return@launch
                 }
 
                 val doStep2 = runCatching { shouldRunSecond(step1) }
-                    .onFailure { t -> RuntimeLogStore.e(TAG, "chain2: shouldRunSecond failed -> treat as false", t) }
+                    .onFailure { t -> logE(TAG, "chain2: shouldRunSecond failed -> treat as false", t) }
                     .getOrElse { false }
 
                 if (!doStep2) {
                     if (DEBUG_LOGS) {
-                        RuntimeLogStore.d(
+                        // Runtime only: rawPreview may contain user/model content.
+                        logDRuntimeOnly(
                             TAG,
-                            "chain2: step2 skipped (score=${step1.score}, followups=${step1.followups.size}, timedOut=${step1.timedOut}, rawPreview='${debugVisible(preview(step1.raw))}')"
+                            "chain2: step2 skipped (score=${step1.score}, followups=${step1.followups.size}, timedOut=${step1.timedOut}, " +
+                                    "rawPreview='${debugVisible(preview(step1.raw))}')"
                         )
                     }
                     return@launch
@@ -444,11 +690,11 @@ class AiViewModel(
 
                 // --- step 2 (FOLLOWUP; JSON or raw text) ---
                 val p2 = runCatching { buildSecondPrompt(step1).trim() }
-                    .onFailure { t -> RuntimeLogStore.e(TAG, "chain2: buildSecondPrompt failed", t) }
+                    .onFailure { t -> logE(TAG, "chain2: buildSecondPrompt failed", t) }
                     .getOrElse { "" }
 
                 if (p2.isEmpty()) {
-                    if (DEBUG_LOGS) RuntimeLogStore.w(TAG, "chain2: step2 prompt is blank -> done")
+                    if (DEBUG_LOGS) logW(TAG, "chain2: step2 prompt is blank -> done")
                     return@launch
                 }
 
@@ -474,21 +720,17 @@ class AiViewModel(
         return chainJob
     }
 
-    /**
-     * Cancel the ongoing evaluation if any.
-     *
-     * This is a user-driven cancellation path.
-     */
     fun cancel() {
-        RuntimeLogStore.i(TAG, "cancel: invoked (isRunning=${running.get()}, loading=${_loading.value})")
+        logI(TAG, "cancel: invoked (isRunning=${running.get()}, loading=${_loading.value})")
         stopCurrentRunInternal(reason = "cancelled", emitCancelledEvent = true, setCancelledError = true)
     }
 
     /**
      * Reset transient AI-related states.
      *
-     * NOTE:
-     * - Also clears [stepHistory] because the UI expects a clean slate.
+     * Notes:
+     * - Clears stepHistory/stream/raw/score/etc (inference UI state).
+     * - DOES NOT clear persisted chat/conversation state (B plan).
      */
     fun resetStates(keepError: Boolean = false) {
         stopCurrentRunInternal(reason = "reset", emitCancelledEvent = false, setCancelledError = false)
@@ -505,17 +747,9 @@ class AiViewModel(
     }
 
     override fun onCleared() {
-        RuntimeLogStore.i(TAG, "onCleared: ViewModel is being cleared -> stopCurrentRunInternal()")
+        logI(TAG, "onCleared: ViewModel is being cleared -> stopCurrentRunInternal()")
         super.onCleared()
         stopCurrentRunInternal(reason = "cleared", emitCancelledEvent = false, setCancelledError = false)
-    }
-
-    @Deprecated(
-        message = "Use resetStates(keepError) instead.",
-        replaceWith = ReplaceWith("resetStates(keepError = keepError)")
-    )
-    fun resetAll(keepError: Boolean = false) {
-        resetStates(keepError = keepError)
     }
 
     // ───────────────────────── Internal evaluation core ─────────────────────────
@@ -542,13 +776,6 @@ class AiViewModel(
         }
     }
 
-    /**
-     * Run one inference call and parse its output according to [mode].
-     *
-     * Key behavior:
-     * - Always appends a [StepSnapshot] to [stepHistory].
-     * - If [commitToPrimaryState] is false, Step1 primary state (score/raw/followups) is NOT overwritten.
-     */
     private suspend fun runEvaluationCore(
         runId: Long,
         userPrompt: String,
@@ -574,19 +801,16 @@ class AiViewModel(
             _stream.value = buf.toString()
         }
 
-        /** Return true if the output is a trivial empty JSON object (optionally with whitespace). */
         fun isEmptyJsonObject(text: String): Boolean {
             val t = text.trim()
             return t == "{}" || t == "{ }"
         }
 
-        /** Return true if the string starts like JSON. */
         fun isJsonLike(text: String): Boolean {
             val t = text.trim()
             return t.startsWith("{") || t.startsWith("[")
         }
 
-        /** Filter out garbage follow-up candidates. */
         fun sanitizeFollowups(list: List<String>): List<String> {
             return list
                 .asSequence()
@@ -599,7 +823,6 @@ class AiViewModel(
                 .toList()
         }
 
-        /** Extract a plausible follow-up question from raw text output (non-JSON fallback). */
         fun extractFollowupFromPlainText(rawText: String): String? {
             val t = rawText.trim()
             if (t.isBlank()) return null
@@ -617,21 +840,23 @@ class AiViewModel(
         try {
             val fullPrompt = runCatching { repo.buildPrompt(userPrompt, phase) }
                 .onFailure { t ->
-                    RuntimeLogStore.e(TAG, "run[$runId]: repo.buildPrompt failed; falling back to userPrompt", t)
+                    logE(TAG, "run[$runId]: repo.buildPrompt failed; falling back to userPrompt", t)
                 }
                 .getOrElse { userPrompt }
 
             if (DEBUG_LOGS) {
-                RuntimeLogStore.d(
+                // Ring-safe: only lengths and hashes.
+                logD(
                     TAG,
                     "run[$runId]: mode=$mode phase=$phase commit=$commitToPrimaryState " +
                             "prompt.len=${userPrompt.length}, fullPrompt.len=${fullPrompt.length}, timeoutMs=$timeoutMs"
                 )
-                RuntimeLogStore.d(TAG, "run[$runId]: sha(prompt)=${sha256Hex(userPrompt)} sha(full)=${sha256Hex(fullPrompt)}")
+                logD(TAG, "run[$runId]: sha(prompt)=${sha256Hex(userPrompt)} sha(full)=${sha256Hex(fullPrompt)}")
             }
 
             if (enableFullLogs) {
-                logLong(
+                // Runtime only: full prompt may contain sensitive user content.
+                logLongRuntimeOnly(
                     tag = FULL_PROMPT_TAG,
                     header = "run[$runId]: phase=$phase FullPrompt",
                     body = fullPrompt,
@@ -642,11 +867,6 @@ class AiViewModel(
             try {
                 withTimeout(timeoutMs) {
                     repo.request(fullPrompt).collect { part ->
-                        /**
-                         * IMPORTANT:
-                         * If this run is no longer active, cancel collection immediately.
-                         * This ensures the upstream callbackFlow sees cancellation and triggers SLM.cancel().
-                         */
                         if (!isActiveRun()) {
                             throw CancellationException("stale-run")
                         }
@@ -660,7 +880,8 @@ class AiViewModel(
                             _events.tryEmit(AiEvent.Stream(part))
 
                             if (DEBUG_LOGS) {
-                                RuntimeLogStore.d(TAG, "run[$runId] chunk[$chunkCount].preview='${debugVisible(preview(part))}'")
+                                // Runtime only: chunk preview may contain model output.
+                                logDRuntimeOnly(TAG, "run[$runId] chunk[$chunkCount].preview='${debugVisible(preview(part))}'")
                             }
                         }
                     }
@@ -668,17 +889,17 @@ class AiViewModel(
             } catch (e: TimeoutCancellationException) {
                 timedOut = true
                 stepError = "timeout"
-                if (DEBUG_LOGS) RuntimeLogStore.w(TAG, "run[$runId]: timeout after ${timeoutMs}ms", e)
+                if (DEBUG_LOGS) logW(TAG, "run[$runId]: timeout after ${timeoutMs}ms", e)
             } catch (e: CancellationException) {
                 if (!isActiveRun()) {
-                    if (DEBUG_LOGS) RuntimeLogStore.w(TAG, "run[$runId]: cancelled (stale run) -> stop quietly")
+                    if (DEBUG_LOGS) logW(TAG, "run[$runId]: cancelled (stale run) -> stop quietly")
                     return EvalResult(runId = runId, raw = "", score = null, followups = emptyList(), timedOut = false)
                 }
 
                 if (looksLikeTimeout(e)) {
                     timedOut = true
                     stepError = "timeout"
-                    if (DEBUG_LOGS) RuntimeLogStore.w(TAG, "run[$runId]: timeout-like cancellation (${e.javaClass.name})")
+                    if (DEBUG_LOGS) logW(TAG, "run[$runId]: timeout-like cancellation (${e.javaClass.name})")
                 } else {
                     throw e
                 }
@@ -694,11 +915,13 @@ class AiViewModel(
             val rawTrim = rawText.trim()
 
             if (DEBUG_LOGS) {
-                RuntimeLogStore.d(TAG, "run[$runId] stats: chunks=$chunkCount, chars=$totalChars, raw.len=${rawText.length}")
-                RuntimeLogStore.d(TAG, "run[$runId] sha(raw)=${sha256Hex(rawText)}")
+                // Ring-safe stats only.
+                logD(TAG, "run[$runId] stats: chunks=$chunkCount, chars=$totalChars, raw.len=${rawText.length}")
+                logD(TAG, "run[$runId] sha(raw)=${sha256Hex(rawText)}")
             }
             if (DEBUG_LOGS && DEBUG_WHITESPACE) {
-                RuntimeLogStore.d(TAG, "run[$runId] rawVisible='${debugVisible(preview(rawText))}'")
+                // Runtime only: raw preview may contain model output.
+                logDRuntimeOnly(TAG, "run[$runId] rawVisible='${debugVisible(preview(rawText))}'")
             }
 
             val parsedScore: Int?
@@ -712,7 +935,8 @@ class AiViewModel(
                         top3 = emptyList()
                         q0 = null
                         if (DEBUG_LOGS) {
-                            RuntimeLogStore.w(
+                            // Runtime only: includes output preview.
+                            logWRuntimeOnly(
                                 TAG,
                                 "run[$runId]: EVAL_JSON output is empty/trivial ('${debugVisible(preview(rawTrim))}') -> score=null, followups=0"
                             )
@@ -726,7 +950,8 @@ class AiViewModel(
                         q0 = top3.firstOrNull()
 
                         if (DEBUG_LOGS) {
-                            RuntimeLogStore.d(
+                            // Runtime only: includes follow-up preview.
+                            logDRuntimeOnly(
                                 TAG,
                                 "run[$runId]: EVAL_JSON parsed score=$parsedScore followups=${top3.size} fu0='${debugVisible(preview(q0.orEmpty()))}'"
                             )
@@ -749,7 +974,8 @@ class AiViewModel(
                     q0 = best
 
                     if (DEBUG_LOGS) {
-                        RuntimeLogStore.d(
+                        // Runtime only: includes extracted text.
+                        logDRuntimeOnly(
                             TAG,
                             "run[$runId]: FOLLOWUP parse " +
                                     "extractorQ='${debugVisible(preview(fromExtractor.orEmpty()))}' " +
@@ -788,13 +1014,18 @@ class AiViewModel(
                 _events.tryEmit(AiEvent.Timeout)
             }
 
-            RuntimeLogStore.i(
+            // Ring-safe: do not include follow-up text. Use sha/len only.
+            val q0Len = q0?.length ?: 0
+            val q0Sha = q0?.let { sha256Hex(it).take(16) } ?: "none"
+            logI(
                 TAG,
-                "run[$runId] done: phase=$phase mode=$mode score=$parsedScore FU[0]=${q0 ?: "<none>"} commit=$commitToPrimaryState err=${stepError ?: "<none>"}"
+                "run[$runId] done: phase=$phase mode=$mode score=$parsedScore FU0.len=$q0Len FU0.sha16=$q0Sha " +
+                        "commit=$commitToPrimaryState err=${stepError ?: "<none>"}"
             )
 
             if (enableFullLogs) {
-                logLong(
+                // Runtime only: full output may contain sensitive model content.
+                logLongRuntimeOnly(
                     tag = FULL_TEXT_OUT_TAG,
                     header = "run[$runId]: RawTextOut",
                     body = rawText,
@@ -807,7 +1038,7 @@ class AiViewModel(
             if (isActiveRun() && _error.value == "cancelled") {
                 _events.tryEmit(AiEvent.Cancelled)
             }
-            if (DEBUG_LOGS) RuntimeLogStore.w(TAG, "run[$runId]: cancelled", e)
+            if (DEBUG_LOGS) logW(TAG, "run[$runId]: cancelled", e)
             throw e
         } catch (t: Throwable) {
             if (!isActiveRun()) {
@@ -817,7 +1048,7 @@ class AiViewModel(
             val msg = t.message ?: "error"
             _error.value = msg
             _events.tryEmit(AiEvent.Error(msg))
-            RuntimeLogStore.e(TAG, "run[$runId]: error", t)
+            logE(TAG, "run[$runId]: error", t)
 
             val rawText = _stream.value
 
@@ -894,7 +1125,7 @@ class AiViewModel(
 
         if (job != null) {
             runCatching { job.cancel(CancellationException(reason)) }
-                .onFailure { t -> RuntimeLogStore.w(TAG, "stopCurrentRunInternal: exception during cancel (ignored)", t) }
+                .onFailure { t -> logW(TAG, "stopCurrentRunInternal: exception during cancel (ignored)", t) }
         }
 
         _loading.value = false
@@ -911,7 +1142,7 @@ class AiViewModel(
         activeRunId.set(-1L)
 
         runCatching { job.cancel(CancellationException(reason)) }
-            .onFailure { t -> RuntimeLogStore.w(TAG, "cancelDanglingJobIfAny: exception during cancel (ignored)", t) }
+            .onFailure { t -> logW(TAG, "cancelDanglingJobIfAny: exception during cancel (ignored)", t) }
     }
 
     // ───────────────────────── helpers ─────────────────────────
@@ -958,10 +1189,11 @@ class AiViewModel(
     /**
      * Chunked log printer to reduce logcat truncation.
      *
-     * Notes:
-     * - Never call this in production for sensitive payloads; caller should gate with BuildConfig.DEBUG.
+     * IMPORTANT:
+     * - This must be runtime-only. Never write full prompt/output into AppRingLogStore.
+     * - Caller must still gate sensitive payloads with BuildConfig.DEBUG.
      */
-    private fun logLong(tag: String, header: String, body: String, level: Int) {
+    private fun logLongRuntimeOnly(tag: String, header: String, body: String, level: Int) {
         val trimmed = if (body.length > MAX_LONG_LOG_CHARS) {
             body.take(MAX_LONG_LOG_CHARS) + "\n... (truncated)"
         } else {
@@ -980,9 +1212,10 @@ class AiViewModel(
             val slice = full.substring(i, end)
             val prefix = "[part=${part.toString().padStart(3, '0')}] "
             when (level) {
-                Log.ERROR -> RuntimeLogStore.e(tag, prefix + slice)
-                Log.WARN -> RuntimeLogStore.w(tag, prefix + slice)
-                else -> RuntimeLogStore.i(tag, prefix + slice)
+                Log.ERROR -> logERuntimeOnly(tag, prefix + slice)
+                Log.WARN -> logWRuntimeOnly(tag, prefix + slice)
+                Log.INFO -> logIRuntimeOnly(tag, prefix + slice)
+                else -> logDRuntimeOnly(tag, prefix + slice)
             }
             i = end
             part++
