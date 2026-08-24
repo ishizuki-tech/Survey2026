@@ -83,7 +83,6 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
@@ -119,6 +118,7 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.ViewModelStore
 import androidx.lifecycle.ViewModelStoreOwner
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.LocalViewModelStoreOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation3.runtime.NavBackStack
@@ -157,6 +157,7 @@ import com.negi.survey.vm.SurveyViewModel
 import com.negi.survey.vm.WhisperSpeechController
 import java.util.Locale
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -663,13 +664,14 @@ fun AppNav() {
         configError = null
         try {
             SurveyConfigLoader.setDebug(
-                format = true,
-                validate = true,
-                prompts = true,
-                dumpSystemPrompts = true
+                format = BuildConfig.DEBUG,
+                validate = BuildConfig.DEBUG,
+                prompts = BuildConfig.DEBUG,
+                // Avoid dumping complete system prompts into normal debug logs.
+                dumpSystemPrompts = false
             )
             val loaded = withContext(Dispatchers.IO) {
-                SurveyConfigLoader.fromAssetsValidated(appContext, chosen.id)
+                SurveyConfigLoader.fromAssetsStrictValidated(appContext, chosen.id)
             }
             config = loaded
             Log.d(MainActivity.TAG, "Config loaded. session=$sessionKey")
@@ -776,6 +778,12 @@ fun AppNav() {
 
     val cfg = config!!
 
+    /*
+     * Session ViewModels are intentionally composition-scoped here.
+     * A full Activity recreation creates a new store; if survey progress must
+     * survive configuration changes, move navigation + session state into a
+     * retained state holder rather than retaining this store alone.
+     */
     val sessionVmStore = remember(sessionKey) { ViewModelStore() }
     val sessionVmOwner = remember(sessionVmStore) {
         object : ViewModelStoreOwner {
@@ -802,7 +810,7 @@ fun AppNav() {
         )
     )
 
-    val state by appVm.state.collectAsState()
+    val state by appVm.state.collectAsStateWithLifecycle()
 
     LaunchedEffect(state) {
         if (state is DlState.Idle) {
@@ -851,8 +859,68 @@ fun AppNav() {
         ) {
             val backStack = rememberNavBackStack(FlowHome)
 
-            val repo: Repository = remember(slmModel, cfg) {
-                LiteRtRepository(slmModel, cfg, appContext)
+            val repo: Repository = remember(sessionKey, slmModel, cfg) {
+                LiteRtRepository(
+                    model = slmModel,
+                    config = cfg,
+                    appContext = appContext,
+                )
+            }
+
+            /**
+             * Initialize the LiteRT-LM Engine while the user is still on the home screen.
+             *
+             * This A-side build intentionally skips inference warm-up so the first real
+             * Survey request measures the cold-inference path after Engine initialization.
+             */
+            LaunchedEffect(repo, sessionKey) {
+                val warmUpStartedAt = SystemClock.elapsedRealtime()
+
+                Log.d(
+                    MainActivity.TAG,
+                    "SLM Engine warm-up started. session=$sessionKey model=${slmModel.name}"
+                )
+
+                try {
+                    repo.warmUp()
+
+                    val elapsedMs =
+                        SystemClock.elapsedRealtime() - warmUpStartedAt
+
+                    /*
+                     * Repository.warmUp() performs its own detailed success/failure
+                     * logging. The method is intentionally best-effort and may return
+                     * without throwing when Engine initialization cannot be completed,
+                     * so this caller records only that the warm-up request finished.
+                     */
+                    Log.d(
+                        MainActivity.TAG,
+                        "SLM Engine warm-up finished. " +
+                                "session=$sessionKey model=${slmModel.name} elapsedMs=$elapsedMs"
+                    )
+                } catch (ce: CancellationException) {
+                    val elapsedMs =
+                        SystemClock.elapsedRealtime() - warmUpStartedAt
+
+                    Log.d(
+                        MainActivity.TAG,
+                        "SLM Engine warm-up cancelled. " +
+                                "session=$sessionKey model=${slmModel.name} elapsedMs=$elapsedMs"
+                    )
+
+                    throw ce
+                } catch (t: Throwable) {
+                    val elapsedMs =
+                        SystemClock.elapsedRealtime() - warmUpStartedAt
+
+                    Log.w(
+                        MainActivity.TAG,
+                        "SLM Engine warm-up failed; continuing without warm-up. " +
+                                "session=$sessionKey model=${slmModel.name} elapsedMs=$elapsedMs " +
+                                "error=${t.message}",
+                        t
+                    )
+                }
             }
 
             val vmSurvey: SurveyViewModel = viewModel(
@@ -959,20 +1027,20 @@ fun SurveyNavHost(
     val owner = sessionVmOwner ?: LocalViewModelStoreOwner.current
     ?: error("Missing ViewModelStoreOwner")
 
-    val canGoBack by vmSurvey.canGoBack.collectAsState()
+    val canGoBack by vmSurvey.canGoBack.collectAsStateWithLifecycle()
     val voiceEnabled = remember(whisperMeta.enabled) { whisperMeta.enabled ?: true }
-    val latestNode by vmSurvey.currentNode.collectAsState()
+    val latestNode by vmSurvey.currentNode.collectAsStateWithLifecycle()
     val latestNodeId = latestNode.id
 
     /** Keep SpeechController aligned with the real survey run id. */
-    val surveyUuid by vmSurvey.surveyUuid.collectAsState()
+    val surveyUuid by vmSurvey.surveyUuid.collectAsStateWithLifecycle()
 
     /**
      * Defensive persistence:
      * - Some navigation paths may clear runFreeText unexpectedly (e.g., back to Home).
      * - Keep a session-level "shadow" and restore when Home re-enters with empty ViewModel state.
      */
-    val runFreeText by vmSurvey.runFreeText.collectAsState()
+    val runFreeText by vmSurvey.runFreeText.collectAsStateWithLifecycle()
     var runFreeTextShadow by rememberSaveable(sessionId) { mutableStateOf("") }
 
     LaunchedEffect(runFreeText) {
@@ -1121,7 +1189,7 @@ fun SurveyNavHost(
                 }
 
                 entry<FlowText> {
-                    val node by vmSurvey.currentNode.collectAsState()
+                    val node by vmSurvey.currentNode.collectAsStateWithLifecycle()
                     TextNodeScreen(
                         title = node.title,
                         question = node.question,
@@ -1131,12 +1199,12 @@ fun SurveyNavHost(
                 }
 
                 entry<FlowSingle> {
-                    val node by vmSurvey.currentNode.collectAsState()
+                    val node by vmSurvey.currentNode.collectAsStateWithLifecycle()
                     SingleChoiceNodeScreen(
                         title = node.title,
                         question = node.question,
                         options = node.options,
-                        selected = vmSurvey.single.collectAsState().value,
+                        selected = vmSurvey.single.collectAsStateWithLifecycle().value,
                         onSelect = { vmSurvey.setSingleChoice(it) },
                         onNext = {
                             val sel = vmSurvey.single.value
@@ -1152,8 +1220,8 @@ fun SurveyNavHost(
                 }
 
                 entry<FlowMulti> {
-                    val node by vmSurvey.currentNode.collectAsState()
-                    val selected by vmSurvey.multi.collectAsState()
+                    val node by vmSurvey.currentNode.collectAsStateWithLifecycle()
+                    val selected by vmSurvey.multi.collectAsStateWithLifecycle()
 
                     MultiChoiceNodeScreen(
                         title = node.title,
@@ -1171,7 +1239,7 @@ fun SurveyNavHost(
                 }
 
                 entry<FlowAI> {
-                    val node by vmSurvey.currentNode.collectAsState()
+                    val node by vmSurvey.currentNode.collectAsStateWithLifecycle()
                     AiScreen(
                         nodeId = node.id,
                         vmSurvey = vmSurvey,
@@ -1225,26 +1293,54 @@ fun SurveyNavHost(
  * - Trim pathPrefix slashes for consistent remote paths.
  */
 private fun buildGitHubConfigOrNull(): GitHubUploader.GitHubConfig? {
-    if (BuildConfig.GH_TOKEN.isBlank()) return null
+    /*
+     * BuildConfig values are embedded in the APK. Do not treat GH_TOKEN as a
+     * secret credential in a distributed production app; prefer a backend or
+     * short-lived scoped credential for production uploads.
+     */
+    val token = BuildConfig.GH_TOKEN.trim()
+    if (token.isBlank()) {
+        return null
+    }
 
-    val owner = BuildConfig.GH_OWNER.trim()
-    if (owner.isBlank()) return null
+    var owner = BuildConfig.GH_OWNER.trim()
+    var repo = BuildConfig.GH_REPO.trim()
 
-    val repoName = BuildConfig.GH_REPO.substringAfterLast('/').trim()
-    if (repoName.isBlank()) return null
+    if (repo.contains('/')) {
+        val inferredOwner = repo.substringBefore('/').trim()
+        val inferredRepo = repo.substringAfterLast('/').trim()
 
-    val branch = BuildConfig.GH_BRANCH.trim().ifBlank { "main" }
-    val prefix = BuildConfig.GH_PATH_PREFIX.trim().trim('/')
+        if (owner.isBlank()) {
+            owner = inferredOwner
+        }
 
-    // Basic sanity checks (avoid weird whitespace configs causing subtle runtime bugs).
-    if (owner.contains(' ') || repoName.contains(' ')) return null
+        repo = inferredRepo
+    }
+
+    if (owner.isBlank() || repo.isBlank()) {
+        return null
+    }
+
+    if (owner.any(Char::isWhitespace) || repo.any(Char::isWhitespace)) {
+        return null
+    }
+
+    val branch =
+        BuildConfig.GH_BRANCH
+            .trim()
+            .ifBlank { "main" }
+
+    val prefix =
+        BuildConfig.GH_PATH_PREFIX
+            .trim()
+            .trim('/')
 
     return GitHubUploader.GitHubConfig(
         owner = owner,
-        repo = repoName,
+        repo = repo,
         branch = branch,
         pathPrefix = prefix,
-        token = BuildConfig.GH_TOKEN
+        token = token
     )
 }
 
@@ -1492,121 +1588,6 @@ private fun RowButtons(
 /* ───────────────────────────── Home Screen ───────────────────────────── */
 
 @Composable
-private fun HomeFreeTextComposer_OLD(
-    value: String,
-    onValueChange: (String) -> Unit,
-    enabled: Boolean,
-    speechEnabled: Boolean,
-    speechRecording: Boolean,
-    speechTranscribing: Boolean,
-    onToggleSpeech: (() -> Unit)?,
-    onSend: () -> Unit,
-    speechStatusText: String?,
-    speechStatusIsError: Boolean,
-    modifier: Modifier = Modifier
-) {
-    val cs = MaterialTheme.colorScheme
-    val focusRequester = remember { FocusRequester() }
-
-    Column(
-        modifier = modifier
-            .fillMaxWidth()
-            .padding(horizontal = 12.dp, vertical = 8.dp)
-    ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .shadow(elevation = 8.dp, shape = CircleShape, clip = false)
-                .background(
-                    brush = Brush.linearGradient(
-                        listOf(
-                            cs.surfaceVariant.copy(alpha = 0.65f),
-                            cs.surface.copy(alpha = 0.65f)
-                        )
-                    ),
-                    shape = CircleShape
-                )
-                .neutralEdge(alpha = 0.14f, corner = 999.dp, stroke = 1.dp)
-                .padding(start = 12.dp, end = 6.dp, top = 6.dp, bottom = 6.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            OutlinedTextField(
-                value = value,
-                onValueChange = onValueChange,
-                modifier = Modifier
-                    .weight(1f)
-                    .focusRequester(focusRequester),
-                placeholder = { Text("Type a note…") },
-                minLines = 1,
-                maxLines = 5,
-                enabled = enabled,
-                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
-                keyboardActions = KeyboardActions(onSend = { onSend() }),
-                colors = OutlinedTextFieldDefaults.colors(
-                    unfocusedContainerColor = Color.Transparent,
-                    focusedContainerColor = Color.Transparent,
-                    disabledContainerColor = Color.Transparent,
-                    focusedBorderColor = Color.Transparent,
-                    unfocusedBorderColor = Color.Transparent
-                ),
-                textStyle = MaterialTheme.typography.bodyMedium
-            )
-
-            if (speechEnabled && onToggleSpeech != null) {
-                val tint = cs.onSurfaceVariant
-                val micEnabled = (enabled || speechRecording) && !speechTranscribing
-
-                IconButton(
-                    onClick = onToggleSpeech,
-                    enabled = micEnabled
-                ) {
-                    Crossfade(
-                        targetState = speechRecording,
-                        label = "mic-toggle-composer"
-                    ) { rec ->
-                        if (rec) {
-                            Icon(
-                                imageVector = Icons.Filled.Stop,
-                                contentDescription = "Stop recording",
-                                tint = tint
-                            )
-                        } else {
-                            Icon(
-                                imageVector = Icons.Filled.Mic,
-                                contentDescription = "Start recording",
-                                tint = tint
-                            )
-                        }
-                    }
-                }
-            }
-        }
-
-        if (speechStatusText != null) {
-            Spacer(Modifier.height(4.dp))
-            Text(
-                text = speechStatusText,
-                style = MaterialTheme.typography.labelSmall,
-                color = if (speechStatusIsError) cs.error else cs.onSurfaceVariant,
-                modifier = Modifier.padding(start = 4.dp, top = 2.dp)
-            )
-        }
-
-        FilledTonalButton(
-            onClick = onSend,
-            enabled = enabled,
-            shape = CircleShape,
-            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp)
-        ) {
-            Icon(
-                imageVector = Icons.AutoMirrored.Outlined.NavigateNext,
-                contentDescription = "Start"
-            )
-        }
-    }
-}
-
-@Composable
 private fun HomeFreeTextComposer(
     value: String,
     onValueChange: (String) -> Unit,
@@ -1734,63 +1715,142 @@ private fun HomeScreen(
     val backplate = appBackplate()
     val focusManager = LocalFocusManager.current
 
-    val surveyUuid by vmSurvey.surveyUuid.collectAsState()
-    val freeText by vmSurvey.runFreeText.collectAsState()
+    val surveyUuid by vmSurvey.surveyUuid.collectAsStateWithLifecycle()
+    val freeText by vmSurvey.runFreeText.collectAsStateWithLifecycle()
 
-    val isRecording by speechController.isRecording.collectAsState()
-    val isTranscribing by speechController.isTranscribing.collectAsState()
-    val partialText by speechController.partialText.collectAsState()
-    val speechError by speechController.errorMessage.collectAsState()
+    val isRecording by speechController.isRecording.collectAsStateWithLifecycle()
+    val isTranscribing by speechController.isTranscribing.collectAsStateWithLifecycle()
+    val partialText by speechController.partialText.collectAsStateWithLifecycle()
+    val speechError by speechController.errorMessage.collectAsStateWithLifecycle()
 
-    /** Latest onStart lambda reference for async completion. */
+    /** Latest onStart lambda reference for asynchronous completion. */
     val latestOnStart = rememberUpdatedState(onStart)
 
-    /** Gate: user pressed Start; we must commit pending dictation before leaving Home. */
+    /** User pressed Start and navigation is waiting for voice finalization. */
     var pendingStart by remember(surveyUuid) { mutableStateOf(false) }
 
-    /** Deadline (elapsedRealtime) to avoid infinite waiting if transcription stalls. */
+    /** Monotonic deadline used by the explicit timeout watchdog below. */
     var startDeadlineMs by remember(surveyUuid) { mutableLongStateOf(0L) }
 
-    /** Arm a single "commit" after the user stops recording. */
+    /** Incremented by the watchdog so the commit effect is re-evaluated at timeout. */
+    var timeoutPulse by remember(surveyUuid) { mutableIntStateOf(0) }
+
+    /** One pending voice-note commit is armed when a recording transitions to stopped. */
     var armCommit by remember(surveyUuid) { mutableStateOf(false) }
+
+    /** Edge detector for recording state. */
     var prevRecording by remember(surveyUuid) { mutableStateOf(false) }
-    var lastCommittedUtterance by remember(surveyUuid) { mutableStateOf("") }
+
+    /** Partial text snapshot from the beginning of the current recording cycle. */
+    var partialAtRecordingStart by remember(surveyUuid) { mutableStateOf("") }
+
+    /** True after transcription has been observed for the current stopped recording. */
+    var sawTranscribingAfterStop by remember(surveyUuid) { mutableStateOf(false) }
 
     LaunchedEffect(isRecording) {
-        if (prevRecording && !isRecording) {
-            // Recording just stopped -> next time transcription settles, commit once.
-            armCommit = true
+        if (!prevRecording && isRecording) {
+            // Start a fresh recording cycle. Do not deduplicate against older recordings.
+            partialAtRecordingStart = partialText.trim()
+            sawTranscribingAfterStop = false
+            armCommit = false
         }
+
+        if (prevRecording && !isRecording) {
+            // Recording just stopped. Wait for the transcription state/result to settle.
+            armCommit = true
+            sawTranscribingAfterStop = isTranscribing
+        }
+
         prevRecording = isRecording
     }
 
-    /** Commit dictation when ready; if Start is pending, proceed only after commit. */
+    LaunchedEffect(isTranscribing, armCommit) {
+        if (armCommit && isTranscribing) {
+            sawTranscribingAfterStop = true
+        }
+    }
+
+    /**
+     * Real timeout watchdog.
+     *
+     * Merely comparing elapsedRealtime() inside another LaunchedEffect is not
+     * sufficient because no recomposition is guaranteed to happen at the
+     * deadline. This coroutine explicitly sleeps until the deadline and then
+     * bumps timeoutPulse to force re-evaluation.
+     */
+    LaunchedEffect(pendingStart, startDeadlineMs) {
+        if (!pendingStart || startDeadlineMs <= 0L) {
+            return@LaunchedEffect
+        }
+
+        val remainingMs =
+            (startDeadlineMs - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
+
+        if (remainingMs > 0L) {
+            delay(remainingMs)
+        }
+
+        if (pendingStart) {
+            timeoutPulse += 1
+        }
+    }
+
+    /** Commit dictation when settled; if Start is pending, navigate afterwards. */
     LaunchedEffect(
         pendingStart,
         startDeadlineMs,
+        timeoutPulse,
         armCommit,
         isRecording,
         isTranscribing,
         partialText,
-        freeText
+        freeText,
+        partialAtRecordingStart,
+        sawTranscribingAfterStop
     ) {
-        if (!pendingStart && !armCommit) return@LaunchedEffect
+        if (!pendingStart && !armCommit) {
+            return@LaunchedEffect
+        }
 
         val now = SystemClock.elapsedRealtime()
-        val timedOut = pendingStart && startDeadlineMs != 0L && now >= startDeadlineMs
+        val timedOut =
+            pendingStart &&
+                    startDeadlineMs > 0L &&
+                    now >= startDeadlineMs
 
-        if ((isRecording || isTranscribing) && !timedOut) return@LaunchedEffect
+        if ((isRecording || isTranscribing) && !timedOut) {
+            return@LaunchedEffect
+        }
 
-        /** Best-effort utterance to merge (final if settled; partial if timed out). */
-        val utter = partialText.trim()
+        val utterance = partialText.trim()
+        val transcriptChanged = utterance != partialAtRecordingStart
+
+        if (
+            armCommit &&
+            !timedOut &&
+            !sawTranscribingAfterStop &&
+            !transcriptChanged
+        ) {
+            /*
+             * Some controllers have a small state gap between recording=false
+             * and transcribing=true. Give that transition a short grace period.
+             * Any state change in the keys above cancels this effect and restarts
+             * it with fresh values.
+             */
+            delay(HOME_TRANSCRIPTION_SETTLE_GRACE_MS)
+        }
 
         if (armCommit) {
-            if (utter.isNotBlank() && utter != lastCommittedUtterance) {
-                val merged = mergeFreeTextDraft(existing = freeText, utterance = utter)
+            if (utterance.isNotBlank()) {
+                val merged = mergeFreeTextDraft(
+                    existing = freeText,
+                    utterance = utterance
+                )
                 vmSurvey.setRunFreeText(merged)
-                lastCommittedUtterance = utter
             }
+
             armCommit = false
+            sawTranscribingAfterStop = false
         }
 
         if (pendingStart) {
@@ -1803,14 +1863,27 @@ private fun HomeScreen(
     val speechStatusIsError = !speechError.isNullOrBlank()
     val speechStatusText: String? = when {
         speechStatusIsError -> speechError
+
         pendingStart -> {
             val live = partialText.trim()
-            if (live.isNotBlank()) "Finalizing… $live" else "Finalizing voice note…"
+            if (live.isNotBlank()) {
+                "Finalizing… $live"
+            } else {
+                "Finalizing voice note…"
+            }
         }
+
         isRecording || isTranscribing -> {
             val live = partialText.trim()
-            if (live.isNotBlank()) live else if (isRecording) "(listening…)" else "Transcribing…"
+            if (live.isNotBlank()) {
+                live
+            } else if (isRecording) {
+                "(listening…)"
+            } else {
+                "Transcribing…"
+            }
         }
+
         else -> null
     }
 
@@ -1838,34 +1911,52 @@ private fun HomeScreen(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                Text(text = "Survey ready", style = MaterialTheme.typography.titleLarge)
                 Text(
-                    text = "Tap Send to start. You can optionally dictate or type a note for this run.",
+                    text = "Survey ready",
+                    style = MaterialTheme.typography.titleLarge
+                )
+
+                Text(
+                    text = "Tap Start to begin. You can optionally dictate or type a note for this run.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
 
                 HomeFreeTextComposer(
                     value = freeText,
-                    onValueChange = { onUpdateFreeText(it) },
+                    onValueChange = onUpdateFreeText,
                     enabled = !pendingStart,
                     speechEnabled = speechEnabled,
                     speechRecording = isRecording,
                     speechTranscribing = isTranscribing,
                     onToggleSpeech = if (speechEnabled) {
                         {
-                            /** Route dictation under a dedicated pseudo questionId for home note. */
-                            runCatching { speechController.updateContext(surveyUuid, HOME_FREE_TEXT_QID) }
-                            runCatching { speechController.toggleRecording() }
+                            // Route Home dictation under a dedicated pseudo question id.
+                            runCatching {
+                                speechController.updateContext(
+                                    surveyUuid,
+                                    HOME_FREE_TEXT_QID
+                                )
+                            }
+                            runCatching {
+                                speechController.toggleRecording()
+                            }
                         }
-                    } else null,
+                    } else {
+                        null
+                    },
                     onSend = {
-                        /** Stop dictation; commit pending transcription before starting the survey flow. */
-                        runCatching { speechController.stopRecording() }
+                        // Stop recording first, then wait for transcription finalization.
+                        runCatching {
+                            speechController.stopRecording()
+                        }
+
                         focusManager.clearFocus(force = true)
-                        /** Delay navigation until commit completes (avoid losing dictation when Home composable disposes). */
+
                         pendingStart = true
-                        startDeadlineMs = SystemClock.elapsedRealtime() + 8_000L
+                        startDeadlineMs =
+                            SystemClock.elapsedRealtime() +
+                                    HOME_START_TIMEOUT_MS
                     },
                     speechStatusText = speechStatusText,
                     speechStatusIsError = speechStatusIsError
@@ -1877,6 +1968,12 @@ private fun HomeScreen(
 
 /** Dedicated pseudo question id for Home screen free-text dictation context. */
 private const val HOME_FREE_TEXT_QID: String = "__home_free_text__"
+
+/** Maximum time Start waits for an in-flight Home transcription. */
+private const val HOME_START_TIMEOUT_MS: Long = 8_000L
+
+/** Small grace period for recording=false -> transcribing=true state transitions. */
+private const val HOME_TRANSCRIPTION_SETTLE_GRACE_MS: Long = 350L
 
 /** Merge an utterance into the existing draft with a stable newline separator. */
 private fun mergeFreeTextDraft(existing: String, utterance: String): String {
@@ -1891,7 +1988,7 @@ private fun mergeFreeTextDraft(existing: String, utterance: String): String {
 /* (The rest is kept as-is from your original file; do not omit.) */
 
 private fun configOptionFromFileName(fileName: String): ConfigOptionUi {
-    val stem = fileName.removeSuffix(".yaml").removeSuffix(".yml")
+    val stem = fileName.replace(Regex("""(?i)\.ya?ml$"""), "")
     val lower = stem.lowercase(Locale.US)
 
     val isDemo = "demo" in lower
@@ -1957,28 +2054,39 @@ private fun prettyNameFromFileStem(stem: String): String {
 
 private fun listAssetYamlConfigs(assetManager: AssetManager): List<String> {
     val roots = listOf("", "configs", "surveys")
-    val out = mutableListOf<String>()
+    val out = linkedSetOf<String>()
+    val visitedDirs = hashSetOf<String>()
 
     fun walk(dir: String, depth: Int) {
-        if (depth > 2) return
+        if (depth > 2 || !visitedDirs.add(dir)) {
+            return
+        }
 
-        val items = runCatching { assetManager.list(dir) }.getOrNull() ?: return
+        val items = runCatching {
+            assetManager.list(dir)
+        }.getOrNull() ?: return
+
         for (name in items) {
             val path = if (dir.isBlank()) name else "$dir/$name"
 
-            if (name.endsWith(".yaml") || name.endsWith(".yml")) {
+            if (
+                name.endsWith(".yaml", ignoreCase = true) ||
+                name.endsWith(".yml", ignoreCase = true)
+            ) {
                 out += path
                 continue
             }
 
-            // AssetManager.list() does not clearly distinguish files vs dirs; attempt to descend.
+            // AssetManager.list() does not clearly distinguish files from directories.
             walk(path, depth + 1)
         }
     }
 
-    roots.forEach { walk(it, 0) }
+    roots.forEach { root ->
+        walk(root, 0)
+    }
 
-    return out.distinct()
+    return out.toList()
 }
 
 /* ───────────────────────────── Config Details Resolver ───────────────────────────── */
@@ -1990,7 +2098,8 @@ private suspend fun resolveConfigDetailsFromAssets(
     val base = configId.trim().trimStart('/')
 
     val hasExt =
-        base.endsWith(".yaml", ignoreCase = true) || base.endsWith(".yml", ignoreCase = true)
+        base.endsWith(".yaml", ignoreCase = true) ||
+                base.endsWith(".yml", ignoreCase = true)
 
     val candidates = buildList {
         add(base)
@@ -2017,27 +2126,38 @@ private suspend fun resolveConfigDetailsFromAssets(
         }
     }.distinct()
 
-    val (assetName, yamlText) = readFirstAssetText(context.assets, candidates)
-    val meta = extractSlmMeta(yamlText)
+    val (assetName, yamlText) =
+        readFirstAssetText(context.assets, candidates)
 
-    val summary = buildString {
-        val model = meta["model_name"] ?: meta["model"] ?: meta["modelName"]
-        val backend = meta["backend"]
-        val accel = meta["accelerator"] ?: meta["device"]
-        val maxTokens = meta["max_tokens"] ?: meta["maxTokens"]
-        val topK = meta["top_k"] ?: meta["topK"]
-        val topP = meta["top_p"] ?: meta["topP"]
-        val temp = meta["temperature"]
+    val parsedResult = runCatching {
+        SurveyConfigLoader.fromString(
+            text = yamlText,
+            fileNameHint = assetName
+        )
+    }
 
-        if (!model.isNullOrBlank()) append("model=$model  ")
-        if (!backend.isNullOrBlank()) append("backend=$backend  ")
-        if (!accel.isNullOrBlank()) append("accel=$accel  ")
-        if (!maxTokens.isNullOrBlank()) append("maxTokens=$maxTokens  ")
-        if (!topK.isNullOrBlank()) append("topK=$topK  ")
-        if (!topP.isNullOrBlank()) append("topP=$topP  ")
-        if (!temp.isNullOrBlank()) append("temp=$temp")
-        if (isBlank()) append("Loaded from assets: $assetName")
-    }.trim()
+    val parsed = parsedResult.getOrNull()
+    val meta = parsed?.let(::buildConfigDetailsMeta).orEmpty()
+
+    val summary = if (parsed != null) {
+        buildConfigDetailsSummary(
+            assetName = assetName,
+            config = parsed
+        )
+    } else {
+        val message =
+            parsedResult.exceptionOrNull()?.message
+                ?.lineSequence()
+                ?.firstOrNull()
+                ?.take(180)
+                .orEmpty()
+
+        if (message.isBlank()) {
+            "Loaded from assets: $assetName"
+        } else {
+            "Loaded from assets: $assetName — metadata parse failed: $message"
+        }
+    }
 
     ScreenConfigDetails(
         title = assetName,
@@ -2047,79 +2167,111 @@ private suspend fun resolveConfigDetailsFromAssets(
     )
 }
 
+private fun buildConfigDetailsMeta(
+    config: SurveyConfig
+): Map<String, String> = buildMap {
+    config.modelDefaults.modelName
+        ?.takeIf { it.isNotBlank() }
+        ?.let { put("model_name", it) }
+
+    config.modelDefaults.defaultFileName
+        ?.takeIf { it.isNotBlank() }
+        ?.let { put("default_file_name", it) }
+
+    config.slm.accelerator
+        ?.takeIf { it.isNotBlank() }
+        ?.let { put("accelerator", it) }
+
+    config.slm.maxTokens
+        ?.let { put("max_tokens", it.toString()) }
+
+    config.slm.topK
+        ?.let { put("top_k", it.toString()) }
+
+    config.slm.topP
+        ?.let { put("top_p", it.toString()) }
+
+    config.slm.temperature
+        ?.let { put("temperature", it.toString()) }
+
+    config.slm.followupOutputMode
+        ?.takeIf { it.isNotBlank() }
+        ?.let { put("followup_output_mode", it) }
+
+    config.whisper.assetModelPath
+        ?.takeIf { it.isNotBlank() }
+        ?.let { put("whisper_model", it) }
+
+    config.whisper.language
+        ?.takeIf { it.isNotBlank() }
+        ?.let { put("whisper_language", it) }
+}
+
+private fun buildConfigDetailsSummary(
+    assetName: String,
+    config: SurveyConfig
+): String = buildString {
+    val model =
+        config.modelDefaults.modelName
+            ?.takeIf { it.isNotBlank() }
+            ?: config.modelDefaults.defaultFileName
+                ?.takeIf { it.isNotBlank() }
+
+    model?.let {
+        append("model=$it  ")
+    }
+
+    config.slm.accelerator
+        ?.takeIf { it.isNotBlank() }
+        ?.let {
+            append("accel=$it  ")
+        }
+
+    config.slm.maxTokens?.let {
+        append("maxTokens=$it  ")
+    }
+
+    config.slm.topK?.let {
+        append("topK=$it  ")
+    }
+
+    config.slm.topP?.let {
+        append("topP=$it  ")
+    }
+
+    config.slm.temperature?.let {
+        append("temp=$it")
+    }
+
+    if (isBlank()) {
+        append("Loaded from assets: $assetName")
+    }
+}.trim()
+
 private fun readFirstAssetText(
     assets: AssetManager,
     candidates: List<String>
 ): Pair<String, String> {
-    var lastErr: Throwable? = null
+    var lastError: Exception? = null
+
     for (name in candidates) {
         try {
-            val text = assets.open(name).bufferedReader(Charsets.UTF_8).use { it.readText() }
+            val text = assets.open(name)
+                .bufferedReader(Charsets.UTF_8)
+                .use { reader ->
+                    reader.readText()
+                }
+
             return name to text
-        } catch (t: Throwable) {
-            lastErr = t
+        } catch (e: Exception) {
+            lastError = e
         }
     }
+
     throw IllegalArgumentException(
         "Config asset not found. Tried: ${candidates.joinToString()}",
-        lastErr
+        lastError
     )
-}
-
-private fun extractSlmMeta(yamlText: String): Map<String, String> {
-    val lines = yamlText.lines()
-
-    var inSlm = false
-    var slmIndent: Int? = null
-    val meta = linkedMapOf<String, String>()
-
-    fun leadingSpacesOrTabs(s: String): Int =
-        s.indexOfFirst { it != ' ' && it != '\t' }.let { if (it < 0) s.length else it }
-
-    for (raw in lines) {
-        val lineNoComment = raw.substringBefore("#")
-        if (lineNoComment.isBlank()) continue
-
-        val indent = leadingSpacesOrTabs(lineNoComment)
-        val trimmed = lineNoComment.trim()
-
-        if (trimmed.endsWith(":") && !trimmed.contains(" ")) {
-            val section = trimmed.removeSuffix(":").trim()
-            if (section == "slm") {
-                inSlm = true
-                slmIndent = indent
-            } else {
-                if (inSlm && slmIndent != null && indent <= slmIndent) {
-                    inSlm = false
-                    slmIndent = null
-                }
-            }
-            continue
-        }
-
-        if (!inSlm || slmIndent == null) continue
-        if (indent <= slmIndent) {
-            inSlm = false
-            slmIndent = null
-            continue
-        }
-
-        val idx = trimmed.indexOf(":")
-        if (idx <= 0) continue
-
-        val k = trimmed.take(idx).trim()
-        val vRaw = trimmed.substring(idx + 1).trim()
-        if (k.isBlank() || vRaw.isBlank()) continue
-
-        val v = vRaw
-            .removeSurrounding("\"")
-            .removeSurrounding("'")
-            .trim()
-
-        meta[k] = v
-    }
-
-    return meta
 }
 
 /* ───────────────────────────── Placeholder Screen ───────────────────────────── */

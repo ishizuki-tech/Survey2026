@@ -24,17 +24,23 @@ import com.negi.survey.slm.FollowupExtractor
 import com.negi.survey.slm.PromptPhase
 import com.negi.survey.slm.Repository
 import java.security.MessageDigest
+import java.util.ArrayDeque
 import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.min
 import kotlin.system.measureTimeMillis
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -44,6 +50,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
 
 /**
@@ -102,6 +110,14 @@ class AiViewModel(
 
         /** Hard cap for long logs to avoid gigantic spam. */
         private const val MAX_LONG_LOG_CHARS = 120_000
+
+        /**
+         * Absolute safety ceiling for one model response.
+         *
+         * Evaluation/follow-up output should be far smaller than this. The ceiling protects the
+         * app from pathological generation loops while still allowing generous diagnostic output.
+         */
+        private const val MAX_MODEL_OUTPUT_CHARS = 32_768
     }
 
     // ───────────────────────── Logging bridge ─────────────────────────
@@ -125,12 +141,18 @@ class AiViewModel(
 
     private fun logW(tag: String, msg: String, tr: Throwable? = null) {
         if (tr != null) RuntimeLogStore.w(tag, msg, tr) else RuntimeLogStore.w(tag, msg)
-        AppRingLogStore.log("W", tag, msg, tr)
+
+        // Never persist Throwable contents in the crash-uploadable ring. Repository/runtime
+        // exceptions may embed prompts, generated text, file paths, or backend diagnostics.
+        AppRingLogStore.log("W", tag, msg)
     }
 
     private fun logE(tag: String, msg: String, tr: Throwable? = null) {
         if (tr != null) RuntimeLogStore.e(tag, msg, tr) else RuntimeLogStore.e(tag, msg)
-        AppRingLogStore.log("E", tag, msg, tr)
+
+        // Keep only the caller-provided ring-safe message. Full exception details stay in
+        // RuntimeLogStore, which is the appropriate debug-only diagnostics pipeline.
+        AppRingLogStore.log("E", tag, msg)
     }
 
     /**
@@ -191,7 +213,10 @@ class AiViewModel(
     /** Last error string or null. */
     val error: StateFlow<String?> = _error.asStateFlow()
 
-    private val _events = MutableSharedFlow<AiEvent>(extraBufferCapacity = 32)
+    private val _events = MutableSharedFlow<AiEvent>(
+        extraBufferCapacity = 64,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
 
     /** Event stream for fine-grained UI reactions. */
     val events: SharedFlow<AiEvent> = _events.asSharedFlow()
@@ -529,7 +554,13 @@ class AiViewModel(
                     chatStore.remove(evict)
                     conversationStore.remove(evict)
                     followupSeen.remove(evict)
-                    if (DEBUG_LOGS) logD(TAG, "chatStore evicted contextKey='$evict'")
+                    if (DEBUG_LOGS) {
+                        logD(
+                            TAG,
+                            "chatStore evicted contextKey.len=${evict.length} " +
+                                    "contextKey.sha16=${sha256Hex(evict).take(16)}"
+                        )
+                    }
                 }
             }
         }
@@ -537,13 +568,32 @@ class AiViewModel(
 
     // ─────────────────────── Execution control ───────────────────────
 
-    private var evalJob: Job? = null
-    private val running = AtomicBoolean(false)
+    /**
+     * Serializes access to the underlying inference backend.
+     *
+     * Logical cancellation makes a new run eligible immediately, but native inference backends
+     * can require a short unwind period. This mutex prevents the old request and a replacement
+     * request from entering [Repository.request] concurrently during that transition.
+     */
+    private val inferenceMutex = Mutex()
 
+    /**
+     * Protects execution ownership and terminal UI-state commits.
+     *
+     * [activeRunId] alone is not sufficient because cancellation can race between an ownership
+     * check and a subsequent StateFlow write. Ownership checks and state commits therefore happen
+     * under this lock so a stale run cannot overwrite a newly started run.
+     */
+    private val executionLock = Any()
+
+    /** Current top-level single-run or chain job. Access is coordinated by [executionLock]. */
+    private val evalJobRef = AtomicReference<Job?>(null)
+
+    private val running = AtomicBoolean(false)
     private val runSeq = AtomicLong(0L)
     private val activeRunId = AtomicLong(0L)
 
-    /** True when an evaluation coroutine is currently running. */
+    /** True when an evaluation coroutine is currently owned by this ViewModel. */
     val isRunning: Boolean
         get() = running.get()
 
@@ -551,7 +601,7 @@ class AiViewModel(
      * Run-local immutable result for chaining.
      *
      * @param runId Internal run identifier.
-     * @param raw Final raw output (may be partial on timeout).
+     * @param raw Final raw output (may be partial on timeout/error).
      * @param score Parsed score.
      * @param followups Extracted follow-ups (top-3).
      * @param timedOut True if the request timed out.
@@ -564,6 +614,15 @@ class AiViewModel(
         val timedOut: Boolean
     )
 
+    /**
+     * Internal non-cancellation control signal used to stop an excessively long model stream.
+     *
+     * EVAL/FOLLOWUP responses are expected to be compact. A hard character ceiling prevents a
+     * malformed model loop (for example repeated characters/tokens) from growing memory until the
+     * wall-clock timeout expires.
+     */
+    private class OutputLimitReachedException : RuntimeException()
+
     suspend fun evaluate(prompt: String, timeoutMs: Long = defaultTimeoutMs): Int? {
         if (prompt.isBlank()) {
             logI(TAG, "evaluate: blank prompt -> reset states and return null")
@@ -571,63 +630,105 @@ class AiViewModel(
             return null
         }
 
-        if (!running.compareAndSet(false, true)) {
-            logW(TAG, "evaluate: already running -> returning current score=${_score.value}")
+        val runId = runSeq.incrementAndGet()
+        lateinit var ownerJob: Job
+
+        ownerJob = viewModelScope.launch(
+            context = ioDispatcher,
+            start = CoroutineStart.LAZY
+        ) {
+            try {
+                runEvaluationCore(
+                    runId = runId,
+                    userPrompt = prompt,
+                    timeoutMs = timeoutMs,
+                    mode = EvalMode.EVAL_JSON,
+                    phase = PromptPhase.ONE_STEP,
+                    commitToPrimaryState = true
+                )
+            } finally {
+                finalizeOwnedJob(ownerJob)
+            }
+        }
+
+        val existing = installExecutionOrGetExisting(
+            newJob = ownerJob,
+            initialRunId = runId,
+            clearHistory = true
+        )
+
+        if (existing != null) {
+            ownerJob.cancel(CancellationException("single-flight-existing-run"))
+            logW(TAG, "evaluate: already running -> joining existing job")
+            existing.join()
             return _score.value
         }
 
-        cancelDanglingJobIfAny(reason = "dangling_before_new_run")
-
-        prepareUiForNewChain(clearHistory = true)
-
-        val runId = runSeq.incrementAndGet()
-        activeRunId.set(runId)
-
-        val elapsed = measureTimeMillis {
-            val job = startEvaluationInternal(
-                runId = runId,
-                userPrompt = prompt,
-                timeoutMs = timeoutMs,
-                mode = EvalMode.EVAL_JSON,
-                phase = PromptPhase.ONE_STEP,
-                commitToPrimaryState = true
+        val elapsed = try {
+            measureTimeMillis {
+                ownerJob.start()
+                ownerJob.join()
+            }
+        } catch (e: CancellationException) {
+            // A suspend API should respect caller cancellation. evaluateAsync() remains available
+            // for intentionally detached ViewModel-owned execution.
+            stopOwnedJob(
+                expectedOwner = ownerJob,
+                reason = "evaluate_caller_cancelled",
+                emitCancelledEvent = false,
+                setCancelledError = false
             )
-            evalJob = job
-            job.join()
+            throw e
         }
 
-        logD(TAG, "evaluate: finished in ${elapsed}ms, score=${_score.value}, err=${_error.value}")
+        logD(
+            TAG,
+            "evaluate: finished in ${elapsed}ms, score=${_score.value}, hasError=${_error.value != null}"
+        )
         return _score.value
     }
 
     fun evaluateAsync(prompt: String, timeoutMs: Long = defaultTimeoutMs): Job {
         if (prompt.isBlank()) {
             resetStates(keepError = false)
-            return viewModelScope.launch { }
+            return completedJob()
         }
-
-        if (!running.compareAndSet(false, true)) {
-            logW(TAG, "evaluateAsync: already running -> returning existing job")
-            return evalJob ?: viewModelScope.launch { }
-        }
-
-        cancelDanglingJobIfAny(reason = "dangling_before_new_run")
-
-        prepareUiForNewChain(clearHistory = true)
 
         val runId = runSeq.incrementAndGet()
-        activeRunId.set(runId)
+        lateinit var ownerJob: Job
 
-        val job = startEvaluationInternal(
-            runId = runId,
-            userPrompt = prompt,
-            timeoutMs = timeoutMs,
-            mode = EvalMode.EVAL_JSON,
-            phase = PromptPhase.ONE_STEP,
-            commitToPrimaryState = true
+        ownerJob = viewModelScope.launch(
+            context = ioDispatcher,
+            start = CoroutineStart.LAZY
+        ) {
+            try {
+                runEvaluationCore(
+                    runId = runId,
+                    userPrompt = prompt,
+                    timeoutMs = timeoutMs,
+                    mode = EvalMode.EVAL_JSON,
+                    phase = PromptPhase.ONE_STEP,
+                    commitToPrimaryState = true
+                )
+            } finally {
+                finalizeOwnedJob(ownerJob)
+            }
+        }
+
+        val existing = installExecutionOrGetExisting(
+            newJob = ownerJob,
+            initialRunId = runId,
+            clearHistory = true
         )
-        evalJob = job
-        return job
+
+        if (existing != null) {
+            ownerJob.cancel(CancellationException("single-flight-existing-run"))
+            logW(TAG, "evaluateAsync: already running -> returning existing job")
+            return existing
+        }
+
+        ownerJob.start()
+        return ownerJob
     }
 
     fun evaluateConditionalTwoStepAsync(
@@ -640,24 +741,18 @@ class AiViewModel(
         val p1 = firstPrompt.trim()
         if (p1.isEmpty()) {
             resetStates(keepError = false)
-            return viewModelScope.launch { }
+            return completedJob()
         }
 
-        if (!running.compareAndSet(false, true)) {
-            logW(TAG, "evaluateConditionalTwoStepAsync: already running -> returning existing job")
-            return evalJob ?: viewModelScope.launch { }
-        }
+        val runId1 = runSeq.incrementAndGet()
+        lateinit var chainJob: Job
 
-        cancelDanglingJobIfAny(reason = "dangling_before_new_chain")
-
-        prepareUiForNewChain(clearHistory = true)
-
-        val chainJob = viewModelScope.launch(ioDispatcher) {
+        chainJob = viewModelScope.launch(
+            context = ioDispatcher,
+            start = CoroutineStart.LAZY
+        ) {
             try {
-                // --- step 1 (EVAL JSON) ---
-                val runId1 = runSeq.incrementAndGet()
-                activeRunId.set(runId1)
-
+                // Step 1: evaluation JSON.
                 val step1 = runEvaluationCore(
                     runId = runId1,
                     userPrompt = p1,
@@ -667,41 +762,60 @@ class AiViewModel(
                     commitToPrimaryState = true
                 )
 
+                currentCoroutineContext().ensureActive()
+
                 if (step1.timedOut && !proceedOnTimeout) {
-                    if (DEBUG_LOGS) logW(TAG, "chain2: step1 timed out -> skipping step2 (proceedOnTimeout=false)")
+                    if (DEBUG_LOGS) {
+                        logW(
+                            TAG,
+                            "chain2: step1 timed out -> skipping step2 (proceedOnTimeout=false)"
+                        )
+                    }
                     return@launch
                 }
 
                 val doStep2 = runCatching { shouldRunSecond(step1) }
-                    .onFailure { t -> logE(TAG, "chain2: shouldRunSecond failed -> treat as false", t) }
+                    .onFailure { t ->
+                        logE(TAG, "chain2: shouldRunSecond failed -> treat as false", t)
+                    }
                     .getOrElse { false }
+
+                currentCoroutineContext().ensureActive()
 
                 if (!doStep2) {
                     if (DEBUG_LOGS) {
-                        // Runtime only: rawPreview may contain user/model content.
+                        // Runtime only: raw preview may contain user/model content.
                         logDRuntimeOnly(
                             TAG,
-                            "chain2: step2 skipped (score=${step1.score}, followups=${step1.followups.size}, timedOut=${step1.timedOut}, " +
+                            "chain2: step2 skipped " +
+                                    "(score=${step1.score}, followups=${step1.followups.size}, " +
+                                    "timedOut=${step1.timedOut}, " +
                                     "rawPreview='${debugVisible(preview(step1.raw))}')"
                         )
                     }
                     return@launch
                 }
 
-                // --- step 2 (FOLLOWUP; JSON or raw text) ---
+                // Step 2: follow-up JSON or plain text.
                 val p2 = runCatching { buildSecondPrompt(step1).trim() }
                     .onFailure { t -> logE(TAG, "chain2: buildSecondPrompt failed", t) }
                     .getOrElse { "" }
+
+                currentCoroutineContext().ensureActive()
 
                 if (p2.isEmpty()) {
                     if (DEBUG_LOGS) logW(TAG, "chain2: step2 prompt is blank -> done")
                     return@launch
                 }
 
-                prepareUiForNextStep()
-
                 val runId2 = runSeq.incrementAndGet()
-                activeRunId.set(runId2)
+                val activated = activateNextRunIfOwner(
+                    ownerJob = chainJob,
+                    nextRunId = runId2
+                )
+                if (!activated) {
+                    throw CancellationException("chain-owner-lost-before-step2")
+                }
 
                 runEvaluationCore(
                     runId = runId2,
@@ -712,17 +826,38 @@ class AiViewModel(
                     commitToPrimaryState = false
                 )
             } finally {
-                finalizeChainFlags()
+                // Owner identity is critical here. An old cancelled chain must never clear the
+                // flags of a replacement inference that started while this coroutine unwound.
+                finalizeOwnedJob(chainJob)
             }
         }
 
-        evalJob = chainJob
+        val existing = installExecutionOrGetExisting(
+            newJob = chainJob,
+            initialRunId = runId1,
+            clearHistory = true
+        )
+
+        if (existing != null) {
+            chainJob.cancel(CancellationException("single-flight-existing-run"))
+            logW(
+                TAG,
+                "evaluateConditionalTwoStepAsync: already running -> returning existing job"
+            )
+            return existing
+        }
+
+        chainJob.start()
         return chainJob
     }
 
     fun cancel() {
         logI(TAG, "cancel: invoked (isRunning=${running.get()}, loading=${_loading.value})")
-        stopCurrentRunInternal(reason = "cancelled", emitCancelledEvent = true, setCancelledError = true)
+        stopCurrentRunInternal(
+            reason = "cancelled",
+            emitCancelledEvent = true,
+            setCancelledError = true
+        )
     }
 
     /**
@@ -733,48 +868,37 @@ class AiViewModel(
      * - DOES NOT clear persisted chat/conversation state (B plan).
      */
     fun resetStates(keepError: Boolean = false) {
-        stopCurrentRunInternal(reason = "reset", emitCancelledEvent = false, setCancelledError = false)
+        val owner = synchronized(executionLock) {
+            val job = evalJobRef.getAndSet(null)
+            activeRunId.set(-1L)
+            running.set(false)
 
-        clearStepHistory()
+            clearStepHistory()
+            _score.value = null
+            _stream.value = ""
+            _raw.value = null
+            _followupQuestion.value = null
+            _followups.value = emptyList()
+            _loading.value = false
+            if (!keepError) _error.value = null
 
-        _score.value = null
-        _stream.value = ""
-        _raw.value = null
-        _followupQuestion.value = null
-        _followups.value = emptyList()
-        _loading.value = false
-        if (!keepError) _error.value = null
+            job
+        }
+
+        owner?.cancel(CancellationException("reset"))
     }
 
     override fun onCleared() {
         logI(TAG, "onCleared: ViewModel is being cleared -> stopCurrentRunInternal()")
+        stopCurrentRunInternal(
+            reason = "cleared",
+            emitCancelledEvent = false,
+            setCancelledError = false
+        )
         super.onCleared()
-        stopCurrentRunInternal(reason = "cleared", emitCancelledEvent = false, setCancelledError = false)
     }
 
     // ───────────────────────── Internal evaluation core ─────────────────────────
-
-    private fun startEvaluationInternal(
-        runId: Long,
-        userPrompt: String,
-        timeoutMs: Long,
-        mode: EvalMode,
-        phase: PromptPhase,
-        commitToPrimaryState: Boolean
-    ): Job = viewModelScope.launch(ioDispatcher) {
-        try {
-            runEvaluationCore(
-                runId = runId,
-                userPrompt = userPrompt,
-                timeoutMs = timeoutMs,
-                mode = mode,
-                phase = phase,
-                commitToPrimaryState = commitToPrimaryState
-            )
-        } finally {
-            finalizeRunFlagsIfActive(runId)
-        }
-    }
 
     private suspend fun runEvaluationCore(
         runId: Long,
@@ -788,17 +912,33 @@ class AiViewModel(
         var chunkCount = 0
         var totalChars = 0
         var timedOut = false
+        var outputLimited = false
         var lastStreamEmitLen = 0
 
+        val effectiveTimeoutMs = timeoutMs.coerceAtLeast(1L)
         val enableFullLogs = BuildConfig.DEBUG && DEBUG_LOGS
 
         fun isActiveRun(): Boolean = activeRunId.get() == runId
 
+        suspend fun requireActiveRun() {
+            currentCoroutineContext().ensureActive()
+            if (!isActiveRun()) {
+                throw CancellationException("stale-run")
+            }
+        }
+
         fun maybeEmitStream(force: Boolean = false) {
             val delta = buf.length - lastStreamEmitLen
             if (!force && delta < STREAM_EMIT_MIN_DELTA_CHARS) return
-            lastStreamEmitLen = buf.length
-            _stream.value = buf.toString()
+
+            val snapshot = buf.toString()
+            val committed = commitIfActive(runId) {
+                lastStreamEmitLen = snapshot.length
+                _stream.value = snapshot
+            }
+            if (!committed) {
+                throw CancellationException("stale-run-stream")
+            }
         }
 
         fun isEmptyJsonObject(text: String): Boolean {
@@ -823,13 +963,25 @@ class AiViewModel(
                 .toList()
         }
 
+        fun sanitizeSingleFollowup(candidate: String?): String? {
+            return candidate
+                ?.trim()
+                ?.takeIf { it.isNotBlank() }
+                ?.takeIf { !isEmptyJsonObject(it) }
+                ?.takeIf { !isJsonLike(it) }
+        }
+
         fun extractFollowupFromPlainText(rawText: String): String? {
             val t = rawText.trim()
             if (t.isBlank()) return null
             if (isEmptyJsonObject(t)) return null
 
             val unquoted = t.removePrefix("\"").removeSuffix("\"").trim()
-            val lines = unquoted.lineSequence().map { it.trim() }.filter { it.isNotBlank() }.toList()
+            val lines = unquoted
+                .lineSequence()
+                .map { it.trim() }
+                .filter { it.isNotBlank() }
+                .toList()
 
             val qLine = lines.firstOrNull { it.contains("?") || it.contains("？") }
             return qLine ?: lines.firstOrNull()
@@ -838,20 +990,31 @@ class AiViewModel(
         var stepError: String? = null
 
         try {
+            requireActiveRun()
+
             val fullPrompt = runCatching { repo.buildPrompt(userPrompt, phase) }
                 .onFailure { t ->
-                    logE(TAG, "run[$runId]: repo.buildPrompt failed; falling back to userPrompt", t)
+                    logE(
+                        TAG,
+                        "run[$runId]: repo.buildPrompt failed; falling back to userPrompt",
+                        t
+                    )
                 }
                 .getOrElse { userPrompt }
 
             if (DEBUG_LOGS) {
-                // Ring-safe: only lengths and hashes.
+                // Ring-safe: only lengths and content fingerprints.
                 logD(
                     TAG,
                     "run[$runId]: mode=$mode phase=$phase commit=$commitToPrimaryState " +
-                            "prompt.len=${userPrompt.length}, fullPrompt.len=${fullPrompt.length}, timeoutMs=$timeoutMs"
+                            "prompt.len=${userPrompt.length}, fullPrompt.len=${fullPrompt.length}, " +
+                            "timeoutMs=$effectiveTimeoutMs"
                 )
-                logD(TAG, "run[$runId]: sha(prompt)=${sha256Hex(userPrompt)} sha(full)=${sha256Hex(fullPrompt)}")
+                logD(
+                    TAG,
+                    "run[$runId]: sha(prompt)=${sha256Hex(userPrompt)} " +
+                            "sha(full)=${sha256Hex(fullPrompt)}"
+                )
             }
 
             if (enableFullLogs) {
@@ -865,23 +1028,52 @@ class AiViewModel(
             }
 
             try {
-                withTimeout(timeoutMs) {
-                    repo.request(fullPrompt).collect { part ->
-                        if (!isActiveRun()) {
-                            throw CancellationException("stale-run")
-                        }
+                withTimeout(effectiveTimeoutMs) {
+                    // Protect native/on-device inference backends from overlapping request calls
+                    // during cancel-and-restart races.
+                    inferenceMutex.withLock {
+                        requireActiveRun()
 
-                        if (part.isNotEmpty()) {
-                            chunkCount++
-                            buf.append(part)
-                            totalChars += part.length
+                        repo.request(fullPrompt).collect { part ->
+                            requireActiveRun()
 
-                            maybeEmitStream(force = false)
-                            _events.tryEmit(AiEvent.Stream(part))
+                            if (part.isNotEmpty()) {
+                                chunkCount++
 
-                            if (DEBUG_LOGS) {
-                                // Runtime only: chunk preview may contain model output.
-                                logDRuntimeOnly(TAG, "run[$runId] chunk[$chunkCount].preview='${debugVisible(preview(part))}'")
+                                val remaining = MAX_MODEL_OUTPUT_CHARS - buf.length
+                                if (remaining <= 0) {
+                                    throw OutputLimitReachedException()
+                                }
+
+                                if (part.length <= remaining) {
+                                    buf.append(part)
+                                    totalChars += part.length
+                                } else {
+                                    buf.append(part, 0, remaining)
+                                    totalChars += remaining
+                                }
+
+                                maybeEmitStream(force = false)
+
+                                val eventCommitted = commitIfActive(runId) {
+                                    _events.tryEmit(AiEvent.Stream(part.take(remaining)))
+                                }
+                                if (!eventCommitted) {
+                                    throw CancellationException("stale-run-event")
+                                }
+
+                                if (DEBUG_LOGS) {
+                                    // Runtime only: chunk preview may contain model output.
+                                    logDRuntimeOnly(
+                                        TAG,
+                                        "run[$runId] chunk[$chunkCount].preview='" +
+                                                "${debugVisible(preview(part))}'"
+                                    )
+                                }
+
+                                if (part.length > remaining) {
+                                    throw OutputLimitReachedException()
+                                }
                             }
                         }
                     }
@@ -889,26 +1081,19 @@ class AiViewModel(
             } catch (e: TimeoutCancellationException) {
                 timedOut = true
                 stepError = "timeout"
-                if (DEBUG_LOGS) logW(TAG, "run[$runId]: timeout after ${timeoutMs}ms", e)
-            } catch (e: CancellationException) {
-                if (!isActiveRun()) {
-                    if (DEBUG_LOGS) logW(TAG, "run[$runId]: cancelled (stale run) -> stop quietly")
-                    return EvalResult(runId = runId, raw = "", score = null, followups = emptyList(), timedOut = false)
+                if (DEBUG_LOGS) {
+                    logW(TAG, "run[$runId]: timeout after ${effectiveTimeoutMs}ms", e)
                 }
-
-                if (looksLikeTimeout(e)) {
-                    timedOut = true
-                    stepError = "timeout"
-                    if (DEBUG_LOGS) logW(TAG, "run[$runId]: timeout-like cancellation (${e.javaClass.name})")
-                } else {
-                    throw e
-                }
+            } catch (e: OutputLimitReachedException) {
+                outputLimited = true
+                stepError = "output_limit"
+                logW(
+                    TAG,
+                    "run[$runId]: model output reached hard limit chars=$MAX_MODEL_OUTPUT_CHARS"
+                )
             }
 
-            if (!isActiveRun()) {
-                return EvalResult(runId = runId, raw = "", score = null, followups = emptyList(), timedOut = timedOut)
-            }
-
+            requireActiveRun()
             maybeEmitStream(force = true)
 
             val rawText = buf.toString().ifBlank { _stream.value }
@@ -916,12 +1101,19 @@ class AiViewModel(
 
             if (DEBUG_LOGS) {
                 // Ring-safe stats only.
-                logD(TAG, "run[$runId] stats: chunks=$chunkCount, chars=$totalChars, raw.len=${rawText.length}")
+                logD(
+                    TAG,
+                    "run[$runId] stats: chunks=$chunkCount, chars=$totalChars, " +
+                            "raw.len=${rawText.length}"
+                )
                 logD(TAG, "run[$runId] sha(raw)=${sha256Hex(rawText)}")
             }
             if (DEBUG_LOGS && DEBUG_WHITESPACE) {
                 // Runtime only: raw preview may contain model output.
-                logDRuntimeOnly(TAG, "run[$runId] rawVisible='${debugVisible(preview(rawText))}'")
+                logDRuntimeOnly(
+                    TAG,
+                    "run[$runId] rawVisible='${debugVisible(preview(rawText))}'"
+                )
             }
 
             val parsedScore: Int?
@@ -938,12 +1130,16 @@ class AiViewModel(
                             // Runtime only: includes output preview.
                             logWRuntimeOnly(
                                 TAG,
-                                "run[$runId]: EVAL_JSON output is empty/trivial ('${debugVisible(preview(rawTrim))}') -> score=null, followups=0"
+                                "run[$runId]: EVAL_JSON output is empty/trivial " +
+                                        "('${debugVisible(preview(rawTrim))}') -> " +
+                                        "score=null, followups=0"
                             )
                         }
                     } else {
                         val s1 = clampScore(FollowupExtractor.extractScore(rawText))
-                        val f1 = sanitizeFollowups(FollowupExtractor.fromRaw(rawText, max = 6))
+                        val f1 = sanitizeFollowups(
+                            FollowupExtractor.fromRaw(rawText, max = 6)
+                        )
 
                         parsedScore = s1
                         top3 = f1.take(3)
@@ -953,7 +1149,9 @@ class AiViewModel(
                             // Runtime only: includes follow-up preview.
                             logDRuntimeOnly(
                                 TAG,
-                                "run[$runId]: EVAL_JSON parsed score=$parsedScore followups=${top3.size} fu0='${debugVisible(preview(q0.orEmpty()))}'"
+                                "run[$runId]: EVAL_JSON parsed score=$parsedScore " +
+                                        "followups=${top3.size} " +
+                                        "fu0='${debugVisible(preview(q0.orEmpty()))}'"
                             )
                         }
                     }
@@ -963,11 +1161,10 @@ class AiViewModel(
                     val fromExtractor = FollowupExtractor.extractFollowupQuestion(rawText)
                     val fromText = extractFollowupFromPlainText(rawText)
 
-                    val best = (fromExtractor ?: fromText)
-                        ?.trim()
-                        ?.takeIf { it.isNotBlank() }
-                        ?.takeIf { !isEmptyJsonObject(it) }
-                        ?.takeIf { !isJsonLike(it) }
+                    // Sanitize each source independently so an invalid extractor candidate does
+                    // not prevent a valid plain-text fallback from being considered.
+                    val best = sanitizeSingleFollowup(fromExtractor)
+                        ?: sanitizeSingleFollowup(fromText)
 
                     parsedScore = null
                     top3 = best?.let { listOf(it) } ?: emptyList()
@@ -986,41 +1183,51 @@ class AiViewModel(
                 }
             }
 
-            _error.value = stepError
+            currentCoroutineContext().ensureActive()
 
-            appendStepSnapshot(
-                StepSnapshot(
-                    runId = runId,
-                    phase = phase,
-                    mode = mode,
-                    raw = rawText,
-                    score = parsedScore,
-                    followups = top3,
-                    timedOut = timedOut,
-                    error = stepError
-                )
+            val snapshot = StepSnapshot(
+                runId = runId,
+                phase = phase,
+                mode = mode,
+                raw = rawText,
+                score = parsedScore,
+                followups = top3,
+                timedOut = timedOut,
+                error = stepError
             )
 
-            if (commitToPrimaryState) {
-                _raw.value = rawText
-                _score.value = parsedScore
-                _followups.value = top3
-                _followupQuestion.value = q0
+            val committed = commitIfActive(runId) {
+                _error.value = stepError
+                appendStepSnapshot(snapshot)
+
+                if (commitToPrimaryState) {
+                    _raw.value = rawText
+                    _score.value = parsedScore
+                    _followups.value = top3
+                    _followupQuestion.value = q0
+                }
+
+                _events.tryEmit(AiEvent.Final(rawText, parsedScore, top3))
+
+                if (timedOut) {
+                    _events.tryEmit(AiEvent.Timeout)
+                } else if (outputLimited) {
+                    _events.tryEmit(AiEvent.Error("output_limit"))
+                }
             }
 
-            _events.tryEmit(AiEvent.Final(rawText, parsedScore, top3))
-
-            if (timedOut) {
-                _events.tryEmit(AiEvent.Timeout)
+            if (!committed) {
+                throw CancellationException("stale-run-terminal-commit")
             }
 
-            // Ring-safe: do not include follow-up text. Use sha/len only.
+            // Ring-safe: do not include follow-up text. Use fingerprint/length only.
             val q0Len = q0?.length ?: 0
             val q0Sha = q0?.let { sha256Hex(it).take(16) } ?: "none"
             logI(
                 TAG,
-                "run[$runId] done: phase=$phase mode=$mode score=$parsedScore FU0.len=$q0Len FU0.sha16=$q0Sha " +
-                        "commit=$commitToPrimaryState err=${stepError ?: "<none>"}"
+                "run[$runId] done: phase=$phase mode=$mode score=$parsedScore " +
+                        "FU0.len=$q0Len FU0.sha16=$q0Sha commit=$commitToPrimaryState " +
+                        "err=${stepError ?: "<none>"}"
             )
 
             if (enableFullLogs) {
@@ -1033,53 +1240,225 @@ class AiViewModel(
                 )
             }
 
-            return EvalResult(runId = runId, raw = rawText, score = parsedScore, followups = top3, timedOut = timedOut)
+            return EvalResult(
+                runId = runId,
+                raw = rawText,
+                score = parsedScore,
+                followups = top3,
+                timedOut = timedOut
+            )
         } catch (e: CancellationException) {
-            if (isActiveRun() && _error.value == "cancelled") {
-                _events.tryEmit(AiEvent.Cancelled)
-            }
             if (DEBUG_LOGS) logW(TAG, "run[$runId]: cancelled", e)
             throw e
         } catch (t: Throwable) {
             if (!isActiveRun()) {
-                return EvalResult(runId = runId, raw = "", score = null, followups = emptyList(), timedOut = false)
+                throw CancellationException("stale-run-error-path").also { it.initCause(t) }
             }
 
-            val msg = t.message ?: "error"
-            _error.value = msg
-            _events.tryEmit(AiEvent.Error(msg))
-            logE(TAG, "run[$runId]: error", t)
+            val msg = t.message?.takeIf { it.isNotBlank() } ?: "error"
 
-            val rawText = _stream.value
+            // Preserve the local buffer rather than _stream. _stream may intentionally lag behind
+            // by STREAM_EMIT_MIN_DELTA_CHARS, so using it here can discard the final partial chunk.
+            val rawText = buf.toString().ifBlank { _stream.value }
 
-            appendStepSnapshot(
-                StepSnapshot(
-                    runId = runId,
-                    phase = phase,
-                    mode = mode,
-                    raw = rawText,
-                    score = null,
-                    followups = emptyList(),
-                    timedOut = false,
-                    error = msg
-                )
+            val snapshot = StepSnapshot(
+                runId = runId,
+                phase = phase,
+                mode = mode,
+                raw = rawText,
+                score = null,
+                followups = emptyList(),
+                timedOut = false,
+                error = msg
             )
 
-            _events.tryEmit(AiEvent.Final(rawText, _score.value, _followups.value))
+            val committed = commitIfActive(runId) {
+                _stream.value = rawText
+                _error.value = msg
+                appendStepSnapshot(snapshot)
+
+                if (commitToPrimaryState) {
+                    _raw.value = rawText
+                    _score.value = null
+                    _followups.value = emptyList()
+                    _followupQuestion.value = null
+                }
+
+                _events.tryEmit(AiEvent.Error(msg))
+
+                // Error-path Final must describe THIS step. Using the primary Step1 state here
+                // would create an inconsistent Step2-raw + Step1-score/followups event.
+                _events.tryEmit(AiEvent.Final(rawText, null, emptyList()))
+            }
+
+            if (!committed) {
+                throw CancellationException("stale-run-error-commit").also { it.initCause(t) }
+            }
+
+            logE(TAG, "run[$runId]: error type=${t.javaClass.name}", t)
 
             return EvalResult(
                 runId = runId,
                 raw = rawText,
-                score = _score.value,
-                followups = _followups.value,
+                score = null,
+                followups = emptyList(),
                 timedOut = false
             )
         }
     }
 
+    // ───────────────────────── Execution-state helpers ─────────────────────────
+
+    /**
+     * Install [newJob] as the sole execution owner.
+     *
+     * The job is created LAZY by callers, so cancellation can safely win after installation but
+     * before start(): starting a cancelled lazy job is harmless and does not execute inference.
+     *
+     * @return the existing owner when single-flight rejects [newJob], otherwise null.
+     */
+    private fun installExecutionOrGetExisting(
+        newJob: Job,
+        initialRunId: Long,
+        clearHistory: Boolean
+    ): Job? = synchronized(executionLock) {
+        val existing = evalJobRef.get()
+
+        if (running.get() && existing != null) {
+            return@synchronized existing
+        }
+
+        // Recover from a theoretically inconsistent state where running=true but the owner
+        // reference was lost. There is no job left to serialize against, so repair the flags and
+        // install the new owner instead of leaving the ViewModel permanently stuck as running.
+        if (running.get()) {
+            logW(TAG, "installExecution: repairing running=true with missing owner job")
+            running.set(false)
+            activeRunId.set(0L)
+            _loading.value = false
+        }
+
+        evalJobRef.set(newJob)
+        running.set(true)
+        activeRunId.set(initialRunId)
+        prepareUiForNewChainLocked(clearHistory = clearHistory)
+        null
+    }
+
+    /**
+     * Move an owned two-step chain to its next run id atomically with UI step preparation.
+     */
+    private fun activateNextRunIfOwner(ownerJob: Job, nextRunId: Long): Boolean {
+        return synchronized(executionLock) {
+            if (evalJobRef.get() !== ownerJob || !running.get()) {
+                return@synchronized false
+            }
+
+            prepareUiForNextStepLocked()
+            activeRunId.set(nextRunId)
+            true
+        }
+    }
+
+    /**
+     * Execute [block] only while [runId] still owns mutable inference state.
+     *
+     * This closes the check-then-write race that exists when activeRunId is read atomically but
+     * StateFlows are written later without the same synchronization boundary.
+     */
+    private inline fun commitIfActive(runId: Long, block: () -> Unit): Boolean {
+        return synchronized(executionLock) {
+            if (activeRunId.get() != runId) {
+                return@synchronized false
+            }
+            block()
+            true
+        }
+    }
+
+    /**
+     * Finalize execution only if [ownerJob] is still the current owner.
+     *
+     * A cancelled old chain can unwind after a replacement job starts. Identity checking prevents
+     * that old finally block from clearing the replacement job's loading/running/run-id state.
+     */
+    private fun finalizeOwnedJob(ownerJob: Job) {
+        synchronized(executionLock) {
+            if (evalJobRef.get() !== ownerJob) return
+
+            evalJobRef.set(null)
+            activeRunId.set(0L)
+            running.set(false)
+            _loading.value = false
+        }
+    }
+
+    /** Stop whichever job currently owns execution. */
+    private fun stopCurrentRunInternal(
+        reason: String,
+        emitCancelledEvent: Boolean,
+        setCancelledError: Boolean
+    ) {
+        val owner = synchronized(executionLock) {
+            val job = evalJobRef.getAndSet(null)
+
+            activeRunId.set(-1L)
+            running.set(false)
+            _loading.value = false
+
+            if (setCancelledError) {
+                _error.value = "cancelled"
+            }
+
+            if (emitCancelledEvent) {
+                _events.tryEmit(AiEvent.Cancelled)
+            }
+
+            job
+        }
+
+        owner?.cancel(CancellationException(reason))
+    }
+
+    /**
+     * Stop only [expectedOwner]. Used by the suspend evaluate() API so caller cancellation cannot
+     * accidentally cancel a newer job that may have replaced the original owner.
+     */
+    private fun stopOwnedJob(
+        expectedOwner: Job,
+        reason: String,
+        emitCancelledEvent: Boolean,
+        setCancelledError: Boolean
+    ) {
+        val shouldCancel = synchronized(executionLock) {
+            if (evalJobRef.get() !== expectedOwner) {
+                return@synchronized false
+            }
+
+            evalJobRef.set(null)
+            activeRunId.set(-1L)
+            running.set(false)
+            _loading.value = false
+
+            if (setCancelledError) {
+                _error.value = "cancelled"
+            }
+            if (emitCancelledEvent) {
+                _events.tryEmit(AiEvent.Cancelled)
+            }
+
+            true
+        }
+
+        if (shouldCancel) {
+            expectedOwner.cancel(CancellationException(reason))
+        }
+    }
+
     // ───────────────────────── UI preparation ─────────────────────────
 
-    private fun prepareUiForNewChain(clearHistory: Boolean) {
+    /** Must be called while holding [executionLock]. */
+    private fun prepareUiForNewChainLocked(clearHistory: Boolean) {
         _loading.value = true
         _score.value = null
         _stream.value = ""
@@ -1090,72 +1469,18 @@ class AiViewModel(
         if (clearHistory) clearStepHistory()
     }
 
-    private fun prepareUiForNextStep() {
+    /** Must be called while holding [executionLock]. */
+    private fun prepareUiForNextStepLocked() {
         _loading.value = true
         _stream.value = ""
         _error.value = null
     }
 
-    private fun finalizeRunFlagsIfActive(runId: Long) {
-        if (activeRunId.get() != runId) return
-        _loading.value = false
-        running.set(false)
-        evalJob = null
-        activeRunId.set(0L)
-    }
-
-    private fun finalizeChainFlags() {
-        _loading.value = false
-        running.set(false)
-        evalJob = null
-        activeRunId.set(0L)
-    }
-
-    private fun stopCurrentRunInternal(
-        reason: String,
-        emitCancelledEvent: Boolean,
-        setCancelledError: Boolean
-    ) {
-        val job = evalJob
-        evalJob = null
-
-        if (setCancelledError) _error.value = "cancelled"
-
-        activeRunId.set(-1L)
-
-        if (job != null) {
-            runCatching { job.cancel(CancellationException(reason)) }
-                .onFailure { t -> logW(TAG, "stopCurrentRunInternal: exception during cancel (ignored)", t) }
-        }
-
-        _loading.value = false
-        running.set(false)
-
-        if (emitCancelledEvent) {
-            _events.tryEmit(AiEvent.Cancelled)
-        }
-    }
-
-    private fun cancelDanglingJobIfAny(reason: String) {
-        val job = evalJob ?: return
-        evalJob = null
-        activeRunId.set(-1L)
-
-        runCatching { job.cancel(CancellationException(reason)) }
-            .onFailure { t -> logW(TAG, "cancelDanglingJobIfAny: exception during cancel (ignored)", t) }
-    }
-
     // ───────────────────────── helpers ─────────────────────────
 
-    private fun clampScore(s: Int?): Int? = s?.coerceIn(0, 100)
+    private fun completedJob(): Job = kotlinx.coroutines.Job().apply { complete() }
 
-    private fun looksLikeTimeout(e: CancellationException): Boolean {
-        val n = e.javaClass.name
-        val m = e.message ?: ""
-        return n.endsWith("TimeoutCancellationException") ||
-                n.contains("Timeout", ignoreCase = true) ||
-                m.contains("timeout", ignoreCase = true)
-    }
+    private fun clampScore(s: Int?): Int? = s?.coerceIn(0, 100)
 
     private fun sha256Hex(input: String): String = runCatching {
         val md = MessageDigest.getInstance("SHA-256")

@@ -20,25 +20,35 @@ import android.util.Log
 import java.io.BufferedOutputStream
 import java.io.File
 import java.io.FileOutputStream
+import java.io.RandomAccessFile
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.min
 
 /**
- * Ring-buffer file logger owned by the app process.
+ * App-owned rotating file logger.
  *
- * Why:
- * - logcat is a finite system ring buffer and cannot be "reliable" for "last crash before logs".
- * - app-owned files in filesDir are reliable across restarts (unless explicitly removed).
+ * Goals:
+ * - Keep recent diagnostic context across process restarts.
+ * - Avoid depending on logcat's finite system ring buffer.
+ * - Keep write ordering deterministic through one IO executor.
+ * - Provide a bounded crash snapshot for CrashCapture.
+ * - Stay best-effort: logging failures must never crash the app.
  *
- * Design:
- * - Writes line-oriented text logs into fixed-size segments (rotating).
- * - Snapshot reads across segments to build a "last N bytes" view.
- * - Provides crash staging: copy a snapshot into CrashCapture's crash dir.
+ * Threading:
+ * - [log] may be called from any thread.
+ * - File writes are serialized through [io].
+ * - Crash snapshotting performs a short best-effort drain of queued writes.
+ *
+ * Storage:
+ * - Segments live under filesDir/diagnostics/applog_ring.
+ * - A fixed number of files is reused in a ring.
  */
 object AppRingLogStore {
 
@@ -50,264 +60,560 @@ object AppRingLogStore {
     /** Segment filename prefix. */
     private const val SEG_PREFIX = "seg_"
 
-    /** Segment count (rotation). */
+    /** Number of files in the rotating ring. */
     private const val SEG_COUNT = 16
 
-    /** Max size per segment in bytes. */
+    /** Maximum target size for one segment. */
     private const val SEG_MAX_BYTES = 256 * 1024
 
-    /** Snapshot size used for crash staging. */
+    /** Maximum crash snapshot payload. */
     private const val CRASH_SNAPSHOT_MAX_BYTES = 1_500_000
 
-    /** Flush strategy: flush every write for safety (slower but reliable). */
-    private const val FLUSH_EVERY_WRITE = true
+    /**
+     * Maximum amount of snapshot memory a public caller may request.
+     *
+     * This prevents accidental very large ByteArray allocations.
+     */
+    private const val ABSOLUTE_SNAPSHOT_MAX_BYTES = SEG_COUNT * SEG_MAX_BYTES
+
+    /**
+     * Prevent one pathological message or stack trace from consuming an
+     * entire segment.
+     */
+    private const val MAX_MESSAGE_CHARS = 16 * 1024
+    private const val MAX_STACK_CHARS = 48 * 1024
+
+    /**
+     * Best-effort time allowed for queued writes to reach disk before a crash
+     * snapshot starts.
+     *
+     * Never wait indefinitely from an uncaught-exception path.
+     */
+    private const val CRASH_DRAIN_TIMEOUT_MS = 300L
+
+    private const val IO_THREAD_NAME = "AppRingLog-IO"
 
     private val installed = AtomicBoolean(false)
 
     @Volatile
     private var rootDir: File? = null
 
+    /**
+     * Only the single IO executor mutates this after installation.
+     * Volatile keeps diagnostics/snapshot readers safe if they inspect it.
+     */
     @Volatile
     private var currentIndex: Int = 0
 
-    private val io = Executors.newSingleThreadExecutor { r ->
-        Thread(r, "AppRingLog-IO").apply { isDaemon = true }
-    }
-
-    private val FILE_TS_UTC = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).apply {
-        timeZone = TimeZone.getTimeZone("UTC")
-    }
+    private val io: ExecutorService =
+        Executors.newSingleThreadExecutor { runnable ->
+            Thread(runnable, IO_THREAD_NAME).apply {
+                isDaemon = true
+            }
+        }
 
     /**
-     * Returns the ring directory (best-effort).
+     * SimpleDateFormat is not thread-safe.
      *
-     * Notes:
-     * - This does NOT implicitly install the store (no segment selection, no header write).
-     * - It is safe to call even before [install]; callers may use it for discovery.
+     * formatLine() may run on any app thread and crash staging may also format
+     * a timestamp concurrently, so every access must be serialized.
+     */
+    private val timestampLock = Any()
+
+    private val fileTimestampUtc =
+        SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).apply {
+            timeZone = TimeZone.getTimeZone("UTC")
+        }
+
+    /**
+     * Returns the ring directory.
+     *
+     * This does not install the logger or write a segment header.
+     * Directory creation is best-effort here; [install] performs strict checks.
      */
     fun ringDir(context: Context): File {
         val appCtx = context.applicationContext ?: context
         val dir = File(appCtx.filesDir, DIR_REL)
-        runCatching { dir.mkdirs() }
+
+        runCatching {
+            if (!dir.exists()) {
+                dir.mkdirs()
+            }
+        }
+
         return dir
     }
 
     /**
-     * Install (initialize) the ring directory and pick a writable segment.
+     * Initializes the ring store.
      *
-     * Call early (Application.onCreate).
+     * Safe to call repeatedly. If installation fails, the installed flag is
+     * restored so a later call may retry.
      */
     fun install(context: Context) {
-        if (!installed.compareAndSet(false, true)) return
+        if (!installed.compareAndSet(false, true)) {
+            return
+        }
 
-        val dir = ringDir(context)
-        dir.mkdirs()
-        rootDir = dir
+        try {
+            val dir = ringDir(context)
+            ensureDirectory(dir)
 
-        // Pick the newest segment index as the current write head.
-        currentIndex = pickWriteIndex(dir)
+            rootDir = dir
+            currentIndex = pickWriteIndex(dir)
 
-        // Write a small session header line.
-        val now = Date()
-        enqueueWrite(
-            formatLine(
+            val line = formatLine(
                 level = "I",
                 tag = TAG,
-                msg = "install: pid=${Process.myPid()} timeUtc=${FILE_TS_UTC.format(now)} uptimeMs=${SystemClock.elapsedRealtime()}",
+                msg = "install: pid=${Process.myPid()} " +
+                        "timeUtc=${timestampUtc()} " +
+                        "uptimeMs=${SystemClock.elapsedRealtime()}",
                 tr = null
             )
+
+            enqueueWrite(
+                line = line,
+                syncToDisk = true
+            )
+
+            Log.d(
+                TAG,
+                "installed: dir=${dir.absolutePath} idx=$currentIndex"
+            )
+        } catch (t: Throwable) {
+            rootDir = null
+            currentIndex = 0
+            installed.set(false)
+
+            Log.w(
+                TAG,
+                "install failed: ${t.message}",
+                t
+            )
+
+            throw t
+        }
+    }
+
+    /**
+     * Writes one log entry asynchronously.
+     *
+     * Warning/error/fatal entries request an fsync. Lower-priority entries are
+     * still flushed and the stream is closed after every write, but skip the
+     * expensive fsync syscall.
+     */
+    fun log(
+        level: String,
+        tag: String,
+        msg: String,
+        tr: Throwable? = null
+    ) {
+        val normalizedLevel = normalizeLevel(level)
+
+        val line = formatLine(
+            level = normalizedLevel,
+            tag = tag,
+            msg = msg,
+            tr = tr
         )
 
-        Log.d(TAG, "installed: dir=${dir.absolutePath} idx=$currentIndex")
+        enqueueWrite(
+            line = line,
+            syncToDisk = shouldSyncToDisk(normalizedLevel)
+        )
     }
 
     /**
-     * Log a line into the ring store.
+     * Creates a bounded snapshot file inside [crashDir].
      *
-     * Notes:
-     * - Keep messages short-ish; snapshot size is capped.
-     * - Do not call from performance-critical tight loops without throttling.
+     * Intended for uncaught-exception handling. The method is best-effort and
+     * deliberately avoids an unbounded wait for the logging executor.
      */
-    fun log(level: String, tag: String, msg: String, tr: Throwable? = null) {
-        val line = formatLine(level = level, tag = tag, msg = msg, tr = tr)
-        enqueueWrite(line)
-    }
-
-    /**
-     * Stage a snapshot into the given crash directory.
-     *
-     * This is designed to be called from an uncaughtException handler (best-effort).
-     * It performs only bounded IO (last N bytes) and writes a plain text file.
-     */
-    fun stageSnapshotForCrash(crashDir: File, prefix: String = "applog"): File? {
+    fun stageSnapshotForCrash(
+        crashDir: File,
+        prefix: String = "applog"
+    ): File? {
         val dir = rootDir ?: return null
-        if (!dir.exists()) return null
 
-        val now = Date()
-        val stampUtc = FILE_TS_UTC.format(now)
-        val out = File(crashDir, "${prefix}_${stampUtc}_pid${Process.myPid()}.log")
+        if (!dir.isDirectory) {
+            return null
+        }
 
         return try {
-            val bytes = snapshotBytes(maxBytes = CRASH_SNAPSHOT_MAX_BYTES)
+            ensureDirectory(crashDir)
+
+            /**
+             * Drain writes already queued before the barrier.
+             *
+             * If the crash happens on the logging executor itself, do not wait
+             * on that same executor because it would deadlock.
+             */
+            drainPendingWritesBestEffort(CRASH_DRAIN_TIMEOUT_MS)
+
+            val stampUtc = timestampUtc()
+            val safePrefix = sanitizeFileComponent(prefix).ifBlank { "applog" }
+
+            val out = File(
+                crashDir,
+                "${safePrefix}_${stampUtc}_pid${Process.myPid()}.log"
+            )
+
+            val bytes = snapshotBytes(
+                maxBytes = CRASH_SNAPSHOT_MAX_BYTES
+            )
+
             FileOutputStream(out).use { fos ->
                 fos.write(bytes)
                 fos.flush()
-                runCatching { fos.fd.sync() }
+
+                /**
+                 * Crash artifacts are worth forcing to stable storage.
+                 */
+                runCatching {
+                    fos.fd.sync()
+                }
             }
+
             out
         } catch (t: Throwable) {
-            Log.w(TAG, "stageSnapshotForCrash failed: ${t.message}", t)
+            Log.w(
+                TAG,
+                "stageSnapshotForCrash failed: ${t.message}",
+                t
+            )
             null
         }
     }
 
     /**
-     * Build a snapshot of the most recent bytes across segments.
+     * Returns the newest [maxBytes] worth of ring data.
      *
-     * Implementation notes:
-     * - We collect chunks from newest -> oldest until the cap is reached (keeps newest data).
-     * - Then we reverse the chunk order for readability (older -> newer among included chunks).
+     * Segment chunks are collected newest-to-oldest, then emitted in readable
+     * chronological order among the selected chunks.
      */
     fun snapshotBytes(maxBytes: Int): ByteArray {
         val dir = rootDir ?: return ByteArray(0)
-        val segsNewestFirst = listSegmentsNewestFirst(dir)
-        if (segsNewestFirst.isEmpty()) return ByteArray(0)
 
-        val chunks = ArrayList<ByteArray>(segsNewestFirst.size)
-        var remaining = maxBytes.coerceAtLeast(0)
+        if (!dir.isDirectory) {
+            return ByteArray(0)
+        }
 
-        for (f in segsNewestFirst) {
-            if (remaining <= 0) break
-            val chunk = readTailBytes(f, remaining)
+        val safeMax = maxBytes.coerceIn(
+            0,
+            ABSOLUTE_SNAPSHOT_MAX_BYTES
+        )
+
+        if (safeMax == 0) {
+            return ByteArray(0)
+        }
+
+        val segmentsNewestFirst =
+            listSegmentsNewestFirst(dir)
+
+        if (segmentsNewestFirst.isEmpty()) {
+            return ByteArray(0)
+        }
+
+        val chunks =
+            ArrayList<ByteArray>(segmentsNewestFirst.size)
+
+        var remaining = safeMax
+
+        for (file in segmentsNewestFirst) {
+            if (remaining <= 0) {
+                break
+            }
+
+            val chunk = readTailBytes(
+                file = file,
+                maxBytes = remaining
+            )
+
             if (chunk.isNotEmpty()) {
-                chunks.add(chunk)
+                chunks += chunk
                 remaining -= chunk.size
             }
         }
 
-        val out = ByteArrayOutputStreamCapped(maxBytes.coerceAtLeast(0))
-        for (i in chunks.indices.reversed()) {
-            out.write(chunks[i])
+        val out = ByteArrayOutputStreamCapped(safeMax)
+
+        for (index in chunks.indices.reversed()) {
+            out.write(chunks[index])
         }
+
         return out.toByteArray()
     }
 
-    // -----------------------------------------------------------------------------
-    // Internals
-    // -----------------------------------------------------------------------------
+    // =====================================================================
+    // Write path
+    // =====================================================================
 
-    private fun enqueueWrite(line: String) {
+    private fun enqueueWrite(
+        line: String,
+        syncToDisk: Boolean
+    ) {
         val dir = rootDir ?: return
-        io.execute {
-            try {
-                val f = resolveWritableSegmentFile(dir)
-                appendLine(f, line)
-            } catch (t: Throwable) {
-                Log.w(TAG, "write failed: ${t.message}", t)
+
+        try {
+            io.execute {
+                try {
+                    val bytes = line.toByteArray(Charsets.UTF_8)
+
+                    val file = resolveWritableSegmentFile(
+                        dir = dir,
+                        incomingBytes = bytes.size
+                    )
+
+                    appendBytes(
+                        file = file,
+                        bytes = bytes,
+                        syncToDisk = syncToDisk
+                    )
+                } catch (t: Throwable) {
+                    Log.w(
+                        TAG,
+                        "write failed: ${t.message}",
+                        t
+                    )
+                }
             }
+        } catch (t: Throwable) {
+            /**
+             * Executor rejection should never escape into application code.
+             */
+            Log.w(
+                TAG,
+                "enqueueWrite failed: ${t.message}",
+                t
+            )
         }
     }
 
     /**
-     * Resolve the current writable segment file.
+     * Resolves the segment that should receive [incomingBytes].
      *
-     * IMPORTANT:
-     * - If rotation happens, this returns the NEW segment file to write into.
-     * - This avoids a subtle bug where callers capture the old file reference and keep writing to it
-     *   even after updating [currentIndex].
+     * Rotation is based on projected size instead of waiting until a segment
+     * is already oversized.
      */
-    private fun resolveWritableSegmentFile(dir: File): File {
-        var idx = currentIndex
-        var f = currentSegmentFile(dir, idx)
+    private fun resolveWritableSegmentFile(
+        dir: File,
+        incomingBytes: Int
+    ): File {
+        var index = currentIndex
+        var file = currentSegmentFile(dir, index)
 
-        if (f.exists() && f.length() >= SEG_MAX_BYTES) {
-            idx = (idx + 1) % SEG_COUNT
-            currentIndex = idx
+        val currentLength =
+            if (file.exists()) file.length() else 0L
 
-            f = currentSegmentFile(dir, idx)
+        val shouldRotate =
+            currentLength > 0L &&
+                    (
+                            currentLength >= SEG_MAX_BYTES ||
+                                    currentLength + incomingBytes.toLong() > SEG_MAX_BYTES
+                            )
 
-            // Start a fresh segment (truncate).
-            runCatching {
-                if (f.exists()) {
-                    f.writeText("")
-                } else {
-                    f.parentFile?.mkdirs()
-                    f.writeText("")
-                }
-            }
+        if (shouldRotate) {
+            index = (index + 1) % SEG_COUNT
+            currentIndex = index
+
+            file = currentSegmentFile(dir, index)
+
+            resetSegmentFile(file)
         }
 
-        return f
+        return file
     }
 
-    private fun appendLine(file: File, line: String) {
+    /**
+     * Truncates the selected ring segment before reuse.
+     *
+     * Failure is propagated to the executor-level catch rather than silently
+     * continuing to append to an old oversized segment.
+     */
+    private fun resetSegmentFile(file: File) {
+        file.parentFile?.let(::ensureDirectory)
+
+        FileOutputStream(file, false).use { fos ->
+            fos.flush()
+        }
+    }
+
+    private fun appendBytes(
+        file: File,
+        bytes: ByteArray,
+        syncToDisk: Boolean
+    ) {
+        file.parentFile?.let(::ensureDirectory)
+
         FileOutputStream(file, true).use { fos ->
             BufferedOutputStream(fos, 32 * 1024).use { bos ->
-                bos.write(line.toByteArray(Charsets.UTF_8))
-                if (FLUSH_EVERY_WRITE) {
-                    bos.flush()
-                    fos.flush()
-                    runCatching { fos.fd.sync() }
+                bos.write(bytes)
+                bos.flush()
+            }
+
+            if (syncToDisk) {
+                runCatching {
+                    fos.fd.sync()
                 }
             }
         }
     }
 
+    // =====================================================================
+    // Rotation / discovery
+    // =====================================================================
+
+    /**
+     * Picks the most recently modified existing segment.
+     *
+     * If no segments exist, index 0 is used.
+     */
     private fun pickWriteIndex(dir: File): Int {
-        // Find the newest existing segment; if none, start at 0.
-        var bestIdx = 0
-        var bestTs = -1L
-        for (i in 0 until SEG_COUNT) {
-            val f = currentSegmentFile(dir, i)
-            if (f.exists()) {
-                val ts = f.lastModified()
-                if (ts > bestTs) {
-                    bestTs = ts
-                    bestIdx = i
-                }
+        var bestIndex = 0
+        var bestTimestamp = Long.MIN_VALUE
+
+        for (index in 0 until SEG_COUNT) {
+            val file = currentSegmentFile(dir, index)
+
+            if (!file.isFile) {
+                continue
+            }
+
+            val timestamp = file.lastModified()
+
+            if (timestamp > bestTimestamp) {
+                bestTimestamp = timestamp
+                bestIndex = index
             }
         }
-        return bestIdx
+
+        return bestIndex
     }
 
-    private fun currentSegmentFile(dir: File, index: Int): File {
-        return File(dir, "$SEG_PREFIX${index.toString().padStart(2, '0')}.log")
+    private fun currentSegmentFile(
+        dir: File,
+        index: Int
+    ): File {
+        val suffix =
+            index.toString().padStart(2, '0')
+
+        return File(
+            dir,
+            "$SEG_PREFIX$suffix.log"
+        )
     }
 
-    private fun listSegmentsNewestFirst(dir: File): List<File> {
-        val segs = (0 until SEG_COUNT)
+    private fun listSegmentsNewestFirst(
+        dir: File
+    ): List<File> {
+        return (0 until SEG_COUNT)
+            .asSequence()
             .map { currentSegmentFile(dir, it) }
-            .filter { it.exists() && it.length() > 0L }
-        return segs.sortedByDescending { it.lastModified() }
+            .filter { it.isFile && it.length() > 0L }
+            .sortedByDescending { it.lastModified() }
+            .toList()
     }
 
-    private fun readTailBytes(file: File, maxBytes: Int): ByteArray {
-        val len = file.length().toInt().coerceAtLeast(0)
-        if (len <= 0) return ByteArray(0)
+    // =====================================================================
+    // Snapshot path
+    // =====================================================================
 
-        val toRead = min(len, maxBytes)
-        val buf = ByteArray(toRead)
+    /**
+     * Reads at most [maxBytes] from the tail of [file].
+     */
+    private fun readTailBytes(
+        file: File,
+        maxBytes: Int
+    ): ByteArray {
+        if (maxBytes <= 0 || !file.isFile) {
+            return ByteArray(0)
+        }
 
-        // Read from end.
-        val raf = java.io.RandomAccessFile(file, "r")
-        return try {
-            raf.seek((len - toRead).toLong())
-            raf.readFully(buf)
-            buf
-        } finally {
-            runCatching { raf.close() }
+        val length = file.length()
+
+        if (length <= 0L) {
+            return ByteArray(0)
+        }
+
+        val toReadLong = min(
+            length,
+            maxBytes.toLong()
+        )
+
+        if (toReadLong <= 0L) {
+            return ByteArray(0)
+        }
+
+        val toRead = toReadLong.toInt()
+        val buffer = ByteArray(toRead)
+
+        RandomAccessFile(file, "r").use { raf ->
+            raf.seek(length - toReadLong)
+            raf.readFully(buffer)
+        }
+
+        return buffer
+    }
+
+    /**
+     * Waits briefly for all writes already queued ahead of the barrier.
+     *
+     * This does not guarantee that another application thread cannot enqueue a
+     * new log immediately after the barrier. It only improves crash snapshots
+     * without risking an indefinite deadlock.
+     */
+    private fun drainPendingWritesBestEffort(
+        timeoutMs: Long
+    ) {
+        if (Thread.currentThread().name == IO_THREAD_NAME) {
+            return
+        }
+
+        val barrier = runCatching {
+            io.submit { Unit }
+        }.getOrNull() ?: return
+
+        runCatching {
+            barrier.get(
+                timeoutMs.coerceAtLeast(1L),
+                TimeUnit.MILLISECONDS
+            )
         }
     }
 
-    private fun formatLine(level: String, tag: String, msg: String, tr: Throwable?): String {
-        val now = Date()
-        val stampUtc = FILE_TS_UTC.format(now)
+    // =====================================================================
+    // Formatting / sanitization
+    // =====================================================================
+
+    private fun formatLine(
+        level: String,
+        tag: String,
+        msg: String,
+        tr: Throwable?
+    ): String {
+        val timestamp = timestampUtc()
+
+        val safeLevel =
+            sanitizeInline(normalizeLevel(level))
+                .ifBlank { "D" }
+
+        val safeTag =
+            sanitizeInline(tag)
+                .take(128)
+                .ifBlank { "<no-tag>" }
+
+        val safeMessage =
+            truncate(
+                sanitizeInline(msg),
+                MAX_MESSAGE_CHARS
+            )
+
         val base = buildString {
-            append(stampUtc)
+            append(timestamp)
             append(" ")
-            append(level)
+            append(safeLevel)
             append("/")
-            append(tag)
+            append(safeTag)
             append(" pid=")
             append(Process.myPid())
             append(" tid=")
@@ -315,28 +621,143 @@ object AppRingLogStore {
             append(" uptimeMs=")
             append(SystemClock.elapsedRealtime())
             append(" msg=")
-            append(msg.replace('\n', ' '))
+            append(safeMessage)
         }
-        if (tr == null) return "$base\n"
-        val stack = Log.getStackTraceString(tr).replace('\n', ' ')
+
+        if (tr == null) {
+            return "$base\n"
+        }
+
+        val stack =
+            truncate(
+                sanitizeInline(
+                    Log.getStackTraceString(tr)
+                ),
+                MAX_STACK_CHARS
+            )
+
         return "$base ex=$stack\n"
     }
 
-    private class ByteArrayOutputStreamCapped(private val cap: Int) {
-        private val buf = ByteArray(cap)
+    private fun timestampUtc(): String {
+        return synchronized(timestampLock) {
+            fileTimestampUtc.format(Date())
+        }
+    }
+
+    private fun normalizeLevel(level: String): String {
+        return when (level.trim().uppercase(Locale.US)) {
+            "V", "VERBOSE" -> "V"
+            "D", "DEBUG" -> "D"
+            "I", "INFO" -> "I"
+            "W", "WARN", "WARNING" -> "W"
+            "E", "ERROR" -> "E"
+            "F", "FATAL", "A", "ASSERT" -> "F"
+            else -> level.trim().uppercase(Locale.US).take(8)
+        }
+    }
+
+    private fun shouldSyncToDisk(level: String): Boolean {
+        return level == "W" ||
+                level == "E" ||
+                level == "F"
+    }
+
+    private fun sanitizeInline(value: String): String {
+        return value
+            .replace('\r', ' ')
+            .replace('\n', ' ')
+            .replace('\u0000', ' ')
+    }
+
+    private fun sanitizeFileComponent(value: String): String {
+        return value
+            .trim()
+            .replace(
+                Regex("[^A-Za-z0-9._-]+"),
+                "_"
+            )
+            .take(64)
+    }
+
+    private fun truncate(
+        value: String,
+        maxChars: Int
+    ): String {
+        if (value.length <= maxChars) {
+            return value
+        }
+
+        val suffix = "...(truncated)"
+        val bodyLimit =
+            (maxChars - suffix.length)
+                .coerceAtLeast(0)
+
+        return value.take(bodyLimit) + suffix
+    }
+
+    // =====================================================================
+    // Filesystem helpers
+    // =====================================================================
+
+    private fun ensureDirectory(dir: File) {
+        if (dir.isDirectory) {
+            return
+        }
+
+        if (dir.exists() && !dir.isDirectory) {
+            throw IllegalStateException(
+                "Path exists but is not a directory: ${dir.absolutePath}"
+            )
+        }
+
+        if (!dir.mkdirs() && !dir.isDirectory) {
+            throw IllegalStateException(
+                "Failed to create directory: ${dir.absolutePath}"
+            )
+        }
+    }
+
+    /**
+     * Small bounded byte accumulator used by snapshot assembly.
+     */
+    private class ByteArrayOutputStreamCapped(
+        private val cap: Int
+    ) {
+        private val buffer =
+            ByteArray(cap.coerceAtLeast(0))
+
         private var size = 0
 
-        fun remaining(): Int = cap - size
+        private fun remaining(): Int =
+            buffer.size - size
 
         fun write(bytes: ByteArray) {
-            if (bytes.isEmpty() || remaining() <= 0) return
-            val n = min(bytes.size, remaining())
-            System.arraycopy(bytes, 0, buf, size, n)
-            size += n
+            if (bytes.isEmpty()) {
+                return
+            }
+
+            val remaining = remaining()
+
+            if (remaining <= 0) {
+                return
+            }
+
+            val count =
+                min(bytes.size, remaining)
+
+            System.arraycopy(
+                bytes,
+                0,
+                buffer,
+                size,
+                count
+            )
+
+            size += count
         }
 
-        fun toByteArray(): ByteArray {
-            return buf.copyOfRange(0, size)
-        }
+        fun toByteArray(): ByteArray =
+            buffer.copyOfRange(0, size)
     }
 }

@@ -61,115 +61,67 @@ graph:
       question: ''
 
 slm:
-  # Runtime
-  accelerator: "GPU"
-  max_tokens: 4096
-  top_k: 64
-  top_p: 0.95
-  temperature: 1.0
+  accelerator: GPU
+  max_tokens: 512
+  top_k: 1
+  top_p: 0.0
+  temperature: 0.0
 
   # Turn formatting (LiteRT-LM chat style)
   user_turn_prefix: "<start_of_turn>user"
   model_turn_prefix: "<start_of_turn>model"
   turn_end: ""
 
-  # System prompt pieces
-  empty_json_instruction: "Respond with an empty JSON object: {}"
-  preamble: "You are a well-known farmer survey expert. Read the Question and the Answer."
+  # Compact evaluation contract optimized for low prefill/decode cost.
+  empty_json_instruction: ""
+  preamble: "Evaluate the survey answer."
 
-  key_contract: |
-    OUTPUT FORMAT:
-    - In English.
-    - Keys exactly:
-      • "analysis": short string
-      • "expected_answer": short string
-      • "followup_question": a single short confirm/validate question (NOT an array; may be empty string)
-      • "score": integer 1–100
+  key_contract: >-
+    Return only compact JSON {"followup_question":"","score":N}; no markdown.
+    Score N=1-100 for relevance, completeness, and accuracy against the Expected answer target only.
+    If Answer satisfies the target, followup_question MUST be "".
+    Otherwise ask one short English question only for target-required information that is missing or ambiguous.
+    Never ask for extra detail, invent uncertainty, or change topic.
 
-    FOLLOW-UP INTENT:
-    - The follow-up must confirm or clarify the respondent's original answer to the SAME question.
-    - Target the biggest uncertainty: missing unit/scale, missing number, time window, baseline, or method used.
-    - Keep it single-scope (no multi-part), concrete, and answerable immediately.
-    - Do not introduce new topics or additional objectives.
-
-  length_budget: |
-    LENGTH LIMITS:
-    - analysis<=60 chars
-    - expected_answer<=120 chars
-    - followup_question<=120 chars
-
-  scoring_rule: "Scoring rule: Judge ONLY content relevance/completeness/accuracy. Do NOT penalize style or formatting."
-
-  strict_output: |-
-    STRICT OUTPUT (NO MARKDOWN):
-    - RAW JSON only, ONE LINE.
-    - Use COMPACT JSON (no spaces around ':' and ',').
-    - No extra text.
+  # All output requirements are folded into key_contract to minimize prompt tokens.
+  length_budget: ""
+  scoring_rule: ""
+  strict_output: ""
 
 prompts:
   - nodeId: Q1
     prompt: |-
-      Task:
-      - Note weaknesses (unclear units, missing seasons, baseline ambiguity).
-      - Provide ONE strong expected_answer: avg FAW loss over last 3 seasons (% or bags/acre).
-      - Ask exactly 1 followup_question to confirm the SAME answer (or empty string if not needed).
-      - Score 1–100.
-
+      Expected answer target: average FAW yield loss over the last 3 seasons (% or bags/acre).
       Question: {{QUESTION}}
       Answer: {{ANSWER}}
 
   - nodeId: Q2
     prompt: |-
-      Task:
-      - Note weaknesses (no unit, vague max trade-off, no boundary).
-      - Provide ONE strong expected_answer: max yield loss willing to accept to harvest 10 days earlier (% or bags/acre).
-      - Ask exactly 1 followup_question to confirm the SAME answer (or empty string if not needed).
-      - Score 1–100.
-
+      Expected answer target: maximum yield loss acceptable for harvesting 10 days earlier (% or bags/acre).
       Question: {{QUESTION}}
       Answer: {{ANSWER}}
 
   - nodeId: Q3
     prompt: |-
-      Task:
-      - Note weaknesses (no threshold, unclear metric, pest vs disease mixed).
-      - Provide ONE strong expected_answer: a clear switching threshold (metric + level + stage).
-      - Ask exactly 1 followup_question to confirm the SAME answer (or empty string if not needed).
-      - Score 1–100.
-
+      Expected answer target: a clear variety-switching damage threshold with metric, level, and stage.
       Question: {{QUESTION}}
       Answer: {{ANSWER}}
 
   - nodeId: Q4
     prompt: |-
-      Task:
-      - Note weaknesses (generic traits, missing numbers).
-      - Provide ONE strong expected_answer: top replacement targets with at least 1 measurable threshold (DTM, FAW tolerance, drought stage, yield).
-      - Ask exactly 1 followup_question to confirm the SAME answer (or empty string if not needed).
-      - Score 1–100.
-
+      Expected answer target: replacement-variety priorities with at least one measurable target (DTM, FAW, drought stage, or yield).
       Question: {{QUESTION}}
       Answer: {{ANSWER}}
 
   - nodeId: Q5
     prompt: |-
-      Task:
-      - Note weaknesses (no baseline, no unit, no decision rule).
-      - Provide ONE strong expected_answer: minimum acceptable harvest in a bad year (% or bags/acre) referencing baseline.
-      - Ask exactly 1 followup_question to confirm the SAME answer (or empty string if not needed).
-      - Score 1–100.
-
+      Expected answer target: minimum acceptable bad-year harvest, with baseline (% or bags/acre).
       Question: {{QUESTION}}
       Answer: {{ANSWER}}
 
   - nodeId: Q6
     prompt: |-
-      Task:
-      - Note weaknesses (vague timing, no stage definition).
-      - Provide ONE strong expected_answer: most damaging drought moment as a crop stage + one-clause reason.
-      - Ask exactly 1 followup_question to confirm the SAME answer (or empty string if not needed).
-      - Score 1–100.
-
+      Expected answer target: the most damaging drought crop stage plus a brief reason.
       Question: {{QUESTION}}
       Answer: {{ANSWER}}
 

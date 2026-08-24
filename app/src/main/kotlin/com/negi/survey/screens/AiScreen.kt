@@ -33,6 +33,28 @@
  *   • Reduce sensitive payload leakage in logs:
  *     - Info logs use len + short hash (no previews).
  *     - Previews are debug-only (BuildConfig.DEBUG) and remain capped.
+ *
+ *  Fix (2026-08-23):
+ *  ---------------------------------------------------------------------
+ *   • Allow identical follow-up text across independent inference runs:
+ *     - Follow-up bubbles are deduplicated by stable step identity (runId),
+ *       not by the normalized question text.
+ *     - Recomposition remains idempotent because upsertChatItem() uses the
+ *       deterministic "fuq-<nodeId>-<runId>" message ID.
+ *     - A later user answer may therefore receive the same valid clarification
+ *       without being incorrectly suppressed by a conversation-wide text set.
+ *   • Add release-safe UI diagnostics for follow-up persistence:
+ *     - Metadata-only Logcat entries remain visible in release builds.
+ *     - User/model text is never emitted; diagnostics contain only step identity,
+ *       structural state, lengths, and a short one-way hash for correlation.
+ *   • Harden StepSnapshot consumption against StateFlow conflation:
+ *     - UI progress is tracked by monotonic StepSnapshot.runId rather than list size.
+ *     - A clear-and-append cycle cannot hide a new step when both lists have the
+ *       same size before Compose observes the intermediate empty state.
+ *     - The logic also remains correct if the bounded history later drops old
+ *       snapshots while retaining the same list size.
+ *   • Decode JSON preview strings through JsonPrimitive.content instead of
+ *     trimming quotes from serialized JSON text, preserving escaped characters.
  * =====================================================================
  */
 
@@ -40,7 +62,9 @@
 
 package com.negi.survey.screens
 
+import android.content.ClipData
 import android.os.SystemClock
+import android.util.Log
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.LinearEasing
@@ -125,11 +149,11 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.ClipEntry
+import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
-import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.Dp
@@ -147,6 +171,7 @@ import kotlin.math.abs
 import kotlin.math.min
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
@@ -286,8 +311,6 @@ fun AiScreen(
     val stream by vmAI.stream.collectAsState()
     val error by vmAI.error.collectAsState()
 
-    val stepHistory by vmAI.stepHistory.collectAsState()
-
     // ---------------------------------------------------------------------
     // Persistent chat + conversation state (B plan)
     // ---------------------------------------------------------------------
@@ -337,8 +360,11 @@ fun AiScreen(
     var lastTypingUpdateMs by remember(contextKey) { mutableLongStateOf(0L) }
     var lastTypingLen by remember(contextKey) { mutableIntStateOf(0) }
 
-    /** Track which steps have already been consumed to avoid reprocessing. */
-    var renderedStepCount by remember(contextKey) { mutableIntStateOf(0) }
+    /**
+     * StepSnapshot persistence is consumed directly from AiViewModel.stepHistory
+     * in a lifecycle-scoped LaunchedEffect below. Keeping this stream out of
+     * Compose render state avoids recomposition solely for persistence side effects.
+     */
 
     LaunchedEffect(contextKey) {
         delay(30)
@@ -384,87 +410,117 @@ fun AiScreen(
     // Step snapshots -> persisted chat
     // ---------------------------------------------------------------------
 
-    LaunchedEffect(stepHistory.size, contextKey, isTwoStepNode) {
-        if (stepHistory.size < renderedStepCount) {
-            renderedStepCount = 0
-        }
-        if (stepHistory.size <= renderedStepCount) return@LaunchedEffect
+    LaunchedEffect(vmAI, contextKey, isTwoStepNode) {
+        /**
+         * Use a local monotonic watermark inside this lifecycle-scoped collector.
+         * AiViewModel allocates a unique increasing runId for every completed step,
+         * including separate run IDs for Step1 and Step2 of a TWO_STEP chain.
+         *
+         * This is deliberately identity-based instead of size-based:
+         * - StateFlow may conflate a fast clear -> append transition, so the UI may
+         *   observe size 1 -> size 1 even though the snapshot identity changed.
+         * - AiViewModel bounds step history and may eventually drop an old item while
+         *   appending a new one, which also leaves list size unchanged.
+         * - A collector can miss intermediate StateFlow values while busy, but the
+         *   next history value still contains every retained runId; filtering by the
+         *   watermark therefore catches all unseen snapshots in order.
+         *
+         * The watermark is intentionally local to this effect. It resets only when
+         * the ViewModel, conversation context, or node mode changes. Stable chat item
+         * IDs make any lifecycle replay idempotent at the persistence layer.
+         */
+        var lastRenderedStepRunId = 0L
 
-        val newSteps = stepHistory.subList(renderedStepCount, stepHistory.size)
-
-        newSteps.forEach { step ->
-            val stepRaw = step.raw
-            val stripped = stripCodeFence(stepRaw).trim()
-
-            val parsed = parseJsonLenient(prettyJson, stripped)
-            val showAsJson = (step.mode == AiViewModel.EvalMode.EVAL_JSON) || (parsed != null)
-
-            vmAI.removeTypingMessage(contextKey, nid)
-
-            val stepMsgId = "step-${step.runId}-$nid"
-            val stepPlainText: String? = if (!showAsJson) {
-                resolveFollowupFromStep(prettyJson, step)
-                    ?: extractPlainFollowup(stepRaw)
-                    ?: stripped.ifBlank { "…" }
-            } else {
-                null
-            }
-
-            if (showAsJson) {
-                val pretty = prettyOrRaw(prettyJson, stepRaw)
-                vmAI.upsertChatItem(
-                    contextKey,
-                    AiViewModel.ChatItem(
-                        id = stepMsgId,
-                        sender = AiViewModel.ChatSender.AI,
-                        json = pretty
-                    )
-                )
-            } else {
-                vmAI.upsertChatItem(
-                    contextKey,
-                    AiViewModel.ChatItem(
-                        id = stepMsgId,
-                        sender = AiViewModel.ChatSender.AI,
-                        text = stepPlainText
-                    )
-                )
-            }
-
-            /**
-             * IMPORTANT:
-             * Follow-up question persist/display policy:
-             * - TWO_STEP nodes: ONLY Step2 (phase=FOLLOWUP) may persist/display follow-up question.
-             * - ONE_STEP nodes: Step1 (phase=ONE_STEP) may persist/display follow-up question.
-             */
-            val shouldPersistFollowup =
-                if (isTwoStepNode) {
-                    step.phase == PromptPhase.FOLLOWUP
-                } else {
-                    step.phase == PromptPhase.ONE_STEP
+        vmAI.stepHistory.collect { history ->
+            val newSteps =
+                history.filter { step ->
+                    step.runId > lastRenderedStepRunId
                 }
 
-            if (shouldPersistFollowup) {
-                val fu = resolveFollowupFromStep(prettyJson, step)
-                    ?: (if (!showAsJson) extractPlainFollowup(stepRaw) else null)
+            if (newSteps.isEmpty()) return@collect
 
-                val fuNorm = fu?.trim()?.takeIf { it.isNotBlank() }
-                if (fuNorm != null) {
-                    val isNew = vmAI.markFollowupSeen(contextKey, fuNorm)
+            newSteps.forEach { step ->
+                val stepRaw = step.raw
+                val stripped = stripCodeFence(stepRaw).trim()
 
-                    /**
-                     * If the step already displays the follow-up as plain text,
-                     * do NOT add a second "fuq" bubble.
-                     */
-                    val displayedAsPlain =
-                        (!showAsJson) && (stepPlainText?.trim() == fuNorm)
+                val parsed = parseJsonLenient(prettyJson, stripped)
+                val showAsJson = (step.mode == AiViewModel.EvalMode.EVAL_JSON) || (parsed != null)
 
-                    if (isNew) {
+                vmAI.removeTypingMessage(contextKey, nid)
+
+                val stepMsgId = "step-${step.runId}-$nid"
+                val stepPlainText: String? = if (!showAsJson) {
+                    resolveFollowupFromStep(prettyJson, step)
+                        ?: extractPlainFollowup(stepRaw)
+                        ?: stripped.ifBlank { "…" }
+                } else {
+                    null
+                }
+
+                if (showAsJson) {
+                    val pretty = prettyOrRaw(prettyJson, stepRaw)
+                    vmAI.upsertChatItem(
+                        contextKey,
+                        AiViewModel.ChatItem(
+                            id = stepMsgId,
+                            sender = AiViewModel.ChatSender.AI,
+                            json = pretty
+                        )
+                    )
+                } else {
+                    vmAI.upsertChatItem(
+                        contextKey,
+                        AiViewModel.ChatItem(
+                            id = stepMsgId,
+                            sender = AiViewModel.ChatSender.AI,
+                            text = stepPlainText
+                        )
+                    )
+                }
+
+                /**
+                 * IMPORTANT:
+                 * Follow-up question persist/display policy:
+                 * - TWO_STEP nodes: ONLY Step2 (phase=FOLLOWUP) may persist/display follow-up question.
+                 * - ONE_STEP nodes: Step1 (phase=ONE_STEP) may persist/display follow-up question.
+                 */
+                val shouldPersistFollowup =
+                    if (isTwoStepNode) {
+                        step.phase == PromptPhase.FOLLOWUP
+                    } else {
+                        step.phase == PromptPhase.ONE_STEP
+                    }
+
+                if (shouldPersistFollowup) {
+                    val fu = resolveFollowupFromStep(prettyJson, step)
+                        ?: (if (!showAsJson) extractPlainFollowup(stepRaw) else null)
+
+                    val fuNorm = fu?.trim()?.takeIf { it.isNotBlank() }
+                    if (fuNorm != null) {
+                        /**
+                         * Do not deduplicate follow-up questions by their text.
+                         *
+                         * Two independent user answers can legitimately require the
+                         * exact same clarification. A conversation-wide text set would
+                         * therefore suppress a valid later follow-up even though the
+                         * model output, JSON parsing, and extraction all succeeded.
+                         *
+                         * Recomposition safety is instead based on step identity:
+                         * - Each completed inference step has a stable runId.
+                         * - The follow-up bubble ID includes that runId.
+                         * - upsertChatItem() updates the existing item when Compose
+                         *   reprocesses the same step instead of appending a duplicate.
+                         * - A later inference receives a different runId and may display
+                         *   the same follow-up text again.
+                         */
+                        val displayedAsPlain =
+                            (!showAsJson) && (stepPlainText?.trim() == fuNorm)
+
                         if (!displayedAsPlain) {
                             val fuqId = "fuq-$nid-${step.runId}"
                             vmAI.upsertChatItem(
-                                contextKey,
-                                AiViewModel.ChatItem(
+                                contextKey = contextKey,
+                                item = AiViewModel.ChatItem(
                                     id = fuqId,
                                     sender = AiViewModel.ChatSender.AI,
                                     text = fuNorm
@@ -472,6 +528,15 @@ fun AiScreen(
                             )
                         }
 
+                        /**
+                         * Persist the follow-up for every qualifying inference step.
+                         *
+                         * This must not be gated by question-text uniqueness. The
+                         * SurveyViewModel needs to observe the current clarification
+                         * turn even when its wording is identical to an earlier turn,
+                         * and the composer must point at the follow-up generated by
+                         * this specific inference.
+                         */
                         vmSurvey.addFollowupQuestion(nid, fuNorm)
                         vmAI.setFollowupMode(contextKey, fuNorm)
 
@@ -481,6 +546,21 @@ fun AiScreen(
                             "Follow-up persisted (context=$contextKey node=$nid runId=${step.runId} " +
                                     "phase=${step.phase} twoStep=$isTwoStepNode mode=${step.mode} len=${fuNorm.length} " +
                                     "sha6=${shortHash(fuNorm)} displayedAsPlain=$displayedAsPlain)"
+                        )
+
+                        /**
+                         * Release-safe Logcat diagnostic.
+                         *
+                         * RuntimeLogStore intentionally disables its Logcat mirror in release
+                         * builds. This direct entry keeps the follow-up UI commit observable
+                         * during release validation without exposing the follow-up text or any
+                         * other user/model payload. The short hash is correlation metadata only.
+                         */
+                        Log.i(
+                            TAG,
+                            "Follow-up UI commit: node=$nid runId=${step.runId} " +
+                                    "phase=${step.phase} mode=${step.mode} len=${fuNorm.length} " +
+                                    "sha6=${shortHash(fuNorm)} displayedAsPlain=$displayedAsPlain"
                         )
 
                         // Debug-only preview for local iteration.
@@ -499,17 +579,40 @@ fun AiScreen(
                         }
                     }
                 }
+
+                RuntimeLogStore.d(
+                    TAG,
+                    "Step rendered (context=$contextKey node=$nid runId=${step.runId} phase=${step.phase} " +
+                            "mode=${step.mode} showJson=$showAsJson rawLen=${stepRaw.length} followups=${step.followups.size} " +
+                            "timedOut=${step.timedOut} twoStep=$isTwoStepNode)"
+                )
+
+                /**
+                 * Release-safe step diagnostic.
+                 *
+                 * This intentionally logs structural metadata only. It confirms that a
+                 * StepSnapshot reached the Compose persistence layer even when the
+                 * RuntimeLogStore Logcat mirror is disabled for a release build.
+                 */
+                Log.i(
+                    TAG,
+                    "Step UI rendered: node=$nid runId=${step.runId} phase=${step.phase} " +
+                            "mode=${step.mode} showJson=$showAsJson followups=${step.followups.size} " +
+                            "timedOut=${step.timedOut} twoStep=$isTwoStepNode"
+                )
             }
 
-            RuntimeLogStore.d(
-                TAG,
-                "Step rendered (context=$contextKey node=$nid runId=${step.runId} phase=${step.phase} " +
-                        "mode=${step.mode} showJson=$showAsJson rawLen=${stepRaw.length} followups=${step.followups.size} " +
-                        "timedOut=${step.timedOut} twoStep=$isTwoStepNode)"
-            )
+            /**
+             * Advance the watermark only after every currently visible new snapshot
+             * has been committed. The max() form documents the monotonic invariant and
+             * remains robust if a future producer ever supplies a non-contiguous list.
+             */
+            lastRenderedStepRunId =
+                maxOf(
+                    lastRenderedStepRunId,
+                    newSteps.maxOf { it.runId }
+                )
         }
-
-        renderedStepCount = stepHistory.size
     }
 
     // ---------------------------------------------------------------------
@@ -1024,7 +1127,7 @@ private fun JsonBubbleMono(
     var expanded by remember(pretty) { mutableStateOf(false) }
 
     val cs = MaterialTheme.colorScheme
-    val clipboard = LocalClipboardManager.current
+    val clipboard = LocalClipboard.current
     val scope = rememberCoroutineScope()
     val clip = RoundedCornerShape(10.dp)
 
@@ -1076,7 +1179,8 @@ private fun JsonBubbleMono(
                 IconButton(
                     onClick = {
                         scope.launch {
-                            clipboard.setText(AnnotatedString(pretty))
+                            val clipData = ClipData.newPlainText("JSON", pretty)
+                            clipboard.setClipEntry(ClipEntry(clipData))
                             snack?.showSnackbar("JSON copied")
                         }
                     },
@@ -1316,8 +1420,17 @@ private fun buildJsonPreview(pretty: String): String {
     if (obj != null) {
         fun pick(vararg keys: String): String? {
             for (k in keys) {
-                val v = obj[k]?.toString()?.trim('"')
-                if (!v.isNullOrBlank()) return v
+                /**
+                 * Read the primitive's decoded content rather than calling
+                 * JsonElement.toString(), which returns serialized JSON and keeps
+                 * escape sequences such as \" or \n in their encoded form.
+                 */
+                val value =
+                    (obj[k] as? JsonPrimitive)
+                        ?.contentOrNull()
+                        ?.trim()
+
+                if (!value.isNullOrBlank()) return value
             }
             return null
         }

@@ -17,10 +17,12 @@
  *   - AppRingLogStore ring segments (seg_XX.log) as full ring body (no deletion).
  *
  *  Key behavior:
- *   - Dedupe via local SHA-256 ledger (runtime logs).
+ *   - Dedupe via an atomic local SHA-256 ledger for runtime logs.
  *   - After successful upload (or dedupe-skip), optionally deletes SOURCE .log on device.
- *   - Active (currently written) log is never deleted.
- *   - Ring segments are never deleted (ring is a retention buffer).
+ *   - Active (currently written) runtime log is never deleted.
+ *   - Ring segments are copied to a stable cache snapshot before upload and are never deleted.
+ *   - Upload session ids remain stable across WorkManager retries.
+ *   - GitHub credentials are resolved at execution time when possible instead of being persisted in WorkManager Data.
  * =====================================================================
  */
 
@@ -40,14 +42,13 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.work.BackoffPolicy
 import androidx.work.Constraints
+import androidx.work.Data
 import androidx.work.CoroutineWorker
 import androidx.work.ExistingWorkPolicy
 import androidx.work.ForegroundInfo
 import androidx.work.NetworkType
-import androidx.work.OneTimeWorkRequest
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.OutOfQuotaPolicy
-import androidx.work.WorkInfo
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
 import androidx.work.workDataOf
@@ -59,16 +60,21 @@ import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.IOException
-import java.io.InputStream
 import java.io.RandomAccessFile
 import java.security.MessageDigest
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
+import java.util.UUID
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import java.util.zip.GZIPOutputStream
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -77,22 +83,18 @@ class GitHubUploadWorker(
     params: WorkerParameters
 ) : CoroutineWorker(appContext, params) {
 
-    private val ledgerLock = Any()
-
     override suspend fun getForegroundInfo(): ForegroundInfo {
         val mode = inputData.getString(KEY_MODE)?.lowercase(Locale.US) ?: MODE_FILE
         ensureChannel()
 
-        val notifTitleBase = when (mode) {
-            MODE_LOGCAT -> "Uploading logcat"
-            MODE_RUNTIME_LOGS -> "Uploading runtime logs"
-            MODE_STARTUP_RUNTIME_LOGS -> "Uploading startup runtime logs"
-            MODE_RING_LOGS -> "Uploading ring logs"
-            MODE_STARTUP_RING_LOGS -> "Uploading startup ring logs"
-            else -> "Uploading payload"
-        }
+        val notifTitleBase =
+            notificationTitleForMode(mode)
 
-        val notifId = stableNotificationId(mode, id.toString())
+        val notifId =
+            stableNotificationId(
+                mode,
+                id.toString()
+            )
 
         return foregroundInfo(
             notificationId = notifId,
@@ -102,39 +104,153 @@ class GitHubUploadWorker(
     }
 
     override suspend fun doWork(): Result {
+        val mode =
+            inputData.getString(KEY_MODE)
+                ?.lowercase(Locale.US)
+                ?: MODE_FILE
+
         val maxFileBytesHint =
-            inputData.getLong(KEY_FILE_MAX_BYTES_HINT, DEFAULT_MAX_RAW_BYTES_HINT)
-                .coerceAtLeast(1L)
+            inputData.getLong(
+                KEY_FILE_MAX_BYTES_HINT,
+                DEFAULT_MAX_RAW_BYTES_HINT
+            ).coerceAtLeast(1L)
 
-        val maxRawBytesHint = maxFileBytesHint
-            .coerceAtMost(Int.MAX_VALUE.toLong())
-            .toInt()
+        val maxRawBytesHint =
+            maxFileBytesHint
+                .coerceAtMost(Int.MAX_VALUE.toLong())
+                .toInt()
 
-        val maxRequestBytesHint = inputData.getInt(
-            KEY_FILE_MAX_REQUEST_BYTES_HINT,
+        val defaultRequestBytesHint =
             estimateRequestBytesHint(maxRawBytesHint)
-        )
 
-        val cfg = GitHubUploader.GitHubConfig(
-            owner = inputData.getString(KEY_OWNER).orEmpty(),
-            repo = inputData.getString(KEY_REPO).orEmpty(),
-            token = inputData.getString(KEY_TOKEN).orEmpty(),
-            branch = inputData.getString(KEY_BRANCH)?.takeIf { it.isNotBlank() } ?: "main",
-            pathPrefix = inputData.getString(KEY_PATH_PREFIX).orEmpty(),
-            maxRawBytesHint = maxRawBytesHint,
-            maxRequestBytesHint = maxRequestBytesHint
-        )
+        val maxRequestBytesHint =
+            inputData.getInt(
+                KEY_FILE_MAX_REQUEST_BYTES_HINT,
+                defaultRequestBytesHint
+            ).coerceAtLeast(1)
 
-        if (cfg.owner.isBlank() || cfg.repo.isBlank() || cfg.token.isBlank()) {
+        val cfg =
+            resolveGitHubConfig(
+                maxRawBytesHint = maxRawBytesHint,
+                maxRequestBytesHint = maxRequestBytesHint
+            )
+
+        if (cfg == null) {
             return Result.failure(
-                workDataOf(ERROR_MESSAGE to "Invalid GitHub configuration (owner/repo/token).")
+                workDataOf(
+                    ERROR_MESSAGE to
+                            "Invalid GitHub configuration. " +
+                            "No usable owner/repo/token could be resolved."
+                )
             )
         }
 
-        val mode = inputData.getString(KEY_MODE)?.lowercase(Locale.US) ?: MODE_FILE
         ensureChannel()
 
-        val notifTitleBase = when (mode) {
+        val notifTitleBase = notificationTitleForMode(mode)
+        val notifId = stableNotificationId(mode, id.toString())
+
+        try {
+            setForeground(
+                foregroundInfo(
+                    notificationId = notifId,
+                    pct = 0,
+                    title = "$notifTitleBase…"
+                )
+            )
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (t: Throwable) {
+            Log.w(
+                TAG,
+                "doWork: setForeground failed; continuing best-effort. err=${t.message}",
+                t
+            )
+        }
+
+        val lastPctRef = intArrayOf(-1)
+
+        val progressCallback: (Int) -> Unit =
+            progressCallback@{ pct ->
+                val clamped = pct.coerceIn(0, 100)
+
+                if (clamped == lastPctRef[0]) {
+                    return@progressCallback
+                }
+
+                lastPctRef[0] = clamped
+
+                setProgressAsync(
+                    workDataOf(
+                        PROGRESS_PCT to clamped,
+                        PROGRESS_MODE to mode
+                    )
+                )
+
+                runCatching {
+                    setForegroundAsync(
+                        foregroundInfo(
+                            notificationId = notifId,
+                            pct = clamped,
+                            title = "$notifTitleBase…"
+                        )
+                    )
+                }
+            }
+
+        val currentPct: () -> Int = {
+            lastPctRef[0].coerceAtLeast(0)
+        }
+
+        /**
+         * CoroutineWorker defaults to Dispatchers.Default.
+         *
+         * This worker is dominated by network and file IO, so keep blocking
+         * uploader/file/process operations off the Default dispatcher.
+         */
+        return withContext(Dispatchers.IO) {
+            when (mode) {
+                MODE_LOGCAT ->
+                    doLogcatUpload(
+                        cfg,
+                        notifId,
+                        progressCallback,
+                        currentPct
+                    )
+
+                MODE_RUNTIME_LOGS,
+                MODE_STARTUP_RUNTIME_LOGS ->
+                    doRuntimeLogsUpload(
+                        mode,
+                        cfg,
+                        notifId,
+                        progressCallback,
+                        currentPct
+                    )
+
+                MODE_RING_LOGS,
+                MODE_STARTUP_RING_LOGS ->
+                    doRingLogsUpload(
+                        mode,
+                        cfg,
+                        notifId,
+                        progressCallback,
+                        currentPct
+                    )
+
+                else ->
+                    doFileUpload(
+                        cfg,
+                        notifId,
+                        progressCallback,
+                        currentPct
+                    )
+            }
+        }
+    }
+
+    private fun notificationTitleForMode(mode: String): String =
+        when (mode) {
             MODE_LOGCAT -> "Uploading logcat"
             MODE_RUNTIME_LOGS -> "Uploading runtime logs"
             MODE_STARTUP_RUNTIME_LOGS -> "Uploading startup runtime logs"
@@ -143,54 +259,191 @@ class GitHubUploadWorker(
             else -> "Uploading payload"
         }
 
-        val notifId = stableNotificationId(mode, id.toString())
+    /**
+     * Resolve upload configuration without requiring a token to be persisted
+     * in WorkManager input Data.
+     *
+     * Priority:
+     *  1) Legacy token from input Data, if present.
+     *  2) GitHubDiagnosticsConfigStore.
+     *  3) BuildConfig fallback.
+     *
+     * Non-secret routing fields supplied in input Data remain authoritative.
+     */
+    private fun resolveGitHubConfig(
+        maxRawBytesHint: Int,
+        maxRequestBytesHint: Int
+    ): GitHubUploader.GitHubConfig? {
+        val appCtx =
+            applicationContext.applicationContext
+                ?: applicationContext
 
-        runCatching {
-            setForeground(
-                foregroundInfo(
-                    notificationId = notifId,
-                    pct = 0,
-                    title = "$notifTitleBase…"
-                )
-            )
-        }.onFailure { e ->
-            Log.w(TAG, "doWork: setForeground failed (continuing). err=${e.message}", e)
-        }
-
-        val lastPctRef = intArrayOf(-1)
-        val progressCallback: (Int) -> Unit = progressCallback@{ pct ->
-            val clamped = pct.coerceIn(0, 100)
-            if (clamped == lastPctRef[0]) return@progressCallback
-            lastPctRef[0] = clamped
-
-            setProgressAsync(
-                workDataOf(
-                    PROGRESS_PCT to clamped,
-                    PROGRESS_MODE to mode
-                )
-            )
-
+        val stored =
             runCatching {
-                setForegroundAsync(
-                    foregroundInfo(
-                        notificationId = notifId,
-                        pct = clamped,
-                        title = "$notifTitleBase…"
-                    )
-                )
+                GitHubDiagnosticsConfigStore
+                    .buildGitHubConfigOrNull(appCtx)
+            }.getOrNull()
+
+        val buildCfg =
+            buildGitHubConfigFromBuildConfig()
+
+        val inputOwner =
+            inputData.getString(KEY_OWNER)
+                ?.trim()
+                .orEmpty()
+
+        val inputRepo =
+            inputData.getString(KEY_REPO)
+                ?.trim()
+                .orEmpty()
+
+        val legacyInputToken =
+            inputData.getString(KEY_TOKEN)
+                ?.trim()
+                .orEmpty()
+
+        val inputBranch =
+            inputData.getString(KEY_BRANCH)
+                ?.trim()
+
+        val inputPrefix =
+            inputData.getString(KEY_PATH_PREFIX)
+
+        var owner =
+            inputOwner.ifBlank {
+                stored?.owner?.trim()
+                    .orEmpty()
+                    .ifBlank {
+                        buildCfg?.owner?.trim().orEmpty()
+                    }
             }
+
+        var repo =
+            inputRepo.ifBlank {
+                stored?.repo?.trim()
+                    .orEmpty()
+                    .ifBlank {
+                        buildCfg?.repo?.trim().orEmpty()
+                    }
+            }
+
+        val token =
+            legacyInputToken.ifBlank {
+                stored?.token?.trim()
+                    .orEmpty()
+                    .ifBlank {
+                        buildCfg?.token?.trim().orEmpty()
+                    }
+            }
+
+        val branch =
+            inputBranch
+                ?.takeIf { it.isNotBlank() }
+                ?: stored?.branch
+                    ?.trim()
+                    ?.takeIf { it.isNotBlank() }
+                ?: buildCfg?.branch
+                    ?.trim()
+                    ?.takeIf { it.isNotBlank() }
+                ?: "main"
+
+        val pathPrefix =
+            if (inputPrefix != null) {
+                inputPrefix.trim().trim('/')
+            } else {
+                stored?.pathPrefix
+                    ?.trim()
+                    ?.trim('/')
+                    ?: buildCfg?.pathPrefix
+                        ?.trim()
+                        ?.trim('/')
+                        .orEmpty()
+            }
+
+        if (repo.contains('/')) {
+            val inferredOwner =
+                repo.substringBefore('/').trim()
+
+            val inferredRepo =
+                repo.substringAfterLast('/').trim()
+
+            if (owner.isBlank()) {
+                owner = inferredOwner
+            }
+
+            repo = inferredRepo
         }
 
-        val currentPct: () -> Int = { lastPctRef[0].coerceAtLeast(0) }
-
-        return when (mode) {
-            MODE_LOGCAT -> doLogcatUpload(cfg, notifId, progressCallback, currentPct)
-            MODE_RUNTIME_LOGS, MODE_STARTUP_RUNTIME_LOGS ->
-                doRuntimeLogsUpload(mode, cfg, notifId, progressCallback, currentPct)
-            MODE_RING_LOGS, MODE_STARTUP_RING_LOGS ->
-                doRingLogsUpload(mode, cfg, notifId, progressCallback, currentPct)
-            else -> doFileUpload(cfg, notifId, progressCallback, currentPct)
+        if (
+            owner.isBlank() ||
+            repo.isBlank() ||
+            token.isBlank()
+        ) {
+            return null
         }
+
+        if (
+            owner.any(Char::isWhitespace) ||
+            repo.any(Char::isWhitespace)
+        ) {
+            return null
+        }
+
+        return GitHubUploader.GitHubConfig(
+            owner = owner,
+            repo = repo,
+            token = token,
+            branch = branch,
+            pathPrefix = pathPrefix,
+            maxRawBytesHint = maxRawBytesHint,
+            maxRequestBytesHint = maxRequestBytesHint
+        )
+    }
+
+    private fun buildGitHubConfigFromBuildConfig(): GitHubUploader.GitHubConfig? {
+        val token = BuildConfig.GH_TOKEN.trim()
+        val rawRepo = BuildConfig.GH_REPO.trim()
+
+        if (
+            token.isBlank() ||
+            rawRepo.isBlank()
+        ) {
+            return null
+        }
+
+        var owner = BuildConfig.GH_OWNER.trim()
+        var repo = rawRepo
+
+        if (rawRepo.contains('/')) {
+            if (owner.isBlank()) {
+                owner =
+                    rawRepo.substringBefore('/').trim()
+            }
+
+            repo =
+                rawRepo.substringAfterLast('/').trim()
+        }
+
+        if (
+            owner.isBlank() ||
+            repo.isBlank()
+        ) {
+            return null
+        }
+
+        return GitHubUploader.GitHubConfig(
+            owner = owner,
+            repo = repo,
+            token = token,
+            branch =
+                BuildConfig.GH_BRANCH
+                    .trim()
+                    .ifBlank { "main" },
+            pathPrefix =
+                BuildConfig.GH_PATH_PREFIX
+                    .trim()
+                    .trim('/')
+        )
     }
 
     // ---------------------------------------------------------------------
@@ -281,6 +534,8 @@ class GitHubUploadWorker(
                     OUT_FILE_URL to (result.fileUrl ?: "")
                 )
             )
+        } catch (ce: CancellationException) {
+            throw ce
         } catch (t: Throwable) {
             Log.w(TAG, "doFileUpload: upload failed for $filePath", t)
 
@@ -295,9 +550,11 @@ class GitHubUploadWorker(
                 )
             }
 
-            val failData = workDataOf(ERROR_MESSAGE to (t.message ?: "Unknown error"))
-            if (shouldRetry(t) && runAttemptCount < MAX_ATTEMPTS) Result.retry()
-            else Result.failure(failData)
+            retryOrFailure(
+                t = t,
+                errorMessage =
+                    t.message ?: "Unknown error"
+            )
         }
     }
 
@@ -330,10 +587,9 @@ class GitHubUploadWorker(
 
             onProgress(20)
 
-            val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-            val pid = Process.myPid()
-            val dateSegment = if (addDate) utcDateFolder() else ""
-            val remoteName = "logcat_${stamp}_pid${pid}.log.gz"
+            val sessionId = resolvedSessionId("logcat")
+            val dateSegment = if (addDate) resolvedSessionDateFolderUtc() else ""
+            val remoteName = "logcat_${sessionId}.log.gz"
             val remotePath = listOf(
                 cfg.pathPrefix.trim('/'),
                 remoteDir.trim('/'),
@@ -372,6 +628,8 @@ class GitHubUploadWorker(
                     OUT_BYTES_GZ to snap.gzBytes.size.toLong(),
                 )
             )
+        } catch (ce: CancellationException) {
+            throw ce
         } catch (t: Throwable) {
             Log.w(TAG, "doLogcatUpload: upload failed", t)
 
@@ -386,9 +644,11 @@ class GitHubUploadWorker(
                 )
             }
 
-            val failData = workDataOf(ERROR_MESSAGE to (t.message ?: "Unknown error"))
-            if (shouldRetry(t) && runAttemptCount < MAX_ATTEMPTS) Result.retry()
-            else Result.failure(failData)
+            retryOrFailure(
+                t = t,
+                errorMessage =
+                    t.message ?: "Unknown error"
+            )
         }
     }
 
@@ -439,11 +699,10 @@ class GitHubUploadWorker(
         onProgress(3)
 
         if (mode == MODE_STARTUP_RUNTIME_LOGS) {
-            runCatching { delay(STARTUP_RTLOG_PRE_DELAY_MS) }
+            delay(STARTUP_RTLOG_PRE_DELAY_MS)
         }
 
-        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-        val pid = Process.myPid()
+        val sessionId = resolvedSessionId("runtime")
         val safeReason = safeFileSegment(reason)
         val appCtx = applicationContext.applicationContext ?: applicationContext
         val outDir = File(appCtx.cacheDir, "diagnostics_upload").apply { mkdirs() }
@@ -548,8 +807,8 @@ class GitHubUploadWorker(
             )
         }
 
-        val dateSegment = if (addDate) utcDateFolder() else ""
-        val sessionDirName = "runtime_logs_${stamp}_pid${pid}_${safeReason}"
+        val dateSegment = if (addDate) resolvedSessionDateFolderUtc() else ""
+        val sessionDirName = "runtime_logs_${sessionId}_${safeReason}"
         val remoteBaseDir = listOf(
             cfg.pathPrefix.trim('/'),
             remoteDir.trim('/'),
@@ -592,8 +851,14 @@ class GitHubUploadWorker(
                     val fp = runCatching { "sha256:" + sha256HexOfFile(file) }.getOrNull()
                     if (fp != null) {
                         ledger.add(fp)
-                        trimLedgerInPlace(ledger, LEDGER_MAX_ITEMS)
-                        saveLedger(appCtx, ledger)
+                        trimLedgerInPlace(
+                            ledger,
+                            LEDGER_MAX_ITEMS
+                        )
+                        recordLedgerFingerprint(
+                            appCtx,
+                            fp
+                        )
                     }
                 }
 
@@ -618,7 +883,7 @@ class GitHubUploadWorker(
                 }.getOrNull()
 
                 if (snap != null && snap.gzBytes.isNotEmpty()) {
-                    val remotePath = "$remoteBaseDir/logcat_${stamp}_pid${pid}.log.gz"
+                    val remotePath = "$remoteBaseDir/logcat_${sessionId}.log.gz"
                     val mapped = mapProgressRange(start = 90, end = 100, sink = onProgress)
 
                     logcatResult = GitHubUploader.uploadBytesAtPath(
@@ -663,6 +928,8 @@ class GitHubUploadWorker(
                     OUT_PLAIN_SOURCE_DELETED_COUNT to deletedSourceCount
                 )
             )
+        } catch (ce: CancellationException) {
+            throw ce
         } catch (t: Throwable) {
             Log.w(TAG, "doRuntimeLogsUpload: upload failed", t)
 
@@ -677,9 +944,11 @@ class GitHubUploadWorker(
                 )
             }
 
-            val failData = workDataOf(ERROR_MESSAGE to (t.message ?: "Unknown error"))
-            if (shouldRetry(t) && runAttemptCount < MAX_ATTEMPTS) Result.retry()
-            else Result.failure(failData)
+            retryOrFailure(
+                t = t,
+                errorMessage =
+                    t.message ?: "Unknown error"
+            )
         }
     }
 
@@ -694,23 +963,47 @@ class GitHubUploadWorker(
         onProgress: (Int) -> Unit,
         currentPct: () -> Int,
     ): Result {
-        val remoteDir = inputData.getString(KEY_RING_REMOTE_DIR) ?: "diagnostics/applog_ring"
-        val addDate = inputData.getBoolean(KEY_RING_ADD_DATE, true)
-        val reason = inputData.getString(KEY_RING_REASON)?.takeIf { it.isNotBlank() } ?: "wm"
+        val remoteDir =
+            inputData.getString(KEY_RING_REMOTE_DIR)
+                ?: "diagnostics/applog_ring"
+
+        val addDate =
+            inputData.getBoolean(
+                KEY_RING_ADD_DATE,
+                true
+            )
+
+        val reason =
+            inputData.getString(KEY_RING_REASON)
+                ?.takeIf { it.isNotBlank() }
+                ?: "wm"
 
         onProgress(3)
 
         if (mode == MODE_STARTUP_RING_LOGS) {
-            runCatching { delay(STARTUP_RING_PRE_DELAY_MS) }
+            delay(STARTUP_RING_PRE_DELAY_MS)
         }
 
-        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-        val pid = Process.myPid()
-        val safeReason = safeFileSegment(reason)
+        val sessionId =
+            resolvedSessionId("ring")
 
-        val dir = runCatching { AppRingLogStore.ringDir(applicationContext) }.getOrNull()
-        if (dir == null || !dir.exists()) {
-            Log.d(TAG, "doRingLogsUpload: ringDir not available; no-op success.")
+        val safeReason =
+            safeFileSegment(reason)
+
+        val ringDir =
+            runCatching {
+                AppRingLogStore.ringDir(applicationContext)
+            }.getOrNull()
+
+        if (
+            ringDir == null ||
+            !ringDir.isDirectory
+        ) {
+            Log.d(
+                TAG,
+                "doRingLogsUpload: ringDir not available; no-op success."
+            )
+
             return Result.success(
                 workDataOf(
                     OUT_MODE to MODE_RING_LOGS,
@@ -721,12 +1014,42 @@ class GitHubUploadWorker(
             )
         }
 
-        val segs = dir.listFiles()?.filter { f ->
-            f.isFile && f.name.startsWith("seg_", ignoreCase = true) && f.name.endsWith(".log", ignoreCase = true)
-        }.orEmpty().sortedBy { it.name }
+        val snapshotDir =
+            File(
+                applicationContext.cacheDir,
+                "diagnostics_ring_upload/$sessionId"
+            )
 
-        if (segs.isEmpty()) {
-            Log.d(TAG, "doRingLogsUpload: no ring segments found; no-op success. dir=${dir.absolutePath}")
+        val snapshots =
+            runCatching {
+                prepareRingSnapshot(
+                    ringDir = ringDir,
+                    snapshotDir = snapshotDir
+                )
+            }.getOrElse { t ->
+                Log.w(
+                    TAG,
+                    "doRingLogsUpload: failed to prepare stable ring snapshot: ${t.message}",
+                    t
+                )
+
+                return retryOrFailure(
+                    t = t,
+                    errorMessage =
+                        "Failed to prepare ring snapshot: ${t.message}"
+                )
+            }
+
+        if (snapshots.isEmpty()) {
+            Log.d(
+                TAG,
+                "doRingLogsUpload: no ring segments found; no-op success. dir=${ringDir.absolutePath}"
+            )
+
+            runCatching {
+                snapshotDir.deleteRecursively()
+            }
+
             return Result.success(
                 workDataOf(
                     OUT_MODE to MODE_RING_LOGS,
@@ -737,36 +1060,66 @@ class GitHubUploadWorker(
             )
         }
 
-        val dateSegment = if (addDate) utcDateFolder() else ""
-        val sessionDirName = "applog_ring_${stamp}_pid${pid}_${safeReason}"
-        val remoteBaseDir = listOf(
-            cfg.pathPrefix.trim('/'),
-            remoteDir.trim('/'),
-            dateSegment,
-            sessionDirName
-        ).filter { it.isNotBlank() }.joinToString("/")
+        val dateSegment =
+            if (addDate) resolvedSessionDateFolderUtc() else ""
 
-        val totalBytes = segs.sumOf { runCatching { it.length() }.getOrNull() ?: 0L }
+        val sessionDirName =
+            "applog_ring_${sessionId}_${safeReason}"
 
-        Log.d(TAG, "doRingLogsUpload: remoteBaseDir=$remoteBaseDir segs=${segs.size} bytes=$totalBytes dir=${dir.absolutePath}")
+        val remoteBaseDir =
+            listOf(
+                cfg.pathPrefix.trim('/'),
+                remoteDir.trim('/'),
+                dateSegment,
+                sessionDirName
+            ).filter { it.isNotBlank() }
+                .joinToString("/")
+
+        val totalBytes =
+            snapshots.sumOf { file ->
+                runCatching {
+                    file.length()
+                }.getOrDefault(0L)
+            }
+
+        Log.d(
+            TAG,
+            "doRingLogsUpload: remoteBaseDir=$remoteBaseDir " +
+                    "segs=${snapshots.size} bytes=$totalBytes " +
+                    "source=${ringDir.absolutePath} snapshot=${snapshotDir.absolutePath}"
+        )
 
         return try {
             val startPct = 10
             val endPct = 100
-            val n = segs.size.coerceAtLeast(1)
+            val count =
+                snapshots.size.coerceAtLeast(1)
 
-            for ((i, file) in segs.withIndex()) {
-                val fileStart = startPct + ((endPct - startPct) * i) / n
-                val fileEnd = startPct + ((endPct - startPct) * (i + 1)) / n
-                val mapped = mapProgressRange(start = fileStart, end = fileEnd, sink = onProgress)
+            for ((index, file) in snapshots.withIndex()) {
+                val fileStart =
+                    startPct +
+                            ((endPct - startPct) * index) / count
 
-                val remotePath = "$remoteBaseDir/${file.name}"
+                val fileEnd =
+                    startPct +
+                            ((endPct - startPct) * (index + 1)) / count
+
+                val mapped =
+                    mapProgressRange(
+                        start = fileStart,
+                        end = fileEnd,
+                        sink = onProgress
+                    )
+
+                val remotePath =
+                    "$remoteBaseDir/${file.name}"
 
                 GitHubUploader.uploadFileAtPath(
                     cfg = cfg,
                     path = remotePath,
                     file = file,
-                    message = "Upload ring logs (segments) ($reason)",
+                    message =
+                        "Upload ring logs (stable snapshot) ($reason)",
                     onProgress = mapped
                 )
             }
@@ -782,16 +1135,34 @@ class GitHubUploadWorker(
                 )
             }
 
+            /**
+             * Keep the stable snapshot across retries, but remove it only after
+             * the whole upload batch has succeeded.
+             */
+            runCatching {
+                snapshotDir.deleteRecursively()
+            }
+
             Result.success(
                 workDataOf(
                     OUT_MODE to MODE_RING_LOGS,
                     OUT_REMOTE_PATH to remoteBaseDir,
-                    OUT_RING_FILE_COUNT to segs.size,
+                    OUT_RING_FILE_COUNT to snapshots.size,
                     OUT_RING_TOTAL_BYTES to totalBytes
                 )
             )
+        } catch (ce: CancellationException) {
+            /**
+             * Do not delete snapshotDir here. WorkManager may retry this same
+             * request later, and the stable files are intentionally reusable.
+             */
+            throw ce
         } catch (t: Throwable) {
-            Log.w(TAG, "doRingLogsUpload: upload failed", t)
+            Log.w(
+                TAG,
+                "doRingLogsUpload: upload failed",
+                t
+            )
 
             runCatching {
                 setForegroundAsync(
@@ -804,10 +1175,261 @@ class GitHubUploadWorker(
                 )
             }
 
-            val failData = workDataOf(ERROR_MESSAGE to (t.message ?: "Unknown error"))
-            if (shouldRetry(t) && runAttemptCount < MAX_ATTEMPTS) Result.retry()
-            else Result.failure(failData)
+            retryOrFailure(
+                t = t,
+                errorMessage =
+                    t.message ?: "Unknown ring upload error"
+            )
         }
+    }
+
+    /**
+     * Prepare a stable cache snapshot of ring segments.
+     *
+     * WorkManager may retry the same request after the live ring has changed.
+     * Reusing a completed snapshot keeps the remote payload stable across
+     * attempts and avoids reading a segment while AppRingLogStore is appending.
+     */
+    private fun prepareRingSnapshot(
+        ringDir: File,
+        snapshotDir: File
+    ): List<File> {
+        val completeMarker =
+            File(
+                snapshotDir,
+                ".complete"
+            )
+
+        if (completeMarker.isFile) {
+            val existing =
+                listRingSnapshotFiles(snapshotDir)
+
+            if (existing.isNotEmpty()) {
+                return existing
+            }
+
+            runCatching {
+                completeMarker.delete()
+            }
+        }
+
+        if (snapshotDir.exists()) {
+            snapshotDir.deleteRecursively()
+        }
+
+        if (
+            !snapshotDir.mkdirs() &&
+            !snapshotDir.isDirectory
+        ) {
+            throw IOException(
+                "Failed to create ring snapshot directory: ${snapshotDir.absolutePath}"
+            )
+        }
+
+        val sources =
+            ringDir.listFiles()
+                ?.asSequence()
+                ?.filter { file ->
+                    file.isFile &&
+                            file.length() > 0L &&
+                            file.name.startsWith(
+                                "seg_",
+                                ignoreCase = true
+                            ) &&
+                            file.name.endsWith(
+                                ".log",
+                                ignoreCase = true
+                            )
+                }
+                ?.sortedBy { it.name }
+                ?.toList()
+                .orEmpty()
+
+        if (sources.isEmpty()) {
+            return emptyList()
+        }
+
+        val snapshots =
+            ArrayList<File>(
+                sources.size
+            )
+
+        for (source in sources) {
+            val target =
+                File(
+                    snapshotDir,
+                    source.name
+                )
+
+            copyStableSnapshotFile(
+                source = source,
+                target = target
+            )
+
+            if (
+                target.isFile &&
+                target.length() > 0L
+            ) {
+                snapshots += target
+            }
+        }
+
+        if (snapshots.isNotEmpty()) {
+            FileOutputStream(
+                completeMarker,
+                false
+            ).use { output ->
+                output.write(
+                    (
+                            "session=${resolvedSessionId("ring")}\n" +
+                                    "files=${snapshots.size}\n" +
+                                    "created_utc=${utcIsoTimestamp()}\n"
+                            ).toByteArray(Charsets.UTF_8)
+                )
+
+                output.flush()
+
+                runCatching {
+                    output.fd.sync()
+                }
+            }
+        }
+
+        return snapshots
+    }
+
+    private fun listRingSnapshotFiles(
+        snapshotDir: File
+    ): List<File> =
+        snapshotDir.listFiles()
+            ?.asSequence()
+            ?.filter { file ->
+                file.isFile &&
+                        file.length() > 0L &&
+                        file.name.startsWith(
+                            "seg_",
+                            ignoreCase = true
+                        ) &&
+                        file.name.endsWith(
+                            ".log",
+                            ignoreCase = true
+                        )
+            }
+            ?.sortedBy { it.name }
+            ?.toList()
+            .orEmpty()
+
+    /**
+     * Copy a live ring segment into a temporary file and verify that the source
+     * did not change during the copy. Retry a few times for the active segment.
+     */
+    private fun copyStableSnapshotFile(
+        source: File,
+        target: File
+    ) {
+        val temp =
+            File(
+                target.parentFile,
+                "${target.name}.part"
+            )
+
+        var lastError: Throwable? = null
+
+        repeat(RING_SNAPSHOT_COPY_ATTEMPTS) { attempt ->
+            try {
+                val beforeLength =
+                    source.length()
+
+                val beforeModified =
+                    source.lastModified()
+
+                FileInputStream(source).use { input ->
+                    FileOutputStream(
+                        temp,
+                        false
+                    ).use { output ->
+                        input.copyTo(
+                            output,
+                            bufferSize = 32 * 1024
+                        )
+
+                        output.flush()
+                    }
+                }
+
+                val afterLength =
+                    source.length()
+
+                val afterModified =
+                    source.lastModified()
+
+                val stable =
+                    beforeLength == afterLength &&
+                            beforeModified == afterModified &&
+                            temp.length() == beforeLength
+
+                if (stable) {
+                    if (target.exists()) {
+                        target.delete()
+                    }
+
+                    if (!temp.renameTo(target)) {
+                        temp.copyTo(
+                            target,
+                            overwrite = true
+                        )
+                        temp.delete()
+                    }
+
+                    target.setLastModified(
+                        beforeModified
+                    )
+
+                    return
+                }
+
+                Log.d(
+                    TAG,
+                    "Ring segment changed during snapshot; retrying. " +
+                            "file=${source.name} attempt=${attempt + 1}/$RING_SNAPSHOT_COPY_ATTEMPTS"
+                )
+            } catch (t: Throwable) {
+                lastError = t
+            }
+        }
+
+        if (
+            temp.isFile &&
+            temp.length() > 0L
+        ) {
+            Log.w(
+                TAG,
+                "Using best-effort ring snapshot after repeated live-file changes. file=${source.name}"
+            )
+
+            if (target.exists()) {
+                target.delete()
+            }
+
+            if (!temp.renameTo(target)) {
+                temp.copyTo(
+                    target,
+                    overwrite = true
+                )
+                temp.delete()
+            }
+
+            return
+        }
+
+        runCatching {
+            temp.delete()
+        }
+
+        throw IOException(
+            "Could not snapshot ring segment: ${source.name}",
+            lastError
+        )
     }
 
     /**
@@ -834,62 +1456,239 @@ class GitHubUploadWorker(
     // ---------------------------------------------------------------------
 
     private fun ledgerFile(ctx: Context): File {
-        val dir = File(ctx.filesDir, "diagnostics/runtime_logs").apply { mkdirs() }
-        return File(dir, "upload_ledger.json")
+        val dir =
+            File(
+                ctx.filesDir,
+                "diagnostics/runtime_logs"
+            )
+
+        if (!dir.isDirectory) {
+            dir.mkdirs()
+        }
+
+        return File(
+            dir,
+            "upload_ledger.json"
+        )
     }
 
-    private fun loadLedger(ctx: Context): LinkedHashSet<String> = synchronized(ledgerLock) {
-        val f = ledgerFile(ctx)
-        if (!f.exists()) return@synchronized LinkedHashSet()
+    private fun loadLedger(
+        ctx: Context
+    ): LinkedHashSet<String> =
+        synchronized(LEDGER_LOCK) {
+            readLedgerUnlocked(ctx)
+        }
 
-        return@synchronized runCatching {
-            val obj = JSONObject(f.readText(Charsets.UTF_8))
-            val arr = obj.optJSONArray("items") ?: JSONArray()
-            val out = LinkedHashSet<String>(arr.length().coerceAtLeast(16))
-            for (i in 0 until arr.length()) {
-                val s = arr.optString(i).takeIf { it.isNotBlank() } ?: continue
-                out.add(s)
+    /**
+     * Record one successful fingerprint without losing entries that may have
+     * been written by another Worker instance in the same process.
+     */
+    private fun recordLedgerFingerprint(
+        ctx: Context,
+        fingerprint: String
+    ) {
+        if (fingerprint.isBlank()) {
+            return
+        }
+
+        synchronized(LEDGER_LOCK) {
+            val current =
+                readLedgerUnlocked(ctx)
+
+            current.add(fingerprint)
+            trimLedgerInPlace(
+                current,
+                LEDGER_MAX_ITEMS
+            )
+
+            writeLedgerAtomicUnlocked(
+                ctx,
+                current
+            )
+        }
+    }
+
+    private fun readLedgerUnlocked(
+        ctx: Context
+    ): LinkedHashSet<String> {
+        val file = ledgerFile(ctx)
+
+        if (!file.isFile) {
+            return LinkedHashSet()
+        }
+
+        return runCatching {
+            val obj =
+                JSONObject(
+                    file.readText(Charsets.UTF_8)
+                )
+
+            val arr =
+                obj.optJSONArray("items")
+                    ?: JSONArray()
+
+            val out =
+                LinkedHashSet<String>(
+                    arr.length()
+                        .coerceAtLeast(16)
+                )
+
+            for (index in 0 until arr.length()) {
+                val value =
+                    arr.optString(index)
+                        .takeIf { it.isNotBlank() }
+                        ?: continue
+
+                out.add(value)
             }
+
             out
-        }.getOrElse { LinkedHashSet() }
+        }.getOrElse { t ->
+            Log.w(
+                TAG,
+                "loadLedger: invalid ledger; treating as empty. err=${t.message}",
+                t
+            )
+            LinkedHashSet()
+        }
     }
 
-    private fun saveLedger(ctx: Context, set: LinkedHashSet<String>) = synchronized(ledgerLock) {
-        val f = ledgerFile(ctx)
+    /**
+     * Write through a same-directory temporary file and rename it into place.
+     *
+     * A damaged ledger should cause duplicate uploads, not source-log loss.
+     */
+    private fun writeLedgerAtomicUnlocked(
+        ctx: Context,
+        set: LinkedHashSet<String>
+    ) {
+        val file = ledgerFile(ctx)
+        val parent =
+            file.parentFile
+                ?: throw IOException(
+                    "Ledger parent directory is unavailable."
+                )
+
+        if (
+            !parent.isDirectory &&
+            !parent.mkdirs() &&
+            !parent.isDirectory
+        ) {
+            throw IOException(
+                "Failed to create ledger directory: ${parent.absolutePath}"
+            )
+        }
+
         val obj = JSONObject()
-        obj.put("v", 1)
-        obj.put("updated_utc", SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US).apply {
-            timeZone = TimeZone.getTimeZone("UTC")
-        }.format(Date()))
-        obj.put("max", LEDGER_MAX_ITEMS)
+        obj.put("v", 2)
+        obj.put(
+            "updated_utc",
+            utcIsoTimestamp()
+        )
+        obj.put(
+            "max",
+            LEDGER_MAX_ITEMS
+        )
 
         val arr = JSONArray()
         set.forEach { arr.put(it) }
         obj.put("items", arr)
 
-        runCatching { f.writeText(obj.toString(2), Charsets.UTF_8) }
-    }
+        val temp =
+            File(
+                parent,
+                "${file.name}.tmp"
+            )
 
-    private fun trimLedgerInPlace(set: LinkedHashSet<String>, maxItems: Int) {
-        while (set.size > maxItems) {
-            val it = set.iterator()
-            if (!it.hasNext()) return
-            it.next()
-            it.remove()
-        }
-    }
-
-    private fun sha256HexOfFile(file: File): String {
-        val md = MessageDigest.getInstance("SHA-256")
-        FileInputStream(file).use { ins ->
-            val buf = ByteArray(32 * 1024)
-            while (true) {
-                val n = ins.read(buf)
-                if (n <= 0) break
-                md.update(buf, 0, n)
+        FileOutputStream(temp, false).use { output ->
+            output.write(
+                obj.toString(2)
+                    .toByteArray(Charsets.UTF_8)
+            )
+            output.flush()
+            runCatching {
+                output.fd.sync()
             }
         }
-        return md.digest().joinToString("") { b -> "%02x".format(b) }
+
+        if (file.exists() && !file.delete()) {
+            /**
+             * renameTo() cannot replace an existing file consistently across
+             * all Android filesystems, so remove the old destination first.
+             */
+            runCatching {
+                temp.delete()
+            }
+
+            throw IOException(
+                "Failed to replace ledger: ${file.absolutePath}"
+            )
+        }
+
+        if (!temp.renameTo(file)) {
+            /**
+             * Same-filesystem rename should normally succeed. Fall back to a
+             * direct copy so ledger maintenance remains best-effort.
+             */
+            temp.copyTo(
+                target = file,
+                overwrite = true
+            )
+
+            runCatching {
+                temp.delete()
+            }
+        }
+    }
+
+    private fun trimLedgerInPlace(
+        set: LinkedHashSet<String>,
+        maxItems: Int
+    ) {
+        while (set.size > maxItems) {
+            val iterator = set.iterator()
+
+            if (!iterator.hasNext()) {
+                return
+            }
+
+            iterator.next()
+            iterator.remove()
+        }
+    }
+
+    private fun sha256HexOfFile(
+        file: File
+    ): String {
+        val digest =
+            MessageDigest.getInstance("SHA-256")
+
+        FileInputStream(file).use { input ->
+            val buffer =
+                ByteArray(32 * 1024)
+
+            while (true) {
+                val count =
+                    input.read(buffer)
+
+                if (count <= 0) {
+                    break
+                }
+
+                digest.update(
+                    buffer,
+                    0,
+                    count
+                )
+            }
+        }
+
+        return digest.digest()
+            .joinToString("") { byte ->
+                (byte.toInt() and 0xff)
+                    .toString(16)
+                    .padStart(2, '0')
+            }
     }
 
     // ---------------------------------------------------------------------
@@ -909,47 +1708,143 @@ class GitHubUploadWorker(
     // Tail copy
     // ---------------------------------------------------------------------
 
-    private fun copyTailOrFull(src: File, dst: File, maxBytes: Long) {
-        dst.parentFile?.mkdirs()
-        val limit = maxBytes.coerceAtLeast(50_000L)
-        val len = runCatching { src.length() }.getOrNull() ?: 0L
+    private fun copyTailOrFull(
+        src: File,
+        dst: File,
+        maxBytes: Long
+    ) {
+        dst.parentFile?.let { parent ->
+            if (
+                !parent.isDirectory &&
+                !parent.mkdirs() &&
+                !parent.isDirectory
+            ) {
+                throw IOException(
+                    "Failed to create directory: ${parent.absolutePath}"
+                )
+            }
+        }
 
-        if (len <= 0L) {
-            FileOutputStream(dst).use { it.fd.sync() }
+        val limit =
+            maxBytes.coerceAtLeast(50_000L)
+
+        val length =
+            runCatching {
+                src.length()
+            }.getOrDefault(0L)
+
+        if (length <= 0L) {
+            FileOutputStream(dst, false).use { output ->
+                output.flush()
+                runCatching {
+                    output.fd.sync()
+                }
+            }
             return
         }
 
-        if (len <= limit) {
-            FileInputStream(src).use { ins ->
-                FileOutputStream(dst).use { outs ->
-                    val buf = ByteArray(16 * 1024)
-                    while (true) {
-                        val n = ins.read(buf)
-                        if (n <= 0) break
-                        outs.write(buf, 0, n)
+        if (length <= limit) {
+            FileInputStream(src).use { input ->
+                FileOutputStream(dst, false).use { output ->
+                    input.copyTo(
+                        output,
+                        bufferSize = 16 * 1024
+                    )
+                    output.flush()
+                    runCatching {
+                        output.fd.sync()
                     }
-                    outs.fd.sync()
                 }
             }
             return
         }
 
         RandomAccessFile(src, "r").use { raf ->
-            raf.seek((len - limit).coerceAtLeast(0L))
-            FileOutputStream(dst).use { outs ->
-                val header = "=== TRUNCATED TAIL COPY ===\noriginal_bytes=$len copied_tail_bytes=$limit\n\n"
-                outs.write(header.toByteArray(Charsets.UTF_8))
+            var start =
+                (length - limit)
+                    .coerceAtLeast(0L)
 
-                val buf = ByteArray(16 * 1024)
-                var remaining = limit
-                while (remaining > 0) {
-                    val toRead = minOf(buf.size.toLong(), remaining).toInt()
-                    val n = raf.read(buf, 0, toRead)
-                    if (n <= 0) break
-                    outs.write(buf, 0, n)
-                    remaining -= n.toLong()
+            raf.seek(start)
+
+            /**
+             * A tail cut can begin in the middle of a UTF-8 sequence or log
+             * line. Skip through the next newline so uploaded diagnostics
+             * begin at a clean line boundary when possible.
+             */
+            if (start > 0L) {
+                while (
+                    raf.filePointer < length
+                ) {
+                    val byte =
+                        raf.read()
+
+                    if (byte < 0) {
+                        break
+                    }
+
+                    if (byte == '\n'.code) {
+                        start =
+                            raf.filePointer
+                        break
+                    }
                 }
-                outs.fd.sync()
+            }
+
+            FileOutputStream(dst, false).use { output ->
+                val copiedLimit =
+                    (length - start)
+                        .coerceAtLeast(0L)
+
+                val header =
+                    "=== TRUNCATED TAIL COPY ===\n" +
+                            "original_bytes=$length " +
+                            "copied_tail_bytes=$copiedLimit\n\n"
+
+                output.write(
+                    header.toByteArray(
+                        Charsets.UTF_8
+                    )
+                )
+
+                val buffer =
+                    ByteArray(16 * 1024)
+
+                var remaining =
+                    copiedLimit
+
+                while (remaining > 0L) {
+                    val toRead =
+                        minOf(
+                            buffer.size.toLong(),
+                            remaining
+                        ).toInt()
+
+                    val count =
+                        raf.read(
+                            buffer,
+                            0,
+                            toRead
+                        )
+
+                    if (count <= 0) {
+                        break
+                    }
+
+                    output.write(
+                        buffer,
+                        0,
+                        count
+                    )
+
+                    remaining -=
+                        count.toLong()
+                }
+
+                output.flush()
+
+                runCatching {
+                    output.fd.sync()
+                }
             }
         }
     }
@@ -1077,45 +1972,148 @@ class GitHubUploadWorker(
         return runCommand(cmd, timeoutMs = 1500L, maxStdoutBytes = COMMAND_STDOUT_MAX_BYTES)
     }
 
-    private fun runCommand(cmd: List<String>, timeoutMs: Long, maxStdoutBytes: Int): String {
-        return try {
-            val proc = ProcessBuilder(cmd)
-                .redirectErrorStream(true)
-                .start()
+    private fun runCommand(
+        cmd: List<String>,
+        timeoutMs: Long,
+        maxStdoutBytes: Int
+    ): String {
+        val safeLimit =
+            maxStdoutBytes.coerceAtLeast(1)
 
-            val finished = proc.waitFor(timeoutMs, TimeUnit.MILLISECONDS)
-            if (!finished) {
-                runCatching { proc.destroy() }
-                runCatching { proc.destroyForcibly() }
-                return "(command timeout: ${cmd.joinToString(" ")})\n"
+        val process =
+            try {
+                ProcessBuilder(cmd)
+                    .redirectErrorStream(true)
+                    .start()
+            } catch (t: Throwable) {
+                return "(command failed: ${t.message})\n"
             }
 
-            val out = proc.inputStream.use { readTextLimited(it, maxStdoutBytes) }
-            runCatching { proc.destroy() }
-            out.ifBlank { "(logcat empty or restricted)\n" }
-        } catch (e: Throwable) {
-            "(command failed: ${e.message})\n"
+        val collector =
+            CappedByteCollector(safeLimit)
+
+        val readerDone =
+            CountDownLatch(1)
+
+        val readerError =
+            AtomicReference<Throwable?>(null)
+
+        val reader =
+            Thread(
+                {
+                    try {
+                        process.inputStream.use { input ->
+                            val buffer =
+                                ByteArray(8 * 1024)
+
+                            while (collector.remaining() > 0) {
+                                val count =
+                                    input.read(
+                                        buffer,
+                                        0,
+                                        minOf(
+                                            buffer.size,
+                                            collector.remaining()
+                                        )
+                                    )
+
+                                if (count <= 0) {
+                                    break
+                                }
+
+                                collector.write(
+                                    buffer = buffer,
+                                    offset = 0,
+                                    count = count
+                                )
+                            }
+                        }
+                    } catch (t: Throwable) {
+                        readerError.set(t)
+                    } finally {
+                        readerDone.countDown()
+                    }
+                },
+                "GitHubUploadWorker-CommandReader"
+            ).apply {
+                isDaemon = true
+            }
+
+        reader.start()
+
+        val completed =
+            runCatching {
+                readerDone.await(
+                    timeoutMs.coerceAtLeast(1L),
+                    TimeUnit.MILLISECONDS
+                )
+            }.getOrDefault(false)
+
+        if (!completed) {
+            runCatching {
+                process.destroy()
+            }
+
+            runCatching {
+                process.waitFor(
+                    COMMAND_KILL_GRACE_MS,
+                    TimeUnit.MILLISECONDS
+                )
+            }
+
+            if (process.isAlive) {
+                runCatching {
+                    process.destroyForcibly()
+                }
+            }
+
+            runCatching {
+                readerDone.await(
+                    COMMAND_KILL_GRACE_MS,
+                    TimeUnit.MILLISECONDS
+                )
+            }
+
+            collector.appendUtf8(
+                "\n(command timeout: ${cmd.joinToString(" ")})\n"
+            )
+        } else {
+            runCatching {
+                process.waitFor(
+                    COMMAND_KILL_GRACE_MS,
+                    TimeUnit.MILLISECONDS
+                )
+            }
         }
-    }
 
-    private fun readTextLimited(input: InputStream, maxBytes: Int): String {
-        return runCatching {
-            val buf = ByteArray(8_192)
-            val bos = ByteArrayOutputStream()
-            var total = 0
-            while (true) {
-                val n = input.read(buf)
-                if (n <= 0) break
-                val remain = maxBytes - total
-                if (remain <= 0) break
-                val toWrite = minOf(n, remain)
-                bos.write(buf, 0, toWrite)
-                total += toWrite
-                if (total >= maxBytes) break
+        runCatching {
+            if (process.isAlive) {
+                process.destroy()
             }
-            bos.toString(Charsets.UTF_8.name())
-        }.getOrElse { e ->
-            "(read failed: ${e.message})\n"
+        }
+
+        runCatching {
+            if (process.isAlive) {
+                process.destroyForcibly()
+            }
+        }
+
+        val error =
+            readerError.get()
+
+        if (
+            error != null &&
+            collector.size() == 0
+        ) {
+            return "(read failed: ${error.message})\n"
+        }
+
+        val output =
+            collector.toByteArray()
+                .toString(Charsets.UTF_8)
+
+        return output.ifBlank {
+            "(logcat empty or restricted)\n"
         }
     }
 
@@ -1147,6 +2145,152 @@ class GitHubUploadWorker(
     // ---------------------------------------------------------------------
     // Foreground + helpers
     // ---------------------------------------------------------------------
+
+    private fun resolvedSessionId(
+        prefix: String
+    ): String {
+        val supplied =
+            inputData.getString(KEY_SESSION_ID)
+                ?.let(::safeFileSegmentLong)
+                ?.takeIf { it.isNotBlank() }
+
+        if (supplied != null) {
+            return supplied
+        }
+
+        return safeFileSegmentLong(
+            "${prefix}_work_${id}"
+        )
+    }
+
+    private fun resolvedSessionDateFolderUtc(): String {
+        val sessionId =
+            inputData.getString(KEY_SESSION_ID)
+                .orEmpty()
+
+        val compactDate =
+            Regex("""(?:^|_)(\d{8})(?:_|$)""")
+                .find(sessionId)
+                ?.groupValues
+                ?.getOrNull(1)
+
+        if (
+            compactDate != null &&
+            compactDate.length == 8
+        ) {
+            return buildString(10) {
+                append(compactDate, 0, 4)
+                append('-')
+                append(compactDate, 4, 6)
+                append('-')
+                append(compactDate, 6, 8)
+            }
+        }
+
+        return utcDateFolder()
+    }
+
+    private fun utcIsoTimestamp(): String =
+        SimpleDateFormat(
+            "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'",
+            Locale.US
+        ).apply {
+            timeZone =
+                TimeZone.getTimeZone("UTC")
+        }.format(Date())
+
+    private fun retryOrFailure(
+        t: Throwable,
+        errorMessage: String
+    ): Result {
+        val attemptsUsed =
+            runAttemptCount + 1
+
+        return if (
+            shouldRetry(t) &&
+            attemptsUsed < MAX_ATTEMPTS
+        ) {
+            Result.retry()
+        } else {
+            Result.failure(
+                workDataOf(
+                    ERROR_MESSAGE to errorMessage
+                )
+            )
+        }
+    }
+
+    private class CappedByteCollector(
+        cap: Int
+    ) {
+        private val buffer =
+            ByteArray(
+                cap.coerceAtLeast(0)
+            )
+
+        private var size = 0
+
+        @Synchronized
+        fun remaining(): Int =
+            buffer.size - size
+
+        @Synchronized
+        fun size(): Int =
+            size
+
+        @Synchronized
+        fun write(
+            buffer: ByteArray,
+            offset: Int,
+            count: Int
+        ) {
+            if (
+                count <= 0 ||
+                size >= this.buffer.size
+            ) {
+                return
+            }
+
+            val safeCount =
+                minOf(
+                    count,
+                    this.buffer.size - size
+                )
+
+            System.arraycopy(
+                buffer,
+                offset,
+                this.buffer,
+                size,
+                safeCount
+            )
+
+            size += safeCount
+        }
+
+        @Synchronized
+        fun appendUtf8(
+            value: String
+        ) {
+            val bytes =
+                value.toByteArray(
+                    Charsets.UTF_8
+                )
+
+            write(
+                buffer = bytes,
+                offset = 0,
+                count = bytes.size
+            )
+        }
+
+        @Synchronized
+        fun toByteArray(): ByteArray =
+            buffer.copyOfRange(
+                0,
+                size
+            )
+    }
 
     private fun foregroundInfo(
         notificationId: Int,
@@ -1221,20 +2365,86 @@ class GitHubUploadWorker(
             .replace(Regex("""[^A-Za-z0-9_\-\.]+"""), "_")
             .take(24)
 
+    private fun safeFileSegmentLong(s: String): String =
+        s.trim()
+            .replace(Regex("""[^A-Za-z0-9_\-\.]+"""), "_")
+            .trim('_')
+            .take(96)
+
     private fun shouldRetry(t: Throwable): Boolean {
-        val msg = t.message.orEmpty()
+        val message =
+            t.message.orEmpty()
 
-        if (msg.startsWith("Transient HTTP ", ignoreCase = true)) return true
+        if (
+            message.startsWith(
+                "Transient HTTP ",
+                ignoreCase = true
+            )
+        ) {
+            return true
+        }
 
-        val httpCode = Regex("""\((\d{3})\)""").find(msg)?.groupValues?.getOrNull(1)?.toIntOrNull()
-        if (httpCode != null && httpCode in 400..499 && httpCode != 429) return false
+        if (
+            message.contains(
+                "rate limit",
+                ignoreCase = true
+            ) ||
+            message.contains(
+                "secondary rate",
+                ignoreCase = true
+            ) ||
+            message.contains(
+                "abuse detection",
+                ignoreCase = true
+            )
+        ) {
+            return true
+        }
 
-        if (msg.contains("too large", ignoreCase = true)) return false
-        if (msg.contains("bad credentials", ignoreCase = true)) return false
-        if (msg.contains("requires authentication", ignoreCase = true)) return false
-        if (msg.contains("403")) return false
+        val httpCode =
+            Regex("""\((\d{3})\)""")
+                .find(message)
+                ?.groupValues
+                ?.getOrNull(1)
+                ?.toIntOrNull()
 
-        return t is IOException || msg.contains("timeout", ignoreCase = true)
+        if (httpCode != null) {
+            if (
+                httpCode in 500..599 ||
+                httpCode == 408 ||
+                httpCode == 425 ||
+                httpCode == 429
+            ) {
+                return true
+            }
+
+            if (httpCode in 400..499) {
+                return false
+            }
+        }
+
+        if (
+            message.contains(
+                "too large",
+                ignoreCase = true
+            ) ||
+            message.contains(
+                "bad credentials",
+                ignoreCase = true
+            ) ||
+            message.contains(
+                "requires authentication",
+                ignoreCase = true
+            )
+        ) {
+            return false
+        }
+
+        return t is IOException ||
+                message.contains(
+                    "timeout",
+                    ignoreCase = true
+                )
     }
 
     companion object {
@@ -1246,6 +2456,7 @@ class GitHubUploadWorker(
 
         private const val DEFAULT_MAX_RAW_BYTES_HINT = 1_000_000L
         private const val COMMAND_STDOUT_MAX_BYTES = 700_000
+        private const val COMMAND_KILL_GRACE_MS = 120L
 
         private const val LOGCAT_TAIL_LINES = 1200
         private const val LOGCAT_CRASH_TAIL_LINES = 200
@@ -1258,6 +2469,10 @@ class GitHubUploadWorker(
         private const val STARTUP_RING_PRE_DELAY_MS = 700L
 
         private const val LEDGER_MAX_ITEMS = 4000
+        private const val RING_SNAPSHOT_COPY_ATTEMPTS = 3
+
+        /** Shared across every Worker instance in this app process. */
+        private val LEDGER_LOCK = Any()
 
         // Modes
         private const val MODE_FILE = "file"
@@ -1278,6 +2493,9 @@ class GitHubUploadWorker(
         const val KEY_BRANCH = "branch"
         const val KEY_PATH_PREFIX = "pathPrefix"
         const val KEY_MODE = "mode"
+
+        /** Stable across WorkManager retries for one logical upload session. */
+        const val KEY_SESSION_ID = "sessionId"
 
         // File input keys
         const val KEY_FILE_PATH = "filePath"
@@ -1366,10 +2584,10 @@ class GitHubUploadWorker(
         }
 
         /**
-         * Enqueue a work request to upload app-owned runtime logs (plain).
+         * Enqueue app-owned runtime logs.
          *
-         * Note:
-         * - maxZipBytes is kept for backward compatibility, now treated as per-file max bytes hint.
+         * A stable session id is placed in input Data so retries keep writing
+         * to the same remote folder.
          */
         fun enqueueRuntimeLogsUpload(
             context: Context,
@@ -1381,47 +2599,89 @@ class GitHubUploadWorker(
             maxZipBytes: Long = DEFAULT_MAX_RAW_BYTES_HINT,
             deleteSourceAfterUpload: Boolean = true
         ) {
-            val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-            val uniqueName = "upload_runtime_logs_$stamp"
+            val appCtx =
+                context.applicationContext
+                    ?: context
 
-            val req: OneTimeWorkRequest =
+            val sessionId =
+                newSessionId("runtime")
+
+            val uniqueName =
+                "upload_runtime_logs_$sessionId"
+
+            val input =
+                buildWorkerInputData(
+                    context = appCtx,
+                    cfg = cfg
+                ) {
+                    putString(
+                        KEY_MODE,
+                        MODE_RUNTIME_LOGS
+                    )
+                    putString(
+                        KEY_SESSION_ID,
+                        sessionId
+                    )
+                    putString(
+                        KEY_RTLOG_REMOTE_DIR,
+                        remoteDir
+                    )
+                    putBoolean(
+                        KEY_RTLOG_ADD_DATE,
+                        addDateSubdir
+                    )
+                    putString(
+                        KEY_RTLOG_REASON,
+                        reason
+                    )
+                    putBoolean(
+                        KEY_RTLOG_DELETE_ZIP_AFTER,
+                        deleteZipAfter
+                    )
+                    putLong(
+                        KEY_RTLOG_MAX_ZIP_BYTES,
+                        maxZipBytes
+                    )
+                    putBoolean(
+                        KEY_RTLOG_DEDUPE_ENABLE,
+                        true
+                    )
+                    putBoolean(
+                        KEY_RTLOG_DELETE_SOURCE_AFTER_UPLOAD,
+                        deleteSourceAfterUpload
+                    )
+                }
+
+            val request =
                 OneTimeWorkRequestBuilder<GitHubUploadWorker>()
-                    .setInputData(
-                        workDataOf(
-                            KEY_MODE to MODE_RUNTIME_LOGS,
-                            KEY_OWNER to cfg.owner,
-                            KEY_REPO to cfg.repo,
-                            KEY_TOKEN to cfg.token,
-                            KEY_BRANCH to cfg.branch,
-                            KEY_PATH_PREFIX to cfg.pathPrefix,
-
-                            KEY_RTLOG_REMOTE_DIR to remoteDir,
-                            KEY_RTLOG_ADD_DATE to addDateSubdir,
-                            KEY_RTLOG_REASON to reason,
-                            KEY_RTLOG_DELETE_ZIP_AFTER to deleteZipAfter,
-                            KEY_RTLOG_MAX_ZIP_BYTES to maxZipBytes,
-
-                            KEY_RTLOG_DEDUPE_ENABLE to true,
-                            KEY_RTLOG_DELETE_SOURCE_AFTER_UPLOAD to deleteSourceAfterUpload,
-                        )
+                    .setInputData(input)
+                    .setConstraints(networkConstraints())
+                    .setBackoffCriteria(
+                        BackoffPolicy.EXPONENTIAL,
+                        30,
+                        TimeUnit.SECONDS
                     )
-                    .setConstraints(
-                        Constraints.Builder()
-                            .setRequiredNetworkType(NetworkType.CONNECTED)
-                            .build()
+                    .setExpedited(
+                        OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST
                     )
-                    .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
-                    .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
                     .addTag(TAG)
                     .addTag("$TAG:runtime_logs")
                     .build()
 
-            WorkManager.getInstance(context.applicationContext)
-                .enqueueUniqueWork(uniqueName, ExistingWorkPolicy.KEEP, req)
+            WorkManager.getInstance(appCtx)
+                .enqueueUniqueWork(
+                    uniqueName,
+                    ExistingWorkPolicy.KEEP,
+                    request
+                )
         }
 
         /**
-         * Enqueue a stable startup runtime logs upload.
+         * Enqueue startup runtime-log upload.
+         *
+         * KEEP is sufficient here: WorkManager's unique-work conflict policy is
+         * only relevant when an unfinished chain with this name already exists.
+         * There is no need to synchronously query WorkManager first.
          */
         fun enqueueStartupRuntimeLogsUpload(
             context: Context,
@@ -1433,55 +2693,93 @@ class GitHubUploadWorker(
             maxZipBytes: Long = DEFAULT_MAX_RAW_BYTES_HINT,
             deleteSourceAfterUpload: Boolean = true
         ) {
-            val uniqueName = "upload_runtime_logs_startup"
+            val appCtx =
+                context.applicationContext
+                    ?: context
 
-            val req: OneTimeWorkRequest =
+            val uniqueName =
+                "upload_runtime_logs_startup"
+
+            val sessionId =
+                newSessionId("startup_runtime")
+
+            val input =
+                buildWorkerInputData(
+                    context = appCtx,
+                    cfg = cfg
+                ) {
+                    putString(
+                        KEY_MODE,
+                        MODE_STARTUP_RUNTIME_LOGS
+                    )
+                    putString(
+                        KEY_SESSION_ID,
+                        sessionId
+                    )
+                    putString(
+                        KEY_RTLOG_REMOTE_DIR,
+                        remoteDir
+                    )
+                    putBoolean(
+                        KEY_RTLOG_ADD_DATE,
+                        addDateSubdir
+                    )
+                    putString(
+                        KEY_RTLOG_REASON,
+                        reason
+                    )
+                    putBoolean(
+                        KEY_RTLOG_DELETE_ZIP_AFTER,
+                        deleteZipAfter
+                    )
+                    putLong(
+                        KEY_RTLOG_MAX_ZIP_BYTES,
+                        maxZipBytes
+                    )
+                    putBoolean(
+                        KEY_RTLOG_DEDUPE_ENABLE,
+                        true
+                    )
+                    putBoolean(
+                        KEY_RTLOG_DELETE_SOURCE_AFTER_UPLOAD,
+                        deleteSourceAfterUpload
+                    )
+                }
+
+            val request =
                 OneTimeWorkRequestBuilder<GitHubUploadWorker>()
-                    .setInputData(
-                        workDataOf(
-                            KEY_MODE to MODE_STARTUP_RUNTIME_LOGS,
-                            KEY_OWNER to cfg.owner,
-                            KEY_REPO to cfg.repo,
-                            KEY_TOKEN to cfg.token,
-                            KEY_BRANCH to cfg.branch,
-                            KEY_PATH_PREFIX to cfg.pathPrefix,
-
-                            KEY_RTLOG_REMOTE_DIR to remoteDir,
-                            KEY_RTLOG_ADD_DATE to addDateSubdir,
-                            KEY_RTLOG_REASON to reason,
-                            KEY_RTLOG_DELETE_ZIP_AFTER to deleteZipAfter,
-                            KEY_RTLOG_MAX_ZIP_BYTES to maxZipBytes,
-
-                            KEY_RTLOG_DEDUPE_ENABLE to true,
-                            KEY_RTLOG_DELETE_SOURCE_AFTER_UPLOAD to deleteSourceAfterUpload,
-                        )
+                    .setInputData(input)
+                    .setConstraints(networkConstraints())
+                    .setBackoffCriteria(
+                        BackoffPolicy.EXPONENTIAL,
+                        30,
+                        TimeUnit.SECONDS
                     )
-                    .setConstraints(
-                        Constraints.Builder()
-                            .setRequiredNetworkType(NetworkType.CONNECTED)
-                            .build()
+                    .setExpedited(
+                        OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST
                     )
-                    .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
-                    .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
                     .addTag(TAG)
                     .addTag("$TAG:startup_runtime_logs")
                     .build()
 
-            val appCtx = context.applicationContext
-            val policy = choosePolicyForUniqueName(appCtx, uniqueName)
-
-            Log.d(TAG, "enqueueStartupRuntimeLogsUpload: uniqueName=$uniqueName policy=$policy")
+            Log.d(
+                TAG,
+                "enqueueStartupRuntimeLogsUpload: uniqueName=$uniqueName policy=KEEP session=$sessionId"
+            )
 
             WorkManager.getInstance(appCtx)
-                .enqueueUniqueWork(uniqueName, policy, req)
+                .enqueueUniqueWork(
+                    uniqueName,
+                    ExistingWorkPolicy.KEEP,
+                    request
+                )
         }
 
         /**
-         * Enqueue a stable startup ring logs upload (AppRingLogStore segments).
+         * Enqueue startup AppRingLogStore upload.
          *
-         * Notes:
-         * - Ring segments are uploaded as-is (seg_XX.log).
-         * - Segments are never deleted on device.
+         * The Worker copies live segments into a stable cache snapshot before
+         * network upload. The ring itself is never deleted.
          */
         fun enqueueStartupRingLogsUpload(
             context: Context,
@@ -1490,64 +2788,204 @@ class GitHubUploadWorker(
             addDateSubdir: Boolean = true,
             reason: String = "app_start",
         ) {
-            val uniqueName = "upload_ring_logs_startup"
+            val appCtx =
+                context.applicationContext
+                    ?: context
 
-            val req: OneTimeWorkRequest =
+            val uniqueName =
+                "upload_ring_logs_startup"
+
+            val sessionId =
+                newSessionId("startup_ring")
+
+            val input =
+                buildWorkerInputData(
+                    context = appCtx,
+                    cfg = cfg
+                ) {
+                    putString(
+                        KEY_MODE,
+                        MODE_STARTUP_RING_LOGS
+                    )
+                    putString(
+                        KEY_SESSION_ID,
+                        sessionId
+                    )
+                    putString(
+                        KEY_RING_REMOTE_DIR,
+                        remoteDir
+                    )
+                    putBoolean(
+                        KEY_RING_ADD_DATE,
+                        addDateSubdir
+                    )
+                    putString(
+                        KEY_RING_REASON,
+                        reason
+                    )
+                }
+
+            val request =
                 OneTimeWorkRequestBuilder<GitHubUploadWorker>()
-                    .setInputData(
-                        workDataOf(
-                            KEY_MODE to MODE_STARTUP_RING_LOGS,
-                            KEY_OWNER to cfg.owner,
-                            KEY_REPO to cfg.repo,
-                            KEY_TOKEN to cfg.token,
-                            KEY_BRANCH to cfg.branch,
-                            KEY_PATH_PREFIX to cfg.pathPrefix,
-
-                            KEY_RING_REMOTE_DIR to remoteDir,
-                            KEY_RING_ADD_DATE to addDateSubdir,
-                            KEY_RING_REASON to reason,
-                        )
+                    .setInputData(input)
+                    .setConstraints(networkConstraints())
+                    .setBackoffCriteria(
+                        BackoffPolicy.EXPONENTIAL,
+                        30,
+                        TimeUnit.SECONDS
                     )
-                    .setConstraints(
-                        Constraints.Builder()
-                            .setRequiredNetworkType(NetworkType.CONNECTED)
-                            .build()
+                    .setExpedited(
+                        OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST
                     )
-                    .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
-                    .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
                     .addTag(TAG)
                     .addTag("$TAG:ring_logs")
                     .build()
 
-            val appCtx = context.applicationContext
-            val policy = choosePolicyForUniqueName(appCtx, uniqueName)
-
-            Log.d(TAG, "enqueueStartupRingLogsUpload: uniqueName=$uniqueName policy=$policy")
+            Log.d(
+                TAG,
+                "enqueueStartupRingLogsUpload: uniqueName=$uniqueName policy=KEEP session=$sessionId"
+            )
 
             WorkManager.getInstance(appCtx)
-                .enqueueUniqueWork(uniqueName, policy, req)
+                .enqueueUniqueWork(
+                    uniqueName,
+                    ExistingWorkPolicy.KEEP,
+                    request
+                )
         }
 
-        private fun choosePolicyForUniqueName(context: Context, uniqueName: String): ExistingWorkPolicy {
-            return try {
-                val infos = WorkManager.getInstance(context)
-                    .getWorkInfosForUniqueWork(uniqueName)
-                    .get(350, TimeUnit.MILLISECONDS)
+        /**
+         * Build common WorkManager input.
+         *
+         * KEY_TOKEN remains supported for compatibility with existing callers,
+         * but these helpers avoid persisting it whenever the same credential is
+         * already available from GitHubDiagnosticsConfigStore or BuildConfig.
+         */
+        private fun buildWorkerInputData(
+            context: Context,
+            cfg: GitHubUploader.GitHubConfig,
+            extras: Data.Builder.() -> Unit
+        ): Data {
+            val builder =
+                Data.Builder()
+                    .putString(
+                        KEY_OWNER,
+                        cfg.owner
+                    )
+                    .putString(
+                        KEY_REPO,
+                        cfg.repo
+                    )
+                    .putString(
+                        KEY_BRANCH,
+                        cfg.branch
+                    )
+                    .putString(
+                        KEY_PATH_PREFIX,
+                        cfg.pathPrefix
+                    )
 
-                val states = infos.joinToString(",") { it.state.name }
-                val inFlight = infos.any {
-                    it.state == WorkInfo.State.RUNNING ||
-                            it.state == WorkInfo.State.ENQUEUED ||
-                            it.state == WorkInfo.State.BLOCKED
-                }
+            if (
+                shouldEmbedLegacyToken(
+                    context = context,
+                    cfg = cfg
+                )
+            ) {
+                /**
+                 * Compatibility fallback for callers that provide an ephemeral
+                 * credential not available from the app's credential store.
+                 */
+                builder.putString(
+                    KEY_TOKEN,
+                    cfg.token
+                )
 
-                val policy = if (inFlight) ExistingWorkPolicy.KEEP else ExistingWorkPolicy.REPLACE
-                Log.d(TAG, "choosePolicy: uniqueName=$uniqueName policy=$policy states=[$states]")
-                policy
-            } catch (t: Throwable) {
-                Log.w(TAG, "choosePolicy: fallback KEEP (query failed). uniqueName=$uniqueName err=${t.message}")
-                ExistingWorkPolicy.KEEP
+                Log.w(
+                    TAG,
+                    "Work request is using legacy embedded credential fallback. " +
+                            "Persist this credential in GitHubDiagnosticsConfigStore to avoid placing it in WorkManager Data."
+                )
             }
+
+            builder.extras()
+            return builder.build()
+        }
+
+        private fun shouldEmbedLegacyToken(
+            context: Context,
+            cfg: GitHubUploader.GitHubConfig
+        ): Boolean {
+            val requested =
+                cfg.token.trim()
+
+            if (requested.isBlank()) {
+                return false
+            }
+
+            val stored =
+                runCatching {
+                    GitHubDiagnosticsConfigStore
+                        .buildGitHubConfigOrNull(context)
+                        ?.token
+                        ?.trim()
+                }.getOrNull()
+                    .orEmpty()
+
+            if (
+                stored.isNotBlank() &&
+                stored == requested
+            ) {
+                return false
+            }
+
+            val builtIn =
+                BuildConfig.GH_TOKEN.trim()
+
+            if (
+                builtIn.isNotBlank() &&
+                builtIn == requested
+            ) {
+                return false
+            }
+
+            return true
+        }
+
+        private fun networkConstraints(): Constraints =
+            Constraints.Builder()
+                .setRequiredNetworkType(
+                    NetworkType.CONNECTED
+                )
+                .build()
+
+        private fun newSessionId(
+            prefix: String
+        ): String {
+            val timestamp =
+                SimpleDateFormat(
+                    "yyyyMMdd_HHmmss",
+                    Locale.US
+                ).apply {
+                    timeZone =
+                        TimeZone.getTimeZone("UTC")
+                }.format(Date())
+
+            val random =
+                UUID.randomUUID()
+                    .toString()
+                    .substring(0, 8)
+
+            val safePrefix =
+                prefix.trim()
+                    .replace(
+                        Regex("""[^A-Za-z0-9_\-\.]+"""),
+                        "_"
+                    )
+                    .trim('_')
+                    .ifBlank { "session" }
+                    .take(24)
+
+            return "${safePrefix}_${timestamp}_$random"
         }
     }
 }

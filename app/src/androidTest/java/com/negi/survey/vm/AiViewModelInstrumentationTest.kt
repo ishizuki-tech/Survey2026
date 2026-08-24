@@ -5,13 +5,14 @@
  *  File: AiViewModelInstrumentationTest.kt
  *  Author: Shu Ishizuki (石附 支)
  *  License: MIT License
- *  © 2025 IshizukiTech LLC. All rights reserved.
+ *  © 2025-2026 IshizukiTech LLC. All rights reserved.
  * =====================================================================
  */
 
 package com.negi.survey.vm
 
 import android.content.Context
+import android.os.SystemClock
 import android.util.Log
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.filters.LargeTest
@@ -21,379 +22,925 @@ import com.negi.survey.config.SurveyConfig
 import com.negi.survey.config.SurveyConfigLoader
 import com.negi.survey.slm.Accelerator
 import com.negi.survey.slm.ConfigKey
+import com.negi.survey.slm.LiteRtRepository
 import com.negi.survey.slm.Model
 import com.negi.survey.slm.SLM
-import com.negi.survey.slm.SlmDirectRepository
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.filter
-import kotlinx.coroutines.flow.map
-import kotlinx.coroutines.flow.merge
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import org.junit.After
 import org.junit.AfterClass
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
-import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Rule
 import org.junit.Test
-import org.junit.runner.RunWith
 import org.junit.rules.Timeout
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicBoolean
+import org.junit.runner.RunWith
 
 /**
- * Instrumentation tests for [AiViewModel] + [SlmDirectRepository] + [SLM] end-to-end behavior.
+ * Real-device instrumentation tests for [AiViewModel] + [LiteRtRepository].
  *
- * Covered:
- *  - Basic “happy path” runs with a real on-device model (multiple times).
- *  - ViewModel cancellation behavior.
- *  - Per-call timeout behavior.
+ * Current contracts under test:
+ * - Model initialization uses the current suspend SLM API.
+ * - [AiViewModel.evaluateAsync] returns the active [Job].
+ * - Successful evaluation commits raw output and clears loading.
+ * - [AiViewModel.cancel] marks the run as "cancelled".
+ * - Per-call timeout commits the "timeout" error before the test resets state.
+ * - Single-flight behavior returns the already-active Job instead of starting a
+ *   second evaluation concurrently.
+ * - Repeated evaluations leave the LiteRT-LM backend reusable.
  *
- * Notes:
- *  - Uses [ModelAssetRule] to ensure the LiteRT-LM model artifact exists on device.
- *  - Initializes the model once per test class (GPU first, with CPU fallback).
+ * Historical APIs intentionally removed from this test:
+ * - SlmDirectRepository
+ * - Model.instance
+ * - SLM.resetSession()
+ * - callback-style SLM.initialize(context, model) { ... }
+ * - SLM.isBusy(model) as a repository/ViewModel lifecycle oracle
  */
 @RunWith(AndroidJUnit4::class)
 @LargeTest
 class AiViewModelInstrumentationTest {
 
     @get:Rule
-    val modelRule = ModelAssetRule()
+    val modelRule =
+        ModelAssetRule()
 
-    /** Global watchdog so a hung generation does not block the whole suite. */
     @get:Rule
-    val globalTimeout: Timeout = Timeout.seconds(120)
+    val globalTimeout: Timeout =
+        Timeout.seconds(GLOBAL_TEST_TIMEOUT_SEC)
 
     private lateinit var appCtx: Context
-    private lateinit var repo: SlmDirectRepository
+    private lateinit var repo: LiteRtRepository
     private lateinit var vm: AiViewModel
     private lateinit var config: SurveyConfig
 
     companion object {
         private const val TAG = "AiVmInstrTest"
 
-        /** ViewModel-level timeout default (ms). */
-        private const val TIMEOUT_SEC = 60L
+        /** Whole-test watchdog. */
+        private const val GLOBAL_TEST_TIMEOUT_SEC = 180L
 
-        /** SLM.initialize timeout (seconds). */
-        private const val INIT_TIMEOUT_SEC = 30L
+        /** Default ViewModel request timeout. */
+        private const val DEFAULT_VM_TIMEOUT_MS = 60_000L
 
-        /** Secondary wait for model.instance to become non-null (ms). */
-        private const val INSTANCE_WAIT_MS = 15_000L
+        /** Hard timeout for model initialization. */
+        private const val INIT_TIMEOUT_MS = 60_000L
+
+        /** Hard timeout for a normal ViewModel evaluation. */
+        private const val COMPLETE_TIMEOUT_MS = 120_000L
+
+        /** Wait for a run to visibly enter loading state. */
+        private const val START_TIMEOUT_MS = 15_000L
+
+        /** Cancellation should settle well before this. */
+        private const val CANCEL_TIMEOUT_MS = 30_000L
+
+        /** Native cleanup callback grace for final class teardown. */
+        private const val CLEANUP_TIMEOUT_MS = 20_000L
+
+        /**
+         * Keep instrumentation runs reasonably short and deterministic.
+         *
+         * 4096 output tokens is unnecessarily expensive for smoke tests.
+         */
+        private const val TEST_MAX_TOKENS = 512
 
         private lateinit var model: Model
-        private val initialized = AtomicBoolean(false)
+
+        private val initialized =
+            AtomicBoolean(false)
+
+        private val initLock =
+            Any()
 
         @AfterClass
         @JvmStatic
         fun afterClass() {
+            if (!::model.isInitialized) {
+                return
+            }
+
             runCatching {
-                if (::model.isInitialized && !SLM.isBusy(model)) {
-                    SLM.cleanUp(model) {}
-                }
-            }.onFailure {
-                Log.w(TAG, "SLM cleanup failed in afterClass: ${it.message}")
+                forceCleanUpBlocking(
+                    targetModel = model,
+                    timeoutMs = CLEANUP_TIMEOUT_MS,
+                )
+            }.onFailure { error ->
+                Log.w(
+                    TAG,
+                    "SLM force cleanup failed in afterClass: ${error.message}",
+                    error,
+                )
             }
         }
-    }
 
-    /**
-     * Selects default accelerator (GPU or CPU) based on instrumentation args or env.
-     * ACCELERATOR=CPU forces CPU-only for more predictable CI behavior.
-     */
-    private fun defaultAccel(): Accelerator {
-        val args = InstrumentationRegistry.getArguments()
-        val acc = (args.getString("ACCELERATOR") ?: System.getenv("ACCELERATOR"))
-            ?.uppercase()
-            ?.trim()
-        return if (acc == "CPU") Accelerator.CPU else Accelerator.GPU
+        private fun forceCleanUpBlocking(
+            targetModel: Model,
+            timeoutMs: Long,
+        ): Boolean {
+            val latch =
+                CountDownLatch(1)
+
+            SLM.forceCleanUp(targetModel) {
+                latch.countDown()
+            }
+
+            return latch.await(
+                timeoutMs,
+                TimeUnit.MILLISECONDS,
+            )
+        }
     }
 
     @Before
-    fun setUp() = runBlocking {
-        appCtx = InstrumentationRegistry.getInstrumentation().targetContext
+    fun setUp() {
+        appCtx =
+            InstrumentationRegistry
+                .getInstrumentation()
+                .targetContext
+                .applicationContext
 
-        // Load and validate SurveyConfig early to surface asset issues.
-        config = SurveyConfigLoader.fromAssets(appCtx, "survey_config1.yaml").also {
-            val issues = it.validate()
-            assertTrue(
-                "SurveyConfig invalid:\n- " + issues.joinToString("\n- "),
-                issues.isEmpty()
-            )
-        }
+        SLM.setApplicationContext(appCtx)
 
-        if (initialized.compareAndSet(false, true)) {
-            var accel = defaultAccel()
-            model = Model(
-                name = "gemma3-local-test",
-                taskPath = modelRule.internalModel.absolutePath,
-                config = mapOf(
-                    ConfigKey.ACCELERATOR to accel.label,
-                    ConfigKey.MAX_TOKENS to 4096,
-                    ConfigKey.TOP_K to 40,
-                    ConfigKey.TOP_P to 0.9f,
-                    ConfigKey.TEMPERATURE to 0.7f
-                )
+        config =
+            loadValidatedConfig(appCtx)
+
+        ensureModelInitialized()
+
+        repo =
+            LiteRtRepository(
+                model = model,
+                config = config,
+                appContext = appCtx,
             )
 
-            var initErr = initializeModel(appCtx, model, INIT_TIMEOUT_SEC)
-            if (!initErr.isNullOrEmpty() && accel != Accelerator.CPU) {
-                Log.w(TAG, "GPU init failed: $initErr — falling back to CPU")
-                accel = Accelerator.CPU
-                model = Model(
-                    name = model.name,
-                    taskPath = modelRule.internalModel.absolutePath,
-                    config = model.config.toMutableMap().apply {
-                        put(ConfigKey.ACCELERATOR, accel.label)
-                    }
-                )
-                initErr = initializeModel(appCtx, model, INIT_TIMEOUT_SEC)
-            }
+        vm =
+            AiViewModel(
+                repo = repo,
+                defaultTimeoutMs = DEFAULT_VM_TIMEOUT_MS,
+            )
 
-            check(initErr.isNullOrEmpty()) { "SLM initialization error: $initErr" }
-
-            if (model.instance == null) {
-                val ok = waitUntil(INSTANCE_WAIT_MS) { model.instance != null }
-                check(ok) { "SLM instance not available within ${INSTANCE_WAIT_MS}ms" }
-            }
-            assertNotNull("Model instance must be created", model.instance)
-        } else {
-            assertNotNull("Model instance must exist", model.instance)
-        }
-
-        repo = SlmDirectRepository(model, config)
-        vm = AiViewModel(
-            repo = repo,
-            defaultTimeoutMs = TIMEOUT_SEC * 1_000
+        /**
+         * Start every test from a known transient ViewModel state.
+         *
+         * resetStates() does not set the "cancelled" error, unlike cancel().
+         */
+        vm.resetStates(
+            keepError = false
         )
-
-        val busy = runCatching { SLM.isBusy(model) }
-            .onFailure { Log.w(TAG, "SLM.isBusy threw in setUp: ${it.message}") }
-            .getOrElse { false }
-
-        assertFalse("busy should be false at test start", busy)
     }
 
     @After
-    fun tearDown() = runBlocking {
-        runCatching { vm.cancel() }
-
-        // Best-effort: wait briefly for the engine to become idle, then reset.
-        val idle = waitUntil(2_000) {
-            !runCatching { SLM.isBusy(model) }.getOrElse { false }
-        }
-        if (idle) {
-            runCatching { SLM.resetSession(model) }
-                .onFailure { Log.w(TAG, "resetSession failed in tearDown: ${it.message}") }
+    fun tearDown() {
+        /**
+         * Do not call vm.cancel() unconditionally here.
+         *
+         * cancel() intentionally writes error="cancelled", which can overwrite
+         * the terminal state a test is trying to inspect. resetStates() stops
+         * any leftover run without introducing that false terminal result.
+         */
+        runCatching {
+            vm.resetStates(
+                keepError = false
+            )
+        }.onFailure { error ->
+            Log.w(
+                TAG,
+                "resetStates failed in tearDown: ${error.message}",
+                error,
+            )
         }
     }
 
-    // ---------------------------------------------------------------------
-    // Prompt + runner helpers
-    // ---------------------------------------------------------------------
+    // =====================================================================
+    // Initialization
+    // =====================================================================
+
+    private fun loadValidatedConfig(
+        context: Context,
+    ): SurveyConfig {
+        return try {
+            SurveyConfigLoader
+                .fromAssetsStrictValidated(
+                    context,
+                    "survey_config1.yaml",
+                )
+        } catch (error: Throwable) {
+            throw AssertionError(
+                "Failed to load/validate SurveyConfig: ${error.message}",
+                error,
+            )
+        }
+    }
 
     /**
-     * Simple JSON-enforcing prompt for smoke tests.
+     * Initialize once per test class.
      *
-     * Contract:
-     *  - Single-line JSON output.
-     *  - Keys:
-     *      "analysis":            short string
-     *      "expected answer":     short string (<200 chars)
-     *      "follow-up questions": array of EXACTLY 3 short strings
-     *      "score":               integer 1..100
+     * GPU is preferred unless ACCELERATOR=CPU is supplied through
+     * instrumentation arguments/environment.
+     *
+     * If GPU initialization fails, explicitly tear down partial runtime state
+     * before retrying the same model path on CPU.
      */
-    private fun jsonPrompt(
-        q: String = "How many days to harvest?",
-        a: String = "About 90 days."
-    ): String = buildString {
-        appendLine("You are a strict JSON generator.")
-        appendLine("Return a SINGLE-LINE JSON object with EXACT keys:")
-        appendLine(" - \"analysis\": short string")
-        appendLine(" - \"expected answer\": short string (<200 chars)")
-        appendLine(" - \"follow-up questions\": array of EXACTLY 3 short strings")
-        appendLine(" - \"score\": integer 1..100")
-        appendLine("No markdown fences. No extra text. One line only.")
-        append("Question: "); append(q); append("  ")
-        append("Answer: "); append(a)
-    }.trim()
+    private fun ensureModelInitialized() {
+        if (initialized.get()) {
+            return
+        }
 
-    /**
-     * One-shot evaluation helper for smoke tests.
-     *
-     * Sequence:
-     *  1) Start evaluation via [AiViewModel.evaluateAsync].
-     *  2) Wait for either:
-     *       - loading==true, OR
-     *       - stream length >= [minStreamChars].
-     *  3) Wait until `raw` becomes non-null (view-model has committed a result).
-     *  4) Optionally observe loading==false (best-effort).
-     *  5) Validate:
-     *       - stream is non-empty
-     *       - raw is non-null
-     *       - score (if present) is in 1..100
-     *       - followupQuestion (if present) is non-blank
-     *
-     * Always cancels the evaluation and Job in a `finally` block.
-     */
-    private suspend fun runOnce(
-        prompt: String = jsonPrompt(),
-        firstChunkTimeoutMs: Long = 60_000L,
-        completeTimeoutMs: Long = 120_000L,
-        minStreamChars: Int = 4
-    ) {
-        val job = vm.evaluateAsync(prompt)
-        try {
-            // 1) Wait for either loading=true or some streaming text.
-            withTimeout(firstChunkTimeoutMs) {
-                merge(
-                    vm.loading.filter { it }.map { Unit },
-                    vm.stream.filter { it.length >= minStreamChars }.map { Unit }
-                ).first()
+        synchronized(initLock) {
+            if (initialized.get()) {
+                return
             }
 
-            // 2) Primary completion condition: raw != null.
-            withTimeout(completeTimeoutMs) {
-                vm.raw.first { it != null }
-            }
+            val preferred =
+                defaultAccelerator()
 
-            // 3) Optionally observe loading=false if visible in time.
-            withTimeoutOrNull(10_000) {
-                if (vm.loading.value) {
-                    vm.loading.first { !it }
+            var candidate =
+                createModel(preferred)
+
+            Log.i(
+                TAG,
+                "Initializing model accelerator=${preferred.label}"
+            )
+
+            try {
+                initializeModelBlocking(candidate)
+            } catch (firstError: Throwable) {
+                if (preferred == Accelerator.CPU) {
+                    throw firstError
+                }
+
+                Log.w(
+                    TAG,
+                    "GPU init failed: ${firstError.message}; falling back to CPU",
+                    firstError,
+                )
+
+                runCatching {
+                    forceCleanUpBlocking(
+                        targetModel = candidate,
+                        timeoutMs = CLEANUP_TIMEOUT_MS,
+                    )
+                }.onFailure { cleanupError ->
+                    Log.w(
+                        TAG,
+                        "Cleanup before CPU fallback failed: ${cleanupError.message}",
+                        cleanupError,
+                    )
+                }
+
+                candidate =
+                    createModel(
+                        Accelerator.CPU
+                    )
+
+                try {
+                    initializeModelBlocking(candidate)
+                } catch (cpuError: Throwable) {
+                    cpuError.addSuppressed(firstError)
+                    throw cpuError
                 }
             }
 
-            // 4) Validation of final state.
-            val streamText = vm.stream.value
-            require(streamText.isNotEmpty()) { "stream was empty" }
+            model = candidate
+            initialized.set(true)
 
-            val raw = vm.raw.value ?: error("raw was null (error=${vm.error.value})")
-
-            vm.score.value?.let { score ->
-                require(score in 1..100) { "score out of range: $score (raw=$raw)" }
-            }
-            vm.followupQuestion.value?.let { fup ->
-                require(fup.isNotBlank()) { "followupQuestion was blank" }
-            }
-        } finally {
-            // Ensure we always unwind evaluation and job.
-            vm.cancel()
-            job.cancel()
-        }
-    }
-
-    // ---------------------------------------------------------------------
-    // Smoke tests (multiple repetitions against a real model)
-    // ---------------------------------------------------------------------
-
-    @Test fun canUseRealModel01() = runBlocking { runOnce() }
-    @Test fun canUseRealModel02() = runBlocking { runOnce() }
-    @Test fun canUseRealModel03() = runBlocking { runOnce() }
-    @Test fun canUseRealModel04() = runBlocking { runOnce() }
-    @Test fun canUseRealModel05() = runBlocking { runOnce() }
-    @Test fun canUseRealModel06() = runBlocking { runOnce() }
-    @Test fun canUseRealModel07() = runBlocking { runOnce() }
-    @Test fun canUseRealModel08() = runBlocking { runOnce() }
-    @Test fun canUseRealModel09() = runBlocking { runOnce() }
-    @Test fun canUseRealModel10() = runBlocking { runOnce() }
-    @Test fun canUseRealModel11() = runBlocking { runOnce() }
-    @Test fun canUseRealModel12() = runBlocking { runOnce() }
-
-    // ---------------------------------------------------------------------
-    // Behavior tests (cancellation / timeout)
-    // ---------------------------------------------------------------------
-
-    /**
-     * Cancellation path: once some streaming text arrives, cancel and ensure
-     * loading eventually drops and error is either null or "cancelled".
-     */
-    @Test
-    fun cancelsCleanly() = runBlocking {
-        val job = vm.evaluateAsync(
-            jsonPrompt(
-                q = "Write a poem slowly",
-                a = "OK"
+            Log.i(
+                TAG,
+                "Model initialized successfully: " +
+                        "name=${model.name} " +
+                        "accelerator=${model.getStringConfigValue(ConfigKey.ACCELERATOR, "")}"
             )
+        }
+    }
+
+    private fun createModel(
+        accelerator: Accelerator,
+    ): Model =
+        Model(
+            name = "gemma3-local-test",
+            taskPath = modelRule.internalModel.absolutePath,
+            config =
+                mapOf(
+                    ConfigKey.ACCELERATOR to accelerator.label,
+                    ConfigKey.MAX_TOKENS to TEST_MAX_TOKENS,
+                    ConfigKey.TOP_K to 1,
+                    ConfigKey.TOP_P to 0.0f,
+                    ConfigKey.TEMPERATURE to 0.0f,
+                ),
         )
-        try {
-            withTimeout(30_000) {
-                vm.stream.filter { it.isNotEmpty() }.first()
+
+    private fun initializeModelBlocking(
+        targetModel: Model,
+    ) {
+        runBlocking {
+            withTimeout(INIT_TIMEOUT_MS) {
+                SLM.initializeIfNeeded(
+                    context = appCtx,
+                    model = targetModel,
+                    supportImage = false,
+                    supportAudio = false,
+                    systemMessage = null,
+                    tools = emptyList(),
+                )
             }
-        } finally {
-            vm.cancel()
-            job.cancel()
+        }
+    }
+
+    private fun defaultAccelerator(): Accelerator {
+        val args =
+            InstrumentationRegistry.getArguments()
+
+        val configured =
+            (
+                    args.getString("ACCELERATOR")
+                        ?: System.getenv("ACCELERATOR")
+                    )
+                ?.trim()
+                ?.uppercase()
+
+        return if (
+            configured == Accelerator.CPU.label
+        ) {
+            Accelerator.CPU
+        } else {
+            Accelerator.GPU
+        }
+    }
+
+    // =====================================================================
+    // Prompt / execution helpers
+    // =====================================================================
+
+    /**
+     * Compact JSON-oriented smoke prompt.
+     *
+     * The extractor is intentionally tolerant, so this test validates the
+     * ViewModel lifecycle and parsed-state sanity rather than demanding exact
+     * model wording.
+     */
+    private fun jsonPrompt(
+        question: String = "How many days to harvest?",
+        answer: String = "About 90 days.",
+    ): String =
+        buildString {
+            appendLine("Return one JSON object only.")
+            appendLine("Use these keys:")
+            appendLine("\"analysis\": short string")
+            appendLine("\"followup_needed\": boolean")
+            appendLine("\"followup_question\": short question or empty string")
+            appendLine("\"score\": integer from 0 to 100")
+            appendLine("No markdown. No text outside JSON.")
+            append("Question: ")
+            append(question)
+            appendLine()
+            append("Answer: ")
+            append(answer)
+        }.trim()
+
+    /**
+     * Prompt intended to keep generation alive long enough to exercise cancel
+     * and single-flight paths.
+     */
+    private fun longPrompt(): String =
+        "Write a detailed multi-paragraph explanation of Android " +
+                "instrumentation testing, including runners, synchronization, " +
+                "timeouts, cancellation, native resources, and test isolation."
+
+    /**
+     * Wait until the current job is complete.
+     *
+     * Joining the Job is stronger than relying on a transient StateFlow value:
+     * it guarantees evaluateAsync's coroutine has actually exited.
+     */
+    private suspend fun awaitJob(
+        job: Job,
+        timeoutMs: Long = COMPLETE_TIMEOUT_MS,
+    ) {
+        withTimeout(timeoutMs) {
+            job.join()
+        }
+    }
+
+    private suspend fun waitUntilLoading(
+        expected: Boolean,
+        timeoutMs: Long,
+    ): Boolean {
+        if (vm.loading.value == expected) {
+            return true
         }
 
-        withTimeout(30_000) {
-            vm.loading.filter { it == false }.first()
-        }
+        return withTimeoutOrNull(timeoutMs) {
+            vm.loading
+                .filter {
+                    it == expected
+                }
+                .first()
 
-        val err = vm.error.value
-        assertTrue("expected cancel; err=$err", err == null || err == "cancelled")
-        Log.d(TAG, "cancel observed: err=$err streamLen=${vm.stream.value.length}")
+            true
+        } ?: false
     }
 
     /**
-     * Per-call timeout: use a tiny timeoutMs and confirm that the view-model
-     * surfaces a timeout-like state (error null or \"timeout\"), and loading
-     * eventually clears.
+     * One successful evaluation.
      */
+    private suspend fun runSuccessfulEvaluation(
+        prompt: String = jsonPrompt(),
+        timeoutMs: Long = COMPLETE_TIMEOUT_MS,
+    ): String {
+        vm.resetStates(
+            keepError = false
+        )
+
+        val job =
+            vm.evaluateAsync(
+                prompt = prompt,
+                timeoutMs = timeoutMs,
+            )
+
+        awaitJob(
+            job = job,
+            timeoutMs = timeoutMs + 10_000L,
+        )
+
+        assertFalse(
+            "loading must be false after evaluateAsync Job completion",
+            vm.loading.value,
+        )
+
+        assertNull(
+            "successful evaluation should not leave an error",
+            vm.error.value,
+        )
+
+        val raw =
+            vm.raw.value
+                ?: throw AssertionError(
+                    "raw output was null after successful evaluation"
+                )
+
+        assertTrue(
+            "raw output should not be blank",
+            raw.isNotBlank(),
+        )
+
+        /**
+         * Parsed fields are optional because malformed model JSON should not
+         * turn a lifecycle smoke test into a false runtime failure.
+         */
+        vm.score.value?.let { score ->
+            assertTrue(
+                "score out of range: $score",
+                score in 0..100,
+            )
+        }
+
+        vm.followupQuestion.value?.let { followup ->
+            assertTrue(
+                "followupQuestion must be non-blank when present",
+                followup.isNotBlank(),
+            )
+        }
+
+        return raw
+    }
+
+    // =====================================================================
+    // Happy path
+    // =====================================================================
+
     @Test
-    fun timesOutProperly() = runBlocking {
-        val job = vm.evaluateAsync(
-            prompt = jsonPrompt(),
-            timeoutMs = 1_000
-        )
-        try {
-            withTimeout(30_000) {
-                vm.loading.filter { it == false }.first()
+    fun real_model_repeated_runs_succeed() =
+        runBlocking {
+            repeat(4) { index ->
+                val raw =
+                    runSuccessfulEvaluation(
+                        prompt =
+                            jsonPrompt(
+                                question = "Harvest question #$index",
+                                answer = "About 90 days.",
+                            )
+                    )
+
+                Log.i(
+                    TAG,
+                    "repeat[$index] raw.len=${raw.length} " +
+                            "score=${vm.score.value} " +
+                            "followups=${vm.followups.value.size}"
+                )
             }
-        } finally {
+        }
+
+    @Test
+    fun successful_run_commits_consistent_primary_state() =
+        runBlocking {
+            val raw =
+                runSuccessfulEvaluation()
+
+            assertEquals(
+                "stream should contain the final committed output",
+                raw,
+                vm.stream.value,
+            )
+
+            assertTrue(
+                "step history should contain the completed evaluation",
+                vm.stepHistory.value.isNotEmpty(),
+            )
+
+            val last =
+                vm.stepHistory.value.last()
+
+            assertEquals(
+                "step-history raw should match primary raw",
+                raw,
+                last.raw,
+            )
+
+            assertFalse(
+                "successful step must not be timed out",
+                last.timedOut,
+            )
+
+            assertNull(
+                "successful step error should be null",
+                last.error,
+            )
+        }
+
+    // =====================================================================
+    // Cancellation
+    // =====================================================================
+
+    @Test
+    fun cancels_cleanly_and_backend_remains_usable() =
+        runBlocking {
+            vm.resetStates(
+                keepError = false
+            )
+
+            val job =
+                vm.evaluateAsync(
+                    prompt = longPrompt(),
+                    timeoutMs = COMPLETE_TIMEOUT_MS,
+                )
+
+            val started =
+                waitUntilLoading(
+                    expected = true,
+                    timeoutMs = START_TIMEOUT_MS,
+                )
+
+            assertTrue(
+                "evaluation should enter loading state before cancellation",
+                started,
+            )
+
+            /**
+             * Prefer to cancel after some stream activity, but do not make that
+             * a hard precondition: startup latency varies by device/backend.
+             */
+            withTimeoutOrNull(10_000L) {
+                vm.stream
+                    .filter {
+                        it.isNotEmpty()
+                    }
+                    .first()
+            }
+
+            val cancelAt =
+                SystemClock.elapsedRealtime()
+
             vm.cancel()
-            job.cancel()
+
+            awaitJob(
+                job = job,
+                timeoutMs = CANCEL_TIMEOUT_MS,
+            )
+
+            val cancelElapsed =
+                SystemClock.elapsedRealtime() -
+                        cancelAt
+
+            assertFalse(
+                "loading must be false after cancel",
+                vm.loading.value,
+            )
+
+            assertEquals(
+                "cancel() should publish the current ViewModel contract",
+                "cancelled",
+                vm.error.value,
+            )
+
+            Log.i(
+                TAG,
+                "cancel settled in ${cancelElapsed}ms " +
+                        "stream.len=${vm.stream.value.length}"
+            )
+
+            /**
+             * Clear only after asserting the terminal cancel state.
+             */
+            vm.resetStates(
+                keepError = false
+            )
+
+            val next =
+                runSuccessfulEvaluation(
+                    prompt =
+                        jsonPrompt(
+                            question = "Can the backend run after cancellation?",
+                            answer = "Yes.",
+                        )
+                )
+
+            assertTrue(
+                "backend should remain usable after cancellation",
+                next.isNotBlank(),
+            )
         }
 
-        val err = vm.error.value
-        assertTrue("expected timeout; err=$err", err == null || err == "timeout")
-        Log.d(
-            TAG,
-            "timeout observed: err=$err rawLen=${vm.raw.value?.toString()?.length ?: -1}"
-        )
-    }
+    // =====================================================================
+    // Timeout
+    // =====================================================================
 
-    // ---------------------------------------------------------------------
-    // Internals
-    // ---------------------------------------------------------------------
+    @Test
+    fun times_out_without_cancel_overwriting_timeout_state() =
+        runBlocking {
+            vm.resetStates(
+                keepError = false
+            )
 
-    /**
-     * Small wrapper around [SLM.initialize] that turns the callback into a
-     * blocking call, returning the error string (null/empty means success).
-     */
-    private fun initializeModel(ctx: Context, model: Model, timeoutSec: Long): String? {
-        val latch = CountDownLatch(1)
-        var err: String? = null
-        SLM.initialize(ctx, model) { e ->
-            err = e
-            latch.countDown()
+            val job =
+                vm.evaluateAsync(
+                    prompt = longPrompt(),
+                    timeoutMs = 1L,
+                )
+
+            awaitJob(
+                job = job,
+                timeoutMs = CANCEL_TIMEOUT_MS,
+            )
+
+            assertFalse(
+                "loading must be false after timeout Job completion",
+                vm.loading.value,
+            )
+
+            /**
+             * Important:
+             * Do NOT call vm.cancel() before this assertion.
+             * cancel() intentionally sets error=\"cancelled\".
+             */
+            assertEquals(
+                "per-call timeout should publish timeout",
+                "timeout",
+                vm.error.value,
+            )
+
+            val last =
+                vm.stepHistory.value.lastOrNull()
+
+            assertTrue(
+                "timeout should produce a timedOut step snapshot",
+                last?.timedOut == true,
+            )
+
+            assertEquals(
+                "timeout snapshot should preserve timeout error",
+                "timeout",
+                last?.error,
+            )
+
+            Log.i(
+                TAG,
+                "timeout observed raw.len=${vm.raw.value?.length ?: -1} " +
+                        "stream.len=${vm.stream.value.length}"
+            )
+
+            /**
+             * Reset after observing timeout, then verify a new normal run works.
+             */
+            vm.resetStates(
+                keepError = false
+            )
+
+            val next =
+                runSuccessfulEvaluation(
+                    prompt =
+                        jsonPrompt(
+                            question = "Can the backend run after timeout?",
+                            answer = "Yes.",
+                        )
+                )
+
+            assertTrue(
+                "backend should remain usable after timeout",
+                next.isNotBlank(),
+            )
         }
-        assertTrue("SLM init timeout", latch.await(timeoutSec, TimeUnit.SECONDS))
-        return err
-    }
 
-    /**
-     * Simple polling helper used for waiting on model.instance and idle states.
-     */
-    private fun waitUntil(timeoutMs: Long, cond: () -> Boolean): Boolean {
-        val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)
-        while (System.nanoTime() < deadline) {
-            if (cond()) return true
-            Thread.sleep(15)
+    // =====================================================================
+    // Single-flight
+    // =====================================================================
+
+    @Test
+    fun second_evaluate_async_while_running_returns_existing_job() =
+        runBlocking {
+            vm.resetStates(
+                keepError = false
+            )
+
+            val firstJob =
+                vm.evaluateAsync(
+                    prompt = longPrompt(),
+                    timeoutMs = COMPLETE_TIMEOUT_MS,
+                )
+
+            assertTrue(
+                "first evaluation should enter loading state",
+                waitUntilLoading(
+                    expected = true,
+                    timeoutMs = START_TIMEOUT_MS,
+                ),
+            )
+
+            val secondJob =
+                vm.evaluateAsync(
+                    prompt =
+                        jsonPrompt(
+                            question = "This second request should not start concurrently.",
+                            answer = "N/A",
+                        ),
+                    timeoutMs = COMPLETE_TIMEOUT_MS,
+                )
+
+            /**
+             * Current AiViewModel single-flight contract:
+             * if already running, evaluateAsync returns evalJob.
+             */
+            assertSame(
+                "second evaluateAsync call should return the active Job",
+                firstJob,
+                secondJob,
+            )
+
+            vm.cancel()
+
+            awaitJob(
+                job = firstJob,
+                timeoutMs = CANCEL_TIMEOUT_MS,
+            )
+
+            assertEquals(
+                "single-flight test ends through explicit cancellation",
+                "cancelled",
+                vm.error.value,
+            )
         }
-        return false
-    }
+
+    // =====================================================================
+    // Empty input / reset behavior
+    // =====================================================================
+
+    @Test
+    fun blank_prompt_resets_transient_state_without_starting_generation() =
+        runBlocking {
+            /**
+             * Seed state with a successful run first.
+             */
+            runSuccessfulEvaluation()
+
+            assertTrue(
+                "precondition: raw should be populated",
+                vm.raw.value != null,
+            )
+
+            val job =
+                vm.evaluateAsync(
+                    prompt = "   ",
+                )
+
+            awaitJob(
+                job = job,
+                timeoutMs = 5_000L,
+            )
+
+            assertFalse(
+                "blank prompt should not leave loading=true",
+                vm.loading.value,
+            )
+
+            assertNull(
+                "blank prompt should clear raw via resetStates",
+                vm.raw.value,
+            )
+
+            assertEquals(
+                "blank prompt should clear stream",
+                "",
+                vm.stream.value,
+            )
+
+            assertNull(
+                "blank prompt should clear error",
+                vm.error.value,
+            )
+
+            assertTrue(
+                "blank prompt should clear step history",
+                vm.stepHistory.value.isEmpty(),
+            )
+        }
+
+    // =====================================================================
+    // Reinitialization / reset
+    // =====================================================================
+
+    @Test
+    fun initialize_if_needed_is_idempotent_and_model_stays_usable() =
+        runBlocking {
+            withTimeout(INIT_TIMEOUT_MS) {
+                SLM.initializeIfNeeded(
+                    context = appCtx,
+                    model = model,
+                    supportImage = false,
+                    supportAudio = false,
+                    systemMessage = null,
+                    tools = emptyList(),
+                )
+            }
+
+            val raw =
+                runSuccessfulEvaluation(
+                    prompt =
+                        jsonPrompt(
+                            question = "Does idempotent reinitialization still work?",
+                            answer = "Yes.",
+                        )
+                )
+
+            assertTrue(
+                "model should remain usable after initializeIfNeeded",
+                raw.isNotBlank(),
+            )
+        }
+
+    @Test
+    fun explicit_conversation_reset_keeps_view_model_path_usable() =
+        runBlocking {
+            val before =
+                runSuccessfulEvaluation(
+                    prompt =
+                        jsonPrompt(
+                            question = "Before reset?",
+                            answer = "Before.",
+                        )
+                )
+
+            assertTrue(
+                "pre-reset run should succeed",
+                before.isNotBlank(),
+            )
+
+            /**
+             * The successful ViewModel run has completed before this control
+             * operation is issued.
+             */
+            SLM.resetConversation(
+                model = model,
+                supportImage = false,
+                supportAudio = false,
+                systemMessage = null,
+                tools = emptyList(),
+            )
+
+            delay(300L)
+
+            val after =
+                runSuccessfulEvaluation(
+                    prompt =
+                        jsonPrompt(
+                            question = "After reset?",
+                            answer = "After.",
+                        )
+                )
+
+            assertTrue(
+                "post-reset run should succeed",
+                after.isNotBlank(),
+            )
+        }
 }

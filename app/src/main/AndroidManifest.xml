@@ -2,28 +2,151 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
-    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!--
+        =====================================================================
+        IshizukiTech LLC — SurveyApp
+        =====================================================================
+        Android application manifest.
+
+        Design goals:
+        - Keep runtime permissions intentionally minimal.
+        - Support optional microphone-based voice input.
+        - Support network-based model downloads and diagnostics uploads.
+        - Support WorkManager foreground data-transfer jobs.
+        - Support LiteRT-LM GPU acceleration through optional native libraries.
+        - Preserve compatibility with legacy shared-storage access where
+          required by older Android versions.
+        =====================================================================
+    -->
+
+
+    <!-- ============================================================= -->
+    <!-- Core application permissions -->
+    <!-- ============================================================= -->
+
+    <!--
+        Required for microphone-based voice input.
+
+        This is a dangerous runtime permission and must be requested from the
+        user before microphone capture begins.
+    -->
+    <uses-permission
+        android:name="android.permission.RECORD_AUDIO" />
+
+    <!--
+        Required for HTTP/HTTPS communication, including:
+        - Hugging Face model downloads
+        - GitHub API uploads
+        - Supabase communication
+        - Other network-backed synchronization
+    -->
+    <uses-permission
+        android:name="android.permission.INTERNET" />
+
+    <!--
+        Allows the application and background workers to inspect the current
+        network connectivity state before scheduling or attempting transfers.
+    -->
+    <uses-permission
+        android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!--
+        Allows inspection of Wi-Fi connectivity information.
+
+        This permission is not required merely to perform HTTP downloads.
+        Keep it only if application code or WorkManager constraints inspect
+        Wi-Fi-specific state.
+    -->
+    <uses-permission
+        android:name="android.permission.ACCESS_WIFI_STATE" />
+
+    <!--
+        Required when the application needs to restore or reschedule persisted
+        background work after device reboot.
+    -->
+    <uses-permission
+        android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <!--
+        Android 13+ runtime permission for application notifications.
+
+        Foreground services can still exist when notification permission is
+        denied, but their notification visibility is restricted. The
+        application should request this permission at an appropriate
+        user-visible point before long foreground work begins.
+    -->
+    <uses-permission
+        android:name="android.permission.POST_NOTIFICATIONS" />
+
+
+    <!-- ============================================================= -->
+    <!-- Foreground service permissions -->
+    <!-- ============================================================= -->
+
+    <!--
+        Base permission required for foreground service execution.
+    -->
+    <uses-permission
+        android:name="android.permission.FOREGROUND_SERVICE" />
+
+    <!--
+        Android 14+ type-specific permission for foreground data-transfer
+        operations such as model downloads, uploads, import/export, and cloud
+        synchronization.
+
+        This is a normal manifest permission and does not require a runtime
+        permission dialog.
+    -->
+    <uses-permission
+        android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+
+
+    <!-- ============================================================= -->
+    <!-- Legacy shared-storage compatibility -->
+    <!-- ============================================================= -->
+
+    <!--
+        Legacy read access for Android 12L / API 32 and older.
+
+        Android 13+ replaced broad media access with media-specific permissions
+        and modern document/media APIs. If all file access uses app-private
+        storage, app-specific storage, MediaStore-owned content, or the Storage
+        Access Framework, this permission can eventually be removed.
+    -->
     <uses-permission
         android:name="android.permission.READ_EXTERNAL_STORAGE"
         android:maxSdkVersion="32" />
+
+    <!--
+        Legacy write access for Android 9 / API 28 and older.
+
+        Android 10 introduced scoped-storage behavior and modern code should
+        not depend on WRITE_EXTERNAL_STORAGE.
+    -->
     <uses-permission
         android:name="android.permission.WRITE_EXTERNAL_STORAGE"
-        android:maxSdkVersion="32"
+        android:maxSdkVersion="28"
         tools:ignore="ScopedStorage" />
-    <uses-permission android:name="android.permission.INTERNET" />
-    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
-    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
-    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
-    <!-- IMPORTANT: Required for any Foreground Service on API 28+ -->
-    <uses-permission
-        android:name="android.permission.FOREGROUND_SERVICE"
-        tools:ignore="ForegroundServicesPolicy" />
 
-    <!-- Android 14+ (type-specific) -->
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- ============================================================= -->
+    <!-- Optional hardware capabilities -->
+    <!-- ============================================================= -->
 
-    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <!--
+        Voice input is an optional application capability.
+
+        required="false" prevents Google Play/device compatibility filtering
+        from excluding devices that do not expose a microphone.
+    -->
+    <uses-feature
+        android:name="android.hardware.microphone"
+        android:required="false" />
+
+
+    <!-- ============================================================= -->
+    <!-- Application -->
+    <!-- ============================================================= -->
 
     <application
         android:name=".SurveyApp"
@@ -34,47 +157,190 @@
         android:label="@string/app_name"
         android:roundIcon="@mipmap/ic_launcher"
         android:supportsRtl="true"
-        android:theme="@style/Theme.SurveyNav"
-        tools:targetApi="31">
+        android:theme="@style/Theme.SurveyNav">
+
+
+        <!-- ========================================================= -->
+        <!-- LiteRT-LM native runtime dependencies -->
+        <!-- ========================================================= -->
 
         <!--
-            WorkManager on-demand initialization:
-            When Application implements androidx.work.Configuration.Provider, remove AndroidX Startup
-            InitializationProvider to satisfy lint and avoid double-init.
+            LiteRT-LM GPU backend dependency.
+
+            libvndksupport.so provides vendor-native library namespace support
+            required by LiteRT-LM on supported Android GPU configurations.
+
+            required="false" is intentional:
+            - The application remains installable on devices without this
+              library.
+            - LiteRT-LM can detect backend availability at runtime.
+            - CPU or another supported backend can remain available as a
+              fallback.
+        -->
+        <uses-native-library
+            android:name="libvndksupport.so"
+            android:required="false" />
+
+        <!--
+            Primary OpenCL runtime used by the LiteRT-LM GPU backend.
+
+            This declaration makes a vendor-provided OpenCL implementation
+            visible to the application when the device exposes one.
+        -->
+        <uses-native-library
+            android:name="libOpenCL.so"
+            android:required="false" />
+
+        <!--
+            Optional Pixel-specific OpenCL shim.
+
+            This library is device/vendor dependent and therefore must never
+            be marked as required.
+        -->
+        <uses-native-library
+            android:name="libOpenCL-pixel.so"
+            android:required="false" />
+
+        <!--
+            Optional Android Automotive / vendor OpenCL shim.
+
+            This remains optional so its absence does not affect application
+            installation or CPU fallback behavior.
+        -->
+        <uses-native-library
+            android:name="libOpenCL-car.so"
+            android:required="false" />
+
+
+        <!-- ========================================================= -->
+        <!-- WorkManager on-demand initialization -->
+        <!-- ========================================================= -->
+
+        <!--
+            SurveyApp implements androidx.work.Configuration.Provider.
+
+            WorkManager 2.6+ normally initializes through AndroidX App Startup.
+            Because SurveyApp provides a custom WorkManager Configuration, the
+            WorkManagerInitializer entry is removed while the shared AndroidX
+            InitializationProvider remains available for other libraries.
+
+            With this configuration:
+
+                WorkManager.getInstance(context)
+
+            initializes WorkManager on demand using:
+
+                SurveyApp.workManagerConfiguration
+
+            Do not also call WorkManager.initialize() manually when using the
+            Configuration.Provider pattern.
         -->
         <provider
             android:name="androidx.startup.InitializationProvider"
             android:authorities="${applicationId}.androidx-startup"
-            tools:node="remove" />
+            android:exported="false"
+            tools:node="merge">
 
+            <!--
+                Remove only WorkManager's default App Startup initializer.
+                Other AndroidX startup components remain unaffected.
+            -->
+            <meta-data
+                android:name="androidx.work.WorkManagerInitializer"
+                android:value="androidx.startup"
+                tools:node="remove" />
+
+        </provider>
+
+
+        <!-- ========================================================= -->
+        <!-- Main application UI -->
+        <!-- ========================================================= -->
+
+        <!--
+            Main launcher Activity.
+
+            exported="true" is required because the Activity is exposed through
+            the MAIN/LAUNCHER intent filter.
+        -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
             android:theme="@style/Theme.SurveyNav"
             android:windowSoftInputMode="adjustResize">
+
             <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
+                <action
+                    android:name="android.intent.action.MAIN" />
+
+                <category
+                    android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+
         </activity>
 
-        <!-- Required for GPU(OpenCL) access on targetSdk 31+ -->
-        <uses-native-library android:name="libOpenCL.so" android:required="false" />
-        <!-- Some devices expose OpenCL via vendor-specific shim names -->
-        <uses-native-library android:name="libOpenCL-pixel.so" android:required="false" />
-        <uses-native-library android:name="libOpenCL-car.so" android:required="false" />
 
+        <!-- ========================================================= -->
+        <!-- Boot and application-update rescheduling -->
+        <!-- ========================================================= -->
+
+        <!--
+            Restores scheduling state after:
+            - Device boot
+            - Application package replacement/update
+
+            exported="false" intentionally prevents arbitrary third-party apps
+            from invoking this receiver as a public application component.
+
+            IMPORTANT FOR ANDROID 15+:
+            A BOOT_COMPLETED receiver must not directly start a dataSync
+            foreground service. It may restore/enqueue WorkManager work, and
+            the scheduler can execute eligible work later under the platform's
+            background-execution rules.
+        -->
         <receiver
             android:name="com.negi.survey.net.UploadRescheduleReceiver"
             android:enabled="true"
-            android:exported="true">
+            android:exported="false">
+
             <intent-filter>
-                <action android:name="android.intent.action.BOOT_COMPLETED" />
-                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+                <action
+                    android:name="android.intent.action.BOOT_COMPLETED" />
+
+                <action
+                    android:name="android.intent.action.MY_PACKAGE_REPLACED" />
             </intent-filter>
+
         </receiver>
 
-        <!-- WorkManager foreground service (used for expedited/foreground work) -->
+
+        <!-- ========================================================= -->
+        <!-- WorkManager foreground service -->
+        <!-- ========================================================= -->
+
+        <!--
+            WorkManager uses SystemForegroundService when a Worker is promoted
+            to foreground execution.
+
+            dataSync is the appropriate foreground-service type for operations
+            such as:
+            - Large model downloads
+            - Diagnostics/log uploads
+            - Cloud synchronization
+            - Import/export transfers
+
+            Android 14+ requires both:
+            1. android:foregroundServiceType="dataSync"
+            2. android.permission.FOREGROUND_SERVICE_DATA_SYNC
+
+            Android 15+ also applies platform execution-time restrictions to
+            background dataSync foreground services, so Workers must finish and
+            release foreground execution promptly after transfer completion.
+
+            If another Worker later requires a different foreground-service
+            type, that type and its corresponding permission must be added
+            explicitly instead of silently reusing dataSync.
+        -->
         <service
             android:name="androidx.work.impl.foreground.SystemForegroundService"
             android:exported="false"
@@ -82,4 +348,5 @@
             tools:node="merge" />
 
     </application>
+
 </manifest>

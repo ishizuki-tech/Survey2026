@@ -28,8 +28,8 @@ import com.negi.survey.net.GitHubUploader
 import com.negi.survey.net.RuntimeLogStore
 import com.negi.survey.slm.LiteRtLM
 import java.io.File
+import java.lang.reflect.Modifier
 import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Application bootstrap:
@@ -40,9 +40,10 @@ import java.util.concurrent.atomic.AtomicLong
  * - Run only in the main process.
  *
  * Notes:
- * - WorkManagerInitializer may be disabled in the manifest; initialize WorkManager manually.
- * - WorkManager may not be ready early on some devices/entry points; always guard getInstance().
- * - Prefer enqueue from onCreate, but do NOT initialize WM in attachBaseContext to avoid edge crashes.
+ * - If the default WorkManager initializer is disabled, Configuration.Provider enables on-demand
+ *   initialization on the first WorkManager.getInstance(context) call.
+ * - Prefer enqueue from onCreate and keep WorkManager off the attachBaseContext critical path.
+ * - Startup upload work is best-effort and retried once when WorkManager/config is temporarily unavailable.
  *
  * Performance note:
  * - Startup uploads (WorkManager + upload workers) can compete with LiteRT engine initialization
@@ -70,7 +71,7 @@ class SurveyApp : Application(), Configuration.Provider {
         val appCtx = base.applicationContext ?: base
 
         // Load LiteRTLM JNI as early as possible (main process only).
-        ensureLiteRtLmJniLoaded(where = "attachBaseContext", ctx = appCtx)
+        ensureLiteRtLmJniLoaded(where = "attachBaseContext")
 
         // Start runtime log capture as early as possible (main process only).
         runCatching { RuntimeLogStore.start(appCtx) }
@@ -102,7 +103,7 @@ class SurveyApp : Application(), Configuration.Provider {
         safeCrashInstall(where = "attachBaseContext", context = appCtx)
     }
 
-    private fun ensureLiteRtLmJniLoaded(where: String, ctx: Context) {
+    private fun ensureLiteRtLmJniLoaded(where: String) {
         if (!litertJniLoadOnce.compareAndSet(false, true)) {
             Log.d(TAG, "LiteRTLM JNI already loaded; skip. where=$where")
             return
@@ -139,6 +140,10 @@ class SurveyApp : Application(), Configuration.Provider {
         }
 
         val appCtx = applicationContext ?: this
+
+        // Retry JNI loading here if the early attachBaseContext attempt failed.
+        // The AtomicBoolean is reset on failure, so this is a real second chance.
+        ensureLiteRtLmJniLoaded(where = "onCreate(retry)")
 
         // Ensure runtime log capture is running (idempotent).
         val tRt0 = SystemClock.elapsedRealtime()
@@ -185,11 +190,12 @@ class SurveyApp : Application(), Configuration.Provider {
     /**
      * WorkManager Configuration provider.
      */
-    override val workManagerConfiguration: Configuration
-        get() = Configuration.Builder()
+    override val workManagerConfiguration: Configuration by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        Configuration.Builder()
             .setMinimumLoggingLevel(Log.INFO)
             .setDefaultProcessName(packageName)
             .build()
+    }
 
     /**
      * Defer startup enqueues to reduce cold-start contention (CPU/IO) with LiteRT initialization.
@@ -208,7 +214,7 @@ class SurveyApp : Application(), Configuration.Provider {
 
         RuntimeLogStore.w(TAG, "Startup enqueues deferred: delay=${delayMs}ms (to reduce init contention)")
 
-        Handler(Looper.getMainLooper()).postDelayed(
+        mainHandler.postDelayed(
             {
                 val t0 = SystemClock.elapsedRealtime()
                 RuntimeLogStore.w(TAG, "Deferred startup enqueues begin...")
@@ -229,61 +235,29 @@ class SurveyApp : Application(), Configuration.Provider {
     }
 
     /**
-     * Ensure WorkManager is initialized.
+     * Ensures WorkManager can be obtained.
      *
-     * This is required when WorkManagerInitializer is explicitly disabled in AndroidManifest.xml.
-     *
-     * Key properties:
-     * - Safe to call multiple times.
-     * - Protects against concurrent init attempts using a lock.
-     * - Re-attempts init if WorkManager is still not accessible.
+     * With Configuration.Provider + disabled default initializer, getInstance(context)
+     * performs WorkManager's documented on-demand initialization. Do not call
+     * WorkManager.initialize() manually from this path.
      */
-    private fun ensureWorkManagerInitialized(where: String, ctx: Context) {
+    private fun ensureWorkManagerAvailable(where: String, ctx: Context): Boolean {
         val appCtx = ctx.applicationContext ?: ctx
+        val t0 = SystemClock.elapsedRealtime()
 
-        // Fast-path: if already accessible, do nothing.
-        if (isWorkManagerReady(appCtx)) {
-            RuntimeLogStore.d(TAG, "WorkManager already ready. where=$where")
-            return
-        }
-
-        synchronized(workManagerInitLock) {
-            if (isWorkManagerReady(appCtx)) {
-                RuntimeLogStore.d(TAG, "WorkManager became ready (after lock). where=$where")
-                return
-            }
-
-            if (workManagerInitAttempted.compareAndSet(false, true)) {
-                RuntimeLogStore.d(TAG, "WorkManager init attempt begins. where=$where")
-            } else {
-                RuntimeLogStore.d(TAG, "WorkManager init re-attempt begins. where=$where")
-            }
-
-            val t0 = SystemClock.elapsedRealtime()
-            runCatching {
-                WorkManager.initialize(appCtx, workManagerConfiguration)
-                RuntimeLogStore.d(TAG, "WorkManager initialized manually. where=$where")
-            }.onFailure { t ->
-                RuntimeLogStore.w(TAG, "WorkManager manual init failed: where=$where msg=${t.message}", t)
-            }
-            RuntimeLogStore.d(TAG, "bootTiming: WorkManager.initialize took=${SystemClock.elapsedRealtime() - t0}ms where=$where")
-
-            if (!isWorkManagerReady(appCtx)) {
-                RuntimeLogStore.w(TAG, "WorkManager still not ready after init attempt. where=$where")
-            }
-        }
-    }
-
-    /**
-     * Returns true if WorkManager.getInstance() works without throwing.
-     */
-    private fun isWorkManagerReady(ctx: Context): Boolean {
         return try {
-            WorkManager.getInstance(ctx)
+            WorkManager.getInstance(appCtx)
+            RuntimeLogStore.d(
+                TAG,
+                "WorkManager available. where=$where took=${SystemClock.elapsedRealtime() - t0}ms"
+            )
             true
-        } catch (_: IllegalStateException) {
-            false
-        } catch (_: Throwable) {
+        } catch (t: Throwable) {
+            RuntimeLogStore.w(
+                TAG,
+                "WorkManager unavailable. where=$where msg=${t.message}",
+                t
+            )
             false
         }
     }
@@ -304,20 +278,9 @@ class SurveyApp : Application(), Configuration.Provider {
     private fun enqueueStartupRuntimeLogsInternal(context: Context, attempt: String) {
         val appCtx = context.applicationContext ?: context
 
-        ensureWorkManagerInitialized(where = "startupRtLogs($attempt)", ctx = appCtx)
-
-        if (!isWorkManagerReady(appCtx)) {
-            RuntimeLogStore.w(TAG, "Startup runtime logs: WorkManager not ready ($attempt).")
-
-            if (startupRtLogsRetryScheduled.compareAndSet(false, true)) {
-                RuntimeLogStore.w(TAG, "Startup runtime logs: scheduling delayed retry.")
-                Handler(Looper.getMainLooper()).postDelayed(
-                    { enqueueStartupRuntimeLogsInternal(appCtx, attempt = "delayed") },
-                    STARTUP_ENQUEUE_RETRY_DELAY_MS
-                )
-            } else {
-                RuntimeLogStore.d(TAG, "Startup runtime logs: delayed retry already scheduled; skipping.")
-            }
+        if (!ensureWorkManagerAvailable(where = "startupRtLogs($attempt)", ctx = appCtx)) {
+            RuntimeLogStore.w(TAG, "Startup runtime logs: WorkManager unavailable ($attempt).")
+            scheduleStartupRuntimeLogsRetry(appCtx, reason = "workmanager")
             return
         }
 
@@ -328,7 +291,8 @@ class SurveyApp : Application(), Configuration.Provider {
             .getOrNull()
 
         if (cfg == null || cfg.owner.isBlank() || cfg.repo.isBlank() || cfg.token.isBlank()) {
-            RuntimeLogStore.d(TAG, "Startup runtime logs: GitHub config not available; skip enqueue.")
+            RuntimeLogStore.d(TAG, "Startup runtime logs: GitHub config not available ($attempt).")
+            scheduleStartupRuntimeLogsRetry(appCtx, reason = "config")
             return
         }
 
@@ -354,6 +318,19 @@ class SurveyApp : Application(), Configuration.Provider {
         }
     }
 
+    private fun scheduleStartupRuntimeLogsRetry(context: Context, reason: String) {
+        if (!startupRtLogsRetryScheduled.compareAndSet(false, true)) {
+            RuntimeLogStore.d(TAG, "Startup runtime logs: retry already scheduled; reason=$reason")
+            return
+        }
+
+        RuntimeLogStore.w(TAG, "Startup runtime logs: scheduling one retry; reason=$reason")
+        mainHandler.postDelayed(
+            { enqueueStartupRuntimeLogsInternal(context, attempt = "delayed") },
+            STARTUP_ENQUEUE_RETRY_DELAY_MS
+        )
+    }
+
     /**
      * On app start, upload AppRingLogStore ring segments (seg_XX.log) to GitHub.
      */
@@ -370,20 +347,9 @@ class SurveyApp : Application(), Configuration.Provider {
     private fun enqueueStartupRingLogsInternal(context: Context, attempt: String) {
         val appCtx = context.applicationContext ?: context
 
-        ensureWorkManagerInitialized(where = "startupRingLogs($attempt)", ctx = appCtx)
-
-        if (!isWorkManagerReady(appCtx)) {
-            RuntimeLogStore.w(TAG, "Startup ring logs: WorkManager not ready ($attempt).")
-
-            if (startupRingLogsRetryScheduled.compareAndSet(false, true)) {
-                RuntimeLogStore.w(TAG, "Startup ring logs: scheduling delayed retry.")
-                Handler(Looper.getMainLooper()).postDelayed(
-                    { enqueueStartupRingLogsInternal(appCtx, attempt = "delayed") },
-                    STARTUP_ENQUEUE_RETRY_DELAY_MS
-                )
-            } else {
-                RuntimeLogStore.d(TAG, "Startup ring logs: delayed retry already scheduled; skipping.")
-            }
+        if (!ensureWorkManagerAvailable(where = "startupRingLogs($attempt)", ctx = appCtx)) {
+            RuntimeLogStore.w(TAG, "Startup ring logs: WorkManager unavailable ($attempt).")
+            scheduleStartupRingLogsRetry(appCtx, reason = "workmanager")
             return
         }
 
@@ -394,7 +360,8 @@ class SurveyApp : Application(), Configuration.Provider {
             .getOrNull()
 
         if (cfg == null || cfg.owner.isBlank() || cfg.repo.isBlank() || cfg.token.isBlank()) {
-            RuntimeLogStore.d(TAG, "Startup ring logs: GitHub config not available; skip enqueue.")
+            RuntimeLogStore.d(TAG, "Startup ring logs: GitHub config not available ($attempt).")
+            scheduleStartupRingLogsRetry(appCtx, reason = "config")
             return
         }
 
@@ -415,6 +382,19 @@ class SurveyApp : Application(), Configuration.Provider {
         }.onFailure { t ->
             RuntimeLogStore.w(TAG, "Startup ring logs: enqueue failed: ${t.confirmedMsg()}", t)
         }
+    }
+
+    private fun scheduleStartupRingLogsRetry(context: Context, reason: String) {
+        if (!startupRingLogsRetryScheduled.compareAndSet(false, true)) {
+            RuntimeLogStore.d(TAG, "Startup ring logs: retry already scheduled; reason=$reason")
+            return
+        }
+
+        RuntimeLogStore.w(TAG, "Startup ring logs: scheduling one retry; reason=$reason")
+        mainHandler.postDelayed(
+            { enqueueStartupRingLogsInternal(context, attempt = "delayed") },
+            STARTUP_ENQUEUE_RETRY_DELAY_MS
+        )
     }
 
     private fun resolveGitHubConfigNormalizedBestEffort(context: Context): GitHubUploader.GitHubConfig? {
@@ -473,21 +453,36 @@ class SurveyApp : Application(), Configuration.Provider {
             }.getOrNull()
 
             for (mn in methodNames) {
-                val m = runCatching { cls.methods.firstOrNull { it.name == mn && it.parameterTypes.size == 1 } }.getOrNull()
+                val m = runCatching {
+                    cls.methods.firstOrNull { method ->
+                        method.name == mn &&
+                                method.parameterTypes.size == 1 &&
+                                Context::class.java.isAssignableFrom(method.parameterTypes[0])
+                    }
+                }.getOrNull()
+
                 if (m != null) {
-                    val pt = m.parameterTypes[0]
-                    if (Context::class.java.isAssignableFrom(pt)) {
-                        val out = runCatching { m.invoke(receiver, context) }.getOrNull()
+                    val invokeReceiver = if (Modifier.isStatic(m.modifiers)) null else receiver
+                    if (Modifier.isStatic(m.modifiers) || invokeReceiver != null) {
+                        val out = runCatching { m.invoke(invokeReceiver, context) }.getOrNull()
                         parseGitHubConfigFromAny(out)?.let { return it }
                     }
                 }
             }
 
             for (mn in methodNames) {
-                val m = runCatching { cls.methods.firstOrNull { it.name == mn && it.parameterTypes.isEmpty() } }.getOrNull()
+                val m = runCatching {
+                    cls.methods.firstOrNull { method ->
+                        method.name == mn && method.parameterTypes.isEmpty()
+                    }
+                }.getOrNull()
+
                 if (m != null) {
-                    val out = runCatching { m.invoke(receiver) }.getOrNull()
-                    parseGitHubConfigFromAny(out)?.let { return it }
+                    val invokeReceiver = if (Modifier.isStatic(m.modifiers)) null else receiver
+                    if (Modifier.isStatic(m.modifiers) || invokeReceiver != null) {
+                        val out = runCatching { m.invoke(invokeReceiver) }.getOrNull()
+                        parseGitHubConfigFromAny(out)?.let { return it }
+                    }
                 }
             }
         }
@@ -559,6 +554,13 @@ class SurveyApp : Application(), Configuration.Provider {
     }
 
     private fun currentProcessName(context: Context): String? {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            runCatching { android.os.Process.myProcessName() }
+                .getOrNull()
+                ?.takeIf { it.isNotBlank() }
+                ?.let { return it }
+        }
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
             runCatching { Application.getProcessName() }
                 .getOrNull()
@@ -566,35 +568,28 @@ class SurveyApp : Application(), Configuration.Provider {
                 ?.let { return it }
         }
 
-        runCatching {
-            val at = Class.forName("android.app.ActivityThread")
-            val m = at.getDeclaredMethod("currentProcessName")
-            m.invoke(null) as? String
-        }.getOrNull()
-            ?.takeIf { it.isNotBlank() }
-            ?.let { return it }
-
+        // Public Linux procfs fallback for older Android versions.
         runCatching {
             val bytes = File("/proc/self/cmdline")
                 .inputStream()
                 .use { it.readBytes() }
 
-            val cmd = bytes
+            bytes
                 .takeWhile { it.toInt() != 0 }
                 .toByteArray()
                 .toString(Charsets.UTF_8)
                 .trim()
-
-            cmd
         }.getOrNull()
             ?.takeIf { it.isNotBlank() }
             ?.let { return it }
 
+        // Last-resort framework lookup.
         runCatching {
             val am = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
             val pid = android.os.Process.myPid()
-            val procs = am?.runningAppProcesses
-            procs?.firstOrNull { it.pid == pid }?.processName
+            am?.runningAppProcesses
+                ?.firstOrNull { it.pid == pid }
+                ?.processName
         }.getOrNull()
             ?.takeIf { it.isNotBlank() }
             ?.let { return it }
@@ -640,27 +635,29 @@ class SurveyApp : Application(), Configuration.Provider {
 
         val appCtx = context.applicationContext ?: context
 
-        ensureWorkManagerInitialized(where = "enqueuePending(immediate)", ctx = appCtx)
-
-        if (!isWorkManagerReady(appCtx)) {
-            RuntimeLogStore.w(TAG, "WorkManager not ready yet; scheduling delayed enqueue retry.")
+        if (!ensureWorkManagerAvailable(where = "enqueuePending(immediate)", ctx = appCtx)) {
+            RuntimeLogStore.w(TAG, "WorkManager unavailable; scheduling delayed crash enqueue retry.")
 
             if (enqueueRetryScheduled.compareAndSet(false, true)) {
-                Handler(Looper.getMainLooper()).postDelayed(
+                mainHandler.postDelayed(
                     {
-                        ensureWorkManagerInitialized(where = "enqueuePending(delayed)", ctx = appCtx)
-
-                        if (!isWorkManagerReady(appCtx)) {
-                            RuntimeLogStore.w(TAG, "WorkManager still not ready in delayed retry; skipping enqueue.")
+                        if (!ensureWorkManagerAvailable(where = "enqueuePending(delayed)", ctx = appCtx)) {
+                            RuntimeLogStore.w(TAG, "WorkManager still unavailable in delayed retry; skipping enqueue.")
                             return@postDelayed
                         }
 
                         runCatching {
-                            CrashCapture.enqueuePendingCrashUploadsIfPossible(appCtx, where = "SurveyApp:enqueuePending(delayed)")
+                            CrashCapture.enqueuePendingCrashUploadsIfPossible(
+                                appCtx,
+                                where = "SurveyApp:enqueuePending(delayed)"
+                            )
                             RuntimeLogStore.d(TAG, "CrashCapture pending uploads requested (delayed retry).")
-                            lastEnqueueAtUptimeMs.set(SystemClock.uptimeMillis())
                         }.onFailure { t ->
-                            RuntimeLogStore.w(TAG, "CrashCapture.enqueuePendingCrashUploads(delayed) failed: ${t.message}", t)
+                            RuntimeLogStore.w(
+                                TAG,
+                                "CrashCapture.enqueuePendingCrashUploads(delayed) failed: ${t.message}",
+                                t
+                            )
                         }
                     },
                     ENQUEUE_RETRY_DELAY_MS
@@ -672,11 +669,17 @@ class SurveyApp : Application(), Configuration.Provider {
         }
 
         runCatching {
-            CrashCapture.enqueuePendingCrashUploadsIfPossible(appCtx, where = "SurveyApp:enqueuePending(immediate)")
+            CrashCapture.enqueuePendingCrashUploadsIfPossible(
+                appCtx,
+                where = "SurveyApp:enqueuePending(immediate)"
+            )
             RuntimeLogStore.d(TAG, "CrashCapture pending uploads requested (immediate).")
-            lastEnqueueAtUptimeMs.set(SystemClock.uptimeMillis())
         }.onFailure { t ->
-            RuntimeLogStore.w(TAG, "CrashCapture.enqueuePendingCrashUploads(immediate) failed: ${t.message}", t)
+            RuntimeLogStore.w(
+                TAG,
+                "CrashCapture.enqueuePendingCrashUploads(immediate) failed: ${t.message}",
+                t
+            )
         }
     }
 
@@ -716,9 +719,8 @@ class SurveyApp : Application(), Configuration.Provider {
         private val startupRingLogsOnce = AtomicBoolean(false)
         private val startupRingLogsRetryScheduled = AtomicBoolean(false)
 
-        private val workManagerInitAttempted = AtomicBoolean(false)
-        private val workManagerInitLock = Any()
-
-        private val lastEnqueueAtUptimeMs = AtomicLong(0L)
+        private val mainHandler: Handler by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+            Handler(Looper.getMainLooper())
+        }
     }
 }
