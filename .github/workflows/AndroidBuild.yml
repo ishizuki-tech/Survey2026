@@ -50,6 +50,7 @@ jobs:
       apk_sha256: ${{ steps.apk.outputs.apk_sha256 }}
       signing_cert_sha256: ${{ steps.apk.outputs.signing_cert_sha256 }}
       short_sha: ${{ steps.apk.outputs.short_sha }}
+      branch: ${{ steps.apk.outputs.branch }}
 
     steps:
       - name: Checkout repository
@@ -347,6 +348,7 @@ jobs:
           fi
 
           SHORT_SHA="${GITHUB_SHA::7}"
+          BRANCH="${GITHUB_REF_NAME}"
           APK_NAME="Survey2026-${SHORT_SHA}-release.apk"
           OUTPUT="$RUNNER_TEMP/$APK_NAME"
           cp "$FINAL_APK" "$OUTPUT"
@@ -363,6 +365,7 @@ jobs:
           echo "apk_sha256=$APK_SHA256" >> "$GITHUB_OUTPUT"
           echo "signing_cert_sha256=$SIGNING_CERT_SHA256" >> "$GITHUB_OUTPUT"
           echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
 
           echo "APK: $APK_NAME"
           echo "APK SHA-256: $APK_SHA256"
@@ -444,13 +447,14 @@ jobs:
           APK_SHA256: ${{ needs.build-release-apk.outputs.apk_sha256 }}
           SIGNING_CERT_SHA256: ${{ needs.build-release-apk.outputs.signing_cert_sha256 }}
           SHORT_SHA: ${{ needs.build-release-apk.outputs.short_sha }}
+          BRANCH: ${{ needs.build-release-apk.outputs.branch }}
           REPOSITORY: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
           RUN_NUMBER: ${{ github.run_number }}
           SERVER_URL: ${{ github.server_url }}
         run: |
           set -euo pipefail
-          for name in RELEASE_TAG RELEASE_URL DOWNLOAD_URL APK_NAME APK_SHA256 SIGNING_CERT_SHA256 SHORT_SHA; do
+          for name in RELEASE_TAG RELEASE_URL DOWNLOAD_URL APK_NAME APK_SHA256 SIGNING_CERT_SHA256 SHORT_SHA BRANCH; do
             if [[ -z "${!name:-}" ]]; then
               echo "::error::Missing download-page value: $name"
               exit 1
@@ -514,8 +518,9 @@ jobs:
                 </div>
                 <div class="grid">
                   <div class="item"><span class="label">Release tag</span><code>${RELEASE_TAG}</code></div>
-                  <div class="item"><span class="label">APK filename</span><code>${APK_NAME}</code></div>
+                  <div class="item"><span class="label">Branch</span><code>${BRANCH}</code></div>
                   <div class="item"><span class="label">Commit SHA</span><code>${SHORT_SHA}</code></div>
+                  <div class="item"><span class="label">APK filename</span><code>${APK_NAME}</code></div>
                   <div class="item"><span class="label">Workflow run number</span><code>${RUN_NUMBER}</code></div>
                   <div class="item"><span class="label">APK SHA-256</span><code>${APK_SHA256}</code></div>
                   <div class="item"><span class="label">Signing certificate SHA-256</span><code>${SIGNING_CERT_SHA256}</code></div>
@@ -537,6 +542,7 @@ jobs:
           {
             "repository": "${REPOSITORY}",
             "release_tag": "${RELEASE_TAG}",
+            "branch": "${BRANCH}",
             "release_url": "${RELEASE_URL}",
             "download_url": "${DOWNLOAD_URL}",
             "apk_name": "${APK_NAME}",
