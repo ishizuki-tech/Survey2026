@@ -61,6 +61,15 @@ android {
         debug {
             isMinifyEnabled = false
             buildConfigField("boolean", "JNI_DEBUG", "true")
+
+            // Keep the Debug APK debuggable while compiling Whisper/GGML with
+            // native Release optimizations, matching upstream Android builds.
+            @Suppress("UnstableApiUsage")
+            externalNativeBuild {
+                cmake {
+                    arguments.add("-DCMAKE_BUILD_TYPE=Release")
+                }
+            }
         }
         release {
             isMinifyEnabled = false

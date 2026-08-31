@@ -271,6 +271,22 @@ if (EXISTS "${WHISPER_LIB_DIR}/CMakeLists.txt")
                 "${CMAKE_MATCH_1}"
         )
     endif()
+
+    if (WHISPER_UPSTREAM_VERSION STREQUAL "unknown")
+        string(
+                REGEX MATCH
+                "set\\(WHISPER_VERSION_MAJOR[ \t]+([0-9]+)\\)[ \t\r\n]+set\\(WHISPER_VERSION_MINOR[ \t]+([0-9]+)\\)[ \t\r\n]+set\\(WHISPER_VERSION_PATCH[ \t]+([0-9]+)\\)"
+                WHISPER_VERSION_PARTS_MATCH
+                "${WHISPER_MAIN_CMAKE}"
+        )
+
+        if (WHISPER_VERSION_PARTS_MATCH)
+            set(
+                    WHISPER_UPSTREAM_VERSION
+                    "${CMAKE_MATCH_1}.${CMAKE_MATCH_2}.${CMAKE_MATCH_3}"
+            )
+        endif()
+    endif()
 endif()
 
 find_program(GIT_EXE git)
@@ -369,6 +385,10 @@ list(
         EXCLUDE
         REGEX ".*/main\\.(c|cpp)$"
 )
+
+# b4938 adds Parakeet as a separate upstream library. Keep this JNI target
+# limited to Whisper instead of absorbing Parakeet through the source glob.
+list(FILTER WHISPER_SRC EXCLUDE REGEX ".*/parakeet\\.cpp$")
 
 file(
         GLOB
@@ -496,6 +516,7 @@ function(build_whisper_library target_name optimized_variant)
     target_compile_definitions(
             ${target_name}
             PRIVATE
+            _GNU_SOURCE
             GGML_USE_CPU
             WHISPER_VERSION="${WHISPER_UPSTREAM_VERSION}"
             GGML_VERSION="ggml-android"
