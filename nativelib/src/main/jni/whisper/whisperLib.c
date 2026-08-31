@@ -713,13 +713,23 @@ Java_com_whispercpp_whisper_WhisperLib_freeContext(
 // Transcription
 // ============================================================
 
+enum whisper_jni_transcription_status {
+    WHISPER_JNI_ERROR_INVALID_ARGUMENT = -1001,
+    WHISPER_JNI_ERROR_EMPTY_AUDIO = -1002,
+    WHISPER_JNI_ERROR_AUDIO_SIZE_OVERFLOW = -1003,
+    WHISPER_JNI_ERROR_PCM_ALLOCATION_FAILED = -1004,
+    WHISPER_JNI_ERROR_UNSUPPORTED_LANGUAGE = -1005,
+    WHISPER_JNI_ERROR_AUDIO_COPY_FAILED = -1006,
+    WHISPER_JNI_ERROR_LANGUAGE_ACCESS_FAILED = -1007,
+};
+
 /**
  * Performs blocking transcription of mono 16 kHz float PCM samples.
  *
  * The Java float[] is copied into native memory before inference so ART does
  * not keep a Java array pinned for the potentially long whisper_full() call.
  */
-JNIEXPORT void JNICALL
+JNIEXPORT jint JNICALL
 Java_com_whispercpp_whisper_WhisperLib_fullTranscribe(
         JNIEnv *env,
         jclass clazz,
@@ -735,33 +745,33 @@ Java_com_whispercpp_whisper_WhisperLib_fullTranscribe(
 
     if (!env || !ctx || !audio) {
         LOGW("fullTranscribe: context or audio is NULL");
-        return;
+        return WHISPER_JNI_ERROR_INVALID_ARGUMENT;
     }
 
     const jsize n = (*env)->GetArrayLength(env, audio);
     if (n <= 0) {
         // Guard zero-length input before whisper_full().
         LOGW("fullTranscribe: empty audio buffer; skipping inference");
-        return;
+        return WHISPER_JNI_ERROR_EMPTY_AUDIO;
     }
 
     if ((size_t) n > SIZE_MAX / sizeof(float)) {
         LOGE("fullTranscribe: audio buffer size overflow");
-        return;
+        return WHISPER_JNI_ERROR_AUDIO_SIZE_OVERFLOW;
     }
 
     const size_t pcm_bytes = (size_t) n * sizeof(float);
     float *pcm = (float *) malloc(pcm_bytes);
     if (!pcm) {
         LOGE("fullTranscribe: malloc(%zu) failed", pcm_bytes);
-        return;
+        return WHISPER_JNI_ERROR_PCM_ALLOCATION_FAILED;
     }
 
     (*env)->GetFloatArrayRegion(env, audio, 0, n, pcm);
     if ((*env)->ExceptionCheck(env)) {
         LOGE("GetFloatArrayRegion() failed");
         free(pcm);
-        return;
+        return WHISPER_JNI_ERROR_AUDIO_COPY_FAILED;
     }
 
     const char *lang = NULL;
@@ -770,7 +780,7 @@ Java_com_whispercpp_whisper_WhisperLib_fullTranscribe(
         if (!lang) {
             LOGE("GetStringUTFChars(language) failed");
             free(pcm);
-            return;
+            return WHISPER_JNI_ERROR_LANGUAGE_ACCESS_FAILED;
         }
     }
 
@@ -785,13 +795,16 @@ Java_com_whispercpp_whisper_WhisperLib_fullTranscribe(
     p.print_progress = false;
     p.print_timestamps = false;
     p.print_special = false;
+    // Keep one greedy decoder during temperature fallback to avoid dynamic
+    // decoder KV-cache expansion and upstream's unsafe -7 state destruction.
+    p.greedy.best_of = 1;
 
     if (lang && lang[0] != '\0' && strcmp(lang, "auto") != 0) {
         if (whisper_lang_id(lang) < 0) {
             LOGE("fullTranscribe: unsupported language '%s'", lang);
             (*env)->ReleaseStringUTFChars(env, lang_str, lang);
             free(pcm);
-            return;
+            return WHISPER_JNI_ERROR_UNSUPPORTED_LANGUAGE;
         }
 
         p.language = lang;
@@ -826,6 +839,7 @@ Java_com_whispercpp_whisper_WhisperLib_fullTranscribe(
     }
 
     free(pcm);
+    return (jint) rc;
 }
 
 // ============================================================

@@ -138,13 +138,18 @@ class WhisperContext private constructor(
                 )
 
                 // JNI -> whisper_full()
-                WhisperLib.fullTranscribe(
+                val status = WhisperLib.fullTranscribe(
                     ptr,
                     language,
                     numThreads,
                     translate,
                     data
                 )
+                if (status != 0) {
+                    throw IllegalStateException(
+                        "WhisperContext: native transcription failed with status $status"
+                    )
+                }
 
                 // Read all segments before allowing another native operation.
                 val segmentCount = WhisperLib.getTextSegmentCount(ptr)
@@ -449,7 +454,7 @@ private class WhisperLib {
             numThreads: Int,
             translate: Boolean,
             audioData: FloatArray
-        )
+        ): Int
 
         @JvmStatic
         external fun getTextSegmentCount(
