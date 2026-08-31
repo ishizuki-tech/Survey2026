@@ -71,17 +71,29 @@ jobs:
           accept-android-sdk-licenses: true
           log-accepted-android-sdk-licenses: false
 
+      - name: Install Android CLI
+        run: |
+          set -euo pipefail
+          curl -fsSL \
+            https://dl.google.com/android/cli/latest/linux_x86_64/install_root.sh \
+            | sudo bash
+
+          command -v android
+          android --version
+
       - name: Install Android SDK components
         run: |
           set -euo pipefail
-          sdkmanager --install \
-            "platforms;android-${COMPILE_SDK}" \
-            "build-tools;${BUILD_TOOLS_VERSION}" \
-            "platform-tools" \
-            "ndk;${NDK_VERSION}" \
-            "cmake;${CMAKE_VERSION}"
+          android --sdk="$ANDROID_SDK_ROOT" \
+            sdk install \
+            --canary \
+            platform-tools \
+            "platforms/android-${COMPILE_SDK}.0" \
+            "build-tools/${BUILD_TOOLS_VERSION}" \
+            "ndk/${NDK_VERSION}" \
+            "cmake/${CMAKE_VERSION}"
 
-          test -f "$ANDROID_SDK_ROOT/platforms/android-${COMPILE_SDK}/android.jar"
+          test -f "$ANDROID_SDK_ROOT/platforms/android-${COMPILE_SDK}.0/android.jar"
           test -x "$ANDROID_SDK_ROOT/build-tools/${BUILD_TOOLS_VERSION}/apksigner"
           test -x "$ANDROID_SDK_ROOT/build-tools/${BUILD_TOOLS_VERSION}/zipalign"
           test -d "$ANDROID_SDK_ROOT/ndk/${NDK_VERSION}"
