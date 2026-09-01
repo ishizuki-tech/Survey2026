@@ -9,44 +9,79 @@ graph:
 
     - id: Q1
       type: AI
-      title: FAW Yield Loss (3 Seasons)
+      title: Fall Armyworm Impact
       question: >-
-        How much yield do you lose because of fall armyworm? Please think back over the last 3 seasons. (Percent or bags per acre are fine.)
+        How has fall armyworm affected your maize harvest over the last three seasons?
       nextId: Q2
 
     - id: Q2
       type: AI
-      title: Trade-off for 10-Day Earlier Harvest
+      title: Early Harvest Benefits
       question: >-
-        If you could harvest 10 days earlier, how much yield would you be willing to give up? (Percent or bags per acre.)
+        How would harvesting maize 10 days earlier affect your harvest outcomes?
       nextId: Q3
 
     - id: Q3
       type: AI
-      title: Damage Threshold to Switch Variety
+      title: Variety Switching (Pests/Disease)
       question: >-
-        What level of pest or disease damage would make you stop using your current maize variety and switch to a new variety? (Give a clear threshold, e.g., % plants/ears damaged or severity.)
+        Under what level of pest or disease pressure would you stop planting your current maize variety and try a new one?
       nextId: Q4
 
     - id: Q4
       type: AI
-      title: Expectations for Replacement Variety
+      title: Desired Maize Traits
       question: >-
-        What would you expect from a new maize variety to replace the one you currently grow? Please be as detailed as possible (e.g., DTM, FAW tolerance, drought stage tolerance, typical yield).
+        What traits would a new maize variety need to have for you to replace your current variety?
       nextId: Q5
 
     - id: Q5
       type: AI
-      title: Minimum Acceptable Harvest in Bad Year
+      title: Minimum Acceptable Harvest
       question: >-
-        In a bad year, what is the smallest harvest you would accept and still plant this maize again next season? (Percent of usual harvest or bags per acre.)
+        In a poor season, what harvest level would make you continue planting this maize?
       nextId: Q6
 
     - id: Q6
       type: AI
-      title: Most Damaging Drought Timing
+      title: Drought Impact by Growth Stage
       question: >-
-        When in the season is drought most devastating for your crop? What is the most difficult drought moment? (e.g., pre-tassel, tasseling/silking, grain fill, pre-harvest.)
+        How does drought affect maize at different growth stages?
+      nextId: Q7
+
+    - id: Q7
+      type: AI
+      title: Yellow Maize for Animal Feed
+      question: >-
+        How do you use yellow maize for your livestock?
+      nextId: Q8
+
+    - id: Q8
+      type: AI
+      title: "Maize Allocation: Food vs Feed"
+      question: >-
+        What factors determine whether maize is used for food, animal feed, or other purposes in your household?
+      nextId: Q9
+
+    - id: Q9
+      type: AI
+      title: Bean Consumption Drivers
+      question: >-
+        What determines how often or how much beans your household consumes?
+      nextId: Q10
+
+    - id: Q10
+      type: AI
+      title: Plantain Sourcing and Use
+      question: >-
+        How do you source plantains and how are they used in your household?
+      nextId: Q11
+
+    - id: Q11
+      type: AI
+      title: Potato Varieties and Processing Preferences
+      question: >-
+        Which potato varieties do processors prefer and how are they used?
       nextId: Review
 
     - id: Review
@@ -71,6 +106,7 @@ slm:
   top_k: 64
   top_p: 0.95
   temperature: 1.0
+  followup_output_mode: "TEXT"
 
   # Turn formatting (LiteRT-LM chat style)
   # NOTE: Newlines help make boundaries explicit; remove '\n' only if your code already injects them.
@@ -211,6 +247,66 @@ prompts_eval:
       Question: {{QUESTION}}
       Answer: {{ANSWER}}
 
+  - nodeId: Q7
+    prompt: |-
+      Task: EVAL
+      - Evaluate the Answer to the Question.
+      - Write weakness (what is missing/unclear).
+      - Identify the single biggest missing/unclear point as followup_target.
+      - Set followup_needed true if clarification is required, else false.
+      - Score 1–100.
+
+      Question: {{QUESTION}}
+      Answer: {{ANSWER}}
+
+  - nodeId: Q8
+    prompt: |-
+      Task: EVAL
+      - Evaluate the Answer to the Question.
+      - Write weakness (what is missing/unclear).
+      - Identify the single biggest missing/unclear point as followup_target.
+      - Set followup_needed true if clarification is required, else false.
+      - Score 1–100.
+
+      Question: {{QUESTION}}
+      Answer: {{ANSWER}}
+
+  - nodeId: Q9
+    prompt: |-
+      Task: EVAL
+      - Evaluate the Answer to the Question.
+      - Write weakness (what is missing/unclear).
+      - Identify the single biggest missing/unclear point as followup_target.
+      - Set followup_needed true if clarification is required, else false.
+      - Score 1–100.
+
+      Question: {{QUESTION}}
+      Answer: {{ANSWER}}
+
+  - nodeId: Q10
+    prompt: |-
+      Task: EVAL
+      - Evaluate the Answer to the Question.
+      - Write weakness (what is missing/unclear).
+      - Identify the single biggest missing/unclear point as followup_target.
+      - Set followup_needed true if clarification is required, else false.
+      - Score 1–100.
+
+      Question: {{QUESTION}}
+      Answer: {{ANSWER}}
+
+  - nodeId: Q11
+    prompt: |-
+      Task: EVAL
+      - Evaluate the Answer to the Question.
+      - Write weakness (what is missing/unclear).
+      - Identify the single biggest missing/unclear point as followup_target.
+      - Set followup_needed true if clarification is required, else false.
+      - Score 1–100.
+
+      Question: {{QUESTION}}
+      Answer: {{ANSWER}}
+
 prompts_followup:
   - nodeId: Q1
     prompt: |-
@@ -263,6 +359,56 @@ prompts_followup:
       EVAL_JSON: {{EVAL_JSON}}
 
   - nodeId: Q6
+    prompt: |-
+      Task: FOLLOWUP
+      - Read the EVAL JSON.
+      - If followup_needed is false: output EMPTY (no characters).
+      - If true: output ONE follow-up question as plain text, one line, targeting exactly followup_target.
+      - Do NOT output JSON.
+
+      EVAL_JSON: {{EVAL_JSON}}
+
+  - nodeId: Q7
+    prompt: |-
+      Task: FOLLOWUP
+      - Read the EVAL JSON.
+      - If followup_needed is false: output EMPTY (no characters).
+      - If true: output ONE follow-up question as plain text, one line, targeting exactly followup_target.
+      - Do NOT output JSON.
+
+      EVAL_JSON: {{EVAL_JSON}}
+
+  - nodeId: Q8
+    prompt: |-
+      Task: FOLLOWUP
+      - Read the EVAL JSON.
+      - If followup_needed is false: output EMPTY (no characters).
+      - If true: output ONE follow-up question as plain text, one line, targeting exactly followup_target.
+      - Do NOT output JSON.
+
+      EVAL_JSON: {{EVAL_JSON}}
+
+  - nodeId: Q9
+    prompt: |-
+      Task: FOLLOWUP
+      - Read the EVAL JSON.
+      - If followup_needed is false: output EMPTY (no characters).
+      - If true: output ONE follow-up question as plain text, one line, targeting exactly followup_target.
+      - Do NOT output JSON.
+
+      EVAL_JSON: {{EVAL_JSON}}
+
+  - nodeId: Q10
+    prompt: |-
+      Task: FOLLOWUP
+      - Read the EVAL JSON.
+      - If followup_needed is false: output EMPTY (no characters).
+      - If true: output ONE follow-up question as plain text, one line, targeting exactly followup_target.
+      - Do NOT output JSON.
+
+      EVAL_JSON: {{EVAL_JSON}}
+
+  - nodeId: Q11
     prompt: |-
       Task: FOLLOWUP
       - Read the EVAL JSON.
