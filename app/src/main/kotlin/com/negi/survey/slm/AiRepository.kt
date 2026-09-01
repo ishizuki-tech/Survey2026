@@ -1165,6 +1165,8 @@ class LiteRtRepository(
             val gateActive = AtomicBoolean(false)
             val inferenceStarted = AtomicBoolean(false)
             val cancelIssued = AtomicBoolean(false)
+            val scopedCancelDispatched = AtomicBoolean(false)
+            val liteRtRunId = AtomicLong(0L)
             val cancelTag = AtomicReference<String?>(null)
 
             /**
@@ -1180,18 +1182,34 @@ class LiteRtRepository(
                 AiTrace.ringW(TAG, "[$requestId] FORCE_REINIT=true reason='$reason'")
             }
 
-            fun issueBackendCancel(tag: String) {
-                cancelTag.compareAndSet(null, tag)
-                if (!cancelIssued.compareAndSet(false, true)) return
+            fun dispatchScopedCancelIfReady() {
+                if (!cancelIssued.get()) return
+
+                val expectedRunId = liteRtRunId.get()
+                if (expectedRunId <= 0L) return
+                if (!scopedCancelDispatched.compareAndSet(false, true)) return
 
                 repoScope.launch {
                     runCatchingSuspend {
-                        runCancelOnSlmThread { SLM.cancel(model) }
+                        runCancelOnSlmThread {
+                            SLM.cancel(
+                                model = model,
+                                expectedRunId = expectedRunId,
+                            )
+                        }
                     }.onFailure { e ->
+                        val tag = cancelTag.get()
                         RuntimeLogStore.w(TAG, "[$requestId] cancel failed tag='$tag': ${e.message}", e)
                         AiTrace.ringW(TAG, "[$requestId] cancel failed tag='$tag' err=${e.message}", e)
                     }
                 }
+            }
+
+            fun issueBackendCancel(tag: String) {
+                cancelTag.compareAndSet(null, tag)
+                if (!cancelIssued.compareAndSet(false, true)) return
+
+                dispatchScopedCancelIfReady()
 
                 RuntimeLogStore.w(TAG, "[$requestId] cancel requested tag='$tag'")
                 AiTrace.ringW(TAG, "[$requestId] cancel requested tag='$tag'")
@@ -2070,7 +2088,22 @@ class LiteRtRepository(
                                                 reason = "error",
                                                 cause = error,
                                             )
-                                        }
+                                        },
+                                        onRunStarted = { runId ->
+                                            val published =
+                                                liteRtRunId.compareAndSet(0L, runId)
+
+                                            if (!published && liteRtRunId.get() != runId) {
+                                                RuntimeLogStore.e(
+                                                    TAG,
+                                                    "[$requestId] conflicting LiteRtLM run publication: " +
+                                                            "current=${liteRtRunId.get()} received=$runId",
+                                                )
+                                                return@runInference
+                                            }
+
+                                            dispatchScopedCancelIfReady()
+                                        },
                                     )
                                 }
                             } catch (ce: CancellationException) {

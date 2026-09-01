@@ -23,7 +23,9 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.junit.After
@@ -178,6 +180,8 @@ class SlmHelperInstrumentationTest {
 
     @After
     fun tearDown() {
+        LiteRtLM.runControlTestHooks = null
+
         /**
          * Best-effort defensive cancellation.
          *
@@ -342,6 +346,70 @@ class SlmHelperInstrumentationTest {
         val nativeClean: Boolean,
         val durationMs: Long,
     )
+
+    private data class ObservedRun(
+        val runId: AtomicLong = AtomicLong(0L),
+        val started: CountDownLatch = CountDownLatch(1),
+        val logicalDone: CountDownLatch = CountDownLatch(1),
+        val nativeClean: CountDownLatch = CountDownLatch(1),
+        val outputSeen: AtomicBoolean = AtomicBoolean(false),
+        val error: AtomicReference<String?> = AtomicReference(null),
+    )
+
+    private fun startObservedRun(
+        prompt: String,
+        releaseRunStart: CountDownLatch? = null,
+    ): ObservedRun {
+        val observed = ObservedRun()
+
+        SLM.runInference(
+            model = model,
+            input = prompt,
+            resultListener = { delta, done ->
+                if (delta.isNotBlank()) observed.outputSeen.set(true)
+                if (done) observed.logicalDone.countDown()
+            },
+            cleanUpListener = {
+                observed.nativeClean.countDown()
+            },
+            onError = { message ->
+                observed.error.compareAndSet(null, message)
+            },
+            onRunStarted = { runId ->
+                observed.runId.set(runId)
+                observed.started.countDown()
+                releaseRunStart?.await(
+                    GENERATION_TIMEOUT_MS,
+                    TimeUnit.MILLISECONDS,
+                )
+            },
+        )
+
+        return observed
+    }
+
+    private fun assertObservedRunCompleted(
+        label: String,
+        run: ObservedRun,
+    ) {
+        assertTrue(
+            "$label did not reach logical completion",
+            run.logicalDone.await(GENERATION_TIMEOUT_MS, TimeUnit.MILLISECONDS),
+        )
+        assertTrue(
+            "$label did not reach native cleanup",
+            run.nativeClean.await(NATIVE_CLEANUP_TIMEOUT_MS, TimeUnit.MILLISECONDS),
+        )
+        assertTrue(
+            "$label should emit non-blank output",
+            run.outputSeen.get(),
+        )
+        assertEquals(
+            "$label should not report an error",
+            null,
+            run.error.get(),
+        )
+    }
 
     /**
      * Run one normal inference and wait for BOTH lifecycle milestones:
@@ -670,6 +738,157 @@ class SlmHelperInstrumentationTest {
             next.isNotBlank(),
         )
     }
+
+    @Test
+    fun stale_scoped_cancel_does_not_cancel_newer_run() =
+        runBlocking {
+            withTimeout(GENERATION_TIMEOUT_MS) {
+                val cancelPaused = CompletableDeferred<Unit>()
+                val releaseCancel = CompletableDeferred<Unit>()
+                val releaseFirstRunStart = CountDownLatch(1)
+
+                try {
+                    val first =
+                        startObservedRun(
+                            prompt = "R1: answer ONE briefly.",
+                            releaseRunStart = releaseFirstRunStart,
+                        )
+                    assertTrue(
+                        "R1 did not publish its run ID",
+                        first.started.await(GENERATION_TIMEOUT_MS, TimeUnit.MILLISECONDS),
+                    )
+
+                    val firstRunId = first.runId.get()
+                    assertTrue("R1 run ID must be positive", firstRunId > 0L)
+
+                    LiteRtLM.runControlTestHooks =
+                        LiteRtLM.RunControlTestHooks(
+                            beforeScopedCancelValidation = { expectedRunId ->
+                                if (expectedRunId == firstRunId) {
+                                    cancelPaused.complete(Unit)
+                                    releaseCancel.await()
+                                }
+                            },
+                        )
+
+                    SLM.cancel(
+                        model = model,
+                        expectedRunId = firstRunId,
+                    )
+
+                    cancelPaused.await()
+                    releaseFirstRunStart.countDown()
+                    assertObservedRunCompleted("R1", first)
+
+                    SLM.resetConversationAndWait(
+                        model = model,
+                        supportImage = false,
+                        supportAudio = false,
+                    )
+
+                    val second = startObservedRun("R2: answer TWO briefly.")
+                    assertTrue(
+                        "R2 did not publish its run ID",
+                        second.started.await(GENERATION_TIMEOUT_MS, TimeUnit.MILLISECONDS),
+                    )
+                    assertTrue(
+                        "R2 must have a different run ID",
+                        second.runId.get() != firstRunId,
+                    )
+
+                    releaseCancel.complete(Unit)
+                    assertObservedRunCompleted("R2", second)
+                } finally {
+                    releaseFirstRunStart.countDown()
+                    releaseCancel.complete(Unit)
+                    LiteRtLM.runControlTestHooks = null
+                }
+            }
+        }
+
+    @Test
+    fun stale_hard_close_does_not_close_newer_run() =
+        runBlocking {
+            withTimeout(GENERATION_TIMEOUT_MS) {
+                val hardClosePaused = CompletableDeferred<Unit>()
+                val releaseHardClose = CompletableDeferred<Unit>()
+                val secondHardClosePaused = CompletableDeferred<Unit>()
+                val releaseSecondHardClose = CompletableDeferred<Unit>()
+
+                try {
+                    val firstRunId = AtomicLong(0L)
+                    val secondRunId = AtomicLong(0L)
+
+                    LiteRtLM.runControlTestHooks =
+                        LiteRtLM.RunControlTestHooks(
+                            armHardCloseOnRunStart = { runId ->
+                                when {
+                                    firstRunId.compareAndSet(0L, runId) -> true
+                                    secondRunId.compareAndSet(0L, runId) -> true
+                                    else -> false
+                                }
+                            },
+                            awaitHardCloseAction = { expectedRunId ->
+                                when (expectedRunId) {
+                                    firstRunId.get() -> {
+                                        hardClosePaused.complete(Unit)
+                                        releaseHardClose.await()
+                                    }
+
+                                    secondRunId.get() -> {
+                                        secondHardClosePaused.complete(Unit)
+                                        releaseSecondHardClose.await()
+                                    }
+                                }
+                            },
+                        )
+
+                    val first =
+                        startObservedRun(
+                            "R1 watchdog: answer ONE briefly.",
+                        )
+                    assertTrue(
+                        "R1 did not publish its run ID",
+                        first.started.await(GENERATION_TIMEOUT_MS, TimeUnit.MILLISECONDS),
+                    )
+                    assertTrue("R1 run ID must be positive", firstRunId.get() > 0L)
+
+                    hardClosePaused.await()
+                    assertObservedRunCompleted("R1 watchdog owner", first)
+
+                    SLM.resetConversationAndWait(
+                        model = model,
+                        supportImage = false,
+                        supportAudio = false,
+                    )
+
+                    val second = startObservedRun("R2 watchdog: answer TWO briefly.")
+                    assertTrue(
+                        "R2 did not publish its run ID",
+                        second.started.await(GENERATION_TIMEOUT_MS, TimeUnit.MILLISECONDS),
+                    )
+                    assertTrue(
+                        "R2 must have a different run ID",
+                        second.runId.get() != firstRunId.get(),
+                    )
+                    assertEquals(
+                        "R2 watchdog must own R2's run ID",
+                        second.runId.get(),
+                        secondRunId.get(),
+                    )
+
+                    secondHardClosePaused.await()
+
+                    releaseHardClose.complete(Unit)
+                    assertObservedRunCompleted("R2 watchdog successor", second)
+                    releaseSecondHardClose.complete(Unit)
+                } finally {
+                    releaseHardClose.complete(Unit)
+                    releaseSecondHardClose.complete(Unit)
+                    LiteRtLM.runControlTestHooks = null
+                }
+            }
+        }
 
     /**
      * Replacement for the old busy_flag_toggles_correctly test.

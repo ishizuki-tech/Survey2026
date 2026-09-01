@@ -418,8 +418,9 @@ object LiteRtLM {
         val lastTerminateAtMs: AtomicLong = AtomicLong(0L),
         val lastUseAtMs: AtomicLong = AtomicLong(0L),
         val lastMessageAtMs: AtomicLong = AtomicLong(0L),
-        val logicalTerminator: AtomicReference<(() -> Unit)?> = AtomicReference(null),
-        val hardCloseRunning: AtomicBoolean = AtomicBoolean(false),
+        val logicalTerminator: AtomicReference<((Long) -> Unit)?> = AtomicReference(null),
+        val hardCloseRunId: AtomicLong = AtomicLong(0L),
+        val terminalRunId: AtomicLong = AtomicLong(0L),
         val cleanupToken: AtomicLong = AtomicLong(0L),
 
         /**
@@ -431,6 +432,15 @@ object LiteRtLM {
 
     private val runStates: ConcurrentHashMap<String, RunState> = ConcurrentHashMap()
 
+    internal data class RunControlTestHooks(
+        val beforeScopedCancelValidation: suspend (Long) -> Unit = {},
+        val armHardCloseOnRunStart: (Long) -> Boolean = { false },
+        val awaitHardCloseAction: (suspend (Long) -> Unit)? = null,
+    )
+
+    @Volatile
+    internal var runControlTestHooks: RunControlTestHooks? = null
+
     /** Get or create per-key run state (thread-safe). */
     private fun getRunState(key: String): RunState {
         val existing = runStates[key]
@@ -438,6 +448,23 @@ object LiteRtLM {
         val created = RunState()
         val prev = runStates.putIfAbsent(key, created)
         return prev ?: created
+    }
+
+    /** Claim terminal processing for exactly one owner of the current run. */
+    private fun claimTerminalRun(
+        rs: RunState,
+        expectedRunId: Long,
+    ): Boolean {
+        while (true) {
+            if (rs.runId.get() != expectedRunId) return false
+
+            val observedOwner = rs.terminalRunId.get()
+            if (observedOwner == expectedRunId) return false
+
+            if (rs.terminalRunId.compareAndSet(observedOwner, expectedRunId)) {
+                return true
+            }
+        }
     }
 
     /** Touch last-use time and invalidate any scheduled cleanup. */
@@ -2919,14 +2946,14 @@ object LiteRtLM {
             getRunState(key)
 
         if (rs.active.get()) {
-            rs.cancelRequested.set(true)
+            val expectedRunId = rs.runId.get()
 
             val terminator =
                 rs.logicalTerminator.get()
 
             if (terminator != null) {
                 runCatching {
-                    terminator.invoke()
+                    terminator.invoke(expectedRunId)
                 }.onFailure { error ->
                     RuntimeLogStore.w(
                         TAG,
@@ -2941,20 +2968,28 @@ object LiteRtLM {
                         instances[key]?.conversation
                     }
 
-                runCatching {
-                    conversation?.cancelProcess()
-                }.onFailure { error ->
-                    RuntimeLogStore.w(
-                        TAG,
-                        "forceCleanUpAndWait: cancelProcess failed: " +
-                                "key='$key' err=${error.message}",
-                        error,
-                    )
+                if (
+                    conversation != null &&
+                    rs.runId.get() == expectedRunId &&
+                    rs.active.get()
+                ) {
+                    runCatching {
+                        conversation.cancelProcess()
+                    }.onFailure { error ->
+                        RuntimeLogStore.w(
+                            TAG,
+                            "forceCleanUpAndWait: cancelProcess failed: " +
+                                    "key='$key' err=${error.message}",
+                            error,
+                        )
+                    }
                 }
 
-                if (HARD_CLOSE_ENABLE) {
+                if (HARD_CLOSE_ENABLE && conversation != null) {
                     startHardCloseWatchdog(
                         key = key,
+                        expectedRunId = expectedRunId,
+                        expectedConversation = conversation,
                         reason = "forceCleanUpAndWait",
                     )
                 }
@@ -3026,10 +3061,31 @@ object LiteRtLM {
         }
     }
 
-    /** Emergency watchdog that attempts to recover from "never terminates" streams. */
-    private fun startHardCloseWatchdog(key: String, reason: String) {
+    /** Acquire watchdog ownership for a run. Caller must already hold sessionMutex. */
+    private suspend fun armHardCloseWatchdogLocked(
+        key: String,
+        expectedRunId: Long,
+        expectedConversation: Conversation,
+        reason: String,
+    ) {
         val rs = getRunState(key)
-        if (!rs.hardCloseRunning.compareAndSet(false, true)) return
+        if (rs.runId.get() != expectedRunId || !rs.active.get()) return
+
+        val currentConversation =
+            stateMutex.withLock {
+                instances[key]?.conversation
+            }
+
+        if (currentConversation !== expectedConversation) return
+
+        while (true) {
+            if (rs.runId.get() != expectedRunId || !rs.active.get()) return
+
+            val owner = rs.hardCloseRunId.get()
+            if (owner == expectedRunId) return
+
+            if (rs.hardCloseRunId.compareAndSet(owner, expectedRunId)) break
+        }
 
         ioScope.launch {
             try {
@@ -3039,114 +3095,141 @@ object LiteRtLM {
                     "Hard-close watchdog started: key='$key' reason='$reason' timeout=${HARD_CLOSE_TIMEOUT_MS}ms"
                 )
 
-                while (true) {
-                    delay(HARD_CLOSE_POLL_MS)
+                val testTrigger = runControlTestHooks?.awaitHardCloseAction
+                if (testTrigger != null) {
+                    testTrigger(expectedRunId)
+                } else {
+                    while (true) {
+                        delay(HARD_CLOSE_POLL_MS)
 
-                    if (!rs.active.get() || rs.terminated.get()) {
-                        RuntimeLogStore.d(TAG, "Hard-close watchdog exit: key='$key' already terminated")
-                        return@launch
-                    }
-
-                    val now = SystemClock.elapsedRealtime()
-                    val elapsed = now - start
-                    val sinceMsg = now - rs.lastMessageAtMs.get()
-
-                    if (sinceMsg in 0..2_000L && elapsed < HARD_CLOSE_TIMEOUT_MS) continue
-
-                    if (elapsed >= HARD_CLOSE_TIMEOUT_MS) {
-                        val didTerminate = rs.terminated.compareAndSet(false, true)
-                        if (!didTerminate) {
-                            RuntimeLogStore.d(TAG, "Hard-close watchdog abort (already terminated): key='$key'")
+                        if (
+                            rs.hardCloseRunId.get() != expectedRunId ||
+                            rs.runId.get() != expectedRunId ||
+                            !rs.active.get() ||
+                            rs.terminated.get()
+                        ) {
+                            RuntimeLogStore.d(TAG, "Hard-close watchdog exit: key='$key' runId=$expectedRunId no longer active")
                             return@launch
                         }
 
-                        RuntimeLogStore.e(TAG, "Hard-close watchdog firing: key='$key' elapsed=${elapsed}ms sinceMsg=${sinceMsg}ms")
-                        debugState(key, rs, "hardClose:firing")
+                        val now = SystemClock.elapsedRealtime()
+                        val elapsed = now - start
+                        val sinceMsg = now - rs.lastMessageAtMs.get()
 
-                        var deferredActions: List<() -> Unit> =
-                            emptyList()
-
-                        withSessionLock(key, reason = "hardClose:$reason") {
-                            val inst: LiteRtLmInstance? =
-                                stateMutex.withLock {
-                                    if (!rs.active.get()) {
-                                        return@withLock null
-                                    }
-
-                                    deferredActions =
-                                        pendingAfterStream
-                                            .remove(key)
-                                            ?.toList()
-                                            ?: emptyList()
-
-                                    clearInitSignalIfIdle(key)
-                                    instances.remove(key)
-                                }
-
-                            if (inst != null) {
-                                runCatching {
-                                    inst.conversation.close()
-                                }.onFailure {
-                                    RuntimeLogStore.e(
-                                        TAG,
-                                        "Hard-close: conversation.close failed: " +
-                                                "key='$key' err=${it.message}",
-                                        it,
-                                    )
-                                }
-
-                                runCatching {
-                                    inst.engine.close()
-                                }.onFailure {
-                                    RuntimeLogStore.e(
-                                        TAG,
-                                        "Hard-close: engine.close failed: " +
-                                                "key='$key' err=${it.message}",
-                                        it,
-                                    )
-                                }
-                            }
-
-                            val tNow =
-                                SystemClock.elapsedRealtime()
-
-                            rs.lastTerminateAtMs.set(tNow)
-
-                            rs.active.set(false)
-                            rs.logicalDone.set(true)
-                            rs.logicalTerminator.set(null)
-
-                            fireNativeDoneHookOnce(key)
-                        }
-
-                        /*
-                         * Do not discard actions that were deferred behind the
-                         * native stream. Hard-close is also a termination
-                         * safepoint from the wrapper's perspective. Running the
-                         * drained actions ensures cleanup callbacks are not
-                         * permanently lost when the native callback never
-                         * arrives.
-                         */
-                        deferredActions.forEach { action ->
-                            runCatching {
-                                action.invoke()
-                            }.onFailure {
-                                RuntimeLogStore.w(
-                                    TAG,
-                                    "Hard-close deferred action failed: " +
-                                            "key='$key' err=${it.message}",
-                                    it,
-                                )
-                            }
-                        }
-
-                        RuntimeLogStore.e(TAG, "Hard-close completed: key='$key'")
-                        debugState(key, rs, "hardClose:done")
-                        return@launch
+                        if (sinceMsg in 0..2_000L && elapsed < HARD_CLOSE_TIMEOUT_MS) continue
+                        if (elapsed >= HARD_CLOSE_TIMEOUT_MS) break
                     }
                 }
+
+                if (
+                    rs.hardCloseRunId.get() != expectedRunId ||
+                    rs.runId.get() != expectedRunId ||
+                    !rs.active.get()
+                ) return@launch
+
+                val elapsed = SystemClock.elapsedRealtime() - start
+                val sinceMsg = SystemClock.elapsedRealtime() - rs.lastMessageAtMs.get()
+                RuntimeLogStore.e(TAG, "Hard-close watchdog firing: key='$key' runId=$expectedRunId elapsed=${elapsed}ms sinceMsg=${sinceMsg}ms")
+                debugState(key, rs, "hardClose:firing")
+
+                var deferredActions: List<() -> Unit> = emptyList()
+
+                withSessionLock(key, reason = "hardClose:$reason") {
+                    if (
+                        rs.hardCloseRunId.get() != expectedRunId ||
+                        rs.runId.get() != expectedRunId ||
+                        !rs.active.get()
+                    ) return@withSessionLock
+
+                    val inst = stateMutex.withLock { instances[key] }
+                    if (inst == null || inst.conversation !== expectedConversation) {
+                        return@withSessionLock
+                    }
+
+                    if (!claimTerminalRun(rs, expectedRunId)) {
+                        return@withSessionLock
+                    }
+
+                    rs.terminated.set(true)
+
+                    val removedExpectedInstance =
+                        stateMutex.withLock {
+                            if (instances[key] !== inst) {
+                                false
+                            } else {
+                                deferredActions =
+                                    pendingAfterStream.remove(key)?.toList() ?: emptyList()
+
+                                clearInitSignalIfIdle(key)
+                                instances.remove(key)
+                                true
+                            }
+                        }
+
+                    if (!removedExpectedInstance) return@withSessionLock
+
+                    runCatching {
+                        inst.conversation.close()
+                    }.onFailure {
+                        RuntimeLogStore.e(
+                            TAG,
+                            "Hard-close: conversation.close failed: key='$key' err=${it.message}",
+                            it,
+                        )
+                    }
+
+                    runCatching {
+                        inst.engine.close()
+                    }.onFailure {
+                        RuntimeLogStore.e(
+                            TAG,
+                            "Hard-close: engine.close failed: key='$key' err=${it.message}",
+                            it,
+                        )
+                    }
+
+                    rs.lastTerminateAtMs.set(SystemClock.elapsedRealtime())
+                    rs.active.set(false)
+                    rs.logicalDone.set(true)
+                    rs.logicalTerminator.set(null)
+
+                    fireNativeDoneHookOnce(key)
+                }
+
+                deferredActions.forEach { action ->
+                    runCatching { action.invoke() }
+                        .onFailure {
+                            RuntimeLogStore.w(
+                                TAG,
+                                "Hard-close deferred action failed: key='$key' err=${it.message}",
+                                it,
+                            )
+                        }
+                }
+
+                RuntimeLogStore.e(TAG, "Hard-close completed: key='$key' runId=$expectedRunId")
+                debugState(key, rs, "hardClose:done")
             } finally {
-                rs.hardCloseRunning.set(false)
+                rs.hardCloseRunId.compareAndSet(expectedRunId, 0L)
+            }
+        }
+    }
+
+    /** Acquire session ownership before arming a hard-close watchdog. */
+    private fun startHardCloseWatchdog(
+        key: String,
+        expectedRunId: Long,
+        expectedConversation: Conversation,
+        reason: String,
+    ) {
+        ioScope.launch {
+            withSessionLock(key, reason = "armHardClose:$reason") {
+                armHardCloseWatchdogLocked(
+                    key = key,
+                    expectedRunId = expectedRunId,
+                    expectedConversation = expectedConversation,
+                    reason = reason,
+                )
             }
         }
     }
@@ -3169,6 +3252,7 @@ object LiteRtLM {
         audioClips: List<ByteArray> = emptyList(),
         notifyCancelToOnError: Boolean = false,
         maxOutputTokens: Int = MAX_OUTPUT_TOKENS_PER_REQUEST,
+        onRunStarted: (Long) -> Unit = {},
     ) {
         val key = runtimeKey(model)
         val effectiveMaxOutputTokens = sanitizeMaxOutputTokens(maxOutputTokens)
@@ -3542,14 +3626,35 @@ object LiteRtLM {
                     scheduleDeferredActions()
                 }
 
-                fun cancelProcessBestEffort(stage: String) {
+                fun cancelProcessBestEffort(
+                    expectedRunId: Long,
+                    expectedConversation: Conversation,
+                    stage: String,
+                ) {
                     ioScope.launch cancelDispatch@{
-                        val convNow = stateMutex.withLock { instances[key]?.conversation }
-                        if (convNow == null) {
-                            RuntimeLogStore.w(TAG, "cancelProcess skipped: conversation missing key='$key' stage='$stage'")
+                        if (
+                            rs.runId.get() != expectedRunId ||
+                            !rs.active.get()
+                        ) {
+                            RuntimeLogStore.d(
+                                TAG,
+                                "cancelProcess skipped: stale run key='$key' runId=$expectedRunId stage='$stage'",
+                            )
                             return@cancelDispatch
                         }
-                        runCatching { convNow.cancelProcess() }
+
+                        val identityMatches =
+                            stateMutex.withLock {
+                                instances[key]?.conversation === expectedConversation
+                            }
+
+                        if (
+                            !identityMatches ||
+                            rs.runId.get() != expectedRunId ||
+                            !rs.active.get()
+                        ) return@cancelDispatch
+
+                        runCatching { expectedConversation.cancelProcess() }
                             .onFailure { t ->
                                 RuntimeLogStore.w(TAG, "cancelProcess() failed: key='$key' stage='$stage' err=${t.message}", t)
                             }
@@ -3579,14 +3684,9 @@ object LiteRtLM {
                     errorMessage: String? = null,
                     isCancel: Boolean = false,
                 ) {
-                    if (
-                        !rs.terminated.compareAndSet(
-                            false,
-                            true,
-                        )
-                    ) {
-                        return
-                    }
+                    if (!claimTerminalRun(rs, myRunId)) return
+
+                    rs.terminated.set(true)
 
                     watchdog?.cancel()
                     watchdog = null
@@ -3728,15 +3828,75 @@ object LiteRtLM {
                     }
                 }
 
-                fun requestLogicalCancel(reason: String) {
+                suspend fun requestLogicalCancelLocked(
+                    expectedRunId: Long,
+                    reason: String,
+                ) {
+                    if (
+                        rs.runId.get() != expectedRunId ||
+                        !rs.active.get()
+                    ) return
+
+                    val expectedConversation = conv ?: return
+
                     rs.cancelRequested.set(true)
+                    rs.pendingCancel.set(false)
                     deliverLogicalDoneOnce(errorMessage = reason, isCancel = true)
 
-                    cancelProcessBestEffort(stage = "logicalCancel")
-                    if (HARD_CLOSE_ENABLE) startHardCloseWatchdog(key, reason = "logicalCancel")
+                    cancelProcessBestEffort(
+                        expectedRunId = expectedRunId,
+                        expectedConversation = expectedConversation,
+                        stage = "logicalCancel",
+                    )
+
+                    if (HARD_CLOSE_ENABLE) {
+                        armHardCloseWatchdogLocked(
+                            key = key,
+                            expectedRunId = expectedRunId,
+                            expectedConversation = expectedConversation,
+                            reason = "logicalCancel",
+                        )
+                    }
                 }
 
-                rs.logicalTerminator.set { requestLogicalCancel("Cancelled") }
+                fun requestLogicalCancel(
+                    expectedRunId: Long,
+                    reason: String,
+                ) {
+                    ioScope.launch {
+                        withSessionLock(
+                            key = key,
+                            reason = "logicalCancel:$reason",
+                        ) {
+                            requestLogicalCancelLocked(
+                                expectedRunId = expectedRunId,
+                                reason = reason,
+                            )
+                        }
+                    }
+                }
+
+                rs.logicalTerminator.set { expectedRunId ->
+                    requestLogicalCancel(
+                        expectedRunId = expectedRunId,
+                        reason = "Cancelled",
+                    )
+                }
+
+                if (
+                    runControlTestHooks
+                        ?.armHardCloseOnRunStart
+                        ?.invoke(myRunId) == true
+                ) {
+                    armHardCloseWatchdogLocked(
+                        key = key,
+                        expectedRunId = myRunId,
+                        expectedConversation = conv,
+                        reason = "test-run-start",
+                    )
+                }
+
+                onRunStarted(myRunId)
 
                 if (rs.cancelRequested.get()) {
                     RuntimeLogStore.d(TAG, "LiteRT-LM start cancelled before sendMessageAsync: key='$key'")
@@ -3752,9 +3912,10 @@ object LiteRtLM {
                     RuntimeLogStore.e(TAG, "Stream watchdog fired: key='$key' runId=$myRunId timeout=${STREAM_WATCHDOG_MS}ms")
                     debugState(key, rs, "watchdog:fired")
 
-                    deliverLogicalDoneOnce("Timeout: inference did not complete in ${STREAM_WATCHDOG_MS}ms")
-                    cancelProcessBestEffort(stage = "watchdog")
-                    if (HARD_CLOSE_ENABLE) startHardCloseWatchdog(key, reason = "watchdog")
+                    requestLogicalCancel(
+                        expectedRunId = myRunId,
+                        reason = "Timeout: inference did not complete in ${STREAM_WATCHDOG_MS}ms",
+                    )
                     if (!nativeStarted.get()) markNativeDoneOnce("Timeout before native start")
                 }
 
@@ -3975,7 +4136,12 @@ object LiteRtLM {
                             val reacquired = stateMutex.withLock {
                                 val acquired2 = rs.active.compareAndSet(false, true)
                                 if (acquired2) {
-                                    rs.logicalTerminator.set { requestLogicalCancel("Cancelled") }
+                                    rs.logicalTerminator.set { expectedRunId ->
+                                        requestLogicalCancel(
+                                            expectedRunId = expectedRunId,
+                                            reason = "Cancelled",
+                                        )
+                                    }
                                 }
                                 acquired2
                             }
@@ -4122,21 +4288,28 @@ object LiteRtLM {
      *   cancellation state belongs only to the run that was actually active
      *   when cancellation was requested.
      */
-    fun cancel(model: Model) {
+    fun cancel(
+        model: Model,
+        expectedRunId: Long,
+    ) {
         val key =
             runtimeKey(model)
 
         ioScope.launch {
+            runControlTestHooks
+                ?.beforeScopedCancelValidation
+                ?.invoke(expectedRunId)
+
             val rs =
                 getRunState(key)
 
-            if (!rs.active.get()) {
-                rs.cancelRequested.set(false)
-                rs.pendingCancel.set(false)
-
+            if (
+                rs.runId.get() != expectedRunId ||
+                !rs.active.get()
+            ) {
                 RuntimeLogStore.d(
                     TAG,
-                    "cancel ignored: no active stream for key='$key'"
+                    "cancel ignored: stale/inactive run for key='$key' expectedRunId=$expectedRunId",
                 )
 
                 if (DEBUG_STATE) {
@@ -4150,15 +4323,12 @@ object LiteRtLM {
                 return@launch
             }
 
-            rs.cancelRequested.set(true)
-            rs.pendingCancel.set(false)
-
             val terminator =
                 rs.logicalTerminator.get()
 
             if (terminator != null) {
                 runCatching {
-                    terminator.invoke()
+                    terminator.invoke(expectedRunId)
                 }.onFailure { error ->
                     RuntimeLogStore.w(
                         TAG,
@@ -4168,35 +4338,26 @@ object LiteRtLM {
                     )
 
                     if (HARD_CLOSE_ENABLE) {
-                        startHardCloseWatchdog(
-                            key = key,
-                            reason = "cancel()-terminator-failed",
-                        )
+                        val conversation =
+                            stateMutex.withLock {
+                                instances[key]?.conversation
+                            }
+
+                        if (conversation != null) {
+                            startHardCloseWatchdog(
+                                key = key,
+                                expectedRunId = expectedRunId,
+                                expectedConversation = conversation,
+                                reason = "cancel()-terminator-failed",
+                            )
+                        }
                     }
                 }
             } else {
-                runCatching {
-                    val conversation =
-                        stateMutex.withLock {
-                            instances[key]?.conversation
-                        }
-
-                    conversation?.cancelProcess()
-                }.onFailure { error ->
-                    RuntimeLogStore.w(
-                        TAG,
-                        "cancelProcess() failed in cancel(): " +
-                                "key='$key' err=${error.message}",
-                        error,
-                    )
-                }
-
-                if (HARD_CLOSE_ENABLE) {
-                    startHardCloseWatchdog(
-                        key = key,
-                        reason = "cancel()",
-                    )
-                }
+                RuntimeLogStore.d(
+                    TAG,
+                    "cancel ignored: terminator unavailable for key='$key' expectedRunId=$expectedRunId",
+                )
             }
 
             if (DEBUG_STATE) {
@@ -4208,5 +4369,21 @@ object LiteRtLM {
             }
         }
     }
-}
 
+    /** Best-effort compatibility API scoped to the run active at invocation time. */
+    fun cancel(model: Model) {
+        val key = runtimeKey(model)
+        val rs = getRunState(key)
+
+        val before = rs.runId.get()
+        if (!rs.active.get()) return
+        val after = rs.runId.get()
+
+        if (before != after || !rs.active.get()) return
+
+        cancel(
+            model = model,
+            expectedRunId = after,
+        )
+    }
+}

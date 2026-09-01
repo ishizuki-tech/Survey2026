@@ -813,6 +813,7 @@ object SLM {
         onError: (message: String) -> Unit = {},
         images: List<Bitmap> = emptyList(),
         audioClips: List<ByteArray> = emptyList(),
+        onRunStarted: (Long) -> Unit = {},
     ) {
         d {
             "runInference: model='${model.name}' " +
@@ -834,6 +835,7 @@ object SLM {
             images = images,
             audioClips = audioClips,
             notifyCancelToOnError = false,
+            onRunStarted = onRunStarted,
         )
     }
 
@@ -889,6 +891,21 @@ object SLM {
         }
 
         LiteRtLM.cancel(model)
+    }
+
+    /** Cancel only the specific LiteRtLM run owned by the caller. */
+    fun cancel(
+        model: Model,
+        expectedRunId: Long,
+    ) {
+        d {
+            "cancel: model='${model.name}' expectedRunId=$expectedRunId"
+        }
+
+        LiteRtLM.cancel(
+            model = model,
+            expectedRunId = expectedRunId,
+        )
     }
 }
 
