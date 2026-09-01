@@ -40,6 +40,7 @@ import java.lang.reflect.Modifier
 import java.security.MessageDigest
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
@@ -47,6 +48,7 @@ import kotlin.math.min
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -55,6 +57,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.asCoroutineDispatcher
 
 private const val TAG = "LiteRtLM"
 
@@ -197,6 +200,7 @@ private const val DEBUG_STATE_EVERY_N = 1
  */
 data class LiteRtLmInstance(
     val engine: Engine,
+    val runtimeIdentity: Any,
     @Volatile var conversation: Conversation,
     val supportImage: Boolean,
     val supportAudio: Boolean,
@@ -216,6 +220,21 @@ object LiteRtLM {
 
     /** Dedicated IO scope for init/cleanup work. */
     private val ioScope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    /** Process-lifetime owner for native close work; never use the SLM dispatcher. */
+    private val nativeTeardownDispatcher =
+        Executors.newSingleThreadExecutor { runnable ->
+            Thread(runnable, "LiteRT-NativeTeardown").apply { isDaemon = true }
+        }.asCoroutineDispatcher()
+    private val nativeTeardownScope: CoroutineScope =
+        CoroutineScope(SupervisorJob() + nativeTeardownDispatcher)
+    private val nativeLifecycleScope: CoroutineScope =
+        CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val ownedTeardownJobs:
+            ConcurrentHashMap<NativeLifecycleCoordinator.TeardownFlight, Job> = ConcurrentHashMap()
+
+    /** One coordinator for the process-wide LiteRT runtime. */
+    private val nativeLifecycle = NativeLifecycleCoordinator()
 
     /** Global lock for instance map + lifecycle transitions. */
     private val stateMutex: Mutex = Mutex()
@@ -295,6 +314,15 @@ object LiteRtLM {
 
     /** Stable runtime key. */
     private fun runtimeKey(model: Model): String = "${model.name}|${model.taskPath}"
+
+    private fun throwIfPoisoned(key: String) {
+        nativeLifecycle.poisonErrorOrNull()?.let { error ->
+            throw error
+        }
+    }
+
+    internal fun nativeRuntimePoisonErrorOrNull(): NativeRuntimePoisonedException? =
+        nativeLifecycle.poisonErrorOrNull()
 
     /** Post work onto the main thread. */
     private fun postToMain(block: () -> Unit) {
@@ -1106,6 +1134,116 @@ object LiteRtLM {
         }
     }
 
+    private sealed interface NativeCloseOutcome {
+        data object Returned : NativeCloseOutcome
+        data class Threw(val error: Throwable) : NativeCloseOutcome
+    }
+
+    private suspend fun closeNativeDetached(
+        key: String,
+        flight: NativeLifecycleCoordinator.TeardownFlight,
+        closeIdentity: Any,
+        label: String,
+        close: () -> Unit,
+    ): Boolean {
+        val finished = CompletableDeferred<NativeCloseOutcome>()
+        nativeTeardownScope.launch {
+            try {
+                close()
+                finished.complete(NativeCloseOutcome.Returned)
+            } catch (error: Throwable) {
+                finished.complete(NativeCloseOutcome.Threw(error))
+            }
+        }
+
+        val result = withTimeoutOrNull(HARD_CLOSE_TIMEOUT_MS) { finished.await() }
+        if (result == null) {
+            nativeLifecycle.poisonIfCloseUnconfirmed(flight, closeIdentity)?.notifyWaiters()
+            RuntimeLogStore.e(TAG, "Native close confirmation timed out: key='$key' label='$label'")
+            return false
+        }
+        if (result is NativeCloseOutcome.Threw) {
+            nativeLifecycle.recordCloseException(flight, closeIdentity, result.error)?.notifyWaiters()
+            RuntimeLogStore.e(TAG, "Native close failed: key='$key' label='$label' err=${result.error.message}", result.error)
+            return false
+        }
+        nativeLifecycle.confirmClose(flight, closeIdentity)
+        return nativeLifecycle.snapshot().status != NativeLifecycleCoordinator.Status.POISONED
+    }
+
+    private fun notifySignal(signal: NativeLifecycleCoordinator.TerminalSignal?) {
+        signal?.notifyWaiters()
+    }
+
+    /** Close unpublished native state after poisoning; this never authorizes recovery. */
+    private fun closeUnpublishedConversationAfterPoison(
+        conversation: Conversation,
+        label: String,
+    ) {
+        nativeTeardownScope.launch {
+            runCatching { conversation.close() }
+                .onFailure { error ->
+                    RuntimeLogStore.e(
+                        TAG,
+                        "Best-effort close of unpublished Conversation failed: label='$label' err=${error.message}",
+                        error,
+                    )
+                }
+        }
+    }
+
+    /** Close an unpublished Engine after poisoning without changing lifecycle state. */
+    private fun closeUnpublishedEngineAfterPoison(
+        engine: Engine,
+        label: String,
+    ) {
+        nativeTeardownScope.launch {
+            runCatching { engine.close() }
+                .onFailure { error ->
+                    RuntimeLogStore.e(
+                        TAG,
+                        "Best-effort close of unpublished Engine failed: label='$label' err=${error.message}",
+                        error,
+                    )
+                }
+        }
+    }
+
+    private suspend fun awaitFlight(flight: NativeLifecycleCoordinator.TeardownFlight) {
+        when (val outcome = flight.completion.await()) {
+            is NativeLifecycleCoordinator.TeardownOutcome.Poisoned -> throw outcome.error
+            else -> Unit
+        }
+    }
+
+    private fun launchFullTeardownOwner(
+        key: String,
+        flight: NativeLifecycleCoordinator.TeardownFlight,
+        instance: LiteRtLmInstance,
+        reason: String,
+    ) {
+        if (ownedTeardownJobs.containsKey(flight)) return
+        val job = nativeLifecycleScope.launch(start = CoroutineStart.LAZY) {
+            try {
+                if (!closeNativeDetached(key, flight, instance.conversation, "$reason-conversation") {
+                        instance.conversation.close()
+                    }
+                ) return@launch
+                if (!closeNativeDetached(key, flight, instance.engine, "$reason-engine") {
+                        instance.engine.close()
+                    }
+                ) return@launch
+                notifySignal(nativeLifecycle.completeFullTeardown(flight))
+            } catch (error: Throwable) {
+                notifySignal(nativeLifecycle.poisonFlight(flight, error))
+            } finally {
+                ownedTeardownJobs.remove(flight)
+            }
+        }
+        val existing = ownedTeardownJobs.putIfAbsent(flight, job)
+        if (existing == null) job.start() else job.cancel()
+    }
+
     /** Convert this Bitmap to PNG bytes. */
     private fun Bitmap.toPngByteArray(): ByteArray {
         return ByteArrayOutputStream().use { stream ->
@@ -1515,6 +1653,8 @@ object LiteRtLM {
         val key =
             runtimeKey(model)
 
+        throwIfPoisoned(key)
+
         setApplicationContext(appContext)
         markUsed(key)
         cancelScheduledCleanup(key, "initialize")
@@ -1548,21 +1688,26 @@ object LiteRtLM {
             return
         }
 
-        ioScope.launch {
+        nativeLifecycleScope.launch {
             val totalInitStartedAt =
                 SystemClock.elapsedRealtime()
 
             var engineToCloseOnFailure: Engine? =
                 null
 
+            var engineCreationLease: NativeLifecycleCoordinator.EngineCreationLease? = null
+            var publicationSignal: NativeLifecycleCoordinator.TerminalSignal? = null
+            var activeTeardownFlight: NativeLifecycleCoordinator.TeardownFlight? = null
+            var unpublishedReplacementConversation: Conversation? = null
+            var unpublishedEngineConversation: Conversation? = null
+            val generationIdentity = Any()
+
             var completed =
                 false
 
             try {
-                withSessionLock(
-                    key = key,
-                    reason = "initialize",
-                ) {
+                throwIfPoisoned(key)
+                run {
                     val runState =
                         getRunState(key)
 
@@ -1652,6 +1797,7 @@ object LiteRtLM {
                             instances[key]
                         }
 
+                    run warmPath@ {
                     if (
                         existing != null &&
                         engineCanServe(
@@ -1688,7 +1834,7 @@ object LiteRtLM {
                             )
 
                             completed = true
-                            return@withSessionLock
+                            return@run
                         }
 
                         /*
@@ -1704,17 +1850,65 @@ object LiteRtLM {
                                     "only: key='$key'"
                         )
 
-                        runCatching {
-                            existing.conversation.close()
-                        }.onFailure { error ->
-                            RuntimeLogStore.w(
-                                TAG,
-                                "Failed to close previous Conversation " +
-                                        "during warm reconfiguration: " +
-                                        "key='$key' err=${error.message}",
-                                error,
-                            )
+                        var warmFlight: NativeLifecycleCoordinator.TeardownFlight? = null
+                        while (warmFlight == null) {
+                            val decision = withSessionLock(key, reason = "initialize:warm-plan") {
+                                stateMutex.withLock {
+                                    throwIfPoisoned(key)
+                                    val current = instances[key]
+                                    if (current !== existing || current.conversationConfigSnapshot == desiredConversationConfig) {
+                                        return@withLock ReplacementPlanDecision.Satisfied
+                                    }
+                                    when (val result = nativeLifecycle.startTeardown(
+                                        mode = NativeLifecycleCoordinator.TeardownMode.CONVERSATION_REPLACEMENT,
+                                        metadata = NativeLifecycleCoordinator.TeardownMetadata(
+                                            runtimeIdentity = existing.runtimeIdentity,
+                                            closeIdentities = listOf(existing.conversation),
+                                        ),
+                                    )) {
+                                        is NativeLifecycleCoordinator.TeardownStartResult.Started ->
+                                            ReplacementPlanDecision.Started(existing, desiredConversationConfig, result.flight)
+                                        is NativeLifecycleCoordinator.TeardownStartResult.ExistingSameRuntime ->
+                                            ReplacementPlanDecision.Join(result.flight)
+                                        is NativeLifecycleCoordinator.TeardownStartResult.Poisoned -> throw result.error
+                                        else -> throw IllegalStateException("Warm Conversation teardown is unavailable.")
+                                    }
+                                }
+                            }
+                            when (decision) {
+                                ReplacementPlanDecision.Satisfied -> {
+                                    val readyNow = stateMutex.withLock {
+                                        instances[key] === existing &&
+                                            existing.conversationConfigSnapshot == desiredConversationConfig
+                                    }
+                                    if (!readyNow) return@warmPath
+                                    completeInitSignal(signal, "")
+                                    postToMain { onDone("") }
+                                    completed = true
+                                    return@run
+                                }
+                                is ReplacementPlanDecision.Join -> awaitFlight(decision.flight)
+                                is ReplacementPlanDecision.Started -> warmFlight = decision.flight
+                            }
                         }
+                        val ownedWarmFlight = checkNotNull(warmFlight)
+                        activeTeardownFlight = ownedWarmFlight
+                        engineToCloseOnFailure = existing.engine
+                        val warmOldConversation = existing.conversation
+                        if (!closeNativeDetached(
+                                key = key,
+                                flight = ownedWarmFlight,
+                                closeIdentity = warmOldConversation,
+                                label = "warm-reconfigure",
+                                close = { warmOldConversation.close() },
+                            )
+                        ) {
+                            throw nativeLifecycle.poisonErrorOrNull()
+                                ?: IllegalStateException("Warm Conversation close could not be confirmed.")
+                        }
+                        val warmAuthorization =
+                            nativeLifecycle.authorizeReplacement(ownedWarmFlight)
+                                ?: throw IllegalStateException("Warm Conversation replacement authorization was lost.")
 
                         val replacement =
                             createConversationWithRetry(
@@ -1726,18 +1920,21 @@ object LiteRtLM {
                                     SESSION_RECREATE_RETRY_TIMEOUT_MS +
                                             SESSION_RECREATE_EXTRA_RETRY_MS,
                             )
+                        unpublishedReplacementConversation = replacement
 
-                        existing.conversation =
-                            replacement
-
-                        existing.conversationConfigSnapshot =
-                            desiredConversationConfig
-
-                        existing.systemMessageSnapshot =
-                            systemMessage
-
-                        existing.toolsSnapshot =
-                            tools
+                        withSessionLock(key, reason = "initialize:warm-publish") {
+                            stateMutex.withLock {
+                                publicationSignal =
+                                    nativeLifecycle.finalizeReplacementPublication(warmAuthorization) {
+                                        existing.conversation = replacement
+                                        existing.conversationConfigSnapshot = desiredConversationConfig
+                                        existing.systemMessageSnapshot = systemMessage
+                                        existing.toolsSnapshot = tools
+                                    }
+                                        ?: throw IllegalStateException("Warm Conversation publication was lost.")
+                            }
+                        }
+                        unpublishedReplacementConversation = null
 
                         markUsed(key)
 
@@ -1763,7 +1960,8 @@ object LiteRtLM {
                         )
 
                         completed = true
-                        return@withSessionLock
+                        return@run
+                    }
                     }
 
                     /*
@@ -1772,7 +1970,7 @@ object LiteRtLM {
                      */
                     val retired =
                         stateMutex.withLock {
-                            instances.remove(key)
+                            instances[key]
                         }
 
                     if (retired != null) {
@@ -1790,28 +1988,47 @@ object LiteRtLM {
                                     "audio=$supportAudio)"
                         )
 
-                        runCatching {
-                            retired.conversation.close()
-                        }.onFailure { error ->
-                            RuntimeLogStore.w(
-                                TAG,
-                                "initialize: failed to close retired " +
-                                        "Conversation: ${error.message}",
-                                error,
-                            )
+                        while (true) {
+                            val decision = withSessionLock(key, reason = "initialize:retire-plan") {
+                                stateMutex.withLock {
+                                    throwIfPoisoned(key)
+                                    if (instances[key] !== retired) return@withLock CleanupPlan.Satisfied
+                                    when (val result = nativeLifecycle.startTeardown(
+                                        mode = NativeLifecycleCoordinator.TeardownMode.FULL_TEARDOWN,
+                                        metadata = NativeLifecycleCoordinator.TeardownMetadata(
+                                            runtimeIdentity = retired.runtimeIdentity,
+                                            closeIdentities = listOf(retired.conversation, retired.engine),
+                                        ),
+                                    )) {
+                                        is NativeLifecycleCoordinator.TeardownStartResult.Started -> {
+                                            instances.remove(key)
+                                            CleanupPlan.Started(
+                                                FullClosePlan(retired, result.flight, "incompatible-retire")
+                                            )
+                                        }
+                                        is NativeLifecycleCoordinator.TeardownStartResult.ExistingSameRuntime ->
+                                            CleanupPlan.Join(result.flight)
+                                        is NativeLifecycleCoordinator.TeardownStartResult.Poisoned -> throw result.error
+                                        else -> throw IllegalStateException("Incompatible Engine teardown is unavailable.")
+                                    }
+                                }
+                            }
+                            when (decision) {
+                                CleanupPlan.Satisfied -> break
+                                is CleanupPlan.Join -> awaitFlight(decision.flight)
+                                is CleanupPlan.Busy -> throw IllegalStateException(decision.reason)
+                                is CleanupPlan.Started -> {
+                                    launchFullTeardownOwner(
+                                        key,
+                                        decision.plan.flight,
+                                        decision.plan.instance,
+                                        decision.plan.reason,
+                                    )
+                                    awaitFlight(decision.plan.flight)
+                                }
+                            }
+                            if (decision is CleanupPlan.Started) break
                         }
-
-                        runCatching {
-                            retired.engine.close()
-                        }.onFailure { error ->
-                            RuntimeLogStore.w(
-                                TAG,
-                                "initialize: failed to close retired " +
-                                        "Engine: ${error.message}",
-                                error,
-                            )
-                        }
-
                     }
 
                     RuntimeLogStore.d(
@@ -1819,6 +2036,25 @@ object LiteRtLM {
                         "Initializing LiteRT-LM: " +
                                 "model='${model.name}', key='$key'"
                     )
+
+                    engineCreationLease = withSessionLock(key, reason = "initialize:engine-plan") {
+                        stateMutex.withLock {
+                            when (
+                                val leaseResult =
+                                    nativeLifecycle.acquireEngineCreationLease(
+                                        initializationIdentity = signal,
+                                    )
+                            ) {
+                            is NativeLifecycleCoordinator.EngineLeaseResult.Acquired -> leaseResult.lease
+                            is NativeLifecycleCoordinator.EngineLeaseResult.Existing -> leaseResult.lease
+                            is NativeLifecycleCoordinator.EngineLeaseResult.Rejected ->
+                                throw leaseResult.poisonError
+                                    ?: IllegalStateException(
+                                        "LiteRT-LM Engine creation is unavailable: ${leaseResult.reason}"
+                                    )
+                            }
+                        }
+                    }
 
                     RuntimeLogStore.d(
                         TAG,
@@ -1988,17 +2224,15 @@ object LiteRtLM {
                     val engineInitStartedAt =
                         SystemClock.elapsedRealtime()
 
-                    val engine =
-                        runCatching {
-                            Engine(
-                                engineConfig
-                            ).also { candidate ->
-                                engineToCloseOnFailure =
-                                    candidate
-
+                    var replacementAuthorization:
+                            NativeLifecycleCoordinator.ReplacementAuthorization? = null
+                    val engine: Engine =
+                        try {
+                            Engine(engineConfig).also { candidate ->
+                                engineToCloseOnFailure = candidate
                                 candidate.initialize()
                             }
-                        }.getOrElse { firstError ->
+                        } catch (firstError: Exception) {
                             if (backend is Backend.GPU) {
                                 RuntimeLogStore.w(
                                     TAG,
@@ -2014,17 +2248,36 @@ object LiteRtLM {
                                  * overwrote this reference and could retain
                                  * native resources from the failed attempt.
                                  */
-                                runCatching {
-                                    engineToCloseOnFailure
-                                        ?.close()
-                                }.onFailure { closeError ->
-                                    RuntimeLogStore.w(
-                                        TAG,
-                                        "Failed to close failed GPU Engine: " +
-                                                "${closeError.message}",
-                                        closeError,
+                                val failedGpu = engineToCloseOnFailure
+                                    ?: throw firstError
+                                val lease = engineCreationLease
+                                    ?: throw firstError
+                                val failedFlight =
+                                    (nativeLifecycle.convertFailedEngineLeaseToTeardown(
+                                        lease = lease,
+                                        metadata =
+                                            NativeLifecycleCoordinator.TeardownMetadata(
+                                                runtimeIdentity = generationIdentity,
+                                                closeIdentities = listOf(failedGpu),
+                                            ),
+                                    ) as? NativeLifecycleCoordinator.TeardownStartResult.Started)
+                                        ?.flight
+                                    ?: throw firstError
+                                activeTeardownFlight = failedFlight
+                                if (!closeNativeDetached(
+                                        key = key,
+                                        flight = failedFlight,
+                                        closeIdentity = failedGpu,
+                                        label = "gpu-fallback",
+                                        close = { failedGpu.close() },
                                     )
+                                ) {
+                                    throw nativeLifecycle.poisonErrorOrNull()
+                                        ?: firstError
                                 }
+                                replacementAuthorization =
+                                    nativeLifecycle.authorizeReplacement(failedFlight)
+                                        ?: throw firstError
 
                                 engineToCloseOnFailure =
                                     null
@@ -2098,6 +2351,7 @@ object LiteRtLM {
                                 SESSION_RECREATE_RETRY_TIMEOUT_MS +
                                         SESSION_RECREATE_EXTRA_RETRY_MS,
                         )
+                    unpublishedEngineConversation = conversation
 
                     val conversationElapsed =
                         SystemClock.elapsedRealtime() -
@@ -2110,26 +2364,35 @@ object LiteRtLM {
                                 "took=${conversationElapsed}ms"
                     )
 
-                    stateMutex.withLock {
-                        instances[key] =
-                            LiteRtLmInstance(
-                                engine = engine,
-                                conversation =
-                                    conversation,
-                                supportImage =
-                                    supportImage,
-                                supportAudio =
-                                    supportAudio,
-                                engineConfigSnapshot =
-                                    engineConfig,
-                                conversationConfigSnapshot =
-                                    desiredConversationConfig,
-                                systemMessageSnapshot =
-                                    systemMessage,
-                                toolsSnapshot =
-                                    tools,
-                            )
+                    withSessionLock(key, reason = "initialize:publish") {
+                        stateMutex.withLock {
+                            val publish = {
+                                instances[key] = LiteRtLmInstance(
+                                    engine = engine,
+                                    runtimeIdentity = generationIdentity,
+                                    conversation = conversation,
+                                    supportImage = supportImage,
+                                    supportAudio = supportAudio,
+                                    engineConfigSnapshot = engineConfig,
+                                    conversationConfigSnapshot = desiredConversationConfig,
+                                    systemMessageSnapshot = systemMessage,
+                                    toolsSnapshot = tools,
+                                )
+                            }
+                            val published = if (replacementAuthorization != null) {
+                                nativeLifecycle.finalizeReplacementPublication(
+                                    replacementAuthorization,
+                                    publish,
+                                ).also { publicationSignal = it } != null
+                            } else {
+                                val lease = engineCreationLease
+                                    ?: throw IllegalStateException("LiteRT-LM Engine creation lease was lost.")
+                                nativeLifecycle.completeEnginePublication(lease, publish)
+                            }
+                            check(published) { "LiteRT-LM Engine publication lease was lost." }
+                        }
                     }
+                    unpublishedEngineConversation = null
 
                     /*
                      * Ownership has moved into instances. The failure cleanup
@@ -2137,6 +2400,9 @@ object LiteRtLM {
                      */
                     engineToCloseOnFailure =
                         null
+                    engineCreationLease = null
+                    activeTeardownFlight = null
+                    activeTeardownFlight = null
 
                     markUsed(key)
 
@@ -2164,6 +2430,7 @@ object LiteRtLM {
                     completed =
                         true
                 }
+                notifySignal(publicationSignal)
             } catch (
                 error: Exception
             ) {
@@ -2187,17 +2454,145 @@ object LiteRtLM {
                     error,
                 )
 
-                runCatching {
-                    engineToCloseOnFailure
-                        ?.close()
-                }.onFailure { closeError ->
-                    RuntimeLogStore.w(
-                        TAG,
-                        "Failed to close Engine after " +
-                                "initialization failure: " +
-                                "${closeError.message}",
-                        closeError,
+                val failedEngine = engineToCloseOnFailure
+                val lease = engineCreationLease
+                val existingFailureFlight = activeTeardownFlight
+                val unpublishedConversation = unpublishedReplacementConversation
+                val unpublishedCreatedEngineConversation = unpublishedEngineConversation
+                if (unpublishedConversation != null) {
+                    if (existingFailureFlight != null) {
+                        notifySignal(nativeLifecycle.poisonFlight(existingFailureFlight, error))
+                    }
+                    closeUnpublishedConversationAfterPoison(
+                        conversation = unpublishedConversation,
+                        label = "initialize-warm-publication",
                     )
+                    unpublishedReplacementConversation = null
+                } else if (unpublishedCreatedEngineConversation != null) {
+                    var poisonOwnerFlight = existingFailureFlight
+
+                    if (poisonOwnerFlight == null && failedEngine != null && lease != null) {
+                        poisonOwnerFlight =
+                            when (
+                                val conversion =
+                                    nativeLifecycle.convertFailedEngineLeaseToTeardown(
+                                        lease = lease,
+                                        metadata =
+                                            NativeLifecycleCoordinator.TeardownMetadata(
+                                                runtimeIdentity = generationIdentity,
+                                                closeIdentities = listOf(failedEngine),
+                                            ),
+                                    )
+                            ) {
+                                is NativeLifecycleCoordinator.TeardownStartResult.Started -> conversion.flight
+                                is NativeLifecycleCoordinator.TeardownStartResult.ExistingSameRuntime -> conversion.flight
+                                is NativeLifecycleCoordinator.TeardownStartResult.Poisoned -> null
+                                NativeLifecycleCoordinator.TeardownStartResult.BusyOtherRuntime -> {
+                                    RuntimeLogStore.e(
+                                        TAG,
+                                        "Unpublished Engine Conversation cleanup could not obtain exact ownership: " +
+                                                "key='$key' result=BusyOtherRuntime; diagnostic cleanup only.",
+                                        error,
+                                    )
+                                    null
+                                }
+                                NativeLifecycleCoordinator.TeardownStartResult.EngineCreationInProgress -> {
+                                    RuntimeLogStore.e(
+                                        TAG,
+                                        "Unpublished Engine Conversation cleanup could not obtain exact ownership: " +
+                                                "key='$key' result=EngineCreationInProgress; diagnostic cleanup only.",
+                                        error,
+                                    )
+                                    null
+                                }
+                                NativeLifecycleCoordinator.TeardownStartResult.InvalidOwner -> {
+                                    RuntimeLogStore.e(
+                                        TAG,
+                                        "Unpublished Engine Conversation cleanup could not obtain exact ownership: " +
+                                                "key='$key' result=InvalidOwner; diagnostic cleanup only.",
+                                        error,
+                                    )
+                                    null
+                                }
+                            }
+                    }
+
+                    val poisonSignal =
+                        poisonOwnerFlight?.let { flight ->
+                            nativeLifecycle.poisonFlight(flight, error)
+                        }
+                    notifySignal(poisonSignal)
+
+                    closeUnpublishedConversationAfterPoison(
+                        conversation = unpublishedCreatedEngineConversation,
+                        label = "initialize-engine-publication",
+                    )
+                    if (failedEngine != null) {
+                        closeUnpublishedEngineAfterPoison(
+                            engine = failedEngine,
+                            label = "initialize-engine-publication",
+                        )
+                    }
+
+                    unpublishedEngineConversation = null
+                    engineToCloseOnFailure = null
+                    engineCreationLease = null
+                    activeTeardownFlight = null
+                } else if (failedEngine == null && existingFailureFlight != null) {
+                    notifySignal(
+                        nativeLifecycle.completeFailedEngineTeardownWithoutReplacement(
+                            existingFailureFlight
+                        )
+                    )
+                } else if (failedEngine != null && existingFailureFlight != null) {
+                    withSessionLock(key, reason = "initialize:failed-teardown-unpublish") {
+                        stateMutex.withLock {
+                            val current = instances[key]
+                            if (current != null && current.engine === failedEngine) {
+                                instances.remove(key)
+                                pendingAfterStream.remove(key)
+                                clearInitSignalIfIdle(key)
+                            }
+                        }
+                    }
+                    nativeLifecycle.escalateReplacementFailureToFullTeardown(
+                        flight = existingFailureFlight,
+                        additionalCloseIdentity = failedEngine,
+                    )
+                    closeNativeDetached(
+                        key = key,
+                        flight = existingFailureFlight,
+                        closeIdentity = failedEngine,
+                        label = "fallback-failure",
+                        close = { failedEngine.close() },
+                    )
+                    notifySignal(nativeLifecycle.completeFullTeardown(existingFailureFlight))
+                } else if (failedEngine == null && lease != null) {
+                    nativeLifecycle.failEngineCreationBeforeNativeState(lease)
+                } else if (failedEngine != null && lease != null) {
+                    val flightResult =
+                        nativeLifecycle.convertFailedEngineLeaseToTeardown(
+                            lease = lease,
+                            metadata =
+                                NativeLifecycleCoordinator.TeardownMetadata(
+                                    runtimeIdentity = generationIdentity,
+                                    closeIdentities = listOf(failedEngine),
+                                ),
+                        )
+                    val flight =
+                        (flightResult as? NativeLifecycleCoordinator.TeardownStartResult.Started)?.flight
+                    if (flight != null) {
+                        closeNativeDetached(
+                            key = key,
+                            flight = flight,
+                            closeIdentity = failedEngine,
+                            label = "initialization-failure",
+                            close = { failedEngine.close() },
+                        )
+                        notifySignal(
+                            nativeLifecycle.completeFailedEngineTeardownWithoutReplacement(flight)
+                        )
+                    }
                 }
 
                 postToMain {
@@ -2252,6 +2647,8 @@ object LiteRtLM {
 
         val key =
             runtimeKey(model)
+
+        throwIfPoisoned(key)
 
         setApplicationContext(appContext)
         markUsed(key)
@@ -2396,68 +2793,121 @@ object LiteRtLM {
     private suspend fun closeInstanceNowBestEffort(key: String, reason: String) {
         cancelScheduledCleanup(key, "closeNow:$reason")
 
-        runCatching { awaitInitIfInFlight(key, reason = "closeNow:$reason") }
-            .onFailure {
-                RuntimeLogStore.w(
-                    TAG,
-                    "closeInstanceNowBestEffort: init wait failed: key='$key' reason='$reason' err=${it.message}"
-                )
-                return
-            }
-
-        withSessionLock(key, reason = "closeNow:$reason") {
-            val instance: LiteRtLmInstance? = stateMutex.withLock {
-                val rs = getRunState(key)
-                if (rs.active.get()) return@withLock null
-                if (initInFlight.contains(key)) return@withLock null
-
-                rs.cancelRequested.set(false)
-                rs.pendingCancel.set(false)
-                rs.logicalTerminator.set(null)
-                rs.nativeDoneHook.set(null)
-                rs.terminated.set(true)
-                rs.logicalDone.set(true)
-
-                pendingAfterStream.remove(key)
-                instances.remove(key).also { clearInitSignalIfIdle(key) }
-            }
-
-            if (instance == null) {
-                RuntimeLogStore.d(
-                    TAG,
-                    "closeInstanceNowBestEffort: nothing to close (or active/initInFlight): key='$key' reason='$reason'"
-                )
-                return@withSessionLock
-            }
-
-            runCatching { instance.conversation.close() }
-                .onFailure {
-                    RuntimeLogStore.e(
-                        TAG,
-                        "Failed to close conversation: key='$key' reason='$reason' err=${it.message}",
-                        it
-                    )
-                }
-            runCatching { instance.engine.close() }
-                .onFailure {
-                    RuntimeLogStore.e(
-                        TAG,
-                        "Failed to close engine: key='$key' reason='$reason' err=${it.message}",
-                        it
-                    )
-                }
-
-            RuntimeLogStore.d(TAG, "LiteRT-LM closed: key='$key' reason='$reason'")
+        try {
+            awaitInitIfInFlight(key, reason = "closeNow:$reason")
+        } catch (error: Throwable) {
+            RuntimeLogStore.w(
+                TAG,
+                "closeInstanceNowBestEffort: init wait failed: key='$key' reason='$reason' err=${error.message}",
+                error,
+            )
+            throw error
         }
+
+        while (true) {
+            val decision: CleanupPlan = withSessionLock(key, reason = "closeNow:plan:$reason") {
+                stateMutex.withLock {
+                    throwIfPoisoned(key)
+                    val rs = getRunState(key)
+                    if (rs.active.get()) {
+                        return@withLock CleanupPlan.Busy(
+                            "A native inference run is active for key='$key'.",
+                        )
+                    }
+                    if (initInFlight.contains(key)) {
+                        return@withLock CleanupPlan.Busy(
+                            "Initialization is in progress for key='$key'.",
+                        )
+                    }
+                    val instance = instances[key] ?: return@withLock CleanupPlan.Satisfied
+                    when (val result = nativeLifecycle.startTeardown(
+                        NativeLifecycleCoordinator.TeardownMode.FULL_TEARDOWN,
+                        NativeLifecycleCoordinator.TeardownMetadata(
+                            runtimeIdentity = instance.runtimeIdentity,
+                            closeIdentities = listOf(instance.conversation, instance.engine),
+                        ),
+                    )) {
+                        is NativeLifecycleCoordinator.TeardownStartResult.Started -> {
+                            if (instances[key] !== instance) return@withLock CleanupPlan.Satisfied
+                            instances.remove(key)
+                            pendingAfterStream.remove(key)
+                            clearInitSignalIfIdle(key)
+                            CleanupPlan.Started(FullClosePlan(instance, result.flight, reason))
+                        }
+                        is NativeLifecycleCoordinator.TeardownStartResult.ExistingSameRuntime ->
+                            CleanupPlan.Join(result.flight)
+                        is NativeLifecycleCoordinator.TeardownStartResult.Poisoned -> throw result.error
+                        NativeLifecycleCoordinator.TeardownStartResult.EngineCreationInProgress ->
+                            CleanupPlan.Busy("Engine creation is in progress for key='$key'.")
+                        NativeLifecycleCoordinator.TeardownStartResult.BusyOtherRuntime ->
+                            CleanupPlan.Busy("Another LiteRT native runtime lifecycle operation is in progress.")
+                        NativeLifecycleCoordinator.TeardownStartResult.InvalidOwner ->
+                            CleanupPlan.Busy("LiteRT native teardown ownership is unavailable for key='$key'.")
+                    }
+                }
+            }
+            when (decision) {
+                CleanupPlan.Satisfied -> return
+                is CleanupPlan.Join -> awaitFlight(decision.flight)
+                is CleanupPlan.Busy -> throw IllegalStateException(decision.reason)
+                is CleanupPlan.Started -> {
+                    launchFullTeardownOwner(key, decision.plan.flight, decision.plan.instance, reason)
+                    awaitFlight(decision.plan.flight)
+                }
+            }
+        }
+        RuntimeLogStore.d(TAG, "LiteRT-LM closed: key='$key' reason='$reason'")
     }
 
     private data class IdleClosePlan(
         val instance: LiteRtLmInstance,
+        val flight: NativeLifecycleCoordinator.TeardownFlight,
         val idleForMs: Long,
         val tokenNow: Long,
         val nowMs: Long,
         val reason: String,
     )
+
+    private data class FullClosePlan(
+        val instance: LiteRtLmInstance,
+        val flight: NativeLifecycleCoordinator.TeardownFlight,
+        val reason: String,
+    )
+
+    private sealed interface CleanupPlan {
+        data class Started(val plan: FullClosePlan) : CleanupPlan
+        data class Join(val flight: NativeLifecycleCoordinator.TeardownFlight) : CleanupPlan
+        data class Busy(val reason: String) : CleanupPlan
+        data object Satisfied : CleanupPlan
+    }
+
+    private sealed interface ReplacementPlanDecision {
+        data class Started(
+            val instance: LiteRtLmInstance,
+            val config: ConversationConfig,
+            val flight: NativeLifecycleCoordinator.TeardownFlight,
+        ) : ReplacementPlanDecision
+        data class Join(val flight: NativeLifecycleCoordinator.TeardownFlight) : ReplacementPlanDecision
+        data object Satisfied : ReplacementPlanDecision
+    }
+
+    private sealed interface IdlePlanDecision {
+        data class Started(val plan: IdleClosePlan) : IdlePlanDecision
+        data class Join(val flight: NativeLifecycleCoordinator.TeardownFlight) : IdlePlanDecision
+        data class Busy(val reason: String) : IdlePlanDecision
+        data object Satisfied : IdlePlanDecision
+    }
+
+    private sealed interface HardClosePlanDecision {
+        data class Started(
+            val plan: FullClosePlan,
+            val deferredActions: List<() -> Unit>,
+        ) : HardClosePlanDecision
+        data class Join(val flight: NativeLifecycleCoordinator.TeardownFlight) : HardClosePlanDecision
+        data class Poison(val signal: NativeLifecycleCoordinator.TerminalSignal?) : HardClosePlanDecision
+        data class Busy(val reason: String) : HardClosePlanDecision
+        data object Stale : HardClosePlanDecision
+    }
 
     /** Token + idleness guarded closer for idle cleanup. */
     private suspend fun closeInstanceIfStillIdle(
@@ -2471,8 +2921,9 @@ object LiteRtLM {
             return
         }
 
-        withSessionLock(key, reason = "idleClose:$reason") {
-            val plan: IdleClosePlan? = stateMutex.withLock {
+        while (true) {
+            val decision: IdlePlanDecision = withSessionLock(key, reason = "idleClose:plan:$reason") {
+                stateMutex.withLock {
                 val rs = getRunState(key)
                 val nowInner = SystemClock.elapsedRealtime()
                 val idleForInner = nowInner - rs.lastUseAtMs.get()
@@ -2480,75 +2931,94 @@ object LiteRtLM {
 
                 if (rs.active.get()) {
                     RuntimeLogStore.d(TAG, "Idle cleanup skipped (active native stream): key='$key'")
-                    return@withLock null
+                    return@withLock IdlePlanDecision.Satisfied
                 }
                 if (initInFlight.contains(key)) {
                     RuntimeLogStore.d(TAG, "Idle cleanup skipped (init in flight): key='$key'")
-                    return@withLock null
+                    return@withLock IdlePlanDecision.Satisfied
                 }
                 if (tokenInner != requiredToken) {
                     RuntimeLogStore.d(
                         TAG,
                         "Idle cleanup skipped (token changed): key='$key' required=$requiredToken now=$tokenInner"
                     )
-                    return@withLock null
+                    return@withLock IdlePlanDecision.Satisfied
                 }
                 if (idleForInner < requiredIdleMs) {
                     RuntimeLogStore.d(
                         TAG,
                         "Idle cleanup skipped (recent use): key='$key' idleFor=${idleForInner}ms < ${requiredIdleMs}ms"
                     )
-                    return@withLock null
+                    return@withLock IdlePlanDecision.Satisfied
                 }
 
-                rs.cancelRequested.set(false)
-                rs.pendingCancel.set(false)
-                rs.logicalTerminator.set(null)
-                rs.nativeDoneHook.set(null)
-                rs.terminated.set(true)
-                rs.logicalDone.set(true)
-
-                pendingAfterStream.remove(key)
-                val inst = instances.remove(key)
+                val inst = instances[key]
                 if (inst == null) {
                     RuntimeLogStore.d(TAG, "Idle cleanup: nothing to close: key='$key'")
-                    return@withLock null
+                    return@withLock IdlePlanDecision.Satisfied
                 }
 
-                clearInitSignalIfIdle(key)
-
-                IdleClosePlan(
-                    instance = inst,
-                    idleForMs = idleForInner,
-                    tokenNow = tokenInner,
-                    nowMs = nowInner,
-                    reason = reason,
-                )
+                when (val result = nativeLifecycle.startTeardown(
+                    NativeLifecycleCoordinator.TeardownMode.FULL_TEARDOWN,
+                    NativeLifecycleCoordinator.TeardownMetadata(
+                        runtimeIdentity = inst.runtimeIdentity,
+                        closeIdentities = listOf(inst.conversation, inst.engine),
+                    ),
+                )) {
+                    is NativeLifecycleCoordinator.TeardownStartResult.Started -> {
+                        if (instances[key] !== inst) return@withLock IdlePlanDecision.Satisfied
+                        rs.cancelRequested.set(false)
+                        rs.pendingCancel.set(false)
+                        rs.logicalTerminator.set(null)
+                        rs.nativeDoneHook.set(null)
+                        rs.terminated.set(true)
+                        rs.logicalDone.set(true)
+                        instances.remove(key)
+                        pendingAfterStream.remove(key)
+                        clearInitSignalIfIdle(key)
+                        IdlePlanDecision.Started(
+                            IdleClosePlan(
+                                instance = inst,
+                                flight = result.flight,
+                                idleForMs = idleForInner,
+                                tokenNow = tokenInner,
+                                nowMs = nowInner,
+                                reason = reason,
+                            )
+                        )
+                    }
+                    is NativeLifecycleCoordinator.TeardownStartResult.ExistingSameRuntime ->
+                        IdlePlanDecision.Join(result.flight)
+                    is NativeLifecycleCoordinator.TeardownStartResult.Poisoned -> throw result.error
+                    NativeLifecycleCoordinator.TeardownStartResult.EngineCreationInProgress ->
+                        IdlePlanDecision.Busy("Engine creation is in progress for key='$key'.")
+                    NativeLifecycleCoordinator.TeardownStartResult.BusyOtherRuntime ->
+                        IdlePlanDecision.Busy("Another LiteRT native runtime lifecycle operation is in progress.")
+                    NativeLifecycleCoordinator.TeardownStartResult.InvalidOwner ->
+                        IdlePlanDecision.Busy("LiteRT native teardown ownership is unavailable for key='$key'.")
+                }
             }
-
-            if (plan == null) return@withSessionLock
-
-            runCatching { plan.instance.conversation.close() }
-                .onFailure {
-                    RuntimeLogStore.e(
+            }
+            when (decision) {
+                IdlePlanDecision.Satisfied -> return
+                is IdlePlanDecision.Join -> awaitFlight(decision.flight)
+                is IdlePlanDecision.Busy -> {
+                    RuntimeLogStore.d(
                         TAG,
-                        "Failed to close conversation: key='$key' reason='${plan.reason}' err=${it.message}",
-                        it
+                        "Idle cleanup skipped (lifecycle busy): key='$key' reason='${decision.reason}'",
                     )
+                    return
                 }
-            runCatching { plan.instance.engine.close() }
-                .onFailure {
-                    RuntimeLogStore.e(
+                is IdlePlanDecision.Started -> {
+                    launchFullTeardownOwner(key, decision.plan.flight, decision.plan.instance, decision.plan.reason)
+                    awaitFlight(decision.plan.flight)
+                    RuntimeLogStore.d(
                         TAG,
-                        "Failed to close engine: key='$key' reason='${plan.reason}' err=${it.message}",
-                        it
+                        "LiteRT-LM closed: key='$key' reason='${decision.plan.reason}' idleFor=${decision.plan.idleForMs}ms token=${decision.plan.tokenNow}"
                     )
+                    return
                 }
-
-            RuntimeLogStore.d(
-                TAG,
-                "LiteRT-LM closed: key='$key' reason='${plan.reason}' idleFor=${plan.idleForMs}ms token=${plan.tokenNow}"
-            )
+            }
         }
     }
 
@@ -2556,7 +3026,11 @@ object LiteRtLM {
     fun cleanUp(model: Model, onDone: () -> Unit) {
         val key = runtimeKey(model)
 
-        ioScope.launch {
+        nativeLifecycleScope.launch {
+            if (nativeLifecycle.poisonErrorOrNull() != null) {
+                postToMain { onDone() }
+                return@launch
+            }
             runCatching { awaitInitIfInFlight(key, reason = "cleanUp") }
                 .onFailure { RuntimeLogStore.w(TAG, "cleanUp: init wait failed: key='$key' err=${it.message}") }
 
@@ -2643,6 +3117,8 @@ object LiteRtLM {
         val key =
             runtimeKey(model)
 
+        throwIfPoisoned(key)
+
         markUsed(key)
         cancelScheduledCleanup(
             key,
@@ -2678,9 +3154,8 @@ object LiteRtLM {
     /**
      * Recreate only the Conversation while retaining the initialized Engine.
      *
-     * This function executes while holding the per-key session mutex. Recovery
-     * must therefore never call another helper that reacquires the same mutex:
-     * kotlinx.coroutines Mutex is non-reentrant and doing so self-deadlocks.
+     * Callers must invoke this outside per-key session ownership. The lifecycle
+     * owner acquires the mutex only for short planning and publication sections.
      */
     private suspend fun resetConversationInternal(
         key: String,
@@ -2691,121 +3166,109 @@ object LiteRtLM {
         tools: List<Any>,
         reason: String,
     ) {
-        withSessionLock(
-            key = key,
-            reason = "resetConversationInternal:$reason",
-        ) {
-            val (instance, runState) =
+        val completion = CompletableDeferred<Throwable?>()
+        nativeLifecycleScope.launch {
+            val failure =
+                runCatching {
+                    resetConversationInternalOwned(
+                        key = key,
+                        model = model,
+                        supportImage = supportImage,
+                        supportAudio = supportAudio,
+                        systemMessage = systemMessage,
+                        tools = tools,
+                        reason = reason,
+                    )
+                }.exceptionOrNull()
+            completion.complete(failure)
+        }
+        completion.await()?.let { throw it }
+    }
+
+    private suspend fun resetConversationInternalOwned(
+        key: String,
+        model: Model,
+        supportImage: Boolean,
+        supportAudio: Boolean,
+        systemMessage: Message?,
+        tools: List<Any>,
+        reason: String,
+    ) {
+        throwIfPoisoned(key)
+        var captured: ReplacementPlanDecision.Started? = null
+        while (captured == null) {
+            val decision = withSessionLock(
+                key = key,
+                reason = "resetConversationInternal:capture:$reason",
+            ) {
                 stateMutex.withLock {
-                    instances[key] to
-                            getRunState(key)
+                throwIfPoisoned(key)
+                val instance = instances[key]
+                    ?: return@withLock ReplacementPlanDecision.Satisfied
+                val runState = getRunState(key)
+
+                if (runState.active.get()) {
+                    throw IllegalStateException("resetConversationInternal rejected: active stream key='$key'")
                 }
 
-            if (instance == null) {
-                RuntimeLogStore.w(
-                    TAG,
-                    "resetConversationInternal skipped: " +
-                            "not initialized key='$key'"
-                )
+                if (supportImage && !instance.supportImage || supportAudio && !instance.supportAudio) {
+                    throw IllegalStateException("resetConversationInternal rejected: requested capability is unavailable for key='$key'")
+                }
 
-                return@withSessionLock
+                val config = buildConversationConfig(model, systemMessage, tools)
+                val oldConversation = instance.conversation
+                when (
+                        val result = nativeLifecycle.startTeardown(
+                            mode = NativeLifecycleCoordinator.TeardownMode.CONVERSATION_REPLACEMENT,
+                            metadata = NativeLifecycleCoordinator.TeardownMetadata(
+                                runtimeIdentity = instance.runtimeIdentity,
+                                closeIdentities = listOf(oldConversation),
+                            ),
+                        )
+                    ) {
+                        is NativeLifecycleCoordinator.TeardownStartResult.Started ->
+                            ReplacementPlanDecision.Started(instance, config, result.flight)
+                        is NativeLifecycleCoordinator.TeardownStartResult.ExistingSameRuntime ->
+                            ReplacementPlanDecision.Join(result.flight)
+                        is NativeLifecycleCoordinator.TeardownStartResult.Poisoned -> throw result.error
+                        else -> throw IllegalStateException("LiteRT-LM teardown is unavailable for key='$key'.")
+                    }
+                }
             }
-
-            if (runState.active.get()) {
-                val message =
-                    "resetConversationInternal rejected: " +
-                            "active stream key='$key'"
-
-                RuntimeLogStore.w(
-                    TAG,
-                    message,
-                )
-
-                throw IllegalStateException(message)
+            when (decision) {
+                ReplacementPlanDecision.Satisfied -> return
+                is ReplacementPlanDecision.Join -> awaitFlight(decision.flight)
+                is ReplacementPlanDecision.Started -> captured = decision
             }
+        }
 
-            /*
-             * A capability superset is valid. For example, an Engine that was
-             * initialized with image support may still create a text-only
-             * Conversation without rebuilding the Engine.
-             */
-            val missingImageCapability =
-                supportImage &&
-                        !instance.supportImage
-
-            val missingAudioCapability =
-                supportAudio &&
-                        !instance.supportAudio
-
-            if (
-                missingImageCapability ||
-                missingAudioCapability
-            ) {
-                val message =
-                    "resetConversationInternal rejected: " +
-                            "requested capability is not available: " +
-                            "key='$key' " +
-                            "have(image=${instance.supportImage}," +
-                            "audio=${instance.supportAudio}) " +
-                            "want(image=$supportImage," +
-                            "audio=$supportAudio)"
-
-                RuntimeLogStore.w(
-                    TAG,
-                    message,
-                )
-
-                throw IllegalStateException(message)
+        val plan = checkNotNull(captured)
+        val instance = plan.instance
+        val config = plan.config
+        val flight = plan.flight
+        val runState = getRunState(key)
+        val oldConversation = instance.conversation
+        var unpublishedFreshConversation: Conversation? = null
+        try {
+        if (!closeNativeDetached(key, flight, oldConversation, "conversation-reset") {
+                oldConversation.close()
             }
+        ) {
+            throw nativeLifecycle.poisonErrorOrNull()
+                ?: IllegalStateException("Conversation close could not be confirmed.")
+        }
+        val authorization = nativeLifecycle.authorizeReplacement(flight)
+            ?: throw IllegalStateException("Conversation replacement authorization was lost.")
 
-            val config =
-                buildConversationConfig(
-                    model = model,
-                    systemMessage = systemMessage,
-                    tools = tools,
-                )
-
-            val startedAt =
-                SystemClock.elapsedRealtime()
-
-            val closeStartedAt =
-                SystemClock.elapsedRealtime()
-
-            val closeFailure =
-                runCatching {
-                    instance.conversation.close()
-                }.exceptionOrNull()
-
-            val closeMs =
-                SystemClock.elapsedRealtime() -
-                        closeStartedAt
-
-            if (closeFailure != null) {
-                RuntimeLogStore.w(
-                    TAG,
-                    "resetConversationInternal: failed to close " +
-                            "old Conversation: key='$key' " +
-                            "closeMs=$closeMs err=${closeFailure.message}",
-                    closeFailure,
-                )
-            }
-
-            val createStartedAt =
-                SystemClock.elapsedRealtime()
-
-            val freshConversation =
-                try {
-                    createConversationWithRetry(
-                        engine = instance.engine,
-                        cfg = config,
-                        key = key,
-                        reason =
-                            "resetConversationInternal:$reason",
-                        timeoutMs =
-                            SESSION_RECREATE_RETRY_TIMEOUT_MS +
-                                    SESSION_RECREATE_EXTRA_RETRY_MS,
-                    )
-                } catch (error: Throwable) {
+        val freshConversation = try {
+            createConversationWithRetry(
+                engine = instance.engine,
+                cfg = config,
+                key = key,
+                reason = "resetConversationInternal:$reason",
+                timeoutMs = SESSION_RECREATE_RETRY_TIMEOUT_MS + SESSION_RECREATE_EXTRA_RETRY_MS,
+            )
+        } catch (error: Throwable) {
                     RuntimeLogStore.e(
                         TAG,
                         "resetConversationInternal failed: " +
@@ -2813,13 +3276,10 @@ object LiteRtLM {
                         error,
                     )
 
-                    /*
-                     * We are already inside this key's session mutex. Remove
-                     * and close the broken instance directly instead of calling
-                     * closeInstanceNowBestEffort(), which would try to acquire
-                     * the same non-reentrant mutex again.
-                     */
-                    stateMutex.withLock {
+                    /* The old Conversation is already confirmed closed. Retire the Engine
+                     * through the same flight before reporting replacement failure. */
+                    withSessionLock(key, reason = "resetConversationInternal:retire:$reason") {
+                        stateMutex.withLock {
                         if (
                             instances[key] ===
                             instance
@@ -2836,19 +3296,22 @@ object LiteRtLM {
                         runState.pendingCancel.set(false)
                         runState.logicalTerminator.set(null)
                         runState.nativeDoneHook.set(null)
+                        }
                     }
 
-                    runCatching {
-                        instance.engine.close()
-                    }.onFailure { closeError ->
-                        RuntimeLogStore.w(
-                            TAG,
-                            "resetConversationInternal recovery: " +
-                                    "Engine.close failed: key='$key' " +
-                                    "err=${closeError.message}",
-                            closeError,
-                        )
-                    }
+                    nativeLifecycle.escalateReplacementFailureToFullTeardown(
+                        flight = flight,
+                        additionalCloseIdentity = instance.engine,
+                    )
+                    closeNativeDetached(
+                        key = key,
+                        flight = flight,
+                        closeIdentity = instance.engine,
+                        label = "conversation-reset-engine-recovery",
+                        close = { instance.engine.close() },
+                    )
+                    val signal = nativeLifecycle.completeFullTeardown(flight)
+                    notifySignal(signal)
 
                     /*
                      * The runtime was removed and the Engine was closed, so the
@@ -2856,15 +3319,9 @@ object LiteRtLM {
                      * would make resetConversationAndWait() report success while
                      * leaving the runtime uninitialized.
                      */
-                    val createMs =
-                        SystemClock.elapsedRealtime() -
-                                createStartedAt
-
                     val failedTimingMessage =
                         "Conversation reset timing: " +
                                 "key='$key' reason='$reason' " +
-                                "closeMs=$closeMs createMs=$createMs " +
-                                "totalMs=${SystemClock.elapsedRealtime() - startedAt} " +
                                 "success=false"
 
                     RuntimeLogStore.w(TAG, failedTimingMessage)
@@ -2872,44 +3329,41 @@ object LiteRtLM {
 
                     throw error
                 }
+        unpublishedFreshConversation = freshConversation
 
-            val createMs =
-                SystemClock.elapsedRealtime() -
-                        createStartedAt
+        var terminalSignal: NativeLifecycleCoordinator.TerminalSignal? = null
+        withSessionLock(key, reason = "resetConversationInternal:publish:$reason") {
+            stateMutex.withLock {
+                throwIfPoisoned(key)
+                if (instances[key] !== instance) {
+                    throw IllegalStateException("Conversation replacement target changed for key='$key'.")
+                }
+                terminalSignal = nativeLifecycle.finalizeReplacementPublication(authorization) {
+                    instance.conversation = freshConversation
+                    instance.conversationConfigSnapshot = config
+                    instance.systemMessageSnapshot = systemMessage
+                    instance.toolsSnapshot = tools
+                } ?: throw IllegalStateException("Conversation replacement publication was lost.")
+            }
+        }
+        unpublishedFreshConversation = null
 
-            instance.conversation =
-                freshConversation
+        markUsed(key)
 
-            instance.conversationConfigSnapshot =
-                config
-
-            instance.systemMessageSnapshot =
-                systemMessage
-
-            instance.toolsSnapshot =
-                tools
-
-            markUsed(key)
-
-            val totalMs =
-                SystemClock.elapsedRealtime() -
-                        startedAt
-
-            val timingMessage =
-                "Conversation reset timing: " +
-                        "key='$key' reason='$reason' " +
-                        "closeMs=$closeMs createMs=$createMs " +
-                        "totalMs=$totalMs success=true"
-
-            RuntimeLogStore.w(TAG, timingMessage)
-            Log.w(TAG, timingMessage)
-
-            RuntimeLogStore.d(
-                TAG,
-                "resetConversationInternal completed: " +
-                        "key='$key' reason='$reason' " +
-                        "took=${totalMs}ms (Engine retained)"
-            )
+        notifySignal(terminalSignal)
+        } catch (error: Throwable) {
+            val unpublished = unpublishedFreshConversation
+            if (unpublished != null) {
+                notifySignal(nativeLifecycle.poisonFlight(flight, error))
+                closeUnpublishedConversationAfterPoison(
+                    conversation = unpublished,
+                    label = "conversation-reset-publication:$reason",
+                )
+                unpublishedFreshConversation = null
+            } else if (nativeLifecycle.snapshot().teardownFlight === flight) {
+                notifySignal(nativeLifecycle.poisonFlight(flight, error))
+            }
+            throw error
         }
     }
 
@@ -2930,6 +3384,8 @@ object LiteRtLM {
     ) {
         val key =
             runtimeKey(model)
+
+        throwIfPoisoned(key)
 
         markUsed(key)
         cancelScheduledCleanup(
@@ -3132,71 +3588,90 @@ object LiteRtLM {
                 RuntimeLogStore.e(TAG, "Hard-close watchdog firing: key='$key' runId=$expectedRunId elapsed=${elapsed}ms sinceMsg=${sinceMsg}ms")
                 debugState(key, rs, "hardClose:firing")
 
-                var deferredActions: List<() -> Unit> = emptyList()
-
-                withSessionLock(key, reason = "hardClose:$reason") {
-                    if (
-                        rs.hardCloseRunId.get() != expectedRunId ||
-                        rs.runId.get() != expectedRunId ||
-                        !rs.active.get()
-                    ) return@withSessionLock
-
-                    val inst = stateMutex.withLock { instances[key] }
-                    if (inst == null || inst.conversation !== expectedConversation) {
-                        return@withSessionLock
-                    }
-
-                    if (!claimTerminalRun(rs, expectedRunId)) {
-                        return@withSessionLock
-                    }
-
-                    rs.terminated.set(true)
-
-                    val removedExpectedInstance =
+                var startedPlan: HardClosePlanDecision.Started? = null
+                while (startedPlan == null) {
+                    val decision = withSessionLock(key, reason = "hardClose:$reason") {
                         stateMutex.withLock {
-                            if (instances[key] !== inst) {
-                                false
-                            } else {
-                                deferredActions =
-                                    pendingAfterStream.remove(key)?.toList() ?: emptyList()
+                            if (
+                                rs.hardCloseRunId.get() != expectedRunId ||
+                                rs.runId.get() != expectedRunId ||
+                                !rs.active.get()
+                            ) return@withLock HardClosePlanDecision.Stale
 
-                                clearInitSignalIfIdle(key)
-                                instances.remove(key)
-                                true
+                            val inst = instances[key]
+                            if (inst == null || inst.conversation !== expectedConversation) {
+                                return@withLock HardClosePlanDecision.Stale
+                            }
+                            when (val result = nativeLifecycle.startTeardown(
+                                mode = NativeLifecycleCoordinator.TeardownMode.FULL_TEARDOWN,
+                                metadata = NativeLifecycleCoordinator.TeardownMetadata(
+                                    runtimeIdentity = inst.runtimeIdentity,
+                                    closeIdentities = listOf(inst.conversation, inst.engine),
+                                ),
+                            )) {
+                                is NativeLifecycleCoordinator.TeardownStartResult.Started -> {
+                                    if (!claimTerminalRun(rs, expectedRunId)) {
+                                        return@withLock HardClosePlanDecision.Poison(
+                                            nativeLifecycle.poisonFlight(
+                                                result.flight,
+                                                IllegalStateException("Hard-close terminal ownership was lost."),
+                                            )
+                                        )
+                                    }
+                                    rs.terminated.set(true)
+                                    val actions = pendingAfterStream.remove(key)?.toList() ?: emptyList()
+                                    clearInitSignalIfIdle(key)
+                                    instances.remove(key)
+                                    rs.lastTerminateAtMs.set(SystemClock.elapsedRealtime())
+                                    rs.active.set(false)
+                                    rs.logicalDone.set(true)
+                                    rs.logicalTerminator.set(null)
+                                    HardClosePlanDecision.Started(
+                                        FullClosePlan(inst, result.flight, "hardClose"),
+                                        actions,
+                                    )
+                                }
+                                is NativeLifecycleCoordinator.TeardownStartResult.ExistingSameRuntime ->
+                                    HardClosePlanDecision.Join(result.flight)
+                                is NativeLifecycleCoordinator.TeardownStartResult.Poisoned -> throw result.error
+                                NativeLifecycleCoordinator.TeardownStartResult.EngineCreationInProgress ->
+                                    HardClosePlanDecision.Busy("Engine creation is in progress.")
+                                NativeLifecycleCoordinator.TeardownStartResult.BusyOtherRuntime ->
+                                    HardClosePlanDecision.Busy("Another LiteRT native runtime lifecycle operation is in progress.")
+                                NativeLifecycleCoordinator.TeardownStartResult.InvalidOwner ->
+                                    HardClosePlanDecision.Busy("LiteRT native teardown ownership is unavailable.")
                             }
                         }
-
-                    if (!removedExpectedInstance) return@withSessionLock
-
-                    runCatching {
-                        inst.conversation.close()
-                    }.onFailure {
-                        RuntimeLogStore.e(
-                            TAG,
-                            "Hard-close: conversation.close failed: key='$key' err=${it.message}",
-                            it,
-                        )
                     }
-
-                    runCatching {
-                        inst.engine.close()
-                    }.onFailure {
-                        RuntimeLogStore.e(
-                            TAG,
-                            "Hard-close: engine.close failed: key='$key' err=${it.message}",
-                            it,
-                        )
+                    when (decision) {
+                        HardClosePlanDecision.Stale -> return@launch
+                        is HardClosePlanDecision.Join -> awaitFlight(decision.flight)
+                        is HardClosePlanDecision.Busy -> {
+                            RuntimeLogStore.w(
+                                TAG,
+                                "Hard-close deferred because lifecycle ownership is busy: " +
+                                        "key='$key' runId=$expectedRunId reason='${decision.reason}'",
+                            )
+                            return@launch
+                        }
+                        is HardClosePlanDecision.Poison -> {
+                            notifySignal(decision.signal)
+                            return@launch
+                        }
+                        is HardClosePlanDecision.Started -> startedPlan = decision
                     }
-
-                    rs.lastTerminateAtMs.set(SystemClock.elapsedRealtime())
-                    rs.active.set(false)
-                    rs.logicalDone.set(true)
-                    rs.logicalTerminator.set(null)
-
-                    fireNativeDoneHookOnce(key)
                 }
+                val ownedPlan = checkNotNull(startedPlan)
+                fireNativeDoneHookOnce(key)
+                launchFullTeardownOwner(
+                    key,
+                    ownedPlan.plan.flight,
+                    ownedPlan.plan.instance,
+                    ownedPlan.plan.reason,
+                )
+                awaitFlight(ownedPlan.plan.flight)
 
-                deferredActions.forEach { action ->
+                ownedPlan.deferredActions.forEach { action ->
                     runCatching { action.invoke() }
                         .onFailure {
                             RuntimeLogStore.w(
@@ -3255,9 +3730,23 @@ object LiteRtLM {
         onRunStarted: (Long) -> Unit = {},
     ) {
         val key = runtimeKey(model)
+        throwIfPoisoned(key)
         val effectiveMaxOutputTokens = sanitizeMaxOutputTokens(maxOutputTokens)
 
         ioScope.launch {
+            val startupFailure =
+                runCatching { throwIfPoisoned(key) }
+                    .exceptionOrNull()
+            if (startupFailure != null) {
+                val message = cleanError(startupFailure.message)
+                RuntimeLogStore.e(TAG, "LiteRT-LM inference start failed: key='$key' err=$message", startupFailure)
+                postToMain {
+                    onError(message)
+                    resultListener("", true)
+                    runCatching { cleanUpListener.invoke() }
+                }
+                return@launch
+            }
             val requestStartedAtMs =
                 SystemClock.elapsedRealtime()
 
@@ -3512,9 +4001,27 @@ object LiteRtLM {
             var myRunId = 0L
             var conversation: Conversation? = null
             var rejectMsg: String? = null
+            var notAliveRecoveryInstance: LiteRtLmInstance? = null
 
             withSessionLock(key, reason = "runInference-start") {
                 stateMutex.withLock {
+                    val lifecycle = nativeLifecycle.snapshot()
+                    when (lifecycle.status) {
+                        NativeLifecycleCoordinator.Status.POISONED -> {
+                            rejectMsg = cleanError(lifecycle.poisonError?.message)
+                            return@withLock
+                        }
+                        NativeLifecycleCoordinator.Status.TEARDOWN_IN_PROGRESS -> {
+                            rejectMsg = "LiteRT-LM runtime teardown is in progress for key='$key'."
+                            return@withLock
+                        }
+                        NativeLifecycleCoordinator.Status.HEALTHY -> {
+                            if (lifecycle.hasEngineCreationLease) {
+                                rejectMsg = "LiteRT-LM Engine initialization is in progress for key='$key'."
+                                return@withLock
+                            }
+                        }
+                    }
                     val i = instances[key]
                     if (i == null) {
                         rejectMsg = "LiteRT-LM model '${model.name}' is not initialized. Call initializeIfNeeded() first."
@@ -4104,95 +4611,58 @@ object LiteRtLM {
                     RuntimeLogStore.e(TAG, "LiteRT-LM sendMessageAsync failed: key='$key' msg=${e.message}", e)
 
                     if (recoverable) {
-                        RuntimeLogStore.w(TAG, "Recovering from not-alive conversation: key='$key' runId=$myRunId")
-
-                        stateMutex.withLock {
-                            rs.active.set(false)
-                            rs.logicalTerminator.set(null)
-                        }
-
-                        val recoveryResult = runCatching {
-                            val i2 =
-                                stateMutex.withLock { instances[key] }
-                                    ?: throw IllegalStateException(
-                                        "Recovery failed: runtime missing for key='$key'."
-                                    )
-
-                            val cfg = i2.conversationConfigSnapshot
-                            runCatching { i2.conversation.close() }
-                            val fresh = createConversationWithRetry(
-                                engine = i2.engine,
-                                cfg = cfg,
-                                key = key,
-                                reason = "runInference-recover",
-                                timeoutMs = SESSION_RECREATE_RETRY_TIMEOUT_MS + SESSION_RECREATE_EXTRA_RETRY_MS
-                            )
-                            i2.conversation = fresh
-                            conv = fresh
-                            conversation = fresh
-                        }
-
-                        if (recoveryResult.isSuccess) {
-                            val reacquired = stateMutex.withLock {
-                                val acquired2 = rs.active.compareAndSet(false, true)
-                                if (acquired2) {
-                                    rs.logicalTerminator.set { expectedRunId ->
-                                        requestLogicalCancel(
-                                            expectedRunId = expectedRunId,
-                                            reason = "Cancelled",
-                                        )
-                                    }
-                                }
-                                acquired2
+                        RuntimeLogStore.w(
+                            TAG,
+                            "Scheduling not-alive Conversation recovery after releasing session ownership: " +
+                                    "key='$key' runId=$myRunId",
+                        )
+                        notAliveRecoveryInstance =
+                            stateMutex.withLock {
+                                instances[key]?.takeIf { it.conversation === conv }
                             }
 
-                            if (reacquired) {
-                                runCatching {
-                                    if (!hasMm) {
-                                        conv!!.sendMessageAsync(
-                                            effectiveText,
-                                            callback,
-                                            maxOutputToken = effectiveMaxOutputTokens,
-                                        )
-                                    } else {
-                                        val contentList = buildContentList(input = effectiveText, images = images, audioClips = audioClips)
-                                        val contentsObj = buildContentsObject(contentList)
-                                        conv!!.sendMessageAsync(
-                                            contentsObj,
-                                            callback,
-                                            maxOutputToken = effectiveMaxOutputTokens,
-                                        )
-                                    }
-                                }.onSuccess {
-                                    sendAcceptedAtMs.set(
-                                        SystemClock.elapsedRealtime()
-                                    )
-                                    RuntimeLogStore.w(TAG, "Recovery retry succeeded: key='$key' runId=$myRunId")
-                                    nativeStarted.set(true)
-                                }.onFailure { e2 ->
-                                    RuntimeLogStore.e(TAG, "Recovery retry failed: key='$key' runId=$myRunId err=${e2.message}", e2)
-                                    markNativeDoneOnce(cleanError(e2.message))
-                                }
-                            } else {
-                                markNativeDoneOnce("Recovery failed: could not reacquire active stream")
-                            }
-                        } else {
-                            val recoveryError =
-                                recoveryResult.exceptionOrNull()
-
-                            RuntimeLogStore.e(
-                                TAG,
-                                "Recovery failed: key='$key' runId=$myRunId " +
-                                        "err=${cleanError(recoveryError?.message)}",
-                                recoveryError,
-                            )
-
-                            markNativeDoneOnce(
-                                "Recovery failed: ${cleanError(recoveryError?.message)}"
-                            )
-                        }
+                        /*
+                         * End this run before starting recovery. The replacement path
+                         * reacquires sessionMutex, so awaiting it here would recursively
+                         * acquire the non-reentrant mutex held by runInference.
+                         */
+                        markNativeDoneOnce("Conversation is not alive")
                     } else {
                         markNativeDoneOnce(cleanError(e.message))
+                    }
+                }
+            }
+
+            val recoveryInstance = notAliveRecoveryInstance
+            if (recoveryInstance != null) {
+                val recoveryStillApplies =
+                    stateMutex.withLock {
+                        val runState = rsLocal
+                        runState != null &&
+                                runState.runId.get() == myRunId &&
+                                !runState.active.get() &&
+                                instances[key] === recoveryInstance &&
+                                recoveryInstance.conversation === conversation
+                    }
+
+                if (recoveryStillApplies) {
+                    runCatching {
+                        resetConversationInternal(
+                            key = key,
+                            model = model,
+                            supportImage = recoveryInstance.supportImage,
+                            supportAudio = recoveryInstance.supportAudio,
+                            systemMessage = recoveryInstance.systemMessageSnapshot,
+                            tools = recoveryInstance.toolsSnapshot,
+                            reason = "runInference-recover",
+                        )
+                    }.onFailure { recoveryError ->
+                        RuntimeLogStore.e(
+                            TAG,
+                            "Not-alive Conversation recovery failed: key='$key' runId=$myRunId " +
+                                    "err=${cleanError(recoveryError.message)}",
+                            recoveryError,
+                        )
                     }
                 }
             }
@@ -4294,6 +4764,8 @@ object LiteRtLM {
     ) {
         val key =
             runtimeKey(model)
+
+        throwIfPoisoned(key)
 
         ioScope.launch {
             runControlTestHooks

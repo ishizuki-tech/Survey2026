@@ -1177,6 +1177,10 @@ class LiteRtRepository(
                 AtomicReference<((String, Throwable?) -> Unit)?>(null)
 
             fun markForceReinit(reason: String) {
+                if (LiteRtLM.nativeRuntimePoisonErrorOrNull() != null) {
+                    RuntimeLogStore.w(TAG, "[$requestId] runtime poisoned; skipping FORCE_REINIT reason='$reason'")
+                    return
+                }
                 FORCE_REINIT.set(true)
                 RuntimeLogStore.w(TAG, "[$requestId] FORCE_REINIT=true reason='$reason'")
                 AiTrace.ringW(TAG, "[$requestId] FORCE_REINIT=true reason='$reason'")
