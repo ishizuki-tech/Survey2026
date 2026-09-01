@@ -143,6 +143,10 @@ jobs:
               echo "::error::HF_TOKEN is required for an internal release."
               exit 1
             fi
+            if [[ -z "$GH_TOKEN" ]]; then
+              echo "::error::GH_TOKEN is required for an internal release."
+              exit 1
+            fi
           else
             RELEASE_ALLOW_SECRETS=false
           fi

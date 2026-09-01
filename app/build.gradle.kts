@@ -512,9 +512,7 @@ extensions.configure<ApplicationExtension> {
             ignoreCase = true,
         )
 
-    // Internal release builds may embed the HF token only when explicitly enabled.
-    //
-    // GitHub credentials remain excluded from release builds.
+    // Internal release builds may embed GitHub and HF credentials only when explicitly enabled.
     val allowReleaseSecrets =
         prop(
             "release.allowSecrets",
@@ -698,11 +696,17 @@ extensions.configure<ApplicationExtension> {
                 quote(ghPathPrefix),
             )
 
-            // Never embed GitHub credentials in release artifacts.
+            // Allow the GitHub token only for explicitly enabled internal releases.
             buildConfigField(
                 "String",
                 "GH_TOKEN",
-                quote(""),
+                quote(
+                    if (allowReleaseSecrets) {
+                        ghToken
+                    } else {
+                        ""
+                    }
+                ),
             )
 
             // Allow the HF token only for explicitly enabled internal releases.

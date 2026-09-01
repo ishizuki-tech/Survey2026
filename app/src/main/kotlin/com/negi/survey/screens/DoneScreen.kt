@@ -124,14 +124,6 @@ private const val PENDING_DIR_SB = "pending_uploads_supabase"
 /** Shared pending root for voice so GitHub/Supabase won't race by moving/deleting the same WAV. */
 private const val PENDING_DIR_SHARED = "pending_uploads_shared"
 
-/**
- * Conservative raw-byte limit for GitHub Contents API uploads.
- *
- * Base64 expands ~4/3, plus JSON wrapper overhead; large binaries frequently fail
- * or cause poor mobile performance. We skip GitHub upload for voice over this limit.
- */
-private const val MAX_GH_CONTENT_RAW_BYTES: Long = 700_000L
-
 private val LOGCAT_TAG_FILTERS = arrayOf(
     "WhisperEngine",
     "MainActivity",
@@ -560,7 +552,10 @@ fun DoneScreen(
                                             val failed = ArrayList<String>()
 
                                             currentVoiceFiles.forEach { file ->
-                                                val canGh = canUploadToGitHubContentsApi(file)
+                                                val canGh = canUploadToGitHubContentsApi(
+                                                    file = file,
+                                                    maxRawBytes = cfg.maxRawBytesHint.toLong()
+                                                )
 
                                                 // Require only destinations we can realistically satisfy.
                                                 VoiceUploadCompletionStore.requireDestinations(
@@ -574,7 +569,8 @@ fun DoneScreen(
                                                     skipped.add("${file.name}(${file.length()}B)")
                                                     Log.w(
                                                         LOG_TAG,
-                                                        "Skip GitHub voice (too large for Contents API): name=${file.name} bytes=${file.length()}"
+                                                        "Skip GitHub voice (outside configured size limit): name=${file.name} " +
+                                                                "bytes=${file.length()} limit=${cfg.maxRawBytesHint}"
                                                     )
                                                     return@forEach
                                                 }
@@ -745,7 +741,10 @@ fun DoneScreen(
 
                                     if (staged.isNotEmpty()) {
                                         staged.forEach { stagedFile ->
-                                            val canGh = canUploadToGitHubContentsApi(stagedFile)
+                                            val canGh = canUploadToGitHubContentsApi(
+                                                file = stagedFile,
+                                                maxRawBytes = cfg.maxRawBytesHint.toLong()
+                                            )
 
                                             // Require only destinations we can realistically satisfy.
                                             VoiceUploadCompletionStore.requireDestinations(
@@ -759,7 +758,8 @@ fun DoneScreen(
                                                 skippedGhVoices++
                                                 Log.w(
                                                     LOG_TAG,
-                                                    "Skip scheduling GitHub voice (too large for Contents API): name=${stagedFile.name} bytes=${stagedFile.length()}"
+                                                    "Skip scheduling GitHub voice (outside configured size limit): name=${stagedFile.name} " +
+                                                            "bytes=${stagedFile.length()} limit=${cfg.maxRawBytesHint}"
                                                 )
                                                 return@forEach
                                             }
@@ -872,7 +872,9 @@ private fun enqueueGitHubWorkerFileUpload(
                     GitHubUploadWorker.KEY_BRANCH to cfg.branch,
                     GitHubUploadWorker.KEY_PATH_PREFIX to cfg.pathPrefix,
                     GitHubUploadWorker.KEY_FILE_PATH to localFile.absolutePath,
-                    GitHubUploadWorker.KEY_FILE_NAME to remoteRelativePath
+                    GitHubUploadWorker.KEY_FILE_NAME to remoteRelativePath,
+                    GitHubUploadWorker.KEY_FILE_MAX_BYTES_HINT to cfg.maxRawBytesHint.toLong(),
+                    GitHubUploadWorker.KEY_FILE_MAX_REQUEST_BYTES_HINT to cfg.maxRequestBytesHint
                 )
             )
             .setConstraints(
@@ -1355,9 +1357,12 @@ private fun normalizeLocalName(name: String): String {
 /**
  * Returns true if the file is safe-ish to upload via GitHub Contents API.
  */
-private fun canUploadToGitHubContentsApi(file: File): Boolean {
+private fun canUploadToGitHubContentsApi(
+    file: File,
+    maxRawBytes: Long
+): Boolean {
     val len = runCatching { file.length() }.getOrDefault(0L)
-    return len in 1L..MAX_GH_CONTENT_RAW_BYTES
+    return maxRawBytes > 0L && len in 1L..maxRawBytes
 }
 
 /**

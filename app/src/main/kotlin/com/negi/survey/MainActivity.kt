@@ -178,6 +178,10 @@ private const val DEFAULT_WHISPER_ASSET_MODEL: String = "models/ggml-small-q5_1.
 /** Default Whisper language when config omits it. */
 private const val DEFAULT_WHISPER_LANGUAGE: String = "en"
 
+/** Bounded upload policy for internal GitHub Contents API uploads. */
+private const val INTERNAL_GH_MAX_RAW_BYTES = 10 * 1024 * 1024
+private const val INTERNAL_GH_MAX_REQUEST_BYTES = 16 * 1024 * 1024
+
 class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -1340,7 +1344,9 @@ private fun buildGitHubConfigOrNull(): GitHubUploader.GitHubConfig? {
         repo = repo,
         branch = branch,
         pathPrefix = prefix,
-        token = token
+        token = token,
+        maxRawBytesHint = INTERNAL_GH_MAX_RAW_BYTES,
+        maxRequestBytesHint = INTERNAL_GH_MAX_REQUEST_BYTES
     )
 }
 
