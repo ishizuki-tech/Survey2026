@@ -134,7 +134,18 @@ jobs:
           if [[ -z "$SUPABASE_LOG_BUCKET" ]]; then SUPABASE_LOG_BUCKET="logs"; fi
           if [[ -z "$SUPABASE_LOG_PREFIX" ]]; then SUPABASE_LOG_PREFIX="surveyapp"; fi
 
+          PUBLISH_RELEASE="${{ github.event_name == 'workflow_dispatch' && inputs.publish_release == true }}"
           HF_TOKEN="${{ secrets.HF_TOKEN }}"
+
+          if [[ "$PUBLISH_RELEASE" == "true" ]]; then
+            RELEASE_ALLOW_SECRETS=true
+            if [[ -z "$HF_TOKEN" ]]; then
+              echo "::error::HF_TOKEN is required for an internal release."
+              exit 1
+            fi
+          else
+            RELEASE_ALLOW_SECRETS=false
+          fi
 
           cat > "$HOME/.gradle/gradle.properties" <<PROPS
           # ---- GitHub config ----
@@ -157,6 +168,7 @@ jobs:
           supabase.logPrefix=$SUPABASE_LOG_PREFIX
 
           # ---- Hugging Face token ----
+          release.allowSecrets=$RELEASE_ALLOW_SECRETS
           hf.token=$HF_TOKEN
           HF_TOKEN=$HF_TOKEN
           PROPS
