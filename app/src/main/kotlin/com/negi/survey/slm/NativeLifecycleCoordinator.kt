@@ -228,9 +228,16 @@ internal class NativeLifecycleCoordinator {
         }
     }
 
-    /** Acquire or recognize the exclusive cold Engine-creation lease. */
+    /**
+     * Acquire or recognize the exclusive cold Engine-creation lease.
+     *
+     * [onLeasePublished] runs under the transition lock after the exact lease is
+     * installed. It may only record caller-local ownership; it must not suspend,
+     * acquire external locks, call native code, or throw.
+     */
     internal fun acquireEngineCreationLease(
         initializationIdentity: Any,
+        onLeasePublished: (EngineCreationLease) -> Unit = {},
     ): EngineLeaseResult =
         synchronized(transitionLock) {
             when (val current = state.get()) {
@@ -240,11 +247,14 @@ internal class NativeLifecycleCoordinator {
                         existing == null -> {
                             val lease = EngineCreationLease(initializationIdentity)
                             state.set(Healthy(engineCreationLease = lease))
+                            onLeasePublished(lease)
                             EngineLeaseResult.Acquired(lease)
                         }
 
-                        existing.initializationIdentity === initializationIdentity ->
+                        existing.initializationIdentity === initializationIdentity -> {
+                            onLeasePublished(existing)
                             EngineLeaseResult.Existing(existing)
+                        }
 
                         else ->
                             EngineLeaseResult.Rejected(
@@ -274,10 +284,12 @@ internal class NativeLifecycleCoordinator {
      * and may only perform the short external mutation protected by that already-held
      * state mutex. It must not acquire the state mutex, suspend, call native code, wait,
      * or throw after making externally visible changes. If it throws before publishing,
-     * the exact Engine lease remains installed.
+     * the exact Engine lease remains installed. [onCommitted] runs immediately after
+     * the coordinator publishes Healthy and must only record caller-local ownership.
      */
     internal fun completeEnginePublication(
         lease: EngineCreationLease,
+        onCommitted: () -> Unit = {},
         publish: () -> Unit,
     ): Boolean =
         synchronized(transitionLock) {
@@ -286,6 +298,7 @@ internal class NativeLifecycleCoordinator {
 
             publish()
             state.set(Healthy(engineCreationLease = null))
+            onCommitted()
             true
         }
 
@@ -302,12 +315,32 @@ internal class NativeLifecycleCoordinator {
         }
 
     /**
+     * Poison native lifecycle ownership when Engine construction may have begun but
+     * no closeable Engine reference was returned.
+     */
+    internal fun poisonEngineCreationLease(
+        lease: EngineCreationLease,
+        cause: Throwable,
+    ): NativeRuntimePoisonedException? =
+        synchronized(transitionLock) {
+            val current = state.get() as? Healthy ?: return@synchronized null
+            if (current.engineCreationLease !== lease) return@synchronized null
+
+            val error = NativeRuntimePoisonedException(cause)
+            state.set(Poisoned(error))
+            error
+        }
+
+    /**
      * Atomically convert a failed Engine lease into teardown ownership.
      * No unrestricted Healthy state is published between these states.
+     * [onStarted] has the same non-throwing, caller-local-only contract as the
+     * Engine-lease publication callback.
      */
     internal fun convertFailedEngineLeaseToTeardown(
         lease: EngineCreationLease,
         metadata: TeardownMetadata,
+        onStarted: (TeardownFlight) -> Unit = {},
     ): TeardownStartResult =
         synchronized(transitionLock) {
             val current = state.get() as? Healthy
@@ -322,13 +355,21 @@ internal class NativeLifecycleCoordinator {
             startFlightLocked(
                 mode = TeardownMode.FAILED_ENGINE_REPLACEMENT,
                 metadata = metadata,
+                onStarted = onStarted,
             )
         }
 
-    /** Start teardown only from unrestricted Healthy state. */
+    /**
+     * Start teardown only from unrestricted Healthy state.
+     *
+     * [onStarted] runs under the transition lock after the exact flight is
+     * installed. It may only record caller-local ownership; it must not suspend,
+     * acquire external locks, call native code, or throw.
+     */
     internal fun startTeardown(
         mode: TeardownMode,
         metadata: TeardownMetadata,
+        onStarted: (TeardownFlight) -> Unit = {},
     ): TeardownStartResult =
         synchronized(transitionLock) {
             when (val current = state.get()) {
@@ -336,7 +377,7 @@ internal class NativeLifecycleCoordinator {
                     if (current.engineCreationLease != null) {
                         TeardownStartResult.EngineCreationInProgress
                     } else {
-                        startFlightLocked(mode, metadata)
+                        startFlightLocked(mode, metadata, onStarted)
                     }
                 }
 
@@ -428,9 +469,12 @@ internal class NativeLifecycleCoordinator {
      * state mutex. It must not acquire the state mutex, suspend, call native code, wait,
      * or throw after making externally visible changes. If it throws before publishing,
      * the exact flight remains installed and no successful terminal signal is produced.
+     * [onCommitted] records caller-local ownership immediately after Healthy is published;
+     * it must be short, non-blocking, and non-throwing.
      */
     internal fun finalizeReplacementPublication(
         authorization: ReplacementAuthorization,
+        onCommitted: (TerminalSignal) -> Unit = {},
         publish: () -> Unit,
     ): TerminalSignal? =
         synchronized(transitionLock) {
@@ -441,12 +485,14 @@ internal class NativeLifecycleCoordinator {
             }
             if (!current.allClosesConfirmed()) return@synchronized null
 
-            publish()
-            state.set(Healthy(engineCreationLease = null))
-            TerminalSignal(
+            val signal = TerminalSignal(
                 completion = current.completion,
                 outcome = TeardownOutcome.ReplacementPublished,
             )
+            publish()
+            state.set(Healthy(engineCreationLease = null))
+            onCommitted(signal)
+            signal
         }
 
     /** Complete a full teardown only after every required close returned successfully. */
@@ -518,6 +564,7 @@ internal class NativeLifecycleCoordinator {
     private fun startFlightLocked(
         mode: TeardownMode,
         metadata: TeardownMetadata,
+        onStarted: (TeardownFlight) -> Unit,
     ): TeardownStartResult.Started {
         val completion = CompletableDeferred<TeardownOutcome>()
         val flight =
@@ -537,6 +584,7 @@ internal class NativeLifecycleCoordinator {
                 replacementAuthorization = null,
             )
         )
+        onStarted(flight)
         return TeardownStartResult.Started(flight)
     }
 

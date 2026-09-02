@@ -26,6 +26,7 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.junit.After
@@ -181,6 +182,8 @@ class SlmHelperInstrumentationTest {
     @After
     fun tearDown() {
         LiteRtLM.runControlTestHooks = null
+        LiteRtLM.nativeLifecycleTestHooks = null
+        LiteRtLM.initializationTestHooks = null
 
         /**
          * Best-effort defensive cancellation.
@@ -885,6 +888,297 @@ class SlmHelperInstrumentationTest {
                 } finally {
                     releaseHardClose.complete(Unit)
                     releaseSecondHardClose.complete(Unit)
+                    LiteRtLM.runControlTestHooks = null
+                }
+            }
+        }
+
+    @Test
+    fun normal_terminal_handoff_cannot_mutate_successor_run() =
+        runBlocking {
+            withTimeout(GENERATION_TIMEOUT_MS) {
+                val beforeRelease = CountDownLatch(1)
+                val releaseBefore = CountDownLatch(1)
+                val afterRelease = CountDownLatch(1)
+                val releaseAfter = CountDownLatch(1)
+                val releaseFirstRunStart = CountDownLatch(1)
+                val firstRunId = AtomicLong(0L)
+
+                try {
+                    LiteRtLM.runControlTestHooks =
+                        LiteRtLM.RunControlTestHooks(
+                            beforeTerminalRelease = { runId ->
+                                if (runId == firstRunId.get()) {
+                                    beforeRelease.countDown()
+                                    check(
+                                        releaseBefore.await(
+                                            GENERATION_TIMEOUT_MS,
+                                            TimeUnit.MILLISECONDS,
+                                        )
+                                    )
+                                }
+                            },
+                            afterTerminalReleaseBeforeCallbacks = { runId ->
+                                if (runId == firstRunId.get()) {
+                                    afterRelease.countDown()
+                                    check(
+                                        releaseAfter.await(
+                                            GENERATION_TIMEOUT_MS,
+                                            TimeUnit.MILLISECONDS,
+                                        )
+                                    )
+                                }
+                            },
+                        )
+
+                    val first =
+                        startObservedRun(
+                            prompt = "R1 terminal handoff: answer ONE briefly.",
+                            releaseRunStart = releaseFirstRunStart,
+                        )
+                    assertTrue(
+                        "R1 did not publish its run ID",
+                        first.started.await(GENERATION_TIMEOUT_MS, TimeUnit.MILLISECONDS),
+                    )
+                    firstRunId.set(first.runId.get())
+                    releaseFirstRunStart.countDown()
+                    assertTrue(
+                        "R1 did not pause before active release",
+                        beforeRelease.await(GENERATION_TIMEOUT_MS, TimeUnit.MILLISECONDS),
+                    )
+
+                    val rejected = startObservedRun("This run must be rejected while R1 is active.")
+                    assertTrue(
+                        "The pre-release attempt did not terminate",
+                        rejected.logicalDone.await(GENERATION_TIMEOUT_MS, TimeUnit.MILLISECONDS),
+                    )
+                    assertTrue(
+                        "The pre-release attempt did not clean up",
+                        rejected.nativeClean.await(GENERATION_TIMEOUT_MS, TimeUnit.MILLISECONDS),
+                    )
+                    assertEquals(
+                        "The pre-release attempt must not claim a run ID",
+                        1L,
+                        rejected.started.count,
+                    )
+                    assertTrue(
+                        "The pre-release attempt must report the active run",
+                        rejected.error.get()?.contains("already active") == true,
+                    )
+
+                    releaseBefore.countDown()
+                    assertTrue(
+                        "R1 did not pause after active release",
+                        afterRelease.await(GENERATION_TIMEOUT_MS, TimeUnit.MILLISECONDS),
+                    )
+
+                    val second = startObservedRun("R2 terminal handoff: answer TWO briefly.")
+                    assertTrue(
+                        "R2 did not claim the released run",
+                        second.started.await(GENERATION_TIMEOUT_MS, TimeUnit.MILLISECONDS),
+                    )
+                    assertTrue(
+                        "R2 must have a different run ID",
+                        second.runId.get() != firstRunId.get(),
+                    )
+
+                    releaseAfter.countDown()
+                    assertObservedRunCompleted("R1 terminal owner", first)
+                    assertObservedRunCompleted("R2 successor", second)
+                } finally {
+                    releaseBefore.countDown()
+                    releaseAfter.countDown()
+                    releaseFirstRunStart.countDown()
+                    LiteRtLM.runControlTestHooks = null
+                }
+            }
+        }
+
+    @Test
+    fun force_cleanup_joins_hard_close_flight_after_instance_removal() {
+        val releaseNativeClose = CompletableDeferred<Unit>()
+        val nativeCloseEntered = CompletableDeferred<Unit>()
+        val cleanupJoined = CompletableDeferred<Unit>()
+        val hardCloseClaimed = CountDownLatch(1)
+
+        try {
+            runBlocking {
+                withTimeout(GENERATION_TIMEOUT_MS) {
+                    LiteRtLM.nativeLifecycleTestHooks =
+                        LiteRtLM.NativeLifecycleTestHooks(
+                            beforeNativeClose = { label ->
+                                if (label == "hardClose-conversation") {
+                                    nativeCloseEntered.complete(Unit)
+                                    releaseNativeClose.await()
+                                }
+                            },
+                            onCleanupJoin = { _, _ ->
+                                cleanupJoined.complete(Unit)
+                            },
+                        )
+                    LiteRtLM.runControlTestHooks =
+                        LiteRtLM.RunControlTestHooks(
+                            armHardCloseOnRunStart = { true },
+                            awaitHardCloseAction = {},
+                            beforeTerminalClaim = {
+                                check(
+                                    hardCloseClaimed.await(
+                                        GENERATION_TIMEOUT_MS,
+                                        TimeUnit.MILLISECONDS,
+                                    )
+                                )
+                            },
+                            afterHardCloseTerminalClaim = {
+                                hardCloseClaimed.countDown()
+                            },
+                        )
+
+                    val run = startObservedRun(longPrompt())
+                    assertTrue(
+                        "Hard-close run did not publish its run ID",
+                        run.started.await(GENERATION_TIMEOUT_MS, TimeUnit.MILLISECONDS),
+                    )
+                    nativeCloseEntered.await()
+                    assertEquals(
+                        "Native cleanup hook must wait for terminal teardown",
+                        1L,
+                        run.nativeClean.count,
+                    )
+
+                    val cleanup =
+                        async {
+                            runCatching {
+                                SLM.forceCleanUpAndWait(model)
+                            }
+                        }
+                    cleanupJoined.await()
+                    assertFalse(
+                        "forceCleanUpAndWait must not report success while close is blocked",
+                        cleanup.isCompleted,
+                    )
+                    assertEquals(
+                        "Native cleanup hook must remain blocked with native close",
+                        1L,
+                        run.nativeClean.count,
+                    )
+
+                    releaseNativeClose.complete(Unit)
+                    val cleanupResult = cleanup.await()
+                    assertTrue(
+                        "forceCleanUpAndWait should succeed after confirmed close",
+                        cleanupResult.isSuccess,
+                    )
+                    assertTrue(
+                        "Hard-close native cleanup hook did not fire after teardown",
+                        run.nativeClean.await(NATIVE_CLEANUP_TIMEOUT_MS, TimeUnit.MILLISECONDS),
+                    )
+                }
+            }
+        } finally {
+            releaseNativeClose.complete(Unit)
+            hardCloseClaimed.countDown()
+            LiteRtLM.runControlTestHooks = null
+            LiteRtLM.nativeLifecycleTestHooks = null
+            initializeModelBlocking(model)
+        }
+    }
+
+    @Test
+    fun warm_initialize_revalidates_active_before_teardown() =
+        runBlocking {
+            withTimeout(GENERATION_TIMEOUT_MS) {
+                val planPaused = CompletableDeferred<Unit>()
+                val releasePlan = CompletableDeferred<Unit>()
+                val sessionLockAcquired = CompletableDeferred<Unit>()
+                val releaseRunStart = CountDownLatch(1)
+                val terminalPaused = CountDownLatch(1)
+                val releaseTerminal = CountDownLatch(1)
+                val secondRunId = AtomicLong(0L)
+                val warmModel =
+                    Model(
+                        name = model.name,
+                        taskPath = model.taskPath,
+                        config =
+                            mapOf(
+                                ConfigKey.ACCELERATOR to
+                                        model.getStringConfigValue(
+                                            ConfigKey.ACCELERATOR,
+                                            Accelerator.CPU.label,
+                                        ),
+                                ConfigKey.MAX_TOKENS to TEST_MAX_TOKENS,
+                                ConfigKey.TOP_K to 2,
+                                ConfigKey.TOP_P to 0.0f,
+                                ConfigKey.TEMPERATURE to 0.0f,
+                            ),
+                    )
+
+                try {
+                    LiteRtLM.initializationTestHooks =
+                        LiteRtLM.InitializationTestHooks(
+                            beforeWarmTeardownPlan = {
+                                planPaused.complete(Unit)
+                                releasePlan.await()
+                            },
+                            onWarmTeardownSessionLockAcquired = {
+                                sessionLockAcquired.complete(Unit)
+                            },
+                        )
+                    LiteRtLM.runControlTestHooks =
+                        LiteRtLM.RunControlTestHooks(
+                            beforeTerminalClaim = { runId ->
+                                if (runId == secondRunId.get()) {
+                                    terminalPaused.countDown()
+                                    check(
+                                        releaseTerminal.await(
+                                            GENERATION_TIMEOUT_MS,
+                                            TimeUnit.MILLISECONDS,
+                                        )
+                                    )
+                                }
+                            },
+                        )
+
+                    val initializeResult =
+                        async {
+                            runCatching {
+                                SLM.initializeIfNeeded(
+                                    context = appCtx,
+                                    model = warmModel,
+                                    supportImage = false,
+                                    supportAudio = false,
+                                )
+                            }
+                        }
+                    planPaused.await()
+
+                    val activeRun =
+                        startObservedRun(
+                            prompt = "R2 active revalidation: answer TWO briefly.",
+                            releaseRunStart = releaseRunStart,
+                        )
+                    assertTrue(
+                        "R2 did not claim active ownership",
+                        activeRun.started.await(GENERATION_TIMEOUT_MS, TimeUnit.MILLISECONDS),
+                    )
+                    secondRunId.set(activeRun.runId.get())
+
+                    releasePlan.complete(Unit)
+                    releaseRunStart.countDown()
+                    sessionLockAcquired.await()
+
+                    val initFailure = initializeResult.await().exceptionOrNull()
+                    assertTrue(
+                        "Warm initialize must fail after inference wins the active race",
+                        initFailure?.message?.contains("active native stream") == true,
+                    )
+
+                    releaseTerminal.countDown()
+                    assertObservedRunCompleted("R2 active owner", activeRun)
+                } finally {
+                    releasePlan.complete(Unit)
+                    releaseRunStart.countDown()
+                    releaseTerminal.countDown()
+                    LiteRtLM.initializationTestHooks = null
                     LiteRtLM.runControlTestHooks = null
                 }
             }

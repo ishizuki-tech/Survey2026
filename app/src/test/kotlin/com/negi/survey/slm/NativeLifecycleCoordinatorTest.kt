@@ -1,5 +1,9 @@
 package com.negi.survey.slm
 
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -9,6 +13,7 @@ import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.util.Collections
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -209,6 +214,372 @@ class NativeLifecycleCoordinatorTest {
                 NativeLifecycleCoordinator.EngineLeaseResult.Acquired
         )
     }
+
+    @Test
+    fun pre_constructor_failure_releases_exact_lease_and_rethrows_error() {
+        val coordinator = NativeLifecycleCoordinator()
+        val acquired = coordinator.acquireEngineCreationLease(Any())
+        val lease =
+            (acquired as NativeLifecycleCoordinator.EngineLeaseResult.Acquired).lease
+        val fatal = AssertionError("pre-constructor failure")
+
+        val thrown =
+            runCatching {
+                assertTrue(coordinator.failEngineCreationBeforeNativeState(lease))
+                throw fatal
+            }.exceptionOrNull()
+
+        assertSame(fatal, thrown)
+        assertEquals(NativeLifecycleCoordinator.Status.HEALTHY, coordinator.snapshot().status)
+        assertFalse(coordinator.snapshot().hasEngineCreationLease)
+        assertNull(coordinator.snapshot().teardownFlight)
+    }
+
+    @Test
+    fun exact_engine_creation_lease_can_poison_runtime() {
+        val coordinator = NativeLifecycleCoordinator()
+        val acquired = coordinator.acquireEngineCreationLease(Any())
+        val lease =
+            (acquired as NativeLifecycleCoordinator.EngineLeaseResult.Acquired).lease
+        val failure = AssertionError("constructor failed")
+
+        val poison = coordinator.poisonEngineCreationLease(lease, failure)
+
+        assertNotNull(poison)
+        assertSame(failure, poison?.cause)
+        assertEquals(
+            NativeLifecycleCoordinator.Status.POISONED,
+            coordinator.snapshot().status,
+        )
+        assertFalse(coordinator.snapshot().hasEngineCreationLease)
+        assertNull(coordinator.snapshot().teardownFlight)
+    }
+
+    @Test
+    fun unrelated_engine_creation_lease_cannot_poison_runtime() {
+        val coordinator = NativeLifecycleCoordinator()
+        val acquired = coordinator.acquireEngineCreationLease(Any())
+        val ownerLease =
+            (acquired as NativeLifecycleCoordinator.EngineLeaseResult.Acquired).lease
+        val unrelatedLease = NativeLifecycleCoordinator.EngineCreationLease(Any())
+
+        assertNull(
+            coordinator.poisonEngineCreationLease(
+                unrelatedLease,
+                AssertionError("unrelated"),
+            )
+        )
+        assertEquals(NativeLifecycleCoordinator.Status.HEALTHY, coordinator.snapshot().status)
+        assertTrue(coordinator.snapshot().hasEngineCreationLease)
+        assertSame(
+            ownerLease,
+            (coordinator.acquireEngineCreationLease(ownerLease.initializationIdentity) as
+                NativeLifecycleCoordinator.EngineLeaseResult.Existing).lease,
+        )
+    }
+
+    @Test
+    fun stale_engine_creation_lease_cannot_poison_newer_lease() {
+        val coordinator = NativeLifecycleCoordinator()
+        val first = coordinator.acquireEngineCreationLease(Any())
+        val staleLease =
+            (first as NativeLifecycleCoordinator.EngineLeaseResult.Acquired).lease
+        assertTrue(coordinator.failEngineCreationBeforeNativeState(staleLease))
+
+        val second = coordinator.acquireEngineCreationLease(Any())
+        val currentLease =
+            (second as NativeLifecycleCoordinator.EngineLeaseResult.Acquired).lease
+
+        assertNull(
+            coordinator.poisonEngineCreationLease(
+                staleLease,
+                AssertionError("stale"),
+            )
+        )
+        assertEquals(NativeLifecycleCoordinator.Status.HEALTHY, coordinator.snapshot().status)
+        assertTrue(coordinator.snapshot().hasEngineCreationLease)
+        assertSame(
+            currentLease,
+            (coordinator.acquireEngineCreationLease(currentLease.initializationIdentity) as
+                NativeLifecycleCoordinator.EngineLeaseResult.Existing).lease,
+        )
+    }
+
+    @Test
+    fun poisoned_engine_creation_lease_rejects_future_creation() {
+        val coordinator = NativeLifecycleCoordinator()
+        val acquired = coordinator.acquireEngineCreationLease(Any())
+        val lease =
+            (acquired as NativeLifecycleCoordinator.EngineLeaseResult.Acquired).lease
+
+        val poison =
+            coordinator.poisonEngineCreationLease(
+                lease,
+                AssertionError("constructor failed"),
+            )
+        val next = coordinator.acquireEngineCreationLease(Any())
+
+        assertNotNull(poison)
+        assertTrue(next is NativeLifecycleCoordinator.EngineLeaseResult.Rejected)
+        next as NativeLifecycleCoordinator.EngineLeaseResult.Rejected
+        assertEquals(
+            NativeLifecycleCoordinator.EngineLeaseRejection.POISONED,
+            next.reason,
+        )
+        assertSame(poison, next.poisonError)
+    }
+
+    @Test
+    fun cpu_constructor_without_reference_poisons_same_fallback_flight() =
+        runBlocking {
+            val coordinator = NativeLifecycleCoordinator()
+            val acquired = coordinator.acquireEngineCreationLease(Any())
+            val lease =
+                (acquired as NativeLifecycleCoordinator.EngineLeaseResult.Acquired).lease
+            val gpuIdentity = Any()
+            val conversion =
+                coordinator.convertFailedEngineLeaseToTeardown(
+                    lease = lease,
+                    metadata = metadata(closeIdentities = listOf(gpuIdentity)),
+                )
+            val flight =
+                (conversion as NativeLifecycleCoordinator.TeardownStartResult.Started).flight
+
+            assertTrue(coordinator.confirmClose(flight, gpuIdentity))
+            assertNotNull(coordinator.authorizeReplacement(flight))
+
+            val constructorFailure = AssertionError("CPU constructor failed")
+            val signal = coordinator.poisonFlight(flight, constructorFailure)
+            assertNotNull(signal)
+            assertTrue(signal!!.notifyWaiters())
+
+            val outcome = flight.completion.await()
+            assertTrue(outcome is NativeLifecycleCoordinator.TeardownOutcome.Poisoned)
+            outcome as NativeLifecycleCoordinator.TeardownOutcome.Poisoned
+            assertSame(constructorFailure, outcome.error.cause)
+            assertSame(flight, conversion.flight)
+            assertNull(
+                coordinator.completeFailedEngineTeardownWithoutReplacement(flight)
+            )
+            assertEquals(
+                NativeLifecycleCoordinator.Status.POISONED,
+                coordinator.snapshot().status,
+            )
+        }
+
+    @Test
+    fun fatal_after_successful_publication_does_not_retire_runtime() {
+        val coordinator = NativeLifecycleCoordinator()
+        val acquired = coordinator.acquireEngineCreationLease(Any())
+        val lease =
+            (acquired as NativeLifecycleCoordinator.EngineLeaseResult.Acquired).lease
+        val engineCloseCount = AtomicInteger(0)
+        val conversationCloseCount = AtomicInteger(0)
+        val poisonCount = AtomicInteger(0)
+        var publicationCommitted = false
+
+        val published =
+            coordinator.completeEnginePublication(
+                lease = lease,
+                onCommitted = {
+                    assertEquals(
+                        NativeLifecycleCoordinator.Status.HEALTHY,
+                        coordinator.snapshot().status,
+                    )
+                    publicationCommitted = true
+                },
+                publish = {},
+            )
+        assertTrue(published)
+
+        val fatal = AssertionError("post-publication failure")
+        val thrown =
+            runCatching {
+                if (!publicationCommitted) {
+                    engineCloseCount.incrementAndGet()
+                    conversationCloseCount.incrementAndGet()
+                    poisonCount.incrementAndGet()
+                }
+                throw fatal
+            }.exceptionOrNull()
+
+        assertSame(fatal, thrown)
+        assertTrue(publicationCommitted)
+        assertEquals(0, engineCloseCount.get())
+        assertEquals(0, conversationCloseCount.get())
+        assertEquals(0, poisonCount.get())
+        assertEquals(NativeLifecycleCoordinator.Status.HEALTHY, coordinator.snapshot().status)
+        assertFalse(coordinator.snapshot().hasEngineCreationLease)
+    }
+
+    @Test
+    fun gpu_timeout_does_not_schedule_second_engine_close() {
+        val tracker = ExactNativeCloseTracker()
+        val gpuIdentity = Any()
+        val cpuIdentity = Any()
+        val gpuCloseCount = AtomicInteger(0)
+        val cpuCloseCount = AtomicInteger(0)
+
+        gpuCloseCount.incrementAndGet()
+        assertTrue(tracker.mark(gpuIdentity))
+
+        /* Timeout leaves the first exact close attempt unresolved and owned. */
+        if (!tracker.contains(gpuIdentity)) {
+            gpuCloseCount.incrementAndGet()
+            tracker.mark(gpuIdentity)
+        }
+        assertEquals(1, gpuCloseCount.get())
+        assertFalse(tracker.mark(gpuIdentity))
+
+        if (!tracker.contains(cpuIdentity)) {
+            cpuCloseCount.incrementAndGet()
+            assertTrue(tracker.mark(cpuIdentity))
+        }
+        assertEquals(1, cpuCloseCount.get())
+    }
+
+    @Test
+    fun earliest_throwable_after_lease_publication_can_finalize_exact_lease() {
+        val coordinator = NativeLifecycleCoordinator()
+        var ownedLease: NativeLifecycleCoordinator.EngineCreationLease? = null
+
+        val result =
+            coordinator.acquireEngineCreationLease(
+                initializationIdentity = Any(),
+                onLeasePublished = { lease ->
+                    ownedLease = lease
+                },
+            )
+        val acquired =
+            (result as NativeLifecycleCoordinator.EngineLeaseResult.Acquired).lease
+
+        assertSame(acquired, ownedLease)
+
+        val fatal = AssertionError("earliest post-acquisition failure")
+        val thrown = runCatching { throw fatal }.exceptionOrNull()
+        val exactLease = checkNotNull(ownedLease)
+        assertTrue(coordinator.failEngineCreationBeforeNativeState(exactLease))
+        ownedLease = null
+
+        assertSame(fatal, thrown)
+        assertNull(ownedLease)
+        assertEquals(NativeLifecycleCoordinator.Status.HEALTHY, coordinator.snapshot().status)
+        assertFalse(coordinator.snapshot().hasEngineCreationLease)
+    }
+
+    @Test
+    fun earliest_throwable_after_teardown_start_can_terminalize_exact_flight() =
+        runBlocking {
+            val coordinator = NativeLifecycleCoordinator()
+            val closeIdentity = Any()
+            var ownedFlight: NativeLifecycleCoordinator.TeardownFlight? = null
+
+            val result =
+                coordinator.startTeardown(
+                    mode = NativeLifecycleCoordinator.TeardownMode.FULL_TEARDOWN,
+                    metadata = metadata(closeIdentities = listOf(closeIdentity)),
+                    onStarted = { flight ->
+                        ownedFlight = flight
+                    },
+                )
+            val started =
+                (result as NativeLifecycleCoordinator.TeardownStartResult.Started).flight
+
+            assertSame(started, ownedFlight)
+
+            val registry =
+                ConcurrentHashMap<NativeLifecycleCoordinator.TeardownFlight, Job>()
+            val fatal = AssertionError("owner registration failed")
+            val thrown =
+                runCatching {
+                    establishExactTeardownOwner(
+                        flight = started,
+                        registry = registry,
+                        createLazyOwner = { throw fatal },
+                        onRegistered = { ownedFlight = null },
+                    )
+                }.exceptionOrNull()
+
+            assertSame(started, ownedFlight)
+            val exactFlight = checkNotNull(ownedFlight)
+            val signal = coordinator.poisonFlight(exactFlight, thrown)
+            ownedFlight = null
+
+            assertNotNull(signal)
+            assertTrue(signal!!.notifyWaiters())
+            assertSame(fatal, thrown)
+            assertNull(ownedFlight)
+            assertTrue(
+                started.completion.await() is
+                    NativeLifecycleCoordinator.TeardownOutcome.Poisoned
+            )
+            assertEquals(NativeLifecycleCoordinator.Status.POISONED, coordinator.snapshot().status)
+        }
+
+    @Test
+    fun registered_process_owner_relinquishes_local_flight_without_duplicate_close() =
+        runBlocking {
+            val coordinator = NativeLifecycleCoordinator()
+            val closeIdentity = Any()
+            var ownedFlight: NativeLifecycleCoordinator.TeardownFlight? = null
+            val result =
+                coordinator.startTeardown(
+                    mode = NativeLifecycleCoordinator.TeardownMode.FULL_TEARDOWN,
+                    metadata = metadata(closeIdentities = listOf(closeIdentity)),
+                    onStarted = { flight ->
+                        ownedFlight = flight
+                    },
+                )
+            val flight =
+                (result as NativeLifecycleCoordinator.TeardownStartResult.Started).flight
+            val registry =
+                ConcurrentHashMap<NativeLifecycleCoordinator.TeardownFlight, Job>()
+            val allowClose = CompletableDeferred<Unit>()
+            val closeCount = AtomicInteger(0)
+            var ownerRegistered = false
+
+            establishExactTeardownOwner(
+                flight = flight,
+                registry = registry,
+                createLazyOwner = {
+                    launch(start = CoroutineStart.LAZY) {
+                        allowClose.await()
+                        closeCount.incrementAndGet()
+                        assertTrue(coordinator.confirmClose(flight, closeIdentity))
+                        val signal = coordinator.completeFullTeardown(flight)
+                        assertNotNull(signal)
+                        assertTrue(signal!!.notifyWaiters())
+                    }
+                },
+                onRegistered = {
+                    ownerRegistered = true
+                    if (ownedFlight === flight) {
+                        ownedFlight = null
+                    }
+                },
+            )
+
+            assertTrue(ownerRegistered)
+            assertNull(ownedFlight)
+            assertSame(flight, coordinator.snapshot().teardownFlight)
+            assertEquals(0, closeCount.get())
+
+            val fatal = AssertionError("post-owner-registration failure")
+            val thrown = runCatching { throw fatal }.exceptionOrNull()
+            ownedFlight?.let { staleLocal ->
+                coordinator.poisonFlight(staleLocal, thrown)?.notifyWaiters()
+            }
+
+            assertSame(fatal, thrown)
+            assertEquals(NativeLifecycleCoordinator.Status.TEARDOWN_IN_PROGRESS, coordinator.snapshot().status)
+            allowClose.complete(Unit)
+            assertEquals(
+                NativeLifecycleCoordinator.TeardownOutcome.FullTeardownCompleted,
+                flight.completion.await(),
+            )
+            assertEquals(1, closeCount.get())
+            assertEquals(NativeLifecycleCoordinator.Status.HEALTHY, coordinator.snapshot().status)
+        }
 
     @Test
     fun failed_engine_lease_converts_directly_to_teardown() {
