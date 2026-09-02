@@ -29,8 +29,7 @@
  *
  *  Notes:
  *  ---------------------------------------------------------------------
- *   • Validation assumes a single-successor graph using nextId.
- *     If you later introduce branching (per-option next ids), update validation.
+ *   • Validation follows nextId and optional SINGLE_CHOICE answer routes.
  * =====================================================================
  */
 
@@ -483,6 +482,13 @@ data class SurveyConfig(
         val ids = rawIds.map { it.trim() }
         val idSet = ids.filter { it.isNotBlank() }.toSet()
 
+        fun NodeDTO.outgoingIds(): List<String> = buildList {
+            nextId?.trim()?.takeIf { it.isNotBlank() }?.let(::add)
+            nextIdByAnswer.values.forEach { destination ->
+                destination.trim().takeIf { it.isNotBlank() }?.let(::add)
+            }
+        }
+
         val blankIds = rawIds.filter { it.isBlank() }.distinct()
         if (blankIds.isNotEmpty()) {
             issues += "graph.nodes contains blank id entries"
@@ -759,6 +765,29 @@ data class SurveyConfig(
                         issues += "node '${node.id}' references unknown nextId='$next'"
                     }
                 }
+
+            if (node.nextIdByAnswer.isNotEmpty() && node.nodeType() != NodeType.SINGLE_CHOICE) {
+                issues += "node '${node.id}' defines nextIdByAnswer but is not SINGLE_CHOICE"
+            }
+
+            node.nextIdByAnswer.forEach { (answer, destination) ->
+                when {
+                    answer.isBlank() ->
+                        issues += "node '${node.id}' nextIdByAnswer contains a blank answer key"
+
+                    answer !in node.options ->
+                        issues += "node '${node.id}' nextIdByAnswer key '$answer' does not exactly match an option"
+                }
+
+                val target = destination.trim()
+                when {
+                    target.isBlank() ->
+                        issues += "node '${node.id}' nextIdByAnswer for '$answer' has a blank destination"
+
+                    target !in idSet ->
+                        issues += "node '${node.id}' nextIdByAnswer for '$answer' references unknown destination '$target'"
+                }
+            }
         }
 
         graph.nodes
@@ -831,8 +860,9 @@ data class SurveyConfig(
                 val cur = queue.removeFirst()
                 if (!visited.add(cur)) continue
                 val node = nodeById[cur] ?: continue
-                val next = node.nextId?.trim()?.takeIf { it.isNotBlank() }
-                if (next != null && next in idSet) queue.add(next)
+                node.outgoingIds()
+                    .filter { it in idSet }
+                    .forEach(queue::add)
             }
 
             val unreachable = idSet - visited
@@ -848,19 +878,27 @@ data class SurveyConfig(
             }
 
             run {
-                val seen = HashSet<String>()
-                var cur: String? = startIdNorm
-                var cycle = false
-                while (cur != null && cur in idSet) {
-                    if (!seen.add(cur)) {
-                        cycle = true
-                        break
-                    }
-                    val n = nodeById[cur]
-                    cur = n?.nextId?.trim()?.takeIf { it.isNotBlank() }
+                val visiting = HashSet<String>()
+                val visitedForCycles = HashSet<String>()
+
+                fun hasCycle(nodeId: String): Boolean {
+                    if (nodeId in visiting) return true
+                    if (nodeId in visitedForCycles) return false
+
+                    visiting += nodeId
+                    val cycleFound = nodeById[nodeId]
+                        ?.outgoingIds()
+                        .orEmpty()
+                        .asSequence()
+                        .filter { it in idSet }
+                        .any(::hasCycle)
+                    visiting -= nodeId
+                    visitedForCycles += nodeId
+                    return cycleFound
                 }
-                if (cycle) {
-                    issues += "cycle detected in nextId chain starting from startId='$startIdNorm'"
+
+                if (hasCycle(startIdNorm)) {
+                    issues += "cycle detected in survey graph starting from startId='$startIdNorm'"
                 }
             }
         }
@@ -926,7 +964,8 @@ data class NodeDTO(
     val title: String = "",
     val question: String = "",
     val options: List<String> = emptyList(),
-    val nextId: String? = null
+    val nextId: String? = null,
+    val nextIdByAnswer: Map<String, String> = emptyMap()
 ) {
     fun nodeType(): NodeType = NodeType.from(type)
 }

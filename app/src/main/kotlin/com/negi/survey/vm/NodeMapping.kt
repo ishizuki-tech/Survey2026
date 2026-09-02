@@ -24,6 +24,7 @@ import java.util.Locale
  * Normalization:
  * - `id` is trimmed to prevent hidden-whitespace key mismatches.
  * - `nextId` is trimmed and blank is converted to null.
+ * - `nextIdByAnswer` keys remain exact; destination IDs are trimmed.
  * - `title` / `question` are trimmed (safe for accidental leading/trailing whitespace).
  *
  * Type mapping:
@@ -35,6 +36,7 @@ fun NodeDTO.toVmNode(): Node {
 
     val safeId = id.trim()
     val safeNextId = nextId?.trim()?.takeIf { it.isNotBlank() }
+    val safeNextIdByAnswer = nextIdByAnswer.mapValues { (_, destination) -> destination.trim() }
 
     val safeOptions: List<String> = options
         .asSequence()
@@ -48,7 +50,8 @@ fun NodeDTO.toVmNode(): Node {
         title = title.orEmpty().trim(),
         question = question.orEmpty().trim(),
         options = safeOptions,
-        nextId = safeNextId
+        nextId = safeNextId,
+        nextIdByAnswer = safeNextIdByAnswer
     )
 }
 

@@ -8,45 +8,127 @@ graph:
       nextId: Q1
 
     - id: Q1
-      type: AI
-      title: FAW Yield Loss (3 Seasons)
-      question: >-
-        How much yield do you lose because of fall armyworm? Please think back over the last 3 seasons. (Percent or bags per acre are fine.)
+      type: TEXT
+      title: Sub-County
+      question: Which sub-county do you live in?
       nextId: Q2
 
     - id: Q2
-      type: AI
-      title: Trade-off for 10-Day Earlier Harvest
-      question: >-
-        If you could harvest 10 days earlier, how much yield would you be willing to give up? (Percent or bags per acre.)
+      type: TEXT
+      title: Ward
+      question: Which ward do you live in?
       nextId: Q3
 
     - id: Q3
-      type: AI
-      title: Damage Threshold to Switch Variety
-      question: >-
-        What level of pest or disease damage would make you stop using your current maize variety and switch to a new variety? (Give a clear threshold, e.g., % plants/ears damaged or severity.)
+      type: SINGLE_CHOICE
+      title: Respondent Gender
+      question: Respondent Gender
+      options:
+        - Male
+        - Female
       nextId: Q4
 
     - id: Q4
-      type: AI
-      title: Expectations for Replacement Variety
-      question: >-
-        What would you expect from a new maize variety to replace the one you currently grow? Please be as detailed as possible (e.g., DTM, FAW tolerance, drought stage tolerance, typical yield).
+      type: SINGLE_CHOICE
+      title: Respondent Age
+      question: What is your age?
+      options:
+        - Under 35/Chini ya 35
+        - 35-50
+        - Over 50/Zaidi ya 50
       nextId: Q5
 
     - id: Q5
-      type: AI
-      title: Minimum Acceptable Harvest in Bad Year
-      question: >-
-        In a bad year, what is the smallest harvest you would accept and still plant this maize again next season? (Percent of usual harvest or bags per acre.)
+      type: TEXT
+      title: Crops Grown
+      question: Which crops do you grow?
       nextId: Q6
 
     - id: Q6
+      type: TEXT
+      title: Animals Kept
+      question: Which animals do you keep?
+      nextId: Q7
+
+    - id: Q7
+      type: SINGLE_CHOICE
+      title: Years Growing White Maize
+      question: How many years have you been growing white maize?
+      options:
+        - More than 2 years
+        - Less than 2 years
+      nextId: Q8
+      nextIdByAnswer:
+        "Less than 2 years": Done
+
+    - id: Q8
       type: AI
-      title: Most Damaging Drought Timing
+      title: FAW Impact on Maize
       question: >-
-        When in the season is drought most devastating for your crop? What is the most difficult drought moment? (e.g., pre-tassel, tasseling/silking, grain fill, pre-harvest.)
+        Has fall armyworm ever affected your maize? If yes, how did it affect your crop?
+      nextId: Q9
+
+    - id: Q9
+      type: AI
+      title: Yield Trade-off for 20-Day Earlier Harvest
+      question: >-
+        If harvesting your maize 20 days earlier reduced your yield, how much yield would you be willing to lose to harvest 20 days earlier?
+      nextId: Q10
+
+    - id: Q10
+      type: AI
+      title: Damage Threshold to Switch Variety
+      question: >-
+        How much pest or disease damage would make you switch to a different maize variety?
+      nextId: Q11
+
+    - id: Q11
+      type: AI
+      title: Traits Needed in Replacement Variety
+      question: >-
+        What traits would a new maize variety need to have for you to plant it instead of your current one?
+      nextId: Q12
+
+    - id: Q12
+      type: AI
+      title: Minimum Acceptable Harvest in Bad Season
+      question: >-
+        In a bad season, what is the lowest maize yield that would still make you continue planting your current maize variety?
+      nextId: Q13
+
+    - id: Q13
+      type: AI
+      title: Growth Stage Most Vulnerable to Drought
+      question: >-
+        During which stage of maize growth does drought cause the greatest losses or damage?
+      nextId: Q14
+
+    - id: Q14
+      type: AI
+      title: "Maize Allocation: Food, Feed, Sale"
+      question: >-
+        How do you decide how much maize to use for household food, livestock feed, sale, or other purposes?
+      nextId: Q15
+
+    - id: Q15
+      type: AI
+      title: White Maize for Livestock Feed
+      question: >-
+        If you use white maize to feed livestock, which animals receive it and how often?
+      nextId: Q16
+
+    - id: Q16
+      type: AI
+      title: Maize Seed Sourcing
+      question: >-
+        Where do you usually obtain the white maize seed that you plant, and why do you prefer getting it there?
+      nextId: Q17
+
+    - id: Q17
+      type: AI
+      title: Maize Selling Market
+      question: >-
+        Where do you usually sell your maize after harvest, and why do you choose that market or buyer?
       nextId: Review
 
     - id: Review
@@ -89,39 +171,63 @@ slm:
   strict_output: ""
 
 prompts:
-  - nodeId: Q1
+  - nodeId: Q8
     prompt: |-
-      Expected answer target: average FAW yield loss over the last 3 seasons (% or bags/acre).
+      Expected answer target: Whether FAW affected the crop, and if so, a description of the effect (yield loss, damage type, etc.).
       Question: {{QUESTION}}
       Answer: {{ANSWER}}
 
-  - nodeId: Q2
+  - nodeId: Q9
     prompt: |-
-      Expected answer target: maximum yield loss acceptable for harvesting 10 days earlier (% or bags/acre).
+      Expected answer target: Maximum yield loss acceptable for harvesting 20 days earlier (% or bags/acre).
       Question: {{QUESTION}}
       Answer: {{ANSWER}}
 
-  - nodeId: Q3
+  - nodeId: Q10
     prompt: |-
-      Expected answer target: a clear variety-switching damage threshold with metric, level, and stage.
+      Expected answer target: A clear pest/disease damage threshold that would trigger switching maize varieties.
       Question: {{QUESTION}}
       Answer: {{ANSWER}}
 
-  - nodeId: Q4
+  - nodeId: Q11
     prompt: |-
-      Expected answer target: replacement-variety priorities with at least one measurable target (DTM, FAW, drought stage, or yield).
+      Expected answer target: Priority traits a new maize variety must have to replace the current one, ideally with a measurable target.
       Question: {{QUESTION}}
       Answer: {{ANSWER}}
 
-  - nodeId: Q5
+  - nodeId: Q12
     prompt: |-
-      Expected answer target: minimum acceptable bad-year harvest, with baseline (% or bags/acre).
+      Expected answer target: The lowest yield in a bad season that would still lead to continued planting of the current variety (% or bags/acre).
       Question: {{QUESTION}}
       Answer: {{ANSWER}}
 
-  - nodeId: Q6
+  - nodeId: Q13
     prompt: |-
-      Expected answer target: the most damaging drought crop stage plus a brief reason.
+      Expected answer target: The maize growth stage where drought causes the greatest loss or damage.
+      Question: {{QUESTION}}
+      Answer: {{ANSWER}}
+
+  - nodeId: Q14
+    prompt: |-
+      Expected answer target: The factors/criteria used to decide how maize is allocated across food, livestock feed, sale, and other uses.
+      Question: {{QUESTION}}
+      Answer: {{ANSWER}}
+
+  - nodeId: Q15
+    prompt: |-
+      Expected answer target: Which animals are fed white maize and how often.
+      Question: {{QUESTION}}
+      Answer: {{ANSWER}}
+
+  - nodeId: Q16
+    prompt: |-
+      Expected answer target: Where seed is usually obtained and the reason for preferring that source.
+      Question: {{QUESTION}}
+      Answer: {{ANSWER}}
+
+  - nodeId: Q17
+    prompt: |-
+      Expected answer target: Where maize is usually sold after harvest and the reason for choosing that market/buyer.
       Question: {{QUESTION}}
       Answer: {{ANSWER}}
 

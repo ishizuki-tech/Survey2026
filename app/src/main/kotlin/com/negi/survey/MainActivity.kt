@@ -1194,9 +1194,12 @@ fun SurveyNavHost(
 
                 entry<FlowText> {
                     val node by vmSurvey.currentNode.collectAsStateWithLifecycle()
+                    val answers by vmSurvey.answers.collectAsStateWithLifecycle()
                     TextNodeScreen(
                         title = node.title,
                         question = node.question,
+                        value = answers[node.id].orEmpty(),
+                        onValueChange = { vmSurvey.setAnswer(it, node.id) },
                         onNext = { vmSurvey.advanceToNext() },
                         onBack = { vmSurvey.backToPrevious() }
                     )
@@ -1353,9 +1356,11 @@ private fun buildGitHubConfigOrNull(): GitHubUploader.GitHubConfig? {
 /* ───────────────────────────── Minimal Node Screens ───────────────────────────── */
 
 @Composable
-private fun TextNodeScreen(
+internal fun TextNodeScreen(
     title: String,
     question: String,
+    value: String,
+    onValueChange: (String) -> Unit,
     onNext: () -> Unit,
     onBack: () -> Unit
 ) {
@@ -1393,6 +1398,13 @@ private fun TextNodeScreen(
                 Text(
                     text = question.ifBlank { "(no question text)" },
                     style = MaterialTheme.typography.bodyLarge
+                )
+
+                OutlinedTextField(
+                    value = value,
+                    onValueChange = onValueChange,
+                    modifier = Modifier.fillMaxWidth(),
+                    minLines = 3
                 )
 
                 Spacer(Modifier.height(10.dp))

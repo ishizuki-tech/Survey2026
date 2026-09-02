@@ -61,8 +61,16 @@ data class Node(
     val title: String = "",
     val question: String = "",
     val options: List<String> = emptyList(),
-    val nextId: String? = null
+    val nextId: String? = null,
+    val nextIdByAnswer: Map<String, String> = emptyMap()
 )
+
+internal fun Node.resolveNextId(answer: String?): String? =
+    if (type == NodeType.SINGLE_CHOICE && answer != null) {
+        nextIdByAnswer[answer] ?: nextId
+    } else {
+        nextId
+    }
 
 /* ───────────────────────────── Nav Keys ───────────────────────────── */
 
@@ -852,7 +860,7 @@ open class SurveyViewModel(
     @Synchronized
     fun advanceToNext() {
         val cur = _currentNode.value
-        val nextId = cur.nextId?.trim().orEmpty()
+        val nextId = cur.resolveNextId(getAnswer(cur.id)).orEmpty().trim()
         if (nextId.isBlank()) {
             RuntimeLogStore.d(TAG, "advanceToNext: no nextId from ${cur.id}")
             return
@@ -929,7 +937,8 @@ open class SurveyViewModel(
             title = this.title,
             question = this.question,
             options = this.options,
-            nextId = this.nextId?.trim()
+            nextId = this.nextId?.trim(),
+            nextIdByAnswer = this.nextIdByAnswer.mapValues { (_, destination) -> destination.trim() }
         )
     }
 
@@ -982,7 +991,10 @@ open class SurveyViewModel(
         }
 
         val missingNext = dtos.asSequence()
-            .mapNotNull { it.nextId?.trim() }
+            .flatMap { dto ->
+                (listOfNotNull(dto.nextId) + dto.nextIdByAnswer.values).asSequence()
+            }
+            .map(String::trim)
             .filter { it.isNotBlank() }
             .filter { !idSet.contains(it) }
             .distinct()
