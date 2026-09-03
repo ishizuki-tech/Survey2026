@@ -430,6 +430,16 @@ private fun IntroCardMono(
                 isRestarting = isRestarting,
                 onRestart = onRestart
             )
+
+            Spacer(Modifier.padding(top = 12.dp))
+
+            /** Always-visible build stamp for support/debugging. */
+            Text(
+                text = "Build: ${BuildConfig.BUILD_TIMESTAMP}",
+                style = MaterialTheme.typography.labelSmall.copy(letterSpacing = 0.2.sp),
+                color = textMuted,
+                modifier = Modifier.testTag("BuildTimestamp")
+            )
         }
     }
 }
