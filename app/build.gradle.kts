@@ -2,6 +2,8 @@
 import com.android.build.api.dsl.ApplicationExtension
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.time.OffsetDateTime
+import java.time.format.DateTimeFormatter
 import java.util.Properties
 import org.gradle.api.GradleException
 import org.gradle.api.tasks.Exec
@@ -140,6 +142,11 @@ fun resolveVersionCode(): Int {
 
     return fromGradle ?: fromEnv ?: fromRunNumber ?: 1
 }
+
+/** Human-readable build timestamp, captured once when Gradle configures this build. */
+fun buildTimestampNow(): String =
+    OffsetDateTime.now()
+        .format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm xxx"))
 
 /* ============================================================================
  * Setup tasks
@@ -547,6 +554,12 @@ extensions.configure<ApplicationExtension> {
             ),
         )
 
+        buildConfigField(
+            "String",
+            "BUILD_TIMESTAMP",
+            quote(buildTimestampNow()),
+        )
+
         testInstrumentationRunner =
             "androidx.test.runner.AndroidJUnitRunner"
 
@@ -865,18 +878,19 @@ dependencies {
         libs.androidx.documentfile
     )
 
+    // JVM tests.
     testImplementation(libs.junit)
     testImplementation(libs.mockk)
     testImplementation(libs.kotlinx.coroutines.test)
     testImplementation(kotlin("test"))
 
+    // Android instrumentation tests.
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
     androidTestImplementation(libs.androidx.ui.test.junit4)
     androidTestImplementation(libs.androidx.work.testing)
     androidTestImplementation(libs.mockk.android)
     androidTestImplementation(libs.kotlinx.coroutines.test)
-    androidTestImplementation(libs.mockito.android)
     androidTestImplementation(libs.androidx.test.runner)
 
     androidTestUtil(
