@@ -42,6 +42,28 @@ class SurveyConfigConditionalNavigationTest {
     }
 
     @Test
+    fun shipped_repair_metadata_does_not_create_two_step_prompt_pairs() {
+        val workingDirectory = File(checkNotNull(System.getProperty("user.dir")))
+        val assetDirectory = listOf(
+            File(workingDirectory, "app/src/main/assets"),
+            File(workingDirectory, "src/main/assets")
+        ).firstOrNull(File::isDirectory)
+            ?: error("Unable to locate app assets from $workingDirectory")
+        val configNames = listOf("survey_config10.yaml", "survey_config_sw_10.yaml")
+
+        configNames.forEach { name ->
+            val config = SurveyConfigLoader.fromFileStrictValidated(File(assetDirectory, name).absolutePath)
+            (8..17).forEach { number ->
+                val nodeId = "Q$number"
+                val hasTwoStepPair =
+                    !config.resolveEvalPrompt(nodeId).isNullOrBlank() &&
+                            !config.resolveFollowupPrompt(nodeId).isNullOrBlank()
+                assertTrue("$name $nodeId must remain ONE_STEP", !hasTwoStepPair)
+            }
+        }
+    }
+
+    @Test
     fun valid_next_id_by_answer_config_parses_and_validates() {
         val config = SurveyConfigLoader.fromStringStrictValidated(
             text = """

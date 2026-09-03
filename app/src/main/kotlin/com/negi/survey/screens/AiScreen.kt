@@ -166,9 +166,11 @@ import com.negi.survey.slm.PromptPhase
 import com.negi.survey.vm.AiViewModel
 import com.negi.survey.vm.SurveyViewModel
 import java.security.MessageDigest
+import java.util.Locale
 import kotlin.collections.ArrayDeque
 import kotlin.math.abs
 import kotlin.math.min
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.collect
@@ -185,9 +187,51 @@ import kotlinx.serialization.json.JsonPrimitive
 private const val TAG = "AiScreen"
 private const val TYPING_UPDATE_THROTTLE_MS = 90L
 private const val AUTO_SCROLL_THROTTLE_MS = 40L
+private const val MAX_FOLLOWUPS_PER_AI_NODE = 2
 
 /** Debug-only crash button visibility. */
 private val SHOW_DEBUG_CRASH_BUTTON: Boolean = BuildConfig.DEBUG
+
+internal fun followupCapacityRemaining(entries: List<SurveyViewModel.FollowupEntry>): Int =
+    (MAX_FOLLOWUPS_PER_AI_NODE - entries.size).coerceAtLeast(0)
+
+internal fun normalizeFollowupQuestion(question: String): String =
+    question.trim()
+        .lowercase(Locale.ROOT)
+        .replace(Regex("\\s+"), " ")
+        .trimEnd { it == '?' || it == '？' }
+        .trim()
+
+internal fun isDistinctFollowupQuestion(
+    candidate: String,
+    existing: List<SurveyViewModel.FollowupEntry>
+): Boolean {
+    val normalizedCandidate = normalizeFollowupQuestion(candidate)
+    return normalizedCandidate.isNotEmpty() && existing.none {
+        normalizeFollowupQuestion(it.question) == normalizedCandidate
+    }
+}
+
+internal fun canAcceptFollowupCandidate(
+    candidate: String,
+    existing: List<SurveyViewModel.FollowupEntry>
+): Boolean =
+    followupCapacityRemaining(existing) > 0 && isDistinctFollowupQuestion(candidate, existing)
+
+internal fun canAdvanceAiTurn(
+    turnCompleted: Boolean,
+    aiLoading: Boolean,
+    mainSubmissionPending: Boolean,
+    speechRecording: Boolean,
+    speechTranscribing: Boolean,
+    hasUnansweredFollowup: Boolean,
+): Boolean =
+    turnCompleted &&
+            !aiLoading &&
+            !mainSubmissionPending &&
+            !speechRecording &&
+            !speechTranscribing &&
+            !hasUnansweredFollowup
 
 /**
  * Simple abstraction for a speech-to-text controller (e.g., Whisper.cpp).
@@ -310,6 +354,9 @@ fun AiScreen(
     val loading by vmAI.loading.collectAsState()
     val stream by vmAI.stream.collectAsState()
     val error by vmAI.error.collectAsState()
+    val persistedFollowups by vmSurvey.followups.collectAsState()
+    val hasUnansweredFollowup = persistedFollowups[nid].orEmpty().any { it.answer == null }
+    var submissionPending by remember(contextKey) { mutableStateOf(false) }
 
     // ---------------------------------------------------------------------
     // Persistent chat + conversation state (B plan)
@@ -430,6 +477,7 @@ fun AiScreen(
          * IDs make any lifecycle replay idempotent at the persistence layer.
          */
         var lastRenderedStepRunId = 0L
+        var pendingRepairInitialRunId: Long? = null
 
         vmAI.stepHistory.collect { history ->
             val newSteps =
@@ -482,13 +530,37 @@ fun AiScreen(
                  * IMPORTANT:
                  * Follow-up question persist/display policy:
                  * - TWO_STEP nodes: ONLY Step2 (phase=FOLLOWUP) may persist/display follow-up question.
-                 * - ONE_STEP nodes: Step1 (phase=ONE_STEP) may persist/display follow-up question.
+                 * - ONE_STEP nodes: Step1 (phase=ONE_STEP), or its owned repair FOLLOWUP step.
                  */
+                val existingFollowups = vmSurvey.followups.value[nid].orEmpty()
+                val capacityRemaining = followupCapacityRemaining(existingFollowups)
+                val repairEligibleInitial =
+                    !isTwoStepNode && AiViewModel.needsFollowupRepair(
+                        phase = step.phase,
+                        score = step.score,
+                        followups = step.followups,
+                        timedOut = step.timedOut,
+                        error = step.error,
+                        capacityRemaining = capacityRemaining
+                    )
+                if (repairEligibleInitial) {
+                    pendingRepairInitialRunId = step.runId
+                    RuntimeLogStore.i(
+                        TAG,
+                        "AI_FOLLOWUP_REPAIR node=$nid initialRun=${step.runId} score=${step.score} attempted=true"
+                    )
+                }
+
+                val isRepairFollowup =
+                    !isTwoStepNode &&
+                            step.phase == PromptPhase.FOLLOWUP &&
+                            pendingRepairInitialRunId?.let { step.runId > it } == true
+
                 val shouldPersistFollowup =
                     if (isTwoStepNode) {
                         step.phase == PromptPhase.FOLLOWUP
                     } else {
-                        step.phase == PromptPhase.ONE_STEP
+                        step.phase == PromptPhase.ONE_STEP || isRepairFollowup
                     }
 
                 if (shouldPersistFollowup) {
@@ -496,23 +568,10 @@ fun AiScreen(
                         ?: (if (!showAsJson) extractPlainFollowup(stepRaw) else null)
 
                     val fuNorm = fu?.trim()?.takeIf { it.isNotBlank() }
-                    if (fuNorm != null) {
-                        /**
-                         * Do not deduplicate follow-up questions by their text.
-                         *
-                         * Two independent user answers can legitimately require the
-                         * exact same clarification. A conversation-wide text set would
-                         * therefore suppress a valid later follow-up even though the
-                         * model output, JSON parsing, and extraction all succeeded.
-                         *
-                         * Recomposition safety is instead based on step identity:
-                         * - Each completed inference step has a stable runId.
-                         * - The follow-up bubble ID includes that runId.
-                         * - upsertChatItem() updates the existing item when Compose
-                         *   reprocesses the same step instead of appending a duplicate.
-                         * - A later inference receives a different runId and may display
-                         *   the same follow-up text again.
-                         */
+                    val candidateAccepted =
+                        fuNorm != null && canAcceptFollowupCandidate(fuNorm, existingFollowups)
+
+                    if (candidateAccepted) {
                         val displayedAsPlain =
                             (!showAsJson) && (stepPlainText?.trim() == fuNorm)
 
@@ -528,15 +587,6 @@ fun AiScreen(
                             )
                         }
 
-                        /**
-                         * Persist the follow-up for every qualifying inference step.
-                         *
-                         * This must not be gated by question-text uniqueness. The
-                         * SurveyViewModel needs to observe the current clarification
-                         * turn even when its wording is identical to an earlier turn,
-                         * and the composer must point at the follow-up generated by
-                         * this specific inference.
-                         */
                         vmSurvey.addFollowupQuestion(nid, fuNorm)
                         vmAI.setFollowupMode(contextKey, fuNorm)
 
@@ -577,6 +627,25 @@ fun AiScreen(
                             focusRequester.requestFocus()
                             keyboard?.show()
                         }
+                    } else if (!repairEligibleInitial) {
+                        if (fuNorm != null) {
+                            RuntimeLogStore.i(
+                                TAG,
+                                "FOLLOWUP_CANDIDATE node=$nid run=${step.runId} duplicate=" +
+                                        "${!isDistinctFollowupQuestion(fuNorm, existingFollowups)} " +
+                                        "capacityRemaining=$capacityRemaining accepted=false"
+                            )
+                        }
+                        vmAI.completeValidationTurn(contextKey, rootQuestion)
+                    }
+
+                    if (isRepairFollowup) {
+                        RuntimeLogStore.i(
+                            TAG,
+                            "AI_FOLLOWUP_REPAIR_RESULT node=$nid run=${step.runId} " +
+                                    "timedOut=${step.timedOut} errorPresent=${step.error != null} parsedCount=${step.followups.size}"
+                        )
+                        pendingRepairInitialRunId = null
                     }
                 }
 
@@ -691,8 +760,26 @@ fun AiScreen(
     // Submit logic (ALWAYS TWO-STEP if configured)
     // ---------------------------------------------------------------------
 
+    fun startOneStepValidation(prompt: String, capacityRemaining: Int) =
+        vmAI.evaluateConditionalTwoStepAsync(
+            firstPrompt = prompt,
+            firstPhase = PromptPhase.ONE_STEP,
+            proceedOnTimeout = false,
+            shouldRunSecond = { step1 ->
+                AiViewModel.needsFollowupRepair(
+                    phase = PromptPhase.ONE_STEP,
+                    score = step1.score,
+                    followups = step1.followups,
+                    timedOut = step1.timedOut,
+                    error = step1.error,
+                    capacityRemaining = capacityRemaining
+                )
+            },
+            buildSecondPrompt = { prompt }
+        )
+
     fun submit() {
-        if (loading) return
+        if (loading || submissionPending) return
         if (speechRecording || speechTranscribing) {
             scope.launch { snack.showSnackbar("Speech is active. Stop recording first.") }
             return
@@ -703,73 +790,124 @@ fun AiScreen(
 
         val isSubmittingMain = (conv.role == AiViewModel.ComposerRole.MAIN)
 
-        if (isSubmittingMain) {
-            vmSurvey.setAnswer(input, nid)
-        } else {
+        if (!isSubmittingMain) {
             vmSurvey.answerLastFollowup(nid, input)
+            vmAI.appendUserMessage(contextKey, input)
+            vmAI.beginValidationTurn(contextKey)
+            submissionPending = true
+            vmAI.updateComposerDraft(contextKey, "")
+            keyboard?.hide()
+            focusManager.clearFocus(force = true)
+
+            scope.launch {
+                val runId = "ai-followup-${nid}-${SystemClock.uptimeMillis()}-${System.nanoTime()}"
+                val t0 = SystemClock.uptimeMillis()
+                try {
+                    val entries = vmSurvey.followups.value[nid].orEmpty()
+                    val capacityRemaining = followupCapacityRemaining(entries)
+                    val originalMainAnswer = vmSurvey.getAnswer(nid)
+                    val accumulatedPrompt = vmSurvey.getAccumulatedPrompt(
+                        nodeId = nid,
+                        question = rootQuestion,
+                        mainAnswer = originalMainAnswer
+                    )
+                    RuntimeLogStore.i(
+                        TAG,
+                        "FOLLOWUP_REVALIDATE node=$nid answeredCount=${entries.count { it.answer != null }} " +
+                                "capacityRemaining=$capacityRemaining"
+                    )
+                    startOneStepValidation(accumulatedPrompt, capacityRemaining).join()
+                } catch (err: Throwable) {
+                    if (err is CancellationException) throw err
+                    RuntimeLogStore.e(
+                        TAG,
+                        "Follow-up revalidation failed runId=$runId node=$nid " +
+                                "errType=${err::class.java.simpleName} errMsg=${err.message}",
+                        err
+                    )
+                    vmAI.completeValidationTurn(contextKey, rootQuestion)
+                    snack.showSnackbar("Validation failed: ${err.message ?: "unknown error"}")
+                    vmAI.removeTypingMessage(contextKey, nid)
+                } finally {
+                    submissionPending = false
+                    RuntimeLogStore.i(
+                        TAG,
+                        "FOLLOWUP_REVALIDATE_END node=$nid runId=$runId " +
+                                "elapsed=${SystemClock.uptimeMillis() - t0}ms"
+                    )
+                }
+            }
+            return
         }
 
+        vmAI.beginValidationTurn(contextKey)
+        vmSurvey.setAnswer(input, nid)
         vmAI.appendUserMessage(contextKey, input)
 
         val questionForTurn =
             if (isSubmittingMain) rootQuestion else conv.activePromptQuestion.ifBlank { rootQuestion }
         val answerForTurn = input
 
+        submissionPending = true
         scope.launch {
             val runId = "ai-${nid}-${SystemClock.uptimeMillis()}-${System.nanoTime()}"
             val t0 = SystemClock.uptimeMillis()
 
-            val isTwoStep = vmSurvey.hasTwoStepPrompt(nid)
+            try {
+                val isTwoStep = vmSurvey.hasTwoStepPrompt(nid)
 
-            // Info log: lengths + short hashes only (no previews).
-            RuntimeLogStore.i(
-                TAG,
-                "Submit begin runId=$runId node=$nid role=${conv.role} isTwoStep=$isTwoStep " +
-                        "sessionId=${runSafe { vmSurvey.sessionId.value }} surveyUuid=${runSafe { vmSurvey.surveyUuid.value }} " +
-                        "qLen=${questionForTurn.length} aLen=${answerForTurn.length} " +
-                        "qSha6=${shortHash(questionForTurn)} aSha6=${shortHash(answerForTurn)}"
-            )
-
-            // Debug-only: capped previews for local iteration.
-            if (BuildConfig.DEBUG) {
-                RuntimeLogStore.d(
+                // Info log: lengths + short hashes only (no previews).
+                RuntimeLogStore.i(
                     TAG,
-                    "Submit payload preview (debug) runId=$runId node=$nid " +
-                            "qPreview=${clipForLog(questionForTurn, 96)} aPreview=${clipForLog(answerForTurn, 96)}"
+                    "Submit begin runId=$runId node=$nid role=${conv.role} isTwoStep=$isTwoStep " +
+                            "sessionId=${runSafe { vmSurvey.sessionId.value }} surveyUuid=${runSafe { vmSurvey.surveyUuid.value }} " +
+                            "qLen=${questionForTurn.length} aLen=${answerForTurn.length} " +
+                            "qSha6=${shortHash(questionForTurn)} aSha6=${shortHash(answerForTurn)}"
                 )
-            }
 
-            runCatching {
-                if (!isTwoStep) {
-                    val prompt = vmSurvey.getPrompt(nid, questionForTurn, answerForTurn)
-                    vmAI.evaluateAsync(prompt)
-                    return@runCatching
+                // Debug-only: capped previews for local iteration.
+                if (BuildConfig.DEBUG) {
+                    RuntimeLogStore.d(
+                        TAG,
+                        "Submit payload preview (debug) runId=$runId node=$nid " +
+                                "qPreview=${clipForLog(questionForTurn, 96)} aPreview=${clipForLog(answerForTurn, 96)}"
+                    )
                 }
 
-                val prompt1 = vmSurvey.getEvalPrompt(nid, questionForTurn, answerForTurn)
-
-                vmAI.evaluateConditionalTwoStepAsync(
-                    firstPrompt = prompt1,
-                    proceedOnTimeout = true,
-                    shouldRunSecond = { step1 ->
-                        val needed = extractFollowupNeeded(prettyJson, step1.raw) ?: false
-                        RuntimeLogStore.i(
-                            TAG,
-                            "TWO_STEP shouldRunSecond runId=$runId node=$nid role=${conv.role} " +
-                                    "followup_needed=$needed timedOut=${step1.timedOut} rawLen=${step1.raw.length}"
-                        )
-                        needed
-                    },
-                    buildSecondPrompt = { step1 ->
-                        vmSurvey.getFollowupPrompt(
-                            nodeId = nid,
-                            question = questionForTurn,
-                            answer = answerForTurn,
-                            evalJsonRaw = step1.raw
-                        )
-                    }
-                )
-            }.onFailure { err ->
+                val inferenceJob =
+                if (!isTwoStep) {
+                    val originalPrompt = vmSurvey.getPrompt(nid, questionForTurn, answerForTurn)
+                    startOneStepValidation(
+                        prompt = originalPrompt,
+                        capacityRemaining = followupCapacityRemaining(vmSurvey.followups.value[nid].orEmpty())
+                    )
+                } else {
+                    val prompt1 = vmSurvey.getEvalPrompt(nid, questionForTurn, answerForTurn)
+                    vmAI.evaluateConditionalTwoStepAsync(
+                        firstPrompt = prompt1,
+                        proceedOnTimeout = true,
+                        shouldRunSecond = { step1 ->
+                            val needed = extractFollowupNeeded(prettyJson, step1.raw) ?: false
+                            RuntimeLogStore.i(
+                                TAG,
+                                "TWO_STEP shouldRunSecond runId=$runId node=$nid role=${conv.role} " +
+                                        "followup_needed=$needed timedOut=${step1.timedOut} rawLen=${step1.raw.length}"
+                            )
+                            needed
+                        },
+                        buildSecondPrompt = { step1 ->
+                            vmSurvey.getFollowupPrompt(
+                                nodeId = nid,
+                                question = questionForTurn,
+                                answer = answerForTurn,
+                                evalJsonRaw = step1.raw
+                            )
+                        }
+                    )
+                }
+                inferenceJob.join()
+            } catch (err: Throwable) {
+                if (err is CancellationException) throw err
                 RuntimeLogStore.e(
                     TAG,
                     "Submit failed runId=$runId node=$nid role=${conv.role} errType=${err::class.java.simpleName} errMsg=${err.message}",
@@ -777,7 +915,9 @@ fun AiScreen(
                 )
                 snack.showSnackbar("Submit failed: ${err.message ?: "unknown error"}")
                 vmAI.removeTypingMessage(contextKey, nid)
-            }.also {
+                vmAI.completeValidationTurn(contextKey, rootQuestion)
+            } finally {
+                submissionPending = false
                 RuntimeLogStore.i(TAG, "Submit end runId=$runId node=$nid elapsed=${SystemClock.uptimeMillis() - t0}ms")
             }
         }
@@ -889,7 +1029,7 @@ fun AiScreen(
                                 }
                             },
                             onSend = ::submit,
-                            enabled = textFieldEnabled && !loading,
+                            enabled = textFieldEnabled && !loading && !submissionPending,
                             focusRequester = focusRequester,
                             speechEnabled = speechController != null,
                             speechRecording = speechRecording,
@@ -920,7 +1060,26 @@ fun AiScreen(
                             androidx.compose.foundation.layout.Spacer(Modifier.weight(1f))
 
                             OutlinedButton(
+                                enabled = canAdvanceAiTurn(
+                                    turnCompleted = conv.turnCompleted,
+                                    aiLoading = loading,
+                                    mainSubmissionPending = submissionPending,
+                                    speechRecording = speechRecording,
+                                    speechTranscribing = speechTranscribing,
+                                    hasUnansweredFollowup = hasUnansweredFollowup,
+                                ),
                                 onClick = {
+                                    if (!canAdvanceAiTurn(
+                                            turnCompleted = conv.turnCompleted,
+                                            aiLoading = loading,
+                                            mainSubmissionPending = submissionPending,
+                                            speechRecording = speechRecording,
+                                            speechTranscribing = speechTranscribing,
+                                            hasUnansweredFollowup = hasUnansweredFollowup,
+                                        )
+                                    ) {
+                                        return@OutlinedButton
+                                    }
                                     vmAI.resetStates()
                                     onNext()
                                 }

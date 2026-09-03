@@ -174,6 +174,10 @@ slm:
     - Keep it single-scope (no multi-part), concrete, and answerable immediately.
     - Do not introduce new topics or additional objectives.
 
+    CONSISTENCY:
+    - followup_question="" inaruhusiwa tu ikiwa Jibu linatimiza kila taarifa inayohitajika na lengo; score lazima iwe 90–100.
+    - Iwapo taarifa yoyote inayohitajika na lengo haipo au haieleweki, score lazima iwe chini ya 90 na followup_question lazima iwe swali moja fupi la Kiswahili kuhusu taarifa hiyo.
+
   length_budget: |
     LENGTH LIMITS:
     - analysis<=60 chars
@@ -187,6 +191,14 @@ slm:
     - RAW JSON only, ONE LINE.
     - Use COMPACT JSON (no spaces around ':' and ',').
     - No extra text.
+
+  followup_output_mode: TEXT
+  key_contract_followup: >-
+    Toa swali moja fupi la Kiswahili kuhusu taarifa inayohitajika na lengo ambayo haipo au haieleweki.
+    Usitoe score, JSON, analysis, maelezo, au maandishi mengine.
+  length_budget_followup: "followup_question<=120 chars"
+  strict_output_followup: >-
+    Toa swali moja tu kwenye mstari mmoja; bila markdown, lebo, au alama za kunukuu.
 
 prompts:
   - nodeId: Q8

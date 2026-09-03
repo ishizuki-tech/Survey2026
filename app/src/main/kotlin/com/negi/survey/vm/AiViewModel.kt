@@ -118,6 +118,36 @@ class AiViewModel(
          * app from pathological generation loops while still allowing generous diagnostic output.
          */
         private const val MAX_MODEL_OUTPUT_CHARS = 32_768
+
+        /**
+         * A one-step result is contradictory only when it reports a low score without
+         * a usable follow-up and completed normally. This is evaluated once by the
+         * owned chain; FOLLOWUP repair snapshots are never eligible.
+         */
+        fun needsFollowupRepair(
+            phase: PromptPhase,
+            score: Int?,
+            followups: List<String>,
+            timedOut: Boolean,
+            error: String?
+        ): Boolean =
+            phase == PromptPhase.ONE_STEP &&
+                    score != null &&
+                    score < 90 &&
+                    followups.isEmpty() &&
+                    !timedOut &&
+                    error == null
+
+        fun needsFollowupRepair(
+            phase: PromptPhase,
+            score: Int?,
+            followups: List<String>,
+            timedOut: Boolean,
+            error: String?,
+            capacityRemaining: Int
+        ): Boolean =
+            capacityRemaining > 0 &&
+                    needsFollowupRepair(phase, score, followups, timedOut, error)
     }
 
     // ───────────────────────── Logging bridge ─────────────────────────
@@ -324,11 +354,13 @@ class AiViewModel(
      * @param role Current composer role.
      * @param activePromptQuestion The question that should be answered next.
      * @param composerDraft Draft text for restoration after navigation.
+     * @param turnCompleted Whether the current AI turn has reached a navigable terminal state.
      */
     data class ConversationState(
         val role: ComposerRole,
         val activePromptQuestion: String,
-        val composerDraft: String
+        val composerDraft: String,
+        val turnCompleted: Boolean = false
     )
 
     private val chatStore = ConcurrentHashMap<String, MutableStateFlow<List<ChatItem>>>()
@@ -358,7 +390,8 @@ class AiViewModel(
                 ConversationState(
                     role = ComposerRole.MAIN,
                     activePromptQuestion = "",
-                    composerDraft = ""
+                    composerDraft = "",
+                    turnCompleted = false
                 )
             )
         }.asStateFlow()
@@ -383,14 +416,15 @@ class AiViewModel(
                 ConversationState(
                     role = ComposerRole.MAIN,
                     activePromptQuestion = rootQuestion,
-                    composerDraft = initialDraft
+                    composerDraft = initialDraft,
+                    turnCompleted = false
                 )
             )
         }
 
         conversationStore[contextKey]?.update { cur ->
             val apq = cur.activePromptQuestion.ifBlank { rootQuestion }
-            val draft = if (cur.composerDraft.isBlank() && initialDraft.isNotBlank()) initialDraft else cur.composerDraft
+            val draft = if (cur.role == ComposerRole.MAIN && cur.composerDraft.isBlank() && initialDraft.isNotBlank()) initialDraft else cur.composerDraft
             cur.copy(activePromptQuestion = apq, composerDraft = draft)
         }
     }
@@ -421,7 +455,31 @@ class AiViewModel(
         val q = followupQuestion.trim()
         if (q.isBlank()) return
         conversationStore[contextKey]?.update { cur ->
-            cur.copy(role = ComposerRole.FOLLOWUP, activePromptQuestion = q)
+            cur.copy(
+                role = ComposerRole.FOLLOWUP,
+                activePromptQuestion = q,
+                composerDraft = "",
+                turnCompleted = false
+            )
+        }
+    }
+
+    /** Mark a main-answer or follow-up validation turn as in progress before inference begins. */
+    fun beginValidationTurn(contextKey: String) {
+        conversationStore[contextKey]?.update { cur ->
+            cur.copy(turnCompleted = false)
+        }
+    }
+
+    /** Mark a terminal validation result as navigable and restore the root composer state. */
+    fun completeValidationTurn(contextKey: String, rootQuestion: String) {
+        conversationStore[contextKey]?.update { cur ->
+            cur.copy(
+                role = ComposerRole.MAIN,
+                activePromptQuestion = rootQuestion,
+                composerDraft = "",
+                turnCompleted = true
+            )
         }
     }
 
@@ -611,7 +669,8 @@ class AiViewModel(
         val raw: String,
         val score: Int?,
         val followups: List<String>,
-        val timedOut: Boolean
+        val timedOut: Boolean,
+        val error: String?
     )
 
     /**
@@ -733,6 +792,7 @@ class AiViewModel(
 
     fun evaluateConditionalTwoStepAsync(
         firstPrompt: String,
+        firstPhase: PromptPhase = PromptPhase.EVAL,
         timeoutMs: Long = defaultTimeoutMs,
         proceedOnTimeout: Boolean = true,
         shouldRunSecond: (EvalResult) -> Boolean,
@@ -752,13 +812,13 @@ class AiViewModel(
             start = CoroutineStart.LAZY
         ) {
             try {
-                // Step 1: evaluation JSON.
+                // Step 1: evaluation JSON. ONE_STEP is used for bounded repair chains.
                 val step1 = runEvaluationCore(
                     runId = runId1,
                     userPrompt = p1,
                     timeoutMs = timeoutMs,
                     mode = EvalMode.EVAL_JSON,
-                    phase = PromptPhase.EVAL,
+                    phase = firstPhase,
                     commitToPrimaryState = true
                 )
 
@@ -1245,7 +1305,8 @@ class AiViewModel(
                 raw = rawText,
                 score = parsedScore,
                 followups = top3,
-                timedOut = timedOut
+                timedOut = timedOut,
+                error = stepError
             )
         } catch (e: CancellationException) {
             if (DEBUG_LOGS) logW(TAG, "run[$runId]: cancelled", e)
@@ -1302,7 +1363,8 @@ class AiViewModel(
                 raw = rawText,
                 score = null,
                 followups = emptyList(),
-                timedOut = false
+                timedOut = false,
+                error = msg
             )
         }
     }

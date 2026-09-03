@@ -591,6 +591,31 @@ open class SurveyViewModel(
         return rendered
     }
 
+    /**
+     * Render the existing one-step prompt with the original main answer, then append
+     * answered follow-up pairs so the model evaluates the accumulated information.
+     */
+    fun getAccumulatedPrompt(nodeId: String, question: String, mainAnswer: String): String {
+        val base = getPrompt(nodeId, question, mainAnswer)
+        val answered = followups.value[nodeId.trim()].orEmpty().filter { !it.answer.isNullOrBlank() }
+        if (answered.isEmpty()) return base
+
+        return buildString {
+            append(base)
+            append("\n\nAdditional clarification (evaluate together with the original Answer):")
+            answered.forEachIndexed { index, entry ->
+                append("\nFollow-up ")
+                append(index + 1)
+                append(": ")
+                append(entry.question.trim())
+                append("\nAnswer ")
+                append(index + 1)
+                append(": ")
+                append(entry.answer!!.trim())
+            }
+        }
+    }
+
     fun getEvalPrompt(nodeId: String, question: String, answer: String): String {
         val k = nodeId.trim()
         require(k.isNotBlank()) { "getEvalPrompt: nodeId is blank" }

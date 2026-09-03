@@ -161,14 +161,20 @@ slm:
   key_contract: >-
     Return only compact JSON {"followup_question":"","score":N}; no markdown.
     Score N=1-100 for relevance, completeness, and accuracy against the Expected answer target only.
-    If Answer satisfies the target, followup_question MUST be "".
-    Otherwise ask one short English question only for target-required information that is missing or ambiguous.
+    Empty followup_question is allowed ONLY when Answer fully satisfies every target-required point; then score MUST be 90-100.
+    If any target-required point is missing or ambiguous, score MUST be below 90 and followup_question MUST contain exactly one short English question for that point.
     Never ask for extra detail, invent uncertainty, or change topic.
 
   # All output requirements are folded into key_contract to minimize prompt tokens.
   length_budget: ""
   scoring_rule: ""
   strict_output: ""
+  followup_output_mode: TEXT
+  key_contract_followup: >-
+    Output exactly one short English question for missing or ambiguous target-required information.
+    No score, JSON, analysis, explanation, or extra text.
+  strict_output_followup: >-
+    Output one question only on one line; no markdown, labels, or quotes.
 
 prompts:
   - nodeId: Q8
