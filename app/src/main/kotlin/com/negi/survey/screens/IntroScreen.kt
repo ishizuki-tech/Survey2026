@@ -430,16 +430,6 @@ private fun IntroCardMono(
                 isRestarting = isRestarting,
                 onRestart = onRestart
             )
-
-            Spacer(Modifier.padding(top = 12.dp))
-
-            /** Always-visible build stamp for support/debugging. */
-            Text(
-                text = "Build: ${BuildConfig.BUILD_TIMESTAMP}",
-                style = MaterialTheme.typography.labelSmall.copy(letterSpacing = 0.2.sp),
-                color = textMuted,
-                modifier = Modifier.testTag("BuildTimestamp")
-            )
         }
     }
 }
@@ -511,6 +501,16 @@ private fun SelectedConfigDetailsMono(
         modifier = if (!expanded) panelModifier.animateContentSize() else panelModifier,
         horizontalAlignment = Alignment.Start
     ) {
+        /** Always-visible build stamp, shown first regardless of load state. */
+        Text(
+            text = "Build: ${BuildConfig.BUILD_TIMESTAMP}",
+            style = MaterialTheme.typography.labelSmall.copy(letterSpacing = 0.2.sp),
+            color = textMuted,
+            modifier = Modifier.testTag("BuildTimestamp")
+        )
+
+        Spacer(Modifier.padding(top = 8.dp))
+
         when (state) {
             is ResolvedDetailsState.Loading -> {
                 Text(
