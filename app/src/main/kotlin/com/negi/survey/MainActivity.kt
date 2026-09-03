@@ -2005,6 +2005,17 @@ private fun mergeFreeTextDraft(existing: String, utterance: String): String {
 /* ───────────────────────────── Config UI Helpers ───────────────────────────── */
 /* (The rest is kept as-is from your original file; do not omit.) */
 
+/**
+ * Human-friendly overrides for specific config file stems (filename without
+ * extension, lowercased). Takes priority over the generic derivation rules
+ * below. Add entries here when a config's auto-generated label (e.g. "Config
+ * 10", "Sw 10") isn't the name we want shown in the picker.
+ */
+private val KNOWN_CONFIG_LABELS: Map<String, String> = mapOf(
+    "survey_config10" to "English",
+    "survey_config_sw_10" to "Swahili",
+)
+
 private fun configOptionFromFileName(fileName: String): ConfigOptionUi {
     val stem = fileName.replace(Regex("""(?i)\.ya?ml$"""), "")
     val lower = stem.lowercase(Locale.US)
@@ -2020,6 +2031,7 @@ private fun configOptionFromFileName(fileName: String): ConfigOptionUi {
         ?.toIntOrNull()
 
     val baseLabel = when {
+        KNOWN_CONFIG_LABELS.containsKey(lower) -> KNOWN_CONFIG_LABELS.getValue(lower)
         isDemo -> "Demo config"
         isFull -> "Full config"
         configNumber != null -> "Config $configNumber"

@@ -501,45 +501,6 @@ private fun SelectedConfigDetailsMono(
         modifier = if (!expanded) panelModifier.animateContentSize() else panelModifier,
         horizontalAlignment = Alignment.Start
     ) {
-        Text(
-            text = "Selected configuration",
-            style = MaterialTheme.typography.labelMedium.copy(letterSpacing = 0.2.sp),
-            color = textMuted
-        )
-
-        Spacer(Modifier.padding(top = 6.dp))
-
-        Text(
-            text = optionLabel,
-            style = MaterialTheme.typography.titleMedium.copy(
-                fontWeight = FontWeight.SemiBold,
-                lineHeight = 22.sp
-            ),
-            color = textPrimary,
-            maxLines = 2,
-            overflow = TextOverflow.Ellipsis
-        )
-
-        Spacer(Modifier.padding(top = 4.dp))
-
-        /** Always-visible short description (about this option). */
-        Text(
-            text = optionDescription,
-            style = MaterialTheme.typography.bodyMedium.copy(lineHeight = 20.sp),
-            color = textSecondary,
-            maxLines = if (expanded) Int.MAX_VALUE else 2,
-            overflow = TextOverflow.Ellipsis,
-            onTextLayout = { r ->
-                if (!expanded) {
-                    val v = r.hasVisualOverflow
-                    if (descOverflow != v) descOverflow = v
-                }
-            },
-            modifier = Modifier.testTag("SelectedConfigDesc")
-        )
-
-        Spacer(Modifier.padding(top = 10.dp))
-
         when (state) {
             is ResolvedDetailsState.Loading -> {
                 Text(
@@ -590,15 +551,6 @@ private fun SelectedConfigDetailsMono(
                 val d = state.details
 
                 Text(
-                    text = d.title,
-                    style = MaterialTheme.typography.labelLarge.copy(letterSpacing = 0.2.sp),
-                    color = Color(0xFFE6E6E6),
-                    modifier = Modifier.testTag("ConfigDetailsTitle")
-                )
-
-                Spacer(Modifier.padding(top = 6.dp))
-
-                Text(
                     text = d.summary,
                     style = MaterialTheme.typography.bodySmall.copy(lineHeight = 18.sp),
                     color = Color(0xFFCFCFCF),
@@ -629,24 +581,6 @@ private fun SelectedConfigDetailsMono(
                     },
                     modifier = Modifier.testTag("ConfigDetailsLongText")
                 )
-
-                if (d.meta.isNotEmpty()) {
-                    Spacer(Modifier.padding(top = 10.dp))
-                    FlowRow(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .testTag("SelectedConfigMetaRow"),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        /** Stable order for predictable UI + tests. */
-                        d.meta.entries
-                            .sortedBy { it.key.lowercase() }
-                            .forEach { (k, v) ->
-                                MetaChipMono(label = k, value = v)
-                            }
-                    }
-                }
             }
         }
 
@@ -868,7 +802,6 @@ private fun MonoConfigOptionChip(
         Color(0xFF8A8A8A).copy(alpha = 0.55f)
     }
     val labelColor = if (selected) textPrimary else Color(0xFFE8E8E8)
-    val descColor = if (selected) Color(0xFFC8C8C8) else textSecondary
 
     Row(
         modifier = Modifier
@@ -898,14 +831,6 @@ private fun MonoConfigOptionChip(
                 ),
                 color = labelColor,
                 maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
-            Spacer(Modifier.padding(top = 4.dp))
-            Text(
-                text = option.description,
-                style = MaterialTheme.typography.bodyMedium.copy(lineHeight = 20.sp),
-                color = descColor,
-                maxLines = 2,
                 overflow = TextOverflow.Ellipsis
             )
         }
