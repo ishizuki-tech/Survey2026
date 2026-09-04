@@ -515,6 +515,8 @@ jobs:
           QR_URL="https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${PAGE_URL}"
           ENGLISH_CONFIG_URL="${SERVER_URL}/${REPOSITORY}/releases/download/${RELEASE_TAG}/survey_config10.yaml"
           SWAHILI_CONFIG_URL="${SERVER_URL}/${REPOSITORY}/releases/download/${RELEASE_TAG}/survey_config_sw_10.yaml"
+          ENGLISH_CONFIG_VIEW_URL="${SERVER_URL}/${REPOSITORY}/blob/${GITHUB_SHA}/app/src/main/assets/survey_config10.yaml"
+          SWAHILI_CONFIG_VIEW_URL="${SERVER_URL}/${REPOSITORY}/blob/${GITHUB_SHA}/app/src/main/assets/survey_config_sw_10.yaml"
 
           cat > download-page/index.html <<HTML
           <!doctype html>
@@ -565,8 +567,8 @@ jobs:
                 <section class="config-files">
                   <h2>Config files included in this APK</h2>
                   <p class="note">These config files were extracted from the exact APK build shown on this page.</p>
-                  <p><a href="${ENGLISH_CONFIG_URL}">English — survey_config10.yaml</a></p>
-                  <p><a href="${SWAHILI_CONFIG_URL}">Swahili — survey_config_sw_10.yaml</a></p>
+                  <p><strong>English — survey_config10.yaml</strong><br><a href="${ENGLISH_CONFIG_VIEW_URL}">View in browser</a> · <a href="${ENGLISH_CONFIG_URL}">Download</a></p>
+                  <p><strong>Swahili — survey_config_sw_10.yaml</strong><br><a href="${SWAHILI_CONFIG_VIEW_URL}">View in browser</a> · <a href="${SWAHILI_CONFIG_URL}">Download</a></p>
                 </section>
                 <div class="qr-panel">
                   <div class="qr-box"><img src="${QR_URL}" alt="QR code for the permanent Survey2026 download page" width="300" height="300"></div>
@@ -602,8 +604,14 @@ jobs:
             "release_url": "${RELEASE_URL}",
             "download_url": "${DOWNLOAD_URL}",
             "config_files": {
-              "english": "${ENGLISH_CONFIG_URL}",
-              "swahili": "${SWAHILI_CONFIG_URL}"
+              "english": {
+                "view_url": "${ENGLISH_CONFIG_VIEW_URL}",
+                "download_url": "${ENGLISH_CONFIG_URL}"
+              },
+              "swahili": {
+                "view_url": "${SWAHILI_CONFIG_VIEW_URL}",
+                "download_url": "${SWAHILI_CONFIG_URL}"
+              }
             },
             "apk_name": "${APK_NAME}",
             "apk_sha256": "${APK_SHA256}",
