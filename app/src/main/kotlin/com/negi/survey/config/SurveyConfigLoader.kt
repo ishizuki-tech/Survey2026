@@ -75,6 +75,7 @@ data class SurveyConfig(
     val graph: Graph,
     val slm: SlmMeta = SlmMeta(),
     val whisper: WhisperMeta = WhisperMeta(),
+    val tts: TtsMeta = TtsMeta(),
     @SerialName("model_defaults") val modelDefaults: ModelDefaults = ModelDefaults()
 ) {
 
@@ -237,6 +238,19 @@ data class SurveyConfig(
         @SerialName("target_sample_rate") val targetSampleRate: Int? = null,
         @SerialName("record_sample_rates") val recordSampleRates: List<Int>? = null,
         @SerialName("compute_checksum") val computeChecksum: Boolean? = null
+    )
+
+    /**
+     * Text-to-speech configuration: whether/how survey questions are read aloud
+     * using the Android platform TextToSpeech engine.
+     */
+    @Serializable
+    data class TtsMeta(
+        @SerialName("enabled") val enabled: Boolean? = null,
+        @SerialName("language") val language: String? = null,
+        @SerialName("auto_play") val autoPlay: Boolean? = null,
+        @SerialName("speech_rate") val speechRate: Float? = null,
+        @SerialName("pitch") val pitch: Float? = null
     )
 
     @Serializable
@@ -928,6 +942,15 @@ data class SurveyConfig(
                 if (bad.isNotEmpty()) issues += "whisper.record_sample_rates contains non-positive entries: ${bad.joinToString(",")}"
             }
         }
+
+        tts.language?.let { lang ->
+            val norm = lang.trim().lowercase()
+            if (norm !in setOf("auto", "en", "ja", "sw")) {
+                issues += "tts.language should be one of 'auto','en','ja','sw' (got '$lang')"
+            }
+        }
+        tts.speechRate?.let { if (it <= 0f) issues += "tts.speech_rate must be > 0 (got $it)" }
+        tts.pitch?.let { if (it <= 0f) issues += "tts.pitch must be > 0 (got $it)" }
 
         modelDefaults.modelName?.let { if (it.isBlank()) issues += "model_defaults.model_name is blank" }
         modelDefaults.defaultModelUrl?.let { if (it.isBlank()) issues += "model_defaults.default_model_url is blank" }

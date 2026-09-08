@@ -164,6 +164,7 @@ import com.negi.survey.net.RuntimeLogStore
 import com.negi.survey.slm.FollowupExtractor
 import com.negi.survey.slm.PromptPhase
 import com.negi.survey.vm.AiViewModel
+import com.negi.survey.vm.QuestionSpeaker
 import com.negi.survey.vm.SurveyViewModel
 import java.security.MessageDigest
 import java.util.Locale
@@ -282,7 +283,8 @@ fun AiScreen(
     vmAI: AiViewModel,
     onNext: () -> Unit,
     onBack: () -> Unit,
-    speechController: SpeechController? = null
+    speechController: SpeechController? = null,
+    ttsController: QuestionSpeaker? = null
 ) {
     val nid = remember(nodeId) { nodeId.trim() }
 
@@ -336,6 +338,13 @@ fun AiScreen(
     val speechTranscribing by transFlow.collectAsState(initial = false)
     val speechPartial by partialFlow.collectAsState(initial = "")
     val speechError by errFlow.collectAsState(initial = null)
+
+    // ---------------------------------------------------------------------
+    // Text-to-speech state with null-safe fallback (question read-aloud)
+    // ---------------------------------------------------------------------
+
+    val ttsSpeakingFlow = remember(ttsController) { ttsController?.isSpeaking ?: flowOf(false) }
+    val ttsSpeaking by ttsSpeakingFlow.collectAsState(initial = false)
 
     val textFieldEnabled = !speechRecording && !speechTranscribing
 
@@ -936,7 +945,13 @@ fun AiScreen(
         if (conv.role == AiViewModel.ComposerRole.FOLLOWUP) "Follow-up • $nid" else "Question • $nid"
 
     Scaffold(
-        topBar = { CompactTopBar(title = title) },
+        topBar = {
+            CompactTopBar(
+                title = title,
+                onReplay = { ttsController?.speak(rootQuestion, nid) },
+                isSpeaking = ttsSpeaking
+            )
+        },
         snackbarHost = { SnackbarHost(snack) },
         contentWindowInsets = zeroInsetsSafe()
     ) { pad ->
@@ -1109,7 +1124,9 @@ fun AiScreen(
 @Composable
 private fun CompactTopBar(
     title: String,
-    height: Dp = 32.dp
+    height: Dp = 32.dp,
+    onReplay: (() -> Unit)? = null,
+    isSpeaking: Boolean = false
 ) {
     val cs = MaterialTheme.colorScheme
     val topBrush = Brush.horizontalGradient(
@@ -1132,8 +1149,18 @@ private fun CompactTopBar(
                 text = title,
                 style = MaterialTheme.typography.titleSmall,
                 maxLines = 1,
-                color = cs.onSurface
+                color = cs.onSurface,
+                modifier = Modifier.weight(1f)
             )
+            if (onReplay != null) {
+                IconButton(onClick = onReplay, modifier = Modifier.size(height)) {
+                    Text(
+                        text = if (isSpeaking) "\u23F9" else "\uD83D\uDD0A",
+                        color = cs.onSurface,
+                        style = MaterialTheme.typography.titleSmall
+                    )
+                }
+            }
         }
     }
 }
