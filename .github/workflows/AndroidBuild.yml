@@ -280,6 +280,9 @@ jobs:
           fi
           ./gradlew "${args[@]}"
 
+      - name: Run JVM unit tests
+        run: ./gradlew :app:testDebugUnitTest --no-daemon -PskipModelDownload=true
+
       - name: Build release APK
         run: |
           set -euo pipefail

@@ -2,7 +2,7 @@
 agp = "9.3.2"
 
 # Kotlin
-kotlin = "2.4.10"
+kotlin = "2.4.20"
 
 # Compose (BOM controls Compose artifact versions)
 composeBom = "2026.08.00"
@@ -32,15 +32,15 @@ lifecycleViewmodelNavigation3Android = "2.11.0"
 lifecycleProcess = "2.11.0"
 
 # Navigation
-navigationCompose = "2.9.8"
-navigation3 = "1.1.6"
+navigationCompose = "2.10.0"
+navigation3 = "1.1.7"
 
 # Media3
 media3Exoplayer = "1.11.0"
 media3Ui = "1.11.0"
 
 # MediaPipe / LiteRT-LM
-litertlm = "0.16.1"
+litertlm = "0.17.0"
 
 # Networking
 okhttp = "5.5.0"

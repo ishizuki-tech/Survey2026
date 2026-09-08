@@ -29,6 +29,21 @@ Do not assume that code, fixes, dependencies, or architectural decisions from ot
 * Do not hide failures with arbitrary sleeps or fixed delays.
 * Do not suppress errors or warnings without understanding their cause.
 
+## Worktree Safety
+
+* Preserve unrelated local changes.
+* Do not use stash, reset, checkout, restore, or clean to handle unrelated work unless explicitly requested.
+* Do not stage unrelated files; prefer explicit file paths over broad staging commands.
+* Do not commit, push, force-push, tag, or open a pull request unless explicitly requested.
+
+## Survey and Configuration Changes
+
+* Treat survey configuration and prompt behavior as user-visible product behavior.
+* Verify config semantics against the current config files, parser/resolver code, and relevant tests before changing them.
+* Do not change wording, routing, scoring, prompt structure, or node semantics as part of unrelated work.
+* Do not assume a configured prompt pipeline and the runtime interaction flow are the same concept.
+* Preserve existing tested behavior unless the task explicitly requests a behavior change.
+
 ## Kotlin
 
 * Write code comments in English.
@@ -77,6 +92,14 @@ Before making non-trivial lifecycle changes, inspect:
 * recovery
 * cleanup
 * Conversation recreation
+
+When modifying AI or conversation state:
+
+* Keep conversation and session ownership explicit.
+* Prevent stale callbacks or state from one run or session from affecting another.
+* Preserve the distinction between persisted survey state and transient composer or inference state.
+* Do not infer terminal UI state while asynchronous/native work or required interaction remains unresolved.
+* Investigate state restoration and re-entry behavior before modifying it.
 
 ## Whisper.cpp
 
@@ -159,6 +182,24 @@ After modifying application or LiteRT-LM Kotlin code, at minimum:
 
 For native changes, also confirm the relevant native/CMake targets are rebuilt successfully.
 
+Run the narrowest relevant tests first and distinguish JVM unit tests, Android instrumentation tests, and real-model device tests. Do not rerun expensive or stochastic real-model tests for unrelated documentation-only or trivial assertion-only changes.
+
+## CI and Release Changes
+
+* Treat signing, secrets, release publishing, artifact naming, and download-page generation as release-critical behavior.
+* Do not change release, signing, or publishing behavior as part of unrelated work.
+* Never print or expose credentials or secrets.
+* Do not trigger a production or publish workflow unless explicitly requested.
+* When changing release packaging, verify that published metadata and artifacts correspond to the exact build being released.
+
+## Documentation
+
+* Keep `README.md` focused on current, verified behavior.
+* Keep unfinished implementation and documentation work in `TODO.md`.
+* Do not document proposed behavior as implemented.
+* Mark a TODO complete only when all of its stated requirements are satisfied.
+* Documentation-only changes normally do not require an Android build unless they affect generated or executable behavior.
+
 ## Before Finishing a Task
 
 Report:
@@ -168,7 +209,9 @@ Report:
 * important behavioral changes
 * tests/build commands run
 * whether they succeeded
+* anything intentionally not tested
 * remaining risks or unverified assumptions
 
 Do not create commits, push branches, open pull requests, or modify remote Git state unless explicitly requested.
 
+For Markdown-only changes, run `git diff --check`, review the changed file diff, and run `git status --short --untracked-files=all`.
