@@ -189,13 +189,12 @@ import kotlinx.serialization.json.JsonPrimitive
 private const val TAG = "AiScreen"
 private const val TYPING_UPDATE_THROTTLE_MS = 90L
 private const val AUTO_SCROLL_THROTTLE_MS = 40L
-private const val MAX_FOLLOWUPS_PER_AI_NODE = 2
 
 /** Debug-only crash button visibility. */
 private val SHOW_DEBUG_CRASH_BUTTON: Boolean = BuildConfig.DEBUG
 
-internal fun followupCapacityRemaining(entries: List<SurveyViewModel.FollowupEntry>): Int =
-    (MAX_FOLLOWUPS_PER_AI_NODE - entries.size).coerceAtLeast(0)
+internal fun followupCapacityRemaining(entries: List<SurveyViewModel.FollowupEntry>, maxFollowups: Int = 2): Int =
+    (maxFollowups - entries.size).coerceAtLeast(0)
 
 internal fun normalizeFollowupQuestion(question: String): String =
     question.trim()
@@ -216,9 +215,10 @@ internal fun isDistinctFollowupQuestion(
 
 internal fun canAcceptFollowupCandidate(
     candidate: String,
-    existing: List<SurveyViewModel.FollowupEntry>
+    existing: List<SurveyViewModel.FollowupEntry>,
+    maxFollowups: Int = 2
 ): Boolean =
-    followupCapacityRemaining(existing) > 0 && isDistinctFollowupQuestion(candidate, existing)
+    followupCapacityRemaining(existing, maxFollowups) > 0 && isDistinctFollowupQuestion(candidate, existing)
 
 internal fun canAdvanceAiTurn(
     turnCompleted: Boolean,
@@ -382,7 +382,10 @@ fun AiScreen(
     val stream by vmAI.stream.collectAsState()
     val error by vmAI.error.collectAsState()
     val persistedFollowups by vmSurvey.followups.collectAsState()
-    val hasUnansweredFollowup = persistedFollowups[nid].orEmpty().any { it.answer == null }
+    val aiReasons by vmSurvey.aiReasons.collectAsState()
+    val aiReason = aiReasons[nid]
+    val hasUnansweredFollowup = aiReason != com.negi.survey.vm.SurveyAiReason.UNABLE_REFUSED &&
+        persistedFollowups[nid].orEmpty().any { it.answer == null }
     var submissionPending by remember(contextKey) { mutableStateOf(false) }
 
     // ---------------------------------------------------------------------
@@ -397,6 +400,19 @@ fun AiScreen(
         )
         vmAI.ensureRootQuestionMessage(contextKey, nid, rootQuestion)
         vmAI.ensureActivePromptIfMain(contextKey, rootQuestion)
+        if (isTwoStepNode) {
+            val reason = vmSurvey.aiReasons.value[nid]
+            if (reason?.terminal == true) vmAI.completeValidationTurn(contextKey, rootQuestion)
+            else if (reason == com.negi.survey.vm.SurveyAiReason.FAILURE && !vmAI.isRunning) {
+                vmAI.failValidationTurn(contextKey)
+            } else {
+                val pending = vmSurvey.followups.value[nid].orEmpty().lastOrNull { it.answer == null }
+                val current = vmAI.conversationStateFlow(contextKey).value
+                if (pending != null && current.activePromptQuestion != pending.question) {
+                    vmAI.setFollowupMode(contextKey, pending.question)
+                }
+            }
+        }
     }
 
     val conv by vmAI.conversationStateFlow(contextKey)
@@ -485,6 +501,8 @@ fun AiScreen(
     // ---------------------------------------------------------------------
 
     LaunchedEffect(vmAI, contextKey, isTwoStepNode) {
+        // Two-step commits are owned by the serialized chain, never by replayed global snapshots.
+        if (isTwoStepNode) return@LaunchedEffect
         /**
          * Use a local monotonic watermark inside this lifecycle-scoped collector.
          * AiViewModel allocates a unique increasing runId for every completed step,
@@ -560,7 +578,7 @@ fun AiScreen(
                  * - ONE_STEP nodes: Step1 (phase=ONE_STEP), or its owned repair FOLLOWUP step.
                  */
                 val existingFollowups = vmSurvey.followups.value[nid].orEmpty()
-                val capacityRemaining = followupCapacityRemaining(existingFollowups)
+                val capacityRemaining = followupCapacityRemaining(existingFollowups, vmSurvey.maxFollowups)
                 val repairEligibleInitial =
                     !isTwoStepNode && AiViewModel.needsFollowupRepair(
                         phase = step.phase,
@@ -596,7 +614,7 @@ fun AiScreen(
 
                     val fuNorm = fu?.trim()?.takeIf { it.isNotBlank() }
                     val candidateAccepted =
-                        fuNorm != null && canAcceptFollowupCandidate(fuNorm, existingFollowups)
+                        fuNorm != null && canAcceptFollowupCandidate(fuNorm, existingFollowups, vmSurvey.maxFollowups)
 
                     if (candidateAccepted) {
                         val displayedAsPlain =
@@ -614,45 +632,46 @@ fun AiScreen(
                             )
                         }
 
-                        vmSurvey.addFollowupQuestion(nid, fuNorm)
-                        vmAI.setFollowupMode(contextKey, fuNorm)
+                        if (vmSurvey.addFollowupQuestion(nid, fuNorm)) {
+                            vmAI.setFollowupMode(contextKey, fuNorm)
 
-                        // Info log: do not include raw text preview (use len + hash).
-                        RuntimeLogStore.i(
-                            TAG,
-                            "Follow-up persisted (context=$contextKey node=$nid runId=${step.runId} " +
-                                    "phase=${step.phase} twoStep=$isTwoStepNode mode=${step.mode} len=${fuNorm.length} " +
-                                    "sha6=${shortHash(fuNorm)} displayedAsPlain=$displayedAsPlain)"
-                        )
-
-                        /**
-                         * Release-safe Logcat diagnostic.
-                         *
-                         * RuntimeLogStore intentionally disables its Logcat mirror in release
-                         * builds. This direct entry keeps the follow-up UI commit observable
-                         * during release validation without exposing the follow-up text or any
-                         * other user/model payload. The short hash is correlation metadata only.
-                         */
-                        Log.i(
-                            TAG,
-                            "Follow-up UI commit: node=$nid runId=${step.runId} " +
-                                    "phase=${step.phase} mode=${step.mode} len=${fuNorm.length} " +
-                                    "sha6=${shortHash(fuNorm)} displayedAsPlain=$displayedAsPlain"
-                        )
-
-                        // Debug-only preview for local iteration.
-                        if (BuildConfig.DEBUG) {
-                            RuntimeLogStore.d(
+                            // Info log: do not include raw text preview (use len + hash).
+                            RuntimeLogStore.i(
                                 TAG,
-                                "Follow-up preview (debug) node=$nid runId=${step.runId} " +
-                                        "preview=${clipForLog(fuNorm, 120)}"
+                                "Follow-up persisted (context=$contextKey node=$nid runId=${step.runId} " +
+                                        "phase=${step.phase} twoStep=$isTwoStepNode mode=${step.mode} len=${fuNorm.length} " +
+                                        "sha6=${shortHash(fuNorm)} displayedAsPlain=$displayedAsPlain)"
                             )
-                        }
 
-                        scope.launch {
-                            delay(40)
-                            focusRequester.requestFocus()
-                            keyboard?.show()
+                            /**
+                             * Release-safe Logcat diagnostic.
+                             *
+                             * RuntimeLogStore intentionally disables its Logcat mirror in release
+                             * builds. This direct entry keeps the follow-up UI commit observable
+                             * during release validation without exposing the follow-up text or any
+                             * other user/model payload. The short hash is correlation metadata only.
+                             */
+                            Log.i(
+                                TAG,
+                                "Follow-up UI commit: node=$nid runId=${step.runId} " +
+                                        "phase=${step.phase} mode=${step.mode} len=${fuNorm.length} " +
+                                        "sha6=${shortHash(fuNorm)} displayedAsPlain=$displayedAsPlain"
+                            )
+
+                            // Debug-only preview for local iteration.
+                            if (BuildConfig.DEBUG) {
+                                RuntimeLogStore.d(
+                                    TAG,
+                                    "Follow-up preview (debug) node=$nid runId=${step.runId} " +
+                                            "preview=${clipForLog(fuNorm, 120)}"
+                                )
+                            }
+
+                            scope.launch {
+                                delay(40)
+                                focusRequester.requestFocus()
+                                keyboard?.show()
+                            }
                         }
                     } else if (!repairEligibleInitial) {
                         if (fuNorm != null) {
@@ -805,7 +824,38 @@ fun AiScreen(
             buildSecondPrompt = { prompt }
         )
 
+    fun runTwoStep(retry: Boolean = false) {
+        if (loading || submissionPending || speechRecording || speechTranscribing) return
+        if (!retry) {
+            val input = conv.composerDraft.trim()
+            if (input.isBlank()) return
+            if (conv.role == AiViewModel.ComposerRole.MAIN) vmSurvey.setAnswer(input, nid)
+            else vmSurvey.answerLastFollowup(nid, input)
+            vmAI.appendUserMessage(contextKey, input)
+        }
+        submissionPending = true
+        keyboard?.hide()
+        focusManager.clearFocus(force = true)
+        scope.launch {
+            try {
+                vmAI.evaluateSurveyTwoStepAsync(vmSurvey, nid, contextKey, rootQuestion).join()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                vmSurvey.setAiReason(nid, com.negi.survey.vm.SurveyAiReason.FAILURE)
+                vmAI.failValidationTurn(contextKey)
+                snack.showSnackbar("Validation failed. Retry using the saved answers.")
+            } finally {
+                submissionPending = false
+            }
+        }
+    }
+
     fun submit() {
+        if (isTwoStepNode) {
+            runTwoStep(retry = conv.validationFailed)
+            return
+        }
         if (loading || submissionPending) return
         if (speechRecording || speechTranscribing) {
             scope.launch { snack.showSnackbar("Speech is active. Stop recording first.") }
@@ -831,7 +881,7 @@ fun AiScreen(
                 val t0 = SystemClock.uptimeMillis()
                 try {
                     val entries = vmSurvey.followups.value[nid].orEmpty()
-                    val capacityRemaining = followupCapacityRemaining(entries)
+                    val capacityRemaining = followupCapacityRemaining(entries, vmSurvey.maxFollowups)
                     val originalMainAnswer = vmSurvey.getAnswer(nid)
                     val accumulatedPrompt = vmSurvey.getAccumulatedPrompt(
                         nodeId = nid,
@@ -901,37 +951,11 @@ fun AiScreen(
                     )
                 }
 
-                val inferenceJob =
-                if (!isTwoStep) {
-                    val originalPrompt = vmSurvey.getPrompt(nid, questionForTurn, answerForTurn)
-                    startOneStepValidation(
-                        prompt = originalPrompt,
-                        capacityRemaining = followupCapacityRemaining(vmSurvey.followups.value[nid].orEmpty())
-                    )
-                } else {
-                    val prompt1 = vmSurvey.getEvalPrompt(nid, questionForTurn, answerForTurn)
-                    vmAI.evaluateConditionalTwoStepAsync(
-                        firstPrompt = prompt1,
-                        proceedOnTimeout = true,
-                        shouldRunSecond = { step1 ->
-                            val needed = extractFollowupNeeded(prettyJson, step1.raw) ?: false
-                            RuntimeLogStore.i(
-                                TAG,
-                                "TWO_STEP shouldRunSecond runId=$runId node=$nid role=${conv.role} " +
-                                        "followup_needed=$needed timedOut=${step1.timedOut} rawLen=${step1.raw.length}"
-                            )
-                            needed
-                        },
-                        buildSecondPrompt = { step1 ->
-                            vmSurvey.getFollowupPrompt(
-                                nodeId = nid,
-                                question = questionForTurn,
-                                answer = answerForTurn,
-                                evalJsonRaw = step1.raw
-                            )
-                        }
-                    )
-                }
+                val originalPrompt = vmSurvey.getPrompt(nid, questionForTurn, answerForTurn)
+                val inferenceJob = startOneStepValidation(
+                    prompt = originalPrompt,
+                    capacityRemaining = vmSurvey.remainingFollowups(nid)
+                )
                 inferenceJob.join()
             } catch (err: Throwable) {
                 if (err is CancellationException) throw err
@@ -1053,6 +1077,24 @@ fun AiScreen(
                             }
                         }
 
+                        if (isTwoStepNode) {
+                            aiReason?.let { Text("Status: ${it.wireValue.replace('_', ' ')}", modifier = Modifier.padding(horizontal = 12.dp)) }
+                            if (conv.validationFailed) {
+                                OutlinedButton(
+                                    enabled = !loading && !submissionPending && !speechRecording && !speechTranscribing,
+                                    onClick = { runTwoStep(retry = true) }
+                                ) { Text("Retry saved answers") }
+                            }
+                            TextButton(
+                                enabled = !loading && !submissionPending && !conv.turnCompleted &&
+                                    !speechRecording && !speechTranscribing,
+                                onClick = {
+                                    vmSurvey.setAiReason(nid, com.negi.survey.vm.SurveyAiReason.UNABLE_REFUSED)
+                                    vmAI.completeValidationTurn(contextKey, rootQuestion)
+                                }
+                            ) { Text("Unable to answer / prefer not to answer") }
+                        }
+
                         ChatComposer(
                             value = conv.composerDraft,
                             onValueChange = { t ->
@@ -1062,7 +1104,8 @@ fun AiScreen(
                                 }
                             },
                             onSend = ::submit,
-                            enabled = textFieldEnabled && !loading && !submissionPending,
+                            enabled = textFieldEnabled && !loading && !submissionPending &&
+                                !(isTwoStepNode && (conv.validationFailed || conv.turnCompleted)),
                             focusRequester = focusRequester,
                             speechEnabled = speechController != null,
                             speechRecording = speechRecording,

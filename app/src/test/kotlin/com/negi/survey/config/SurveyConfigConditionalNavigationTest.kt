@@ -42,7 +42,7 @@ class SurveyConfigConditionalNavigationTest {
     }
 
     @Test
-    fun shipped_repair_metadata_does_not_create_two_step_prompt_pairs() {
+    fun shipped_ai_nodes_resolve_two_step_prompt_pairs() {
         val workingDirectory = File(checkNotNull(System.getProperty("user.dir")))
         val assetDirectory = listOf(
             File(workingDirectory, "app/src/main/assets"),
@@ -58,7 +58,12 @@ class SurveyConfigConditionalNavigationTest {
                 val hasTwoStepPair =
                     !config.resolveEvalPrompt(nodeId).isNullOrBlank() &&
                             !config.resolveFollowupPrompt(nodeId).isNullOrBlank()
-                assertTrue("$name $nodeId must remain ONE_STEP", !hasTwoStepPair)
+                assertTrue("$name $nodeId must use TWO_STEP", hasTwoStepPair)
+                assertEquals(null, config.resolveOneStepPrompt(nodeId))
+                assertTrue(config.resolveEvalPrompt(nodeId)!!.contains("{{HISTORY}}"))
+                assertTrue(config.resolveFollowupPrompt(nodeId)!!.contains("{{EVAL_JSON}}"))
+                assertTrue(config.composeSystemPromptEval().contains("missing_points"))
+                assertTrue(config.composeSystemPromptFollowup().contains(if (name.contains("_sw_")) "Swahili" else "English"))
             }
         }
     }

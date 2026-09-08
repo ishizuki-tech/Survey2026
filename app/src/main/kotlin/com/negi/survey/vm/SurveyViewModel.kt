@@ -331,21 +331,52 @@ open class SurveyViewModel(
     private val _followups = MutableStateFlow<Map<String, List<FollowupEntry>>>(LinkedHashMap())
     val followups: StateFlow<Map<String, List<FollowupEntry>>> = _followups.asStateFlow()
 
+    val maxFollowups: Int get() = config.aiInteraction.maxFollowups
+
+    private val _aiReasons = MutableStateFlow<Map<String, SurveyAiReason>>(emptyMap())
+    val aiReasons: StateFlow<Map<String, SurveyAiReason>> = _aiReasons.asStateFlow()
+
+    fun setAiReason(nodeId: String, reason: SurveyAiReason?) {
+        _aiReasons.update { old ->
+            if (reason == null) old - nodeId.trim() else old + (nodeId.trim() to reason)
+        }
+    }
+
+    fun aiReasonsJson(): String = kotlinx.serialization.json.JsonObject(
+        aiReasons.value.mapValues { kotlinx.serialization.json.JsonPrimitive(it.value.wireValue) }
+    ).toString()
+
+    fun remainingFollowups(nodeId: String): Int =
+        (maxFollowups - followups.value[nodeId.trim()].orEmpty().size).coerceAtLeast(0)
+
+    private fun answeredHistory(nodeId: String): String =
+        followups.value[nodeId.trim()].orEmpty().filter { !it.answer.isNullOrBlank() }
+            .mapIndexed { index, entry ->
+                "Follow-up ${index + 1}: ${entry.question}\nAnswer ${index + 1}: ${entry.answer}"
+            }.joinToString("\n")
+
     fun addFollowupQuestion(
         nodeId: String,
         question: String,
         dedupAdjacent: Boolean = true
-    ) {
+    ): Boolean {
         val k = nodeId.trim()
+        val q = question.trim()
+        if (q.isBlank()) return false
+
+        var added = false
         _followups.update { old ->
+            added = false
             val mutable = old.mutableLinkedLists<FollowupEntry>()
             val list = mutable.getOrPut(k) { mutableListOf() }
-            val last = list.lastOrNull()
-            if (!(dedupAdjacent && last?.question == question)) {
-                list.add(FollowupEntry(question = question))
+            if (list.size < maxFollowups &&
+                !(dedupAdjacent && list.any { SurveyAiPolicy.normalize(it.question) == SurveyAiPolicy.normalize(q) })) {
+                list.add(FollowupEntry(question = q))
+                added = true
             }
             mutable.toImmutableLists()
         }
+        return added
     }
 
     fun answerLastFollowup(nodeId: String, answer: String) {
@@ -379,6 +410,7 @@ open class SurveyViewModel(
 
     fun clearFollowups(nodeId: String) {
         val k = nodeId.trim()
+        setAiReason(k, null)
         _followups.update { old ->
             val mutable = old.mutableLinkedLists<FollowupEntry>()
             mutable.remove(k)
@@ -387,6 +419,7 @@ open class SurveyViewModel(
     }
 
     fun resetFollowups() {
+        _aiReasons.value = emptyMap()
         _followups.value = LinkedHashMap()
     }
 
@@ -628,6 +661,7 @@ open class SurveyViewModel(
             vars = linkedMapOf(
                 KEY_QUESTION to question.trim(),
                 KEY_ANSWER to answer.trim(),
+                "HISTORY" to answeredHistory(k),
                 KEY_NODE_ID to k
             )
         )
@@ -656,6 +690,7 @@ open class SurveyViewModel(
             vars = linkedMapOf(
                 KEY_QUESTION to question.trim(),
                 KEY_ANSWER to answer.trim(),
+                "HISTORY" to answeredHistory(k),
                 KEY_NODE_ID to k,
                 KEY_EVAL_JSON to evalJsonRaw.trim()
             )
