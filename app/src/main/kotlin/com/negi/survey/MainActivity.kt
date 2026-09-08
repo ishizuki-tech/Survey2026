@@ -153,7 +153,10 @@ import com.negi.survey.vm.FlowMulti
 import com.negi.survey.vm.FlowReview
 import com.negi.survey.vm.FlowSingle
 import com.negi.survey.vm.FlowText
+import com.negi.survey.vm.NoOpQuestionSpeaker
+import com.negi.survey.vm.QuestionSpeaker
 import com.negi.survey.vm.SurveyViewModel
+import com.negi.survey.vm.TtsController
 import com.negi.survey.vm.WhisperSpeechController
 import java.util.Locale
 import kotlinx.coroutines.CancellationException
@@ -177,6 +180,9 @@ private const val DEFAULT_WHISPER_ASSET_MODEL: String = "models/ggml-small-q5_1.
 
 /** Default Whisper language when config omits it. */
 private const val DEFAULT_WHISPER_LANGUAGE: String = "en"
+
+/** Default TTS language when config omits it. */
+private const val DEFAULT_TTS_LANGUAGE: String = "en"
 
 /** Bounded upload policy for internal GitHub Contents API uploads. */
 private const val INTERNAL_GH_MAX_RAW_BYTES = 10 * 1024 * 1024
@@ -963,6 +969,7 @@ fun AppNav() {
                         backStack = backStack,
                         onResetToSelector = resetToSelector,
                         whisperMeta = cfg.whisper,
+                        ttsMeta = cfg.tts,
                         sessionId = sessionKey,
                         sessionVmOwner = sessionVmOwner
                     )
@@ -974,6 +981,7 @@ fun AppNav() {
                     backStack = backStack,
                     onResetToSelector = resetToSelector,
                     whisperMeta = cfg.whisper,
+                    ttsMeta = cfg.tts,
                     sessionId = sessionKey,
                     sessionVmOwner = sessionVmOwner
                 )
@@ -1024,6 +1032,7 @@ fun SurveyNavHost(
     backStack: NavBackStack<NavKey>,
     onResetToSelector: () -> Unit = {},
     whisperMeta: SurveyConfig.WhisperMeta = SurveyConfig.WhisperMeta(),
+    ttsMeta: SurveyConfig.TtsMeta = SurveyConfig.TtsMeta(),
     sessionId: String = "session",
     sessionVmOwner: ViewModelStoreOwner? = null
 ) {
@@ -1132,6 +1141,49 @@ fun SurveyNavHost(
         }
     }
 
+    /* ───────────────────────── Text-to-speech (question read-aloud) ───────────────────────── */
+
+    val ttsEnabled = remember(ttsMeta.enabled) { ttsMeta.enabled ?: true }
+    val ttsAutoPlay = remember(ttsMeta.autoPlay) { ttsMeta.autoPlay ?: true }
+
+    val ttsLang = remember(ttsMeta.language) {
+        ttsMeta.language
+            ?.trim()
+            ?.lowercase(Locale.US)
+            ?.ifBlank { null }
+            ?: DEFAULT_TTS_LANGUAGE
+    }
+    val ttsRate = remember(ttsMeta.speechRate) { ttsMeta.speechRate?.takeIf { it > 0f } ?: 1.0f }
+    val ttsPitch = remember(ttsMeta.pitch) { ttsMeta.pitch?.takeIf { it > 0f } ?: 1.0f }
+
+    val ttsController: QuestionSpeaker = if (ttsEnabled) {
+        val ttsFactory = remember(appContext, ttsLang, ttsRate, ttsPitch) {
+            TtsController.provideFactory(
+                appContext = appContext,
+                languageCode = ttsLang,
+                speechRate = ttsRate,
+                pitch = ttsPitch
+            )
+        }
+
+        val ttsVm: TtsController = viewModel(
+            viewModelStoreOwner = owner,
+            key = "TtsController_${sessionId}_$ttsLang",
+            factory = ttsFactory
+        )
+
+        ttsVm
+    } else {
+        remember { NoOpQuestionSpeaker("Text-to-speech is disabled by configuration.") }
+    }
+
+    DisposableEffect(ttsController) {
+        onDispose {
+            // Best-effort: stop any in-progress playback when leaving the host.
+            runCatching { ttsController.stop() }
+        }
+    }
+
     Box(modifier = rootModifier) {
         NavDisplay(
             backStack = backStack,
@@ -1195,18 +1247,36 @@ fun SurveyNavHost(
                 entry<FlowText> {
                     val node by vmSurvey.currentNode.collectAsStateWithLifecycle()
                     val answers by vmSurvey.answers.collectAsStateWithLifecycle()
+                    val ttsSpeaking by ttsController.isSpeaking.collectAsStateWithLifecycle()
+
+                    LaunchedEffect(node.id, node.question, ttsAutoPlay) {
+                        if (ttsAutoPlay) {
+                            runCatching { ttsController.speak(node.question, node.id) }
+                        }
+                    }
+
                     TextNodeScreen(
                         title = node.title,
                         question = node.question,
                         value = answers[node.id].orEmpty(),
                         onValueChange = { vmSurvey.setAnswer(it, node.id) },
                         onNext = { vmSurvey.advanceToNext() },
-                        onBack = { vmSurvey.backToPrevious() }
+                        onBack = { vmSurvey.backToPrevious() },
+                        onReplay = { ttsController.speak(node.question, node.id) },
+                        isSpeaking = ttsSpeaking
                     )
                 }
 
                 entry<FlowSingle> {
                     val node by vmSurvey.currentNode.collectAsStateWithLifecycle()
+                    val ttsSpeaking by ttsController.isSpeaking.collectAsStateWithLifecycle()
+
+                    LaunchedEffect(node.id, node.question, ttsAutoPlay) {
+                        if (ttsAutoPlay) {
+                            runCatching { ttsController.speak(node.question, node.id) }
+                        }
+                    }
+
                     SingleChoiceNodeScreen(
                         title = node.title,
                         question = node.question,
@@ -1222,13 +1292,22 @@ fun SurveyNavHost(
                             }
                             vmSurvey.advanceToNext()
                         },
-                        onBack = { vmSurvey.backToPrevious() }
+                        onBack = { vmSurvey.backToPrevious() },
+                        onReplay = { ttsController.speak(node.question, node.id) },
+                        isSpeaking = ttsSpeaking
                     )
                 }
 
                 entry<FlowMulti> {
                     val node by vmSurvey.currentNode.collectAsStateWithLifecycle()
                     val selected by vmSurvey.multi.collectAsStateWithLifecycle()
+                    val ttsSpeaking by ttsController.isSpeaking.collectAsStateWithLifecycle()
+
+                    LaunchedEffect(node.id, node.question, ttsAutoPlay) {
+                        if (ttsAutoPlay) {
+                            runCatching { ttsController.speak(node.question, node.id) }
+                        }
+                    }
 
                     MultiChoiceNodeScreen(
                         title = node.title,
@@ -1241,19 +1320,29 @@ fun SurveyNavHost(
                             vmSurvey.setAnswer(ans, node.id)
                             vmSurvey.advanceToNext()
                         },
-                        onBack = { vmSurvey.backToPrevious() }
+                        onBack = { vmSurvey.backToPrevious() },
+                        onReplay = { ttsController.speak(node.question, node.id) },
+                        isSpeaking = ttsSpeaking
                     )
                 }
 
                 entry<FlowAI> {
                     val node by vmSurvey.currentNode.collectAsStateWithLifecycle()
+
+                    LaunchedEffect(node.id, node.question, ttsAutoPlay) {
+                        if (ttsAutoPlay) {
+                            runCatching { ttsController.speak(node.question, node.id) }
+                        }
+                    }
+
                     AiScreen(
                         nodeId = node.id,
                         vmSurvey = vmSurvey,
                         vmAI = vmAI,
                         onNext = { vmSurvey.advanceToNext() },
                         onBack = { vmSurvey.backToPrevious() },
-                        speechController = speechController
+                        speechController = speechController,
+                        ttsController = ttsController
                     )
                 }
 
@@ -1362,7 +1451,9 @@ internal fun TextNodeScreen(
     value: String,
     onValueChange: (String) -> Unit,
     onNext: () -> Unit,
-    onBack: () -> Unit
+    onBack: () -> Unit,
+    onReplay: () -> Unit = {},
+    isSpeaking: Boolean = false
 ) {
     val backplate = appBackplate()
     val scroll = rememberScrollState()
@@ -1395,10 +1486,19 @@ internal fun TextNodeScreen(
                 if (title.isNotBlank()) {
                     Text(text = title, style = MaterialTheme.typography.titleLarge)
                 }
-                Text(
-                    text = question.ifBlank { "(no question text)" },
-                    style = MaterialTheme.typography.bodyLarge
-                )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    Text(
+                        text = question.ifBlank { "(no question text)" },
+                        style = MaterialTheme.typography.bodyLarge,
+                        modifier = Modifier.weight(1f)
+                    )
+                    IconButton(onClick = onReplay) {
+                        Text(if (isSpeaking) "\u23F9" else "\uD83D\uDD0A")
+                    }
+                }
 
                 OutlinedTextField(
                     value = value,
@@ -1430,7 +1530,9 @@ private fun SingleChoiceNodeScreen(
     selected: String?,
     onSelect: (String?) -> Unit,
     onNext: () -> Unit,
-    onBack: () -> Unit
+    onBack: () -> Unit,
+    onReplay: () -> Unit = {},
+    isSpeaking: Boolean = false
 ) {
     val backplate = appBackplate()
     val scroll = rememberScrollState()
@@ -1463,10 +1565,19 @@ private fun SingleChoiceNodeScreen(
                 if (title.isNotBlank()) {
                     Text(text = title, style = MaterialTheme.typography.titleLarge)
                 }
-                Text(
-                    text = question.ifBlank { "(no question text)" },
-                    style = MaterialTheme.typography.bodyLarge
-                )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    Text(
+                        text = question.ifBlank { "(no question text)" },
+                        style = MaterialTheme.typography.bodyLarge,
+                        modifier = Modifier.weight(1f)
+                    )
+                    IconButton(onClick = onReplay) {
+                        Text(if (isSpeaking) "\u23F9" else "\uD83D\uDD0A")
+                    }
+                }
 
                 Spacer(Modifier.height(8.dp))
 
@@ -1512,7 +1623,9 @@ private fun MultiChoiceNodeScreen(
     selected: Set<String>,
     onToggle: (String) -> Unit,
     onNext: () -> Unit,
-    onBack: () -> Unit
+    onBack: () -> Unit,
+    onReplay: () -> Unit = {},
+    isSpeaking: Boolean = false
 ) {
     val backplate = appBackplate()
     val scroll = rememberScrollState()
@@ -1545,10 +1658,19 @@ private fun MultiChoiceNodeScreen(
                 if (title.isNotBlank()) {
                     Text(text = title, style = MaterialTheme.typography.titleLarge)
                 }
-                Text(
-                    text = question.ifBlank { "(no question text)" },
-                    style = MaterialTheme.typography.bodyLarge
-                )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    Text(
+                        text = question.ifBlank { "(no question text)" },
+                        style = MaterialTheme.typography.bodyLarge,
+                        modifier = Modifier.weight(1f)
+                    )
+                    IconButton(onClick = onReplay) {
+                        Text(if (isSpeaking) "\u23F9" else "\uD83D\uDD0A")
+                    }
+                }
 
                 Spacer(Modifier.height(8.dp))
 
