@@ -72,11 +72,23 @@ data class SurveyConfig(
     @SerialName("prompts_eval") val promptsEval: List<NodePrompt> = emptyList(),
     @SerialName("prompts_followup") val promptsFollowup: List<NodePrompt> = emptyList(),
 
+    @SerialName("ai_interaction") val aiInteraction: AiInteraction = AiInteraction(),
     val graph: Graph,
     val slm: SlmMeta = SlmMeta(),
     val whisper: WhisperMeta = WhisperMeta(),
     @SerialName("model_defaults") val modelDefaults: ModelDefaults = ModelDefaults()
 ) {
+
+    @Serializable
+    data class AiInteraction(
+        @SerialName("max_followups") val maxFollowups: Int = 2
+    ) {
+        init {
+            require(maxFollowups >= 0) {
+                "ai_interaction.max_followups must be an integer in 0..2147483647"
+            }
+        }
+    }
 
     /**
      * A prompt template entry for a graph node.
@@ -1242,6 +1254,29 @@ object SurveyConfigLoader {
         file.writeText(text, charset)
     }
 
+    private fun validateFollowupCapSource(text: String, format: ConfigFormat) {
+        val message = "ai_interaction.max_followups must be an unquoted integer in 0..2147483647"
+        if (format == ConfigFormat.JSON) {
+            val root = jsonCompact.parseToJsonElement(text) as? kotlinx.serialization.json.JsonObject ?: return
+            val interaction = root["ai_interaction"] as? kotlinx.serialization.json.JsonObject ?: return
+            val value = interaction["max_followups"] ?: return
+            val scalar = value as? kotlinx.serialization.json.JsonPrimitive
+            require(scalar != null && !scalar.isString &&
+                scalar.content.matches(Regex("[0-9]+")) &&
+                scalar.content.toIntOrNull()?.let { it >= 0 } == true) { message }
+        } else if (format == ConfigFormat.YAML) {
+            val root = yamlLenient.parseToYamlNode(text) as? com.charleskorn.kaml.YamlMap ?: return
+            val interaction = root.get<com.charleskorn.kaml.YamlMap>("ai_interaction") ?: return
+            val value = interaction.get<com.charleskorn.kaml.YamlNode>("max_followups") ?: return
+            val scalar = value as? com.charleskorn.kaml.YamlScalar
+            val first = text.lineSequence().elementAtOrNull(value.location.line - 1)
+                ?.getOrNull(value.location.column - 1)
+            require(scalar != null && first in '0'..'9' &&
+                scalar.content.matches(Regex("[0-9]+")) &&
+                scalar.content.toIntOrNull()?.let { it >= 0 } == true) { message }
+        }
+    }
+
     fun fromString(
         text: String,
         format: ConfigFormat = ConfigFormat.AUTO,
@@ -1255,6 +1290,7 @@ object SurveyConfigLoader {
         }
 
         val cfg = try {
+            validateFollowupCapSource(sanitized, decision.format)
             when (decision.format) {
                 ConfigFormat.JSON -> jsonCompact.decodeFromString(SurveyConfig.serializer(), sanitized)
                 ConfigFormat.YAML -> yamlLenient.decodeFromString(SurveyConfig.serializer(), sanitized)
@@ -1331,6 +1367,7 @@ object SurveyConfigLoader {
         }
 
         val cfg = try {
+            validateFollowupCapSource(sanitized, decision.format)
             when (decision.format) {
                 ConfigFormat.JSON ->
                     jsonStrict.decodeFromString(SurveyConfig.serializer(), sanitized)

@@ -1,3 +1,6 @@
+ai_interaction:
+  max_followups: 2
+
 graph:
   startId: Start
   nodes:
@@ -155,161 +158,158 @@ slm:
   model_turn_prefix: "<start_of_turn>model"
   turn_end: ""
 
-  # System prompt pieces
-  empty_json_instruction: "Jibu kwa kitu cha JSON kilicho tupu: {}"
-  preamble: "Wewe ni mtaalamu mashuhuri wa tafiti za wakulima. Soma Swali na Jibu."
-
-  key_contract: |
-    OUTPUT FORMAT:
-    - In Swahili.
-    - Keys exactly:
-      • "analysis": short string
-      • "expected_answer": short string
-      • "followup_question": a single short confirm/validate question (NOT an array; may be empty string)
-      • "score": integer 1–100
-
-    FOLLOW-UP INTENT:
-    - The follow-up must confirm or clarify the respondent's original answer to the SAME question.
-    - Target the biggest uncertainty: missing unit/scale, missing number, time window, baseline, or method used.
-    - Keep it single-scope (no multi-part), concrete, and answerable immediately.
-    - Do not introduce new topics or additional objectives.
-
-    CONSISTENCY:
-    - followup_question="" inaruhusiwa tu ikiwa Jibu linatimiza kila taarifa inayohitajika na lengo; score lazima iwe 90–100.
-    - Iwapo taarifa yoyote inayohitajika na lengo haipo au haieleweki, score lazima iwe chini ya 90 na followup_question lazima iwe swali moja fupi la Kiswahili kuhusu taarifa hiyo.
-
-  length_budget: |
-    LENGTH LIMITS:
-    - analysis<=60 chars
-    - expected_answer<=120 chars
-    - followup_question<=120 chars
-
-  scoring_rule: "Scoring rule: Judge ONLY content relevance/completeness/accuracy. Do NOT penalize style or formatting."
-
-  strict_output: |-
-    STRICT OUTPUT (NO MARKDOWN):
-    - RAW JSON only, ONE LINE.
-    - Use COMPACT JSON (no spaces around ':' and ',').
-    - No extra text.
-
+  preamble: "Evaluate only the original survey target using all supplied answers."
+  empty_json_instruction: ""
+  key_contract_eval: >-
+    Return only compact JSON {"score":N,"missing_points":[],"followup_needed":false}.
+    N must be an integer 1-100 for relevance, completeness and accuracy against the original target.
+    Evaluate the original answer and all answered followup pairs together.
+    Score 90-100 only when all target-required information is satisfied; otherwise score below 90.
+    For score below 90, missing_points must contain the specific missing or ambiguous target-required information
+    and followup_needed must be true. Otherwise missing_points is empty and followup_needed is false.
+    Do not generate a question. Do not penalize style or request information outside the target.
+    Write missing_points in Swahili.
+  strict_output_eval: "One JSON object only; no markdown or generated question."
+  length_budget_eval: "Keep missing_points concise."
   followup_output_mode: TEXT
   key_contract_followup: >-
-    Toa swali moja fupi la Kiswahili kuhusu taarifa inayohitajika na lengo ambayo haipo au haieleweki.
-    Usitoe score, JSON, analysis, maelezo, au maandishi mengine.
-  length_budget_followup: "followup_question<=120 chars"
-  strict_output_followup: >-
-    Toa swali moja tu kwenye mstari mmoja; bila markdown, lebo, au alama za kunukuu.
+    Generate exactly one short Swahili question addressing one unresolved target-required deficiency in EVAL_JSON.
+    Use the original target, original answer and accumulated answered followup pairs.
+    Do not repeat an earlier question or ask for information already provided. Never add new objectives.
+    Output only the question on one line; no JSON, score, analysis, labels, or quotes.
+  strict_output_followup: "Exactly one Swahili question on one line."
+  length_budget_followup: "Keep the question short and single-scope."
 
 prompts:
   - nodeId: Q8
-    prompt: |-
-      Kazi:
-      - Tambua udhaifu (haijulikani kama FAW iliathiri au la, maelezo ya athari hayapo).
-      - Toa expected_answer moja thabiti: kama FAW iliathiri mazao, na maelezo ya athari hiyo (upotevu wa mavuno, aina ya uharibifu, n.k.).
-      - Uliza followup_question 1 tu ili kuthibitisha JIBU HILO HILO (au "" ikiwa halihitajiki).
-      - Toa score 1–100.
-
-      Swali: {{QUESTION}}
-      Jibu: {{ANSWER}}
+    eval_prompt: |-
+      Lengo la jibu: kama FAW iliathiri mazao, na maelezo ya athari hiyo (upotevu wa mavuno, aina ya uharibifu, n.k.).
+      Question: {{QUESTION}}
+      Original answer: {{ANSWER}}
+      Answered followup pairs: {{HISTORY}}
+    followup_prompt: |-
+      Lengo la jibu: kama FAW iliathiri mazao, na maelezo ya athari hiyo (upotevu wa mavuno, aina ya uharibifu, n.k.).
+      Question: {{QUESTION}}
+      Original answer: {{ANSWER}}
+      Answered followup pairs: {{HISTORY}}
+      EVAL_JSON: {{EVAL_JSON}}
 
   - nodeId: Q9
-    prompt: |-
-      Kazi:
-      - Tambua udhaifu (hakuna kipimo, kiwango cha juu hakijawekwa).
-      - Toa expected_answer moja thabiti: hasara ya juu ya mavuno unayokubali ili kuvuna siku 20 mapema (% au magunia/ekari).
-      - Uliza followup_question 1 tu ili kuthibitisha JIBU HILO HILO (au "" ikiwa halihitajiki).
-      - Toa score 1–100.
-
-      Swali: {{QUESTION}}
-      Jibu: {{ANSWER}}
+    eval_prompt: |-
+      Lengo la jibu: hasara ya juu ya mavuno unayokubali ili kuvuna siku 20 mapema (% au magunia/ekari).
+      Question: {{QUESTION}}
+      Original answer: {{ANSWER}}
+      Answered followup pairs: {{HISTORY}}
+    followup_prompt: |-
+      Lengo la jibu: hasara ya juu ya mavuno unayokubali ili kuvuna siku 20 mapema (% au magunia/ekari).
+      Question: {{QUESTION}}
+      Original answer: {{ANSWER}}
+      Answered followup pairs: {{HISTORY}}
+      EVAL_JSON: {{EVAL_JSON}}
 
   - nodeId: Q10
-    prompt: |-
-      Kazi:
-      - Tambua udhaifu (hakuna kizingiti wazi, kipimo kutoeleweka).
-      - Toa expected_answer moja thabiti: kizingiti wazi cha kubadilisha aina ya mahindi (kipimo + kiwango).
-      - Uliza followup_question 1 tu ili kuthibitisha JIBU HILO HILO (au "" ikiwa halihitajiki).
-      - Toa score 1–100.
-
-      Swali: {{QUESTION}}
-      Jibu: {{ANSWER}}
+    eval_prompt: |-
+      Lengo la jibu: kizingiti wazi cha kubadilisha aina ya mahindi (kipimo + kiwango).
+      Question: {{QUESTION}}
+      Original answer: {{ANSWER}}
+      Answered followup pairs: {{HISTORY}}
+    followup_prompt: |-
+      Lengo la jibu: kizingiti wazi cha kubadilisha aina ya mahindi (kipimo + kiwango).
+      Question: {{QUESTION}}
+      Original answer: {{ANSWER}}
+      Answered followup pairs: {{HISTORY}}
+      EVAL_JSON: {{EVAL_JSON}}
 
   - nodeId: Q11
-    prompt: |-
-      Kazi:
-      - Tambua udhaifu (sifa za jumla tu, namba hazipo).
-      - Toa expected_answer moja thabiti: sifa za kipaumbele za aina mpya, ikiwezekana na kigezo kimoja kinachopimika.
-      - Uliza followup_question 1 tu ili kuthibitisha JIBU HILO HILO (au "" ikiwa halihitajiki).
-      - Toa score 1–100.
-
-      Swali: {{QUESTION}}
-      Jibu: {{ANSWER}}
+    eval_prompt: |-
+      Lengo la jibu: sifa za kipaumbele za aina mpya, ikiwezekana na kigezo kimoja kinachopimika.
+      Question: {{QUESTION}}
+      Original answer: {{ANSWER}}
+      Answered followup pairs: {{HISTORY}}
+    followup_prompt: |-
+      Lengo la jibu: sifa za kipaumbele za aina mpya, ikiwezekana na kigezo kimoja kinachopimika.
+      Question: {{QUESTION}}
+      Original answer: {{ANSWER}}
+      Answered followup pairs: {{HISTORY}}
+      EVAL_JSON: {{EVAL_JSON}}
 
   - nodeId: Q12
-    prompt: |-
-      Kazi:
-      - Tambua udhaifu (baseline haipo, kipimo hakipo).
-      - Toa expected_answer moja thabiti: mavuno ya chini unayokubali katika msimu mbaya (% au magunia/ekari).
-      - Uliza followup_question 1 tu ili kuthibitisha JIBU HILO HILO (au "" ikiwa halihitajiki).
-      - Toa score 1–100.
-
-      Swali: {{QUESTION}}
-      Jibu: {{ANSWER}}
+    eval_prompt: |-
+      Lengo la jibu: mavuno ya chini unayokubali katika msimu mbaya (% au magunia/ekari).
+      Question: {{QUESTION}}
+      Original answer: {{ANSWER}}
+      Answered followup pairs: {{HISTORY}}
+    followup_prompt: |-
+      Lengo la jibu: mavuno ya chini unayokubali katika msimu mbaya (% au magunia/ekari).
+      Question: {{QUESTION}}
+      Original answer: {{ANSWER}}
+      Answered followup pairs: {{HISTORY}}
+      EVAL_JSON: {{EVAL_JSON}}
 
   - nodeId: Q13
-    prompt: |-
-      Kazi:
-      - Tambua udhaifu (hatua ya ukuaji haijafafanuliwa wazi).
-      - Toa expected_answer moja thabiti: hatua ya ukuaji wa mahindi inayoathiriwa zaidi na ukame.
-      - Uliza followup_question 1 tu ili kuthibitisha JIBU HILO HILO (au "" ikiwa halihitajiki).
-      - Toa score 1–100.
-
-      Swali: {{QUESTION}}
-      Jibu: {{ANSWER}}
+    eval_prompt: |-
+      Lengo la jibu: hatua ya ukuaji wa mahindi inayoathiriwa zaidi na ukame.
+      Question: {{QUESTION}}
+      Original answer: {{ANSWER}}
+      Answered followup pairs: {{HISTORY}}
+    followup_prompt: |-
+      Lengo la jibu: hatua ya ukuaji wa mahindi inayoathiriwa zaidi na ukame.
+      Question: {{QUESTION}}
+      Original answer: {{ANSWER}}
+      Answered followup pairs: {{HISTORY}}
+      EVAL_JSON: {{EVAL_JSON}}
 
   - nodeId: Q14
-    prompt: |-
-      Kazi:
-      - Tambua udhaifu (vigezo vya uamuzi havijabainishwa).
-      - Toa expected_answer moja thabiti: vigezo/sababu zinazotumika kuamua ugawaji wa mahindi kati ya chakula, malisho, kuuza, na matumizi mengine.
-      - Uliza followup_question 1 tu ili kuthibitisha JIBU HILO HILO (au "" ikiwa halihitajiki).
-      - Toa score 1–100.
-
-      Swali: {{QUESTION}}
-      Jibu: {{ANSWER}}
+    eval_prompt: |-
+      Lengo la jibu: vigezo/sababu zinazotumika kuamua ugawaji wa mahindi kati ya chakula, malisho, kuuza, na matumizi mengine.
+      Question: {{QUESTION}}
+      Original answer: {{ANSWER}}
+      Answered followup pairs: {{HISTORY}}
+    followup_prompt: |-
+      Lengo la jibu: vigezo/sababu zinazotumika kuamua ugawaji wa mahindi kati ya chakula, malisho, kuuza, na matumizi mengine.
+      Question: {{QUESTION}}
+      Original answer: {{ANSWER}}
+      Answered followup pairs: {{HISTORY}}
+      EVAL_JSON: {{EVAL_JSON}}
 
   - nodeId: Q15
-    prompt: |-
-      Kazi:
-      - Tambua udhaifu (aina ya mifugo au mara za kulisha hazijabainishwa).
-      - Toa expected_answer moja thabiti: mifugo inayolishwa mahindi meupe na mara ngapi.
-      - Uliza followup_question 1 tu ili kuthibitisha JIBU HILO HILO (au "" ikiwa halihitajiki).
-      - Toa score 1–100.
-
-      Swali: {{QUESTION}}
-      Jibu: {{ANSWER}}
+    eval_prompt: |-
+      Lengo la jibu: mifugo inayolishwa mahindi meupe na mara ngapi.
+      Question: {{QUESTION}}
+      Original answer: {{ANSWER}}
+      Answered followup pairs: {{HISTORY}}
+    followup_prompt: |-
+      Lengo la jibu: mifugo inayolishwa mahindi meupe na mara ngapi.
+      Question: {{QUESTION}}
+      Original answer: {{ANSWER}}
+      Answered followup pairs: {{HISTORY}}
+      EVAL_JSON: {{EVAL_JSON}}
 
   - nodeId: Q16
-    prompt: |-
-      Kazi:
-      - Tambua udhaifu (chanzo au sababu hazijabainishwa wazi).
-      - Toa expected_answer moja thabiti: chanzo cha kawaida cha mbegu na sababu ya kuchagua chanzo hicho.
-      - Uliza followup_question 1 tu ili kuthibitisha JIBU HILO HILO (au "" ikiwa halihitajiki).
-      - Toa score 1–100.
-
-      Swali: {{QUESTION}}
-      Jibu: {{ANSWER}}
+    eval_prompt: |-
+      Lengo la jibu: chanzo cha kawaida cha mbegu na sababu ya kuchagua chanzo hicho.
+      Question: {{QUESTION}}
+      Original answer: {{ANSWER}}
+      Answered followup pairs: {{HISTORY}}
+    followup_prompt: |-
+      Lengo la jibu: chanzo cha kawaida cha mbegu na sababu ya kuchagua chanzo hicho.
+      Question: {{QUESTION}}
+      Original answer: {{ANSWER}}
+      Answered followup pairs: {{HISTORY}}
+      EVAL_JSON: {{EVAL_JSON}}
 
   - nodeId: Q17
-    prompt: |-
-      Kazi:
-      - Tambua udhaifu (soko/mnunuzi au sababu hazijabainishwa).
-      - Toa expected_answer moja thabiti: mahali pa kawaida pa kuuza mahindi baada ya kuvuna na sababu ya kuchagua soko/mnunuzi huyo.
-      - Uliza followup_question 1 tu ili kuthibitisha JIBU HILO HILO (au "" ikiwa halihitajiki).
-      - Toa score 1–100.
-
-      Swali: {{QUESTION}}
-      Jibu: {{ANSWER}}
+    eval_prompt: |-
+      Lengo la jibu: mahali pa kawaida pa kuuza mahindi baada ya kuvuna na sababu ya kuchagua soko/mnunuzi huyo.
+      Question: {{QUESTION}}
+      Original answer: {{ANSWER}}
+      Answered followup pairs: {{HISTORY}}
+    followup_prompt: |-
+      Lengo la jibu: mahali pa kawaida pa kuuza mahindi baada ya kuvuna na sababu ya kuchagua soko/mnunuzi huyo.
+      Question: {{QUESTION}}
+      Original answer: {{ANSWER}}
+      Answered followup pairs: {{HISTORY}}
+      EVAL_JSON: {{EVAL_JSON}}
 
 model_defaults:
   default_model_url: "https://huggingface.co/google/gemma-3n-E4B-it-litert-lm/resolve/main/gemma-3n-E4B-it-int4.litertlm"

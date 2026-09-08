@@ -1,3 +1,6 @@
+ai_interaction:
+  max_followups: 2
+
 graph:
   startId: Start
   nodes:
@@ -154,88 +157,158 @@ slm:
   model_turn_prefix: "<start_of_turn>model"
   turn_end: ""
 
-  # Compact evaluation contract optimized for low prefill/decode cost.
+  preamble: "Evaluate only the original survey target using all supplied answers."
   empty_json_instruction: ""
-  preamble: "Evaluate the survey answer."
-
-  key_contract: >-
-    Return only compact JSON {"followup_question":"","score":N}; no markdown.
-    Score N=1-100 for relevance, completeness, and accuracy against the Expected answer target only.
-    Empty followup_question is allowed ONLY when Answer fully satisfies every target-required point; then score MUST be 90-100.
-    If any target-required point is missing or ambiguous, score MUST be below 90 and followup_question MUST contain exactly one short English question for that point.
-    Never ask for extra detail, invent uncertainty, or change topic.
-
-  # All output requirements are folded into key_contract to minimize prompt tokens.
-  length_budget: ""
-  scoring_rule: ""
-  strict_output: ""
+  key_contract_eval: >-
+    Return only compact JSON {"score":N,"missing_points":[],"followup_needed":false}.
+    N must be an integer 1-100 for relevance, completeness and accuracy against the original target.
+    Evaluate the original answer and all answered followup pairs together.
+    Score 90-100 only when all target-required information is satisfied; otherwise score below 90.
+    For score below 90, missing_points must contain the specific missing or ambiguous target-required information
+    and followup_needed must be true. Otherwise missing_points is empty and followup_needed is false.
+    Do not generate a question. Do not penalize style or request information outside the target.
+    Write missing_points in English.
+  strict_output_eval: "One JSON object only; no markdown or generated question."
+  length_budget_eval: "Keep missing_points concise."
   followup_output_mode: TEXT
   key_contract_followup: >-
-    Output exactly one short English question for missing or ambiguous target-required information.
-    No score, JSON, analysis, explanation, or extra text.
-  strict_output_followup: >-
-    Output one question only on one line; no markdown, labels, or quotes.
+    Generate exactly one short English question addressing one unresolved target-required deficiency in EVAL_JSON.
+    Use the original target, original answer and accumulated answered followup pairs.
+    Do not repeat an earlier question or ask for information already provided. Never add new objectives.
+    Output only the question on one line; no JSON, score, analysis, labels, or quotes.
+  strict_output_followup: "Exactly one English question on one line."
+  length_budget_followup: "Keep the question short and single-scope."
 
 prompts:
   - nodeId: Q8
-    prompt: |-
+    eval_prompt: |-
       Expected answer target: Whether FAW affected the crop, and if so, a description of the effect (yield loss, damage type, etc.).
       Question: {{QUESTION}}
-      Answer: {{ANSWER}}
+      Original answer: {{ANSWER}}
+      Answered followup pairs: {{HISTORY}}
+    followup_prompt: |-
+      Expected answer target: Whether FAW affected the crop, and if so, a description of the effect (yield loss, damage type, etc.).
+      Question: {{QUESTION}}
+      Original answer: {{ANSWER}}
+      Answered followup pairs: {{HISTORY}}
+      EVAL_JSON: {{EVAL_JSON}}
 
   - nodeId: Q9
-    prompt: |-
+    eval_prompt: |-
       Expected answer target: Maximum yield loss acceptable for harvesting 20 days earlier (% or bags/acre).
       Question: {{QUESTION}}
-      Answer: {{ANSWER}}
+      Original answer: {{ANSWER}}
+      Answered followup pairs: {{HISTORY}}
+    followup_prompt: |-
+      Expected answer target: Maximum yield loss acceptable for harvesting 20 days earlier (% or bags/acre).
+      Question: {{QUESTION}}
+      Original answer: {{ANSWER}}
+      Answered followup pairs: {{HISTORY}}
+      EVAL_JSON: {{EVAL_JSON}}
 
   - nodeId: Q10
-    prompt: |-
+    eval_prompt: |-
       Expected answer target: A clear pest/disease damage threshold that would trigger switching maize varieties.
       Question: {{QUESTION}}
-      Answer: {{ANSWER}}
+      Original answer: {{ANSWER}}
+      Answered followup pairs: {{HISTORY}}
+    followup_prompt: |-
+      Expected answer target: A clear pest/disease damage threshold that would trigger switching maize varieties.
+      Question: {{QUESTION}}
+      Original answer: {{ANSWER}}
+      Answered followup pairs: {{HISTORY}}
+      EVAL_JSON: {{EVAL_JSON}}
 
   - nodeId: Q11
-    prompt: |-
+    eval_prompt: |-
       Expected answer target: Priority traits a new maize variety must have to replace the current one, ideally with a measurable target.
       Question: {{QUESTION}}
-      Answer: {{ANSWER}}
+      Original answer: {{ANSWER}}
+      Answered followup pairs: {{HISTORY}}
+    followup_prompt: |-
+      Expected answer target: Priority traits a new maize variety must have to replace the current one, ideally with a measurable target.
+      Question: {{QUESTION}}
+      Original answer: {{ANSWER}}
+      Answered followup pairs: {{HISTORY}}
+      EVAL_JSON: {{EVAL_JSON}}
 
   - nodeId: Q12
-    prompt: |-
+    eval_prompt: |-
       Expected answer target: The lowest yield in a bad season that would still lead to continued planting of the current variety (% or bags/acre).
       Question: {{QUESTION}}
-      Answer: {{ANSWER}}
+      Original answer: {{ANSWER}}
+      Answered followup pairs: {{HISTORY}}
+    followup_prompt: |-
+      Expected answer target: The lowest yield in a bad season that would still lead to continued planting of the current variety (% or bags/acre).
+      Question: {{QUESTION}}
+      Original answer: {{ANSWER}}
+      Answered followup pairs: {{HISTORY}}
+      EVAL_JSON: {{EVAL_JSON}}
 
   - nodeId: Q13
-    prompt: |-
+    eval_prompt: |-
       Expected answer target: The maize growth stage where drought causes the greatest loss or damage.
       Question: {{QUESTION}}
-      Answer: {{ANSWER}}
+      Original answer: {{ANSWER}}
+      Answered followup pairs: {{HISTORY}}
+    followup_prompt: |-
+      Expected answer target: The maize growth stage where drought causes the greatest loss or damage.
+      Question: {{QUESTION}}
+      Original answer: {{ANSWER}}
+      Answered followup pairs: {{HISTORY}}
+      EVAL_JSON: {{EVAL_JSON}}
 
   - nodeId: Q14
-    prompt: |-
+    eval_prompt: |-
       Expected answer target: The factors/criteria used to decide how maize is allocated across food, livestock feed, sale, and other uses.
       Question: {{QUESTION}}
-      Answer: {{ANSWER}}
+      Original answer: {{ANSWER}}
+      Answered followup pairs: {{HISTORY}}
+    followup_prompt: |-
+      Expected answer target: The factors/criteria used to decide how maize is allocated across food, livestock feed, sale, and other uses.
+      Question: {{QUESTION}}
+      Original answer: {{ANSWER}}
+      Answered followup pairs: {{HISTORY}}
+      EVAL_JSON: {{EVAL_JSON}}
 
   - nodeId: Q15
-    prompt: |-
+    eval_prompt: |-
       Expected answer target: Which animals are fed white maize and how often.
       Question: {{QUESTION}}
-      Answer: {{ANSWER}}
+      Original answer: {{ANSWER}}
+      Answered followup pairs: {{HISTORY}}
+    followup_prompt: |-
+      Expected answer target: Which animals are fed white maize and how often.
+      Question: {{QUESTION}}
+      Original answer: {{ANSWER}}
+      Answered followup pairs: {{HISTORY}}
+      EVAL_JSON: {{EVAL_JSON}}
 
   - nodeId: Q16
-    prompt: |-
+    eval_prompt: |-
       Expected answer target: Where seed is usually obtained and the reason for preferring that source.
       Question: {{QUESTION}}
-      Answer: {{ANSWER}}
+      Original answer: {{ANSWER}}
+      Answered followup pairs: {{HISTORY}}
+    followup_prompt: |-
+      Expected answer target: Where seed is usually obtained and the reason for preferring that source.
+      Question: {{QUESTION}}
+      Original answer: {{ANSWER}}
+      Answered followup pairs: {{HISTORY}}
+      EVAL_JSON: {{EVAL_JSON}}
 
   - nodeId: Q17
-    prompt: |-
+    eval_prompt: |-
       Expected answer target: Where maize is usually sold after harvest and the reason for choosing that market/buyer.
       Question: {{QUESTION}}
-      Answer: {{ANSWER}}
+      Original answer: {{ANSWER}}
+      Answered followup pairs: {{HISTORY}}
+    followup_prompt: |-
+      Expected answer target: Where maize is usually sold after harvest and the reason for choosing that market/buyer.
+      Question: {{QUESTION}}
+      Original answer: {{ANSWER}}
+      Answered followup pairs: {{HISTORY}}
+      EVAL_JSON: {{EVAL_JSON}}
 
 model_defaults:
   default_model_url: "https://huggingface.co/google/gemma-3n-E4B-it-litert-lm/resolve/main/gemma-3n-E4B-it-int4.litertlm"
