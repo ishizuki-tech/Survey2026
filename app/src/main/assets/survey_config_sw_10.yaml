@@ -327,3 +327,10 @@ whisper:
   target_sample_rate: 16000
   record_sample_rates: [16000, 48000, 44100]
   compute_checksum: true
+
+tts:
+  enabled: true
+  language: "sw"
+  auto_play: true
+  speech_rate: 1.0
+  pitch: 1.0
