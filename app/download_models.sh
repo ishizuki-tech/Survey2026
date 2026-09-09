@@ -22,7 +22,7 @@ MODEL_DIR="${MODEL_DIR:-src/main/assets/models}"
 MODEL_URL="${MODEL_URL:-https://huggingface.co/ggerganov/whisper.cpp/resolve/main}"
 
 # space-separated list
-MODEL_NAMES="${MODEL_NAMES:-ggml-tiny-q5_1.bin ggml-base-q5_1.bin ggml-small-q5_1.bin ggml-model-q4_0.bin ggml-model-q5_0.bin}"
+MODEL_NAMES="${MODEL_NAMES:-ggml-small-q5_1.bin}"
 
 # model-specific URL overrides
 NDIZI_GGML_Q4_URL="${NDIZI_GGML_Q4_URL:-https://huggingface.co/smutuvi/ndizi-whisper-large-turbo-v3-GGUF/resolve/main/ggml-model-q4_0.bin}"
