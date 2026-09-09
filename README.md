@@ -170,7 +170,8 @@ git submodule update --init --recursive
 CLI build:
 
 ```bash
-./gradlew :app:assembleDebug
+./gradlew :app:testDebugUnitTest --no-daemon -PskipModelDownload=true
+./gradlew :app:assembleDebug --no-daemon -PskipModelDownload=true
 ```
 
 ---
@@ -205,21 +206,29 @@ Search for these in `app/`:
 * `LiteRtLM` (engine wrapper)
 * `SurveyConfig` prompt resolvers
 
-### Prompting patterns
+### Current survey AI flow
 
-This repo supports (or is designed to support) both:
+A survey node uses the `TWO_STEP` path when both its evaluation and follow-up prompt templates resolve to non-blank values. In the current shipped English and Swahili configurations, Q8 through Q17 have `eval_prompt`/`followup_prompt` pairs and therefore run through this path.
 
-* **One-step prompts** (single completion)
-* **Two-step prompts**:
+For a configured two-step node:
 
-    * Step 1: EVAL (strict JSON)
-    * Step 2: FOLLOWUP (guided by EVAL output)
+1. The app evaluates the original answer using the evaluation prompt.
+2. The model must return one evaluation JSON object with an integer `score`, an array of non-blank `missing_points`, and a boolean `followup_needed`.
+3. Malformed, incomplete, wrongly typed, or contradictory evaluation output fails closed. It does not create a follow-up or consume follow-up capacity.
+4. A valid incomplete evaluation can start a separate follow-up-generation step. The generated question is constrained by the original question, original answer, and evaluation output, including the missing information.
+5. Answered follow-up question/answer pairs are included in later evaluation and follow-up prompts where the configuration references history. Unanswered follow-ups are excluded.
 
-**TODO (align with implementation):**
+The follow-up step is distinct from evaluation: evaluation JSON is not displayed as a respondent question, and only an accepted, non-duplicate generated question can be persisted. The AI layer serializes inference and guards terminal state with run and survey ownership so a stale or cancelled chain cannot overwrite a replacement chain.
 
-* Document the exact prompt resolver APIs and JSON schema enforced.
+One-step support remains available for configurations that provide only a one-step prompt, but it is not the active Q8–Q17 configuration.
 
-    * Owner: `SurveyViewModel.kt` + `SurveyConfig` definitions
+### English and Swahili prompt content
+
+The shipped English and Swahili configurations provide human-facing question and follow-up content for their respective survey languages. Some model-facing labels remain English, including `Question:` and `EVAL_JSON:` in the Swahili templates. Runtime template rendering substitutes placeholders such as `{{QUESTION}}` and `{{EVAL_JSON}}`; evaluation parsing relies on the JSON fields rather than a translation of those labels. The labels are intentionally left unchanged here pending separate prompt-policy and real-model validation.
+
+### Validation scope
+
+JVM and scripted instrumentation tests cover deterministic evaluation-policy, capacity, retry, timeout, history, and stale-chain invariants. They do not by themselves establish that a real model generates a semantically meaningful follow-up in every language. Real-device model acceptance remains a separate validation step.
 
 ### Streaming + termination contract (recommended invariants)
 
@@ -440,8 +449,8 @@ Workflows live in:
 
 Typical goals:
 
-* `./gradlew assembleDebug`
-* `./gradlew test`
+* `./gradlew :app:testDebugUnitTest --no-daemon -PskipModelDownload=true`
+* `./gradlew :app:assembleDebug --no-daemon -PskipModelDownload=true`
 
 Some variants of this repo include workflows like **Android CI & Release** (manual dispatch, version/tag handling, artifact publishing).
 
