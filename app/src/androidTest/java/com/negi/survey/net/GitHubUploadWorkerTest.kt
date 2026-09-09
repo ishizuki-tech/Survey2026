@@ -17,6 +17,7 @@ import androidx.test.platform.app.InstrumentationRegistry
 import androidx.work.ListenableWorker
 import androidx.work.testing.TestListenableWorkerBuilder
 import androidx.work.workDataOf
+import org.junit.Assume.assumeTrue
 import com.negi.survey.net.GitHubUploadWorker.Companion.KEY_BRANCH
 import com.negi.survey.net.GitHubUploadWorker.Companion.KEY_FILE_NAME
 import com.negi.survey.net.GitHubUploadWorker.Companion.KEY_FILE_PATH
@@ -47,6 +48,37 @@ import kotlin.text.Charsets
  */
 @RunWith(AndroidJUnit4::class)
 class GitHubUploadWorkerTest {
+
+    @Test
+    fun explicitInstrumentationGate_returnsSuccessWithoutDeletingLocalPayload() = runBlocking {
+        assumeTrue(DiagnosticUploadInstrumentationGate.isDisabled())
+
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val payload = createPayloadFile(context.filesDir, "worker_instrumentation_gate.json")
+
+        try {
+            val input = workDataOf(
+                KEY_OWNER to "owner",
+                KEY_REPO to "repo",
+                KEY_BRANCH to "main",
+                KEY_TOKEN to "fake-token",
+                KEY_PATH_PREFIX to "",
+                KEY_FILE_PATH to payload.absolutePath,
+                KEY_FILE_NAME to payload.name,
+            )
+
+            val worker = TestListenableWorkerBuilder<GitHubUploadWorker>(context)
+                .setInputData(input)
+                .build()
+
+            val result = worker.doWork()
+
+            assertTrue("Expected Success when uploads are explicitly disabled", result is ListenableWorker.Result.Success)
+            assertTrue("The local payload must remain when upload is skipped", payload.exists())
+        } finally {
+            payload.delete()
+        }
+    }
 
     /**
      * When the token is missing or blank, the worker must return Failure

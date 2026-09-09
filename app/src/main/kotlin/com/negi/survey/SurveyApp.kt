@@ -23,6 +23,7 @@ import android.os.SystemClock
 import android.util.Log
 import androidx.work.Configuration
 import androidx.work.WorkManager
+import com.negi.survey.net.DiagnosticUploadInstrumentationGate
 import com.negi.survey.net.GitHubUploadWorker
 import com.negi.survey.net.GitHubUploader
 import com.negi.survey.net.RuntimeLogStore
@@ -140,6 +141,11 @@ class SurveyApp : Application(), Configuration.Provider {
         }
 
         val appCtx = applicationContext ?: this
+        val disableDiagnosticUpload = DiagnosticUploadInstrumentationGate.isDisabled()
+
+        if (disableDiagnosticUpload) {
+            cancelDiagnosticUploadWorkForInstrumentation(appCtx)
+        }
 
         // Retry JNI loading here if the early attachBaseContext attempt failed.
         // The AtomicBoolean is reset on failure, so this is a real second chance.
@@ -181,8 +187,14 @@ class SurveyApp : Application(), Configuration.Provider {
         // Optional: self-heal if another SDK overwrites the handler later in runtime.
         safeRegisterSelfHealingOnce(this)
 
-        // Defer WorkManager-related enqueues to reduce contention with model initialization.
-        scheduleDeferredStartupEnqueues(appCtx)
+        // Instrumentation may explicitly suppress only external diagnostic upload scheduling.
+        // Local runtime/ring/crash capture remains active above.
+        if (disableDiagnosticUpload) {
+            RuntimeLogStore.w(TAG, "Startup diagnostic upload scheduling disabled by instrumentation argument.")
+        } else {
+            // Defer WorkManager-related enqueues to reduce contention with model initialization.
+            scheduleDeferredStartupEnqueues(appCtx)
+        }
 
         RuntimeLogStore.d(TAG, "bootTiming: onCreate total=${SystemClock.elapsedRealtime() - t0}ms")
     }
@@ -195,6 +207,19 @@ class SurveyApp : Application(), Configuration.Provider {
             .setMinimumLoggingLevel(Log.INFO)
             .setDefaultProcessName(packageName)
             .build()
+    }
+
+    /**
+     * Test-only isolation for pre-existing diagnostic work. This deliberately targets the
+     * upload worker's shared tag, not all application WorkManager work or local artifacts.
+     */
+    private fun cancelDiagnosticUploadWorkForInstrumentation(context: Context) {
+        runCatching {
+            WorkManager.getInstance(context).cancelAllWorkByTag(GitHubUploadWorker.TAG).result.get()
+            RuntimeLogStore.w(TAG, "Diagnostic upload work cancelled by instrumentation argument.")
+        }.onFailure { t ->
+            RuntimeLogStore.w(TAG, "Diagnostic upload work cancellation failed: ${t.message}", t)
+        }
     }
 
     /**

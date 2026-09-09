@@ -109,6 +109,14 @@ class GitHubUploadWorker(
                 ?.lowercase(Locale.US)
                 ?: MODE_FILE
 
+        if (DiagnosticUploadInstrumentationGate.isDisabled()) {
+            Log.i(
+                TAG,
+                "doWork: external diagnostic upload skipped by instrumentation argument; mode=$mode",
+            )
+            return Result.success()
+        }
+
         val maxFileBytesHint =
             inputData.getLong(
                 KEY_FILE_MAX_BYTES_HINT,
