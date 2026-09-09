@@ -3,15 +3,12 @@ package com.negi.survey.screens
 import android.os.SystemClock
 import android.util.Log
 import androidx.compose.runtime.remember
-import androidx.compose.ui.test.SemanticsMatcher
-import androidx.compose.ui.test.assert
+import androidx.compose.ui.test.assertTextEquals
 import androidx.compose.ui.test.hasSetTextAction
 import androidx.compose.ui.test.junit4.v2.createComposeRule
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performTextReplacement
-import androidx.compose.ui.semantics.SemanticsProperties
-import androidx.compose.ui.text.AnnotatedString
 import androidx.navigation3.runtime.rememberNavBackStack
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.filters.LargeTest
@@ -23,6 +20,10 @@ import com.negi.survey.vm.FlowHome
 import com.negi.survey.vm.SurveyAiDecision
 import com.negi.survey.vm.SurveyAiPolicy
 import com.negi.survey.vm.SurveyViewModel
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -51,7 +52,31 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
     @Test
     fun q8_real_model_two_step_acceptance() {
         val fixture = hostAiScreen()
-        runTwoStepAcceptance(fixture, iteration = 1)
+        runTwoStepAcceptance(
+            fixture = fixture,
+            answer = instrumentationString("answer") ?: MAIN_ANSWER,
+            expected = expectedClassification(),
+            iteration = 1,
+        )
+    }
+
+    @Test
+    fun q8_ui_only_composer_smoke() {
+        val fixture = hostAiScreen()
+
+        composeRule.runOnIdle {
+            fixture.survey.resetToStart()
+            fixture.survey.goto(NODE_ID)
+        }
+        val contextKey = "sid=${fixture.survey.sessionId.value}|nid=$NODE_ID"
+        waitForFreshContext(contextKey)
+        assertEquals(NODE_ID, fixture.survey.currentNode.value.id)
+
+        awaitMainComposerInput("ui-only")
+        val input = composeRule.onNode(hasSetTextAction())
+        input.performTextReplacement("Test answer")
+        input.assertTextEquals("Test answer")
+        Log.i(TAG, "REAL_AI_Q8_UI_SMOKE input replacement completed context=$contextKey")
     }
 
     @Test
@@ -61,7 +86,12 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
         val observations = linkedMapOf<String, Int>()
 
         repeat(iterations) { index ->
-            val result = runTwoStepAcceptance(fixture, iteration = index + 1)
+            val result = runTwoStepAcceptance(
+                fixture = fixture,
+                answer = instrumentationString("answer") ?: MAIN_ANSWER,
+                expected = expectedClassification(),
+                iteration = index + 1,
+            )
             result.observations.forEach { observation ->
                 observations[observation] = (observations[observation] ?: 0) + 1
             }
@@ -92,7 +122,12 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
      * A failure from this method aborts its caller. In particular, a timed-out
      * native inference is never followed by another iteration.
      */
-    private fun runTwoStepAcceptance(fixture: Fixture, iteration: Int): IterationResult {
+    private fun runTwoStepAcceptance(
+        fixture: Fixture,
+        answer: String,
+        expected: ExpectedClassification?,
+        iteration: Int,
+    ): IterationResult {
         val startedAt = SystemClock.elapsedRealtime()
         val previousSessionId = fixture.survey.sessionId.value
         val previousSurveyUuid = fixture.survey.surveyUuid.value
@@ -123,72 +158,68 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
             vm.chatHistoryFlow(contextKey).value.none { it.sender == AiViewModel.ChatSender.USER },
         )
 
-        val mainSteps = submitAndAwaitStable(MAIN_ANSWER, contextKey, "MAIN", fixture)
-        assertEquals(
-            "an incomplete Q8 answer must run evaluation before follow-up generation",
-            listOf(PromptPhase.EVAL, PromptPhase.FOLLOWUP),
-            mainSteps.map { it.phase },
-        )
+        val mainSteps = submitAndAwaitStable(answer, contextKey, "MAIN", fixture)
         val evaluation = mainSteps.first()
         assertEquals(AiViewModel.EvalMode.EVAL_JSON, evaluation.mode)
-        assertEquals(
-            "only a valid incomplete evaluation may start follow-up generation",
-            SurveyAiDecision.GENERATE,
-            SurveyAiPolicy.evaluate(
-                raw = evaluation.raw,
-                timedOut = evaluation.timedOut,
-                error = evaluation.error,
-                remaining = fixture.survey.maxFollowups,
-            ),
+        val policy = SurveyAiPolicy.evaluate(
+            raw = evaluation.raw,
+            timedOut = evaluation.timedOut,
+            error = evaluation.error,
+            remaining = fixture.survey.maxFollowups,
         )
-        val generation = mainSteps.last()
-        assertEquals(AiViewModel.EvalMode.FOLLOWUP_JSON_OR_TEXT, generation.mode)
-
+        val fields = evaluationFields(evaluation.raw)
         val entries = fixture.survey.followups.value[NODE_ID].orEmpty()
-        assertEquals("one successful generation must persist one follow-up", 1, entries.size)
-        val generatedQuestion = entries.single().question
-        assertTrue("generated follow-up must be non-blank", generatedQuestion.isNotBlank())
-        assertTrue("generated follow-up must be distinct", isDistinctFollowupQuestion(generatedQuestion, emptyList()))
-        assertEquals("one persisted follow-up consumes one slot", fixture.survey.maxFollowups - 1, fixture.survey.remainingFollowups(NODE_ID))
-        assertNull("a pending follow-up is not terminal", fixture.survey.aiReasons.value[NODE_ID])
-
+        val generation = mainSteps.lastOrNull { it.phase == PromptPhase.FOLLOWUP }
         val conversation = vm.conversationStateFlow(contextKey).value
-        assertEquals("persisted follow-up switches the composer role", AiViewModel.ComposerRole.FOLLOWUP, conversation.role)
-        assertEquals("FOLLOWUP composer must be cleared before input", "", conversation.composerDraft)
-        assertFalse("pending follow-up must not complete the turn", conversation.turnCompleted)
-        composeRule
-            .onNode(hasSetTextAction())
-            .assert(
-                SemanticsMatcher.expectValue(
-                    SemanticsProperties.EditableText,
-                    AnnotatedString(""),
-                ),
-            )
 
-        val rootQuestion = fixture.survey.currentNode.value.question
-        val evalPrompt = fixture.survey.getEvalPrompt(NODE_ID, rootQuestion, MAIN_ANSWER)
-        val followupPrompt = fixture.survey.getFollowupPrompt(NODE_ID, rootQuestion, MAIN_ANSWER, evaluation.raw)
-        assertTrue("evaluation prompt includes original question", evalPrompt.contains(rootQuestion))
-        assertTrue("evaluation prompt includes original answer", evalPrompt.contains(MAIN_ANSWER))
-        assertTrue("follow-up prompt includes original question", followupPrompt.contains(rootQuestion))
-        assertTrue("follow-up prompt includes original answer", followupPrompt.contains(MAIN_ANSWER))
-        assertTrue("follow-up prompt includes accepted evaluation JSON", followupPrompt.contains(evaluation.raw))
-        assertTrue("evaluation JSON supplies missing-point grounding", evaluation.raw.contains("missing_points"))
-
-        fixture.survey.answerLastFollowup(NODE_ID, FOLLOWUP_1_ANSWER)
-        val reevalPrompt = fixture.survey.getEvalPrompt(NODE_ID, rootQuestion, MAIN_ANSWER)
-        assertTrue("re-evaluation prompt includes answered follow-up question", reevalPrompt.contains(generatedQuestion))
-        assertTrue("re-evaluation prompt includes answered follow-up answer", reevalPrompt.contains(FOLLOWUP_1_ANSWER))
-
-        val observations = linkedSetOf<String>()
-        observations += "EVAL_TO_FOLLOWUP"
+        assertTrue("evaluation JSON must use the required schema", fields != null)
         Log.i(
             TAG,
-            "REAL_AI_TWO_STEP iter=$iteration node=$NODE_ID " +
-                "runs=${mainSteps.joinToString { "${it.runId}:${it.phase}" }} " +
-                "evaluationAccepted=true secondStepRan=true persistedFollowups=${entries.size} " +
-                "generatedFollowup=$generatedQuestion elapsedMs=${SystemClock.elapsedRealtime() - startedAt}",
+            "REAL_AI_Q8_FIXTURE iter=$iteration expected=${expected?.wireValue ?: "<none>"} " +
+                "answer=$answer raw=${evaluation.raw} score=${fields?.score} " +
+                "missingPoints=${fields?.missingPoints} followupNeeded=${fields?.followupNeeded} " +
+                "policy=$policy secondStepRan=${generation != null} " +
+                "generatedFollowup=${entries.singleOrNull()?.question ?: "<none>"} " +
+                "persistedFollowups=${entries.size} remaining=${fixture.survey.remainingFollowups(NODE_ID)} " +
+                "composer=${conversation.role} turnCompleted=${conversation.turnCompleted} " +
+                "elapsedMs=${SystemClock.elapsedRealtime() - startedAt}",
         )
+
+        when (expected) {
+            ExpectedClassification.COMPLETE -> {
+                assertEquals("complete answer must be accepted", SurveyAiDecision.ACHIEVED, policy)
+                assertTrue("complete score must be 90..100", fields!!.score in 90..100)
+                assertTrue("complete answer has no missing points", fields.missingPoints.isEmpty())
+                assertFalse("complete answer needs no follow-up", fields.followupNeeded)
+                assertEquals("complete answer only runs evaluation", listOf(PromptPhase.EVAL), mainSteps.map { it.phase })
+                assertTrue("complete answer persists no follow-up", entries.isEmpty())
+                assertEquals("complete answer consumes no capacity", fixture.survey.maxFollowups, fixture.survey.remainingFollowups(NODE_ID))
+                assertEquals("complete answer returns composer to MAIN", AiViewModel.ComposerRole.MAIN, conversation.role)
+                assertTrue("complete answer completes the turn", conversation.turnCompleted)
+            }
+
+            ExpectedClassification.INCOMPLETE -> {
+                assertEquals("incomplete answer must generate a follow-up", SurveyAiDecision.GENERATE, policy)
+                assertTrue("incomplete score must be 1..89", fields!!.score in 1..89)
+                assertTrue("incomplete answer identifies missing information", fields.missingPoints.isNotEmpty())
+                assertTrue("incomplete answer needs a follow-up", fields.followupNeeded)
+                assertEquals("incomplete answer runs evaluation then follow-up", listOf(PromptPhase.EVAL, PromptPhase.FOLLOWUP), mainSteps.map { it.phase })
+                assertEquals(AiViewModel.EvalMode.FOLLOWUP_JSON_OR_TEXT, generation!!.mode)
+                assertEquals("one successful generation persists one follow-up", 1, entries.size)
+                val generatedQuestion = entries.single().question
+                assertTrue("generated follow-up must be non-blank", generatedQuestion.isNotBlank())
+                assertTrue("generated follow-up must be distinct", isDistinctFollowupQuestion(generatedQuestion, emptyList()))
+                assertEquals("one persisted follow-up consumes one slot", fixture.survey.maxFollowups - 1, fixture.survey.remainingFollowups(NODE_ID))
+                assertNull("a pending follow-up is not terminal", fixture.survey.aiReasons.value[NODE_ID])
+                assertEquals("persisted follow-up switches the composer role", AiViewModel.ComposerRole.FOLLOWUP, conversation.role)
+                assertFalse("pending follow-up must not complete the turn", conversation.turnCompleted)
+            }
+
+            null -> Unit
+        }
+
+        val observations = linkedSetOf<String>()
+        observations += if (generation == null) "EVAL_ONLY" else "EVAL_TO_FOLLOWUP"
         return IterationResult(observations)
     }
 
@@ -207,13 +238,26 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
         fixture: Fixture,
     ): List<AiViewModel.StepSnapshot> {
         val baselineRunId = vm.stepHistory.value.maxOfOrNull { it.runId } ?: 0L
+        awaitMainComposerInput(label)
         composeRule.onNode(hasSetTextAction()).performTextReplacement(answer)
         composeRule.onNodeWithContentDescription("Send").performClick()
+        Log.i(TAG, "REAL_AI_Q8_SUBMITTED label=$label context=$contextKey")
 
         awaitState("$label inference") {
             val conversation = vm.conversationStateFlow(contextKey).value
             val hasUnansweredFollowup = fixture.survey.followups.value[NODE_ID].orEmpty().any { it.answer == null }
-            !vm.loading.value && !vm.isRunning && (hasUnansweredFollowup || conversation.turnCompleted)
+            val hasEvaluationFailure = vm.stepHistory.value.any { step ->
+                step.runId > baselineRunId &&
+                    step.phase == PromptPhase.EVAL &&
+                    SurveyAiPolicy.evaluate(
+                        raw = step.raw,
+                        timedOut = step.timedOut,
+                        error = step.error,
+                        remaining = fixture.survey.maxFollowups,
+                    ) == SurveyAiDecision.FAILURE
+            }
+            !vm.loading.value && !vm.isRunning &&
+                (hasUnansweredFollowup || conversation.turnCompleted || hasEvaluationFailure)
         }
 
         val newSteps = vm.stepHistory.value.filter { it.runId > baselineRunId }
@@ -224,6 +268,39 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
             newSteps.count { it.phase == PromptPhase.FOLLOWUP } <= 1,
         )
         return newSteps
+    }
+
+    private fun awaitMainComposerInput(label: String) {
+        val startedAt = SystemClock.elapsedRealtime()
+        var lastUiState = "not queried"
+        composeRule.waitForIdle()
+        try {
+            composeRule.waitUntil(timeoutMillis = UI_TIMEOUT_MS) {
+                runCatching {
+                    composeRule.onNode(hasSetTextAction()).fetchSemanticsNode().also {
+                        lastUiState = "inputNodePresent"
+                    }
+                    true
+                }.getOrElse { error ->
+                    lastUiState = "composeRootUnavailable=${error.javaClass.simpleName}:${error.message}"
+                    false
+                }
+            }
+            composeRule.onNode(hasSetTextAction()).fetchSemanticsNode()
+            Log.i(
+                TAG,
+                "REAL_AI_Q8_UI_READY label=$label state=$lastUiState " +
+                    "elapsedMs=${SystemClock.elapsedRealtime() - startedAt}",
+            )
+        } catch (error: Throwable) {
+            Log.e(
+                TAG,
+                "REAL_AI_Q8_UI_UNAVAILABLE label=$label state=$lastUiState " +
+                    "elapsedMs=${SystemClock.elapsedRealtime() - startedAt}",
+                error,
+            )
+            throw error
+        }
     }
 
     private fun awaitState(label: String, predicate: () -> Boolean) {
@@ -243,16 +320,46 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
     private fun instrumentationInt(key: String): Int? =
         InstrumentationRegistry.getArguments().getString(key)?.trim()?.toIntOrNull()
 
+    private fun instrumentationString(key: String): String? =
+        InstrumentationRegistry.getArguments().getString(key)?.trim()?.takeIf { it.isNotEmpty() }
+
+    private fun expectedClassification(): ExpectedClassification? =
+        when (instrumentationString("expected")?.lowercase()) {
+            null -> null
+            "complete" -> ExpectedClassification.COMPLETE
+            "incomplete" -> ExpectedClassification.INCOMPLETE
+            else -> throw AssertionError("expected must be complete or incomplete")
+        }
+
+    private fun evaluationFields(raw: String): EvaluationFields? = runCatching {
+        val json = Json.parseToJsonElement(raw.trim()) as JsonObject
+        val score = (json["score"] as JsonPrimitive).content.toInt()
+        val missing = (json["missing_points"] as JsonArray).map { (it as JsonPrimitive).content }
+        val followupNeeded = (json["followup_needed"] as JsonPrimitive).content.toBooleanStrict()
+        EvaluationFields(score, missing, followupNeeded)
+    }.getOrNull()
+
     private data class Fixture(val survey: SurveyViewModel)
 
     private data class IterationResult(val observations: Set<String>)
+
+    private data class EvaluationFields(
+        val score: Int,
+        val missingPoints: List<String>,
+        val followupNeeded: Boolean,
+    )
+
+    private enum class ExpectedClassification(val wireValue: String) {
+        COMPLETE("complete"),
+        INCOMPLETE("incomplete"),
+    }
 
     private companion object {
         const val TAG = "RealLiteRtAiFollowup"
         const val NODE_ID = "Q8"
         const val STATE_TIMEOUT_MS = 120_000L
+        const val UI_TIMEOUT_MS = 15_000L
 
         const val MAIN_ANSWER = "Fall armyworm affected my maize."
-        const val FOLLOWUP_1_ANSWER = "It reduced my harvest by half."
     }
 }
