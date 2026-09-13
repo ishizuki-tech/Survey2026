@@ -33,6 +33,28 @@
  *   • Reduce sensitive payload leakage in logs:
  *     - Info logs use len + short hash (no previews).
  *     - Previews are debug-only (BuildConfig.DEBUG) and remain capped.
+ *
+ *  Fix (2026-08-23):
+ *  ---------------------------------------------------------------------
+ *   • Allow identical follow-up text across independent inference runs:
+ *     - Follow-up bubbles are deduplicated by stable step identity (runId),
+ *       not by the normalized question text.
+ *     - Recomposition remains idempotent because upsertChatItem() uses the
+ *       deterministic "fuq-<nodeId>-<runId>" message ID.
+ *     - A later user answer may therefore receive the same valid clarification
+ *       without being incorrectly suppressed by a conversation-wide text set.
+ *   • Add release-safe UI diagnostics for follow-up persistence:
+ *     - Metadata-only Logcat entries remain visible in release builds.
+ *     - User/model text is never emitted; diagnostics contain only step identity,
+ *       structural state, lengths, and a short one-way hash for correlation.
+ *   • Harden StepSnapshot consumption against StateFlow conflation:
+ *     - UI progress is tracked by monotonic StepSnapshot.runId rather than list size.
+ *     - A clear-and-append cycle cannot hide a new step when both lists have the
+ *       same size before Compose observes the intermediate empty state.
+ *     - The logic also remains correct if the bounded history later drops old
+ *       snapshots while retaining the same list size.
+ *   • Decode JSON preview strings through JsonPrimitive.content instead of
+ *     trimming quotes from serialized JSON text, preserving escaped characters.
  * =====================================================================
  */
 
@@ -40,7 +62,9 @@
 
 package com.negi.survey.screens
 
+import android.content.ClipData
 import android.os.SystemClock
+import android.util.Log
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.LinearEasing
@@ -125,11 +149,11 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.ClipEntry
+import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
-import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.Dp
@@ -140,13 +164,17 @@ import com.negi.survey.net.RuntimeLogStore
 import com.negi.survey.slm.FollowupExtractor
 import com.negi.survey.slm.PromptPhase
 import com.negi.survey.vm.AiViewModel
+import com.negi.survey.vm.QuestionSpeaker
 import com.negi.survey.vm.SurveyViewModel
 import java.security.MessageDigest
+import java.util.Locale
 import kotlin.collections.ArrayDeque
 import kotlin.math.abs
 import kotlin.math.min
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
@@ -160,9 +188,51 @@ import kotlinx.serialization.json.JsonPrimitive
 private const val TAG = "AiScreen"
 private const val TYPING_UPDATE_THROTTLE_MS = 90L
 private const val AUTO_SCROLL_THROTTLE_MS = 40L
+private const val MAX_FOLLOWUPS_PER_AI_NODE = 2
 
 /** Debug-only crash button visibility. */
 private val SHOW_DEBUG_CRASH_BUTTON: Boolean = BuildConfig.DEBUG
+
+internal fun followupCapacityRemaining(entries: List<SurveyViewModel.FollowupEntry>): Int =
+    (MAX_FOLLOWUPS_PER_AI_NODE - entries.size).coerceAtLeast(0)
+
+internal fun normalizeFollowupQuestion(question: String): String =
+    question.trim()
+        .lowercase(Locale.ROOT)
+        .replace(Regex("\\s+"), " ")
+        .trimEnd { it == '?' || it == '？' }
+        .trim()
+
+internal fun isDistinctFollowupQuestion(
+    candidate: String,
+    existing: List<SurveyViewModel.FollowupEntry>
+): Boolean {
+    val normalizedCandidate = normalizeFollowupQuestion(candidate)
+    return normalizedCandidate.isNotEmpty() && existing.none {
+        normalizeFollowupQuestion(it.question) == normalizedCandidate
+    }
+}
+
+internal fun canAcceptFollowupCandidate(
+    candidate: String,
+    existing: List<SurveyViewModel.FollowupEntry>
+): Boolean =
+    followupCapacityRemaining(existing) > 0 && isDistinctFollowupQuestion(candidate, existing)
+
+internal fun canAdvanceAiTurn(
+    turnCompleted: Boolean,
+    aiLoading: Boolean,
+    mainSubmissionPending: Boolean,
+    speechRecording: Boolean,
+    speechTranscribing: Boolean,
+    hasUnansweredFollowup: Boolean,
+): Boolean =
+    turnCompleted &&
+            !aiLoading &&
+            !mainSubmissionPending &&
+            !speechRecording &&
+            !speechTranscribing &&
+            !hasUnansweredFollowup
 
 /**
  * Simple abstraction for a speech-to-text controller (e.g., Whisper.cpp).
@@ -213,7 +283,8 @@ fun AiScreen(
     vmAI: AiViewModel,
     onNext: () -> Unit,
     onBack: () -> Unit,
-    speechController: SpeechController? = null
+    speechController: SpeechController? = null,
+    ttsController: QuestionSpeaker? = null
 ) {
     val nid = remember(nodeId) { nodeId.trim() }
 
@@ -268,6 +339,13 @@ fun AiScreen(
     val speechPartial by partialFlow.collectAsState(initial = "")
     val speechError by errFlow.collectAsState(initial = null)
 
+    // ---------------------------------------------------------------------
+    // Text-to-speech state with null-safe fallback (question read-aloud)
+    // ---------------------------------------------------------------------
+
+    val ttsSpeakingFlow = remember(ttsController) { ttsController?.isSpeaking ?: flowOf(false) }
+    val ttsSpeaking by ttsSpeakingFlow.collectAsState(initial = false)
+
     val textFieldEnabled = !speechRecording && !speechTranscribing
 
     val speechStatusText: String? = when {
@@ -285,8 +363,9 @@ fun AiScreen(
     val loading by vmAI.loading.collectAsState()
     val stream by vmAI.stream.collectAsState()
     val error by vmAI.error.collectAsState()
-
-    val stepHistory by vmAI.stepHistory.collectAsState()
+    val persistedFollowups by vmSurvey.followups.collectAsState()
+    val hasUnansweredFollowup = persistedFollowups[nid].orEmpty().any { it.answer == null }
+    var submissionPending by remember(contextKey) { mutableStateOf(false) }
 
     // ---------------------------------------------------------------------
     // Persistent chat + conversation state (B plan)
@@ -337,8 +416,11 @@ fun AiScreen(
     var lastTypingUpdateMs by remember(contextKey) { mutableLongStateOf(0L) }
     var lastTypingLen by remember(contextKey) { mutableIntStateOf(0) }
 
-    /** Track which steps have already been consumed to avoid reprocessing. */
-    var renderedStepCount by remember(contextKey) { mutableIntStateOf(0) }
+    /**
+     * StepSnapshot persistence is consumed directly from AiViewModel.stepHistory
+     * in a lifecycle-scoped LaunchedEffect below. Keeping this stream out of
+     * Compose render state avoids recomposition solely for persistence side effects.
+     */
 
     LaunchedEffect(contextKey) {
         delay(30)
@@ -384,87 +466,129 @@ fun AiScreen(
     // Step snapshots -> persisted chat
     // ---------------------------------------------------------------------
 
-    LaunchedEffect(stepHistory.size, contextKey, isTwoStepNode) {
-        if (stepHistory.size < renderedStepCount) {
-            renderedStepCount = 0
-        }
-        if (stepHistory.size <= renderedStepCount) return@LaunchedEffect
+    LaunchedEffect(vmAI, contextKey, isTwoStepNode) {
+        /**
+         * Use a local monotonic watermark inside this lifecycle-scoped collector.
+         * AiViewModel allocates a unique increasing runId for every completed step,
+         * including separate run IDs for Step1 and Step2 of a TWO_STEP chain.
+         *
+         * This is deliberately identity-based instead of size-based:
+         * - StateFlow may conflate a fast clear -> append transition, so the UI may
+         *   observe size 1 -> size 1 even though the snapshot identity changed.
+         * - AiViewModel bounds step history and may eventually drop an old item while
+         *   appending a new one, which also leaves list size unchanged.
+         * - A collector can miss intermediate StateFlow values while busy, but the
+         *   next history value still contains every retained runId; filtering by the
+         *   watermark therefore catches all unseen snapshots in order.
+         *
+         * The watermark is intentionally local to this effect. It resets only when
+         * the ViewModel, conversation context, or node mode changes. Stable chat item
+         * IDs make any lifecycle replay idempotent at the persistence layer.
+         */
+        var lastRenderedStepRunId = 0L
+        var pendingRepairInitialRunId: Long? = null
 
-        val newSteps = stepHistory.subList(renderedStepCount, stepHistory.size)
-
-        newSteps.forEach { step ->
-            val stepRaw = step.raw
-            val stripped = stripCodeFence(stepRaw).trim()
-
-            val parsed = parseJsonLenient(prettyJson, stripped)
-            val showAsJson = (step.mode == AiViewModel.EvalMode.EVAL_JSON) || (parsed != null)
-
-            vmAI.removeTypingMessage(contextKey, nid)
-
-            val stepMsgId = "step-${step.runId}-$nid"
-            val stepPlainText: String? = if (!showAsJson) {
-                resolveFollowupFromStep(prettyJson, step)
-                    ?: extractPlainFollowup(stepRaw)
-                    ?: stripped.ifBlank { "…" }
-            } else {
-                null
-            }
-
-            if (showAsJson) {
-                val pretty = prettyOrRaw(prettyJson, stepRaw)
-                vmAI.upsertChatItem(
-                    contextKey,
-                    AiViewModel.ChatItem(
-                        id = stepMsgId,
-                        sender = AiViewModel.ChatSender.AI,
-                        json = pretty
-                    )
-                )
-            } else {
-                vmAI.upsertChatItem(
-                    contextKey,
-                    AiViewModel.ChatItem(
-                        id = stepMsgId,
-                        sender = AiViewModel.ChatSender.AI,
-                        text = stepPlainText
-                    )
-                )
-            }
-
-            /**
-             * IMPORTANT:
-             * Follow-up question persist/display policy:
-             * - TWO_STEP nodes: ONLY Step2 (phase=FOLLOWUP) may persist/display follow-up question.
-             * - ONE_STEP nodes: Step1 (phase=ONE_STEP) may persist/display follow-up question.
-             */
-            val shouldPersistFollowup =
-                if (isTwoStepNode) {
-                    step.phase == PromptPhase.FOLLOWUP
-                } else {
-                    step.phase == PromptPhase.ONE_STEP
+        vmAI.stepHistory.collect { history ->
+            val newSteps =
+                history.filter { step ->
+                    step.runId > lastRenderedStepRunId
                 }
 
-            if (shouldPersistFollowup) {
-                val fu = resolveFollowupFromStep(prettyJson, step)
-                    ?: (if (!showAsJson) extractPlainFollowup(stepRaw) else null)
+            if (newSteps.isEmpty()) return@collect
 
-                val fuNorm = fu?.trim()?.takeIf { it.isNotBlank() }
-                if (fuNorm != null) {
-                    val isNew = vmAI.markFollowupSeen(contextKey, fuNorm)
+            newSteps.forEach { step ->
+                val stepRaw = step.raw
+                val stripped = stripCodeFence(stepRaw).trim()
 
-                    /**
-                     * If the step already displays the follow-up as plain text,
-                     * do NOT add a second "fuq" bubble.
-                     */
-                    val displayedAsPlain =
-                        (!showAsJson) && (stepPlainText?.trim() == fuNorm)
+                val parsed = parseJsonLenient(prettyJson, stripped)
+                val showAsJson = (step.mode == AiViewModel.EvalMode.EVAL_JSON) || (parsed != null)
 
-                    if (isNew) {
+                vmAI.removeTypingMessage(contextKey, nid)
+
+                val stepMsgId = "step-${step.runId}-$nid"
+                val stepPlainText: String? = if (!showAsJson) {
+                    resolveFollowupFromStep(prettyJson, step)
+                        ?: extractPlainFollowup(stepRaw)
+                        ?: stripped.ifBlank { "…" }
+                } else {
+                    null
+                }
+
+                if (showAsJson) {
+                    val pretty = prettyOrRaw(prettyJson, stepRaw)
+                    vmAI.upsertChatItem(
+                        contextKey,
+                        AiViewModel.ChatItem(
+                            id = stepMsgId,
+                            sender = AiViewModel.ChatSender.AI,
+                            json = pretty
+                        )
+                    )
+                } else {
+                    vmAI.upsertChatItem(
+                        contextKey,
+                        AiViewModel.ChatItem(
+                            id = stepMsgId,
+                            sender = AiViewModel.ChatSender.AI,
+                            text = stepPlainText
+                        )
+                    )
+                }
+
+                /**
+                 * IMPORTANT:
+                 * Follow-up question persist/display policy:
+                 * - TWO_STEP nodes: ONLY Step2 (phase=FOLLOWUP) may persist/display follow-up question.
+                 * - ONE_STEP nodes: Step1 (phase=ONE_STEP), or its owned repair FOLLOWUP step.
+                 */
+                val existingFollowups = vmSurvey.followups.value[nid].orEmpty()
+                val capacityRemaining = followupCapacityRemaining(existingFollowups)
+                val repairEligibleInitial =
+                    !isTwoStepNode && AiViewModel.needsFollowupRepair(
+                        phase = step.phase,
+                        score = step.score,
+                        followups = step.followups,
+                        timedOut = step.timedOut,
+                        error = step.error,
+                        capacityRemaining = capacityRemaining
+                    )
+                if (repairEligibleInitial) {
+                    pendingRepairInitialRunId = step.runId
+                    RuntimeLogStore.i(
+                        TAG,
+                        "AI_FOLLOWUP_REPAIR node=$nid initialRun=${step.runId} score=${step.score} attempted=true"
+                    )
+                }
+
+                val isRepairFollowup =
+                    !isTwoStepNode &&
+                            step.phase == PromptPhase.FOLLOWUP &&
+                            pendingRepairInitialRunId?.let { step.runId > it } == true
+
+                val shouldPersistFollowup =
+                    if (isTwoStepNode) {
+                        step.phase == PromptPhase.FOLLOWUP
+                    } else {
+                        step.phase == PromptPhase.ONE_STEP || isRepairFollowup
+                    }
+
+                if (shouldPersistFollowup) {
+                    val fu = resolveFollowupFromStep(prettyJson, step)
+                        ?: (if (!showAsJson) extractPlainFollowup(stepRaw) else null)
+
+                    val fuNorm = fu?.trim()?.takeIf { it.isNotBlank() }
+                    val candidateAccepted =
+                        fuNorm != null && canAcceptFollowupCandidate(fuNorm, existingFollowups)
+
+                    if (candidateAccepted) {
+                        val displayedAsPlain =
+                            (!showAsJson) && (stepPlainText?.trim() == fuNorm)
+
                         if (!displayedAsPlain) {
                             val fuqId = "fuq-$nid-${step.runId}"
                             vmAI.upsertChatItem(
-                                contextKey,
-                                AiViewModel.ChatItem(
+                                contextKey = contextKey,
+                                item = AiViewModel.ChatItem(
                                     id = fuqId,
                                     sender = AiViewModel.ChatSender.AI,
                                     text = fuNorm
@@ -483,6 +607,21 @@ fun AiScreen(
                                     "sha6=${shortHash(fuNorm)} displayedAsPlain=$displayedAsPlain)"
                         )
 
+                        /**
+                         * Release-safe Logcat diagnostic.
+                         *
+                         * RuntimeLogStore intentionally disables its Logcat mirror in release
+                         * builds. This direct entry keeps the follow-up UI commit observable
+                         * during release validation without exposing the follow-up text or any
+                         * other user/model payload. The short hash is correlation metadata only.
+                         */
+                        Log.i(
+                            TAG,
+                            "Follow-up UI commit: node=$nid runId=${step.runId} " +
+                                    "phase=${step.phase} mode=${step.mode} len=${fuNorm.length} " +
+                                    "sha6=${shortHash(fuNorm)} displayedAsPlain=$displayedAsPlain"
+                        )
+
                         // Debug-only preview for local iteration.
                         if (BuildConfig.DEBUG) {
                             RuntimeLogStore.d(
@@ -497,19 +636,61 @@ fun AiScreen(
                             focusRequester.requestFocus()
                             keyboard?.show()
                         }
+                    } else if (!repairEligibleInitial) {
+                        if (fuNorm != null) {
+                            RuntimeLogStore.i(
+                                TAG,
+                                "FOLLOWUP_CANDIDATE node=$nid run=${step.runId} duplicate=" +
+                                        "${!isDistinctFollowupQuestion(fuNorm, existingFollowups)} " +
+                                        "capacityRemaining=$capacityRemaining accepted=false"
+                            )
+                        }
+                        vmAI.completeValidationTurn(contextKey, rootQuestion)
+                    }
+
+                    if (isRepairFollowup) {
+                        RuntimeLogStore.i(
+                            TAG,
+                            "AI_FOLLOWUP_REPAIR_RESULT node=$nid run=${step.runId} " +
+                                    "timedOut=${step.timedOut} errorPresent=${step.error != null} parsedCount=${step.followups.size}"
+                        )
+                        pendingRepairInitialRunId = null
                     }
                 }
+
+                RuntimeLogStore.d(
+                    TAG,
+                    "Step rendered (context=$contextKey node=$nid runId=${step.runId} phase=${step.phase} " +
+                            "mode=${step.mode} showJson=$showAsJson rawLen=${stepRaw.length} followups=${step.followups.size} " +
+                            "timedOut=${step.timedOut} twoStep=$isTwoStepNode)"
+                )
+
+                /**
+                 * Release-safe step diagnostic.
+                 *
+                 * This intentionally logs structural metadata only. It confirms that a
+                 * StepSnapshot reached the Compose persistence layer even when the
+                 * RuntimeLogStore Logcat mirror is disabled for a release build.
+                 */
+                Log.i(
+                    TAG,
+                    "Step UI rendered: node=$nid runId=${step.runId} phase=${step.phase} " +
+                            "mode=${step.mode} showJson=$showAsJson followups=${step.followups.size} " +
+                            "timedOut=${step.timedOut} twoStep=$isTwoStepNode"
+                )
             }
 
-            RuntimeLogStore.d(
-                TAG,
-                "Step rendered (context=$contextKey node=$nid runId=${step.runId} phase=${step.phase} " +
-                        "mode=${step.mode} showJson=$showAsJson rawLen=${stepRaw.length} followups=${step.followups.size} " +
-                        "timedOut=${step.timedOut} twoStep=$isTwoStepNode)"
-            )
+            /**
+             * Advance the watermark only after every currently visible new snapshot
+             * has been committed. The max() form documents the monotonic invariant and
+             * remains robust if a future producer ever supplies a non-contiguous list.
+             */
+            lastRenderedStepRunId =
+                maxOf(
+                    lastRenderedStepRunId,
+                    newSteps.maxOf { it.runId }
+                )
         }
-
-        renderedStepCount = stepHistory.size
     }
 
     // ---------------------------------------------------------------------
@@ -588,8 +769,26 @@ fun AiScreen(
     // Submit logic (ALWAYS TWO-STEP if configured)
     // ---------------------------------------------------------------------
 
+    fun startOneStepValidation(prompt: String, capacityRemaining: Int) =
+        vmAI.evaluateConditionalTwoStepAsync(
+            firstPrompt = prompt,
+            firstPhase = PromptPhase.ONE_STEP,
+            proceedOnTimeout = false,
+            shouldRunSecond = { step1 ->
+                AiViewModel.needsFollowupRepair(
+                    phase = PromptPhase.ONE_STEP,
+                    score = step1.score,
+                    followups = step1.followups,
+                    timedOut = step1.timedOut,
+                    error = step1.error,
+                    capacityRemaining = capacityRemaining
+                )
+            },
+            buildSecondPrompt = { prompt }
+        )
+
     fun submit() {
-        if (loading) return
+        if (loading || submissionPending) return
         if (speechRecording || speechTranscribing) {
             scope.launch { snack.showSnackbar("Speech is active. Stop recording first.") }
             return
@@ -600,73 +799,124 @@ fun AiScreen(
 
         val isSubmittingMain = (conv.role == AiViewModel.ComposerRole.MAIN)
 
-        if (isSubmittingMain) {
-            vmSurvey.setAnswer(input, nid)
-        } else {
+        if (!isSubmittingMain) {
             vmSurvey.answerLastFollowup(nid, input)
+            vmAI.appendUserMessage(contextKey, input)
+            vmAI.beginValidationTurn(contextKey)
+            submissionPending = true
+            vmAI.updateComposerDraft(contextKey, "")
+            keyboard?.hide()
+            focusManager.clearFocus(force = true)
+
+            scope.launch {
+                val runId = "ai-followup-${nid}-${SystemClock.uptimeMillis()}-${System.nanoTime()}"
+                val t0 = SystemClock.uptimeMillis()
+                try {
+                    val entries = vmSurvey.followups.value[nid].orEmpty()
+                    val capacityRemaining = followupCapacityRemaining(entries)
+                    val originalMainAnswer = vmSurvey.getAnswer(nid)
+                    val accumulatedPrompt = vmSurvey.getAccumulatedPrompt(
+                        nodeId = nid,
+                        question = rootQuestion,
+                        mainAnswer = originalMainAnswer
+                    )
+                    RuntimeLogStore.i(
+                        TAG,
+                        "FOLLOWUP_REVALIDATE node=$nid answeredCount=${entries.count { it.answer != null }} " +
+                                "capacityRemaining=$capacityRemaining"
+                    )
+                    startOneStepValidation(accumulatedPrompt, capacityRemaining).join()
+                } catch (err: Throwable) {
+                    if (err is CancellationException) throw err
+                    RuntimeLogStore.e(
+                        TAG,
+                        "Follow-up revalidation failed runId=$runId node=$nid " +
+                                "errType=${err::class.java.simpleName} errMsg=${err.message}",
+                        err
+                    )
+                    vmAI.completeValidationTurn(contextKey, rootQuestion)
+                    snack.showSnackbar("Validation failed: ${err.message ?: "unknown error"}")
+                    vmAI.removeTypingMessage(contextKey, nid)
+                } finally {
+                    submissionPending = false
+                    RuntimeLogStore.i(
+                        TAG,
+                        "FOLLOWUP_REVALIDATE_END node=$nid runId=$runId " +
+                                "elapsed=${SystemClock.uptimeMillis() - t0}ms"
+                    )
+                }
+            }
+            return
         }
 
+        vmAI.beginValidationTurn(contextKey)
+        vmSurvey.setAnswer(input, nid)
         vmAI.appendUserMessage(contextKey, input)
 
         val questionForTurn =
             if (isSubmittingMain) rootQuestion else conv.activePromptQuestion.ifBlank { rootQuestion }
         val answerForTurn = input
 
+        submissionPending = true
         scope.launch {
             val runId = "ai-${nid}-${SystemClock.uptimeMillis()}-${System.nanoTime()}"
             val t0 = SystemClock.uptimeMillis()
 
-            val isTwoStep = vmSurvey.hasTwoStepPrompt(nid)
+            try {
+                val isTwoStep = vmSurvey.hasTwoStepPrompt(nid)
 
-            // Info log: lengths + short hashes only (no previews).
-            RuntimeLogStore.i(
-                TAG,
-                "Submit begin runId=$runId node=$nid role=${conv.role} isTwoStep=$isTwoStep " +
-                        "sessionId=${runSafe { vmSurvey.sessionId.value }} surveyUuid=${runSafe { vmSurvey.surveyUuid.value }} " +
-                        "qLen=${questionForTurn.length} aLen=${answerForTurn.length} " +
-                        "qSha6=${shortHash(questionForTurn)} aSha6=${shortHash(answerForTurn)}"
-            )
-
-            // Debug-only: capped previews for local iteration.
-            if (BuildConfig.DEBUG) {
-                RuntimeLogStore.d(
+                // Info log: lengths + short hashes only (no previews).
+                RuntimeLogStore.i(
                     TAG,
-                    "Submit payload preview (debug) runId=$runId node=$nid " +
-                            "qPreview=${clipForLog(questionForTurn, 96)} aPreview=${clipForLog(answerForTurn, 96)}"
+                    "Submit begin runId=$runId node=$nid role=${conv.role} isTwoStep=$isTwoStep " +
+                            "sessionId=${runSafe { vmSurvey.sessionId.value }} surveyUuid=${runSafe { vmSurvey.surveyUuid.value }} " +
+                            "qLen=${questionForTurn.length} aLen=${answerForTurn.length} " +
+                            "qSha6=${shortHash(questionForTurn)} aSha6=${shortHash(answerForTurn)}"
                 )
-            }
 
-            runCatching {
-                if (!isTwoStep) {
-                    val prompt = vmSurvey.getPrompt(nid, questionForTurn, answerForTurn)
-                    vmAI.evaluateAsync(prompt)
-                    return@runCatching
+                // Debug-only: capped previews for local iteration.
+                if (BuildConfig.DEBUG) {
+                    RuntimeLogStore.d(
+                        TAG,
+                        "Submit payload preview (debug) runId=$runId node=$nid " +
+                                "qPreview=${clipForLog(questionForTurn, 96)} aPreview=${clipForLog(answerForTurn, 96)}"
+                    )
                 }
 
-                val prompt1 = vmSurvey.getEvalPrompt(nid, questionForTurn, answerForTurn)
-
-                vmAI.evaluateConditionalTwoStepAsync(
-                    firstPrompt = prompt1,
-                    proceedOnTimeout = true,
-                    shouldRunSecond = { step1 ->
-                        val needed = extractFollowupNeeded(prettyJson, step1.raw) ?: false
-                        RuntimeLogStore.i(
-                            TAG,
-                            "TWO_STEP shouldRunSecond runId=$runId node=$nid role=${conv.role} " +
-                                    "followup_needed=$needed timedOut=${step1.timedOut} rawLen=${step1.raw.length}"
-                        )
-                        needed
-                    },
-                    buildSecondPrompt = { step1 ->
-                        vmSurvey.getFollowupPrompt(
-                            nodeId = nid,
-                            question = questionForTurn,
-                            answer = answerForTurn,
-                            evalJsonRaw = step1.raw
-                        )
-                    }
-                )
-            }.onFailure { err ->
+                val inferenceJob =
+                if (!isTwoStep) {
+                    val originalPrompt = vmSurvey.getPrompt(nid, questionForTurn, answerForTurn)
+                    startOneStepValidation(
+                        prompt = originalPrompt,
+                        capacityRemaining = followupCapacityRemaining(vmSurvey.followups.value[nid].orEmpty())
+                    )
+                } else {
+                    val prompt1 = vmSurvey.getEvalPrompt(nid, questionForTurn, answerForTurn)
+                    vmAI.evaluateConditionalTwoStepAsync(
+                        firstPrompt = prompt1,
+                        proceedOnTimeout = true,
+                        shouldRunSecond = { step1 ->
+                            val needed = extractFollowupNeeded(prettyJson, step1.raw) ?: false
+                            RuntimeLogStore.i(
+                                TAG,
+                                "TWO_STEP shouldRunSecond runId=$runId node=$nid role=${conv.role} " +
+                                        "followup_needed=$needed timedOut=${step1.timedOut} rawLen=${step1.raw.length}"
+                            )
+                            needed
+                        },
+                        buildSecondPrompt = { step1 ->
+                            vmSurvey.getFollowupPrompt(
+                                nodeId = nid,
+                                question = questionForTurn,
+                                answer = answerForTurn,
+                                evalJsonRaw = step1.raw
+                            )
+                        }
+                    )
+                }
+                inferenceJob.join()
+            } catch (err: Throwable) {
+                if (err is CancellationException) throw err
                 RuntimeLogStore.e(
                     TAG,
                     "Submit failed runId=$runId node=$nid role=${conv.role} errType=${err::class.java.simpleName} errMsg=${err.message}",
@@ -674,7 +924,9 @@ fun AiScreen(
                 )
                 snack.showSnackbar("Submit failed: ${err.message ?: "unknown error"}")
                 vmAI.removeTypingMessage(contextKey, nid)
-            }.also {
+                vmAI.completeValidationTurn(contextKey, rootQuestion)
+            } finally {
+                submissionPending = false
                 RuntimeLogStore.i(TAG, "Submit end runId=$runId node=$nid elapsed=${SystemClock.uptimeMillis() - t0}ms")
             }
         }
@@ -693,7 +945,13 @@ fun AiScreen(
         if (conv.role == AiViewModel.ComposerRole.FOLLOWUP) "Follow-up • $nid" else "Question • $nid"
 
     Scaffold(
-        topBar = { CompactTopBar(title = title) },
+        topBar = {
+            CompactTopBar(
+                title = title,
+                onReplay = { ttsController?.speak(rootQuestion, nid) },
+                isSpeaking = ttsSpeaking
+            )
+        },
         snackbarHost = { SnackbarHost(snack) },
         contentWindowInsets = zeroInsetsSafe()
     ) { pad ->
@@ -786,7 +1044,7 @@ fun AiScreen(
                                 }
                             },
                             onSend = ::submit,
-                            enabled = textFieldEnabled && !loading,
+                            enabled = textFieldEnabled && !loading && !submissionPending,
                             focusRequester = focusRequester,
                             speechEnabled = speechController != null,
                             speechRecording = speechRecording,
@@ -817,7 +1075,26 @@ fun AiScreen(
                             androidx.compose.foundation.layout.Spacer(Modifier.weight(1f))
 
                             OutlinedButton(
+                                enabled = canAdvanceAiTurn(
+                                    turnCompleted = conv.turnCompleted,
+                                    aiLoading = loading,
+                                    mainSubmissionPending = submissionPending,
+                                    speechRecording = speechRecording,
+                                    speechTranscribing = speechTranscribing,
+                                    hasUnansweredFollowup = hasUnansweredFollowup,
+                                ),
                                 onClick = {
+                                    if (!canAdvanceAiTurn(
+                                            turnCompleted = conv.turnCompleted,
+                                            aiLoading = loading,
+                                            mainSubmissionPending = submissionPending,
+                                            speechRecording = speechRecording,
+                                            speechTranscribing = speechTranscribing,
+                                            hasUnansweredFollowup = hasUnansweredFollowup,
+                                        )
+                                    ) {
+                                        return@OutlinedButton
+                                    }
                                     vmAI.resetStates()
                                     onNext()
                                 }
@@ -847,7 +1124,9 @@ fun AiScreen(
 @Composable
 private fun CompactTopBar(
     title: String,
-    height: Dp = 32.dp
+    height: Dp = 32.dp,
+    onReplay: (() -> Unit)? = null,
+    isSpeaking: Boolean = false
 ) {
     val cs = MaterialTheme.colorScheme
     val topBrush = Brush.horizontalGradient(
@@ -870,8 +1149,18 @@ private fun CompactTopBar(
                 text = title,
                 style = MaterialTheme.typography.titleSmall,
                 maxLines = 1,
-                color = cs.onSurface
+                color = cs.onSurface,
+                modifier = Modifier.weight(1f)
             )
+            if (onReplay != null) {
+                IconButton(onClick = onReplay, modifier = Modifier.size(height)) {
+                    Text(
+                        text = if (isSpeaking) "\u23F9" else "\uD83D\uDD0A",
+                        color = cs.onSurface,
+                        style = MaterialTheme.typography.titleSmall
+                    )
+                }
+            }
         }
     }
 }
@@ -1024,7 +1313,7 @@ private fun JsonBubbleMono(
     var expanded by remember(pretty) { mutableStateOf(false) }
 
     val cs = MaterialTheme.colorScheme
-    val clipboard = LocalClipboardManager.current
+    val clipboard = LocalClipboard.current
     val scope = rememberCoroutineScope()
     val clip = RoundedCornerShape(10.dp)
 
@@ -1076,7 +1365,8 @@ private fun JsonBubbleMono(
                 IconButton(
                     onClick = {
                         scope.launch {
-                            clipboard.setText(AnnotatedString(pretty))
+                            val clipData = ClipData.newPlainText("JSON", pretty)
+                            clipboard.setClipEntry(ClipEntry(clipData))
                             snack?.showSnackbar("JSON copied")
                         }
                     },
@@ -1316,8 +1606,17 @@ private fun buildJsonPreview(pretty: String): String {
     if (obj != null) {
         fun pick(vararg keys: String): String? {
             for (k in keys) {
-                val v = obj[k]?.toString()?.trim('"')
-                if (!v.isNullOrBlank()) return v
+                /**
+                 * Read the primitive's decoded content rather than calling
+                 * JsonElement.toString(), which returns serialized JSON and keeps
+                 * escape sequences such as \" or \n in their encoded form.
+                 */
+                val value =
+                    (obj[k] as? JsonPrimitive)
+                        ?.contentOrNull()
+                        ?.trim()
+
+                if (!value.isNullOrBlank()) return value
             }
             return null
         }

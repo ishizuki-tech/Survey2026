@@ -12,15 +12,20 @@
  *  ---------------------------------------------------------------------
  *  A robust coroutine-based HTTP file downloader built upon HttpURLConnection.
  *  Provides resumable, integrity-verified transfers with exponential backoff,
- *  progress tracking, and Hugging Face token support.
+ *  progress tracking, Hugging Face token support, and parallel HTTP Range
+ *  downloading for large files.
  *
  *  Features:
  *   • HEAD probe with manual redirects and ETag/Last-Modified validators
- *   • Safe resume using Range/If-Range with `.part` and `.meta` files
- *   • Resume overlap (truncate + re-download tail) to reduce silent corruption risk
+ *   • Parallel HTTP Range download for large files
+ *   • Per-chunk resume support
+ *   • Automatic fallback to single-stream download
+ *   • Safe single-stream resume using Range/If-Range with `.part` and `.meta`
+ *   • Resume overlap to reduce silent corruption risk
  *   • Content-Range validation for 206 responses
- *   • Exponential backoff retry with Retry-After compliance (cap + jitter)
- *   • SHA-256 integrity verification and free-space check
+ *   • Exponential backoff retry with Retry-After compliance
+ *   • SHA-256 integrity verification and free-space checks
+ *   • Throttled progress callbacks
  * =====================================================================
  */
 
@@ -43,11 +48,16 @@ import java.security.MessageDigest
 import java.time.Instant
 import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
+import kotlin.coroutines.coroutineContext
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.pow
 import kotlin.random.Random
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
@@ -55,36 +65,26 @@ import kotlinx.coroutines.withContext
 /**
  * Coroutine-safe downloader for large, resumable HTTP transfers.
  *
- * This class implements reliable file downloads with integrity validation
- * and resumable partial transfers, making it suitable for ML model downloads
- * or offline asset synchronization.
+ * Large files are downloaded using multiple HTTP Range requests when the
+ * server supports byte ranges. Existing single-stream logic remains as a
+ * fallback for servers that do not support parallel Range transfers.
  *
- * @property hfToken Optional Hugging Face token ("hf_xxx"), applied only for `huggingface.co` hosts.
- * @property debugLogs Enables verbose diagnostic logs.
+ * @property hfToken Optional Hugging Face token ("hf_xxx"), applied only to
+ * Hugging Face hosts.
+ * @property debugLogs Enables diagnostic logging.
  */
 class HttpUrlFileDownloader(
     private val hfToken: String? = null,
-    private val debugLogs: Boolean = true
+    private val debugLogs: Boolean = true,
 ) {
     private val tag = "HttpUrlFileDl"
 
     /**
-     * Downloads a file from the given [url] into [dst], resuming if partially complete.
+     * Downloads [url] to [dst].
      *
-     * Performs HEAD probe, progress updates, SHA-256 verification, and
-     * exponential retry on transient errors.
-     *
-     * @param url Remote resource URL.
-     * @param dst Target destination file.
-     * @param onProgress Called periodically with downloaded bytes and total length.
-     * @param expectedSha256 Optional expected SHA-256 hash for final validation.
-     * @param connectTimeoutMs Timeout for connection setup.
-     * @param firstByteTimeoutMs Timeout for HEAD request read.
-     * @param stallTimeoutMs Timeout for read stalls during transfer.
-     * @param ioBufferBytes Buffer size in bytes (default: 1 MiB).
-     * @param maxRetries Maximum number of retry attempts.
-     * @param resumeOverlapBytes When resuming, truncate this many bytes from the tail and re-download.
-     * @throws IOException When the operation fails permanently.
+     * Large files use parallel HTTP Range requests when possible.
+     * Smaller files and unsupported servers use the original single-stream
+     * resumable transfer path.
      */
     suspend fun downloadToFile(
         url: String,
@@ -96,74 +96,209 @@ class HttpUrlFileDownloader(
         stallTimeoutMs: Int = 90_000,
         ioBufferBytes: Int = 1 * 1024 * 1024,
         maxRetries: Int = 3,
-        resumeOverlapBytes: Int = 64 * 1024
+        resumeOverlapBytes: Int = 64 * 1024,
     ) = withContext(Dispatchers.IO) {
 
-        val parent = dst.absoluteFile.parentFile
-            ?: throw IOException("Invalid destination: ${dst.absolutePath}")
-        parent.mkdirs()
+        val parent =
+            dst.absoluteFile.parentFile
+                ?: throw IOException(
+                    "Invalid destination: ${dst.absolutePath}"
+                )
 
-        val part = File(parent, dst.name + ".part")
-        val meta = MetaFile(part)
+        if (!parent.exists() && !parent.mkdirs()) {
+            throw IOException(
+                "Unable to create destination directory: ${parent.absolutePath}"
+            )
+        }
 
-        // Fast path: skip if already complete and valid (when server gives Content-Length).
-        runCatching { headProbeSmart(url, connectTimeoutMs, firstByteTimeoutMs).total }.getOrNull()
-            ?.let { headLen ->
-                val okSize = dst.exists() && dst.length() == headLen
-                val okHash = expectedSha256 == null || sha256(dst).equals(expectedSha256, true)
-                if (okSize && okHash) {
-                    onProgress(dst.length(), dst.length())
-                    logd("Already complete, skipping download.")
-                    return@withContext
-                }
+        val part =
+            File(
+                parent,
+                dst.name + ".part",
+            )
+
+        val meta =
+            MetaFile(part)
+
+        /*
+         * Fast path.
+         */
+        runCatching {
+            headProbeSmart(
+                srcUrl = url,
+                connectTimeoutMs = connectTimeoutMs,
+                readTimeoutMs = firstByteTimeoutMs,
+            ).total
+        }.getOrNull()?.let { headLength ->
+
+            val sizeMatches =
+                dst.exists() &&
+                        dst.length() == headLength
+
+            val hashMatches =
+                expectedSha256 == null ||
+                        (
+                                dst.exists() &&
+                                        sha256(dst).equals(
+                                            expectedSha256,
+                                            ignoreCase = true,
+                                        )
+                                )
+
+            if (sizeMatches && hashMatches) {
+                onProgress(
+                    dst.length(),
+                    dst.length(),
+                )
+
+                logd(
+                    "Already complete, skipping download."
+                )
+
+                return@withContext
             }
+        }
 
         var attempt = 0
         var lastError: Throwable? = null
 
         while (attempt < maxRetries) {
+            coroutineContext.ensureActive()
+
             try {
-                coroutineContext.ensureActive()
+                val probe =
+                    headProbeSmart(
+                        srcUrl = url,
+                        connectTimeoutMs = connectTimeoutMs,
+                        readTimeoutMs = firstByteTimeoutMs,
+                    )
 
-                val probe = headProbeSmart(url, connectTimeoutMs, firstByteTimeoutMs)
+                val total =
+                    probe.total
 
-                // Prefer known total. If still unknown, we can download but cannot do strict size checks.
-                val total = probe.total
-                val finalUrl = probe.finalUrl
+                /*
+                 * ---------------------------------------------------------
+                 * Parallel Range download
+                 * ---------------------------------------------------------
+                 */
 
-                // If server does not support ranges, avoid attempting resume.
+                val parallelEligible =
+                    total != null &&
+                            total >= PARALLEL_MIN_FILE_BYTES &&
+                            probe.acceptRanges &&
+                            !part.exists()
+
+                if (parallelEligible) {
+                    try {
+                        prepareParallelState(
+                            parent = parent,
+                            part = part,
+                            meta = meta,
+                            probe = probe,
+                            total = total,
+                        )
+
+                        logd(
+                            "Starting parallel download: " +
+                                    "$PARALLEL_CHUNKS chunks, " +
+                                    "${bytesToMiB(total)} MiB total"
+                        )
+
+                        downloadParallel(
+                            probe = probe,
+                            dst = dst,
+                            part = part,
+                            meta = meta,
+                            total = total,
+                            expectedSha256 = expectedSha256,
+                            connectTimeoutMs = connectTimeoutMs,
+                            stallTimeoutMs = stallTimeoutMs,
+                            maxRetries = maxRetries,
+                            onProgress = onProgress,
+                        )
+
+                        return@withContext
+                    } catch (t: CancellationException) {
+                        throw t
+                    } catch (t: ParallelRangeUnsupportedException) {
+                        /*
+                         * Range is not usable on this server/CDN.
+                         * Clean parallel state and continue below using
+                         * the existing single-stream downloader.
+                         */
+                        logw(
+                            "Parallel Range download unavailable; " +
+                                    "falling back to single stream: ${t.message}"
+                        )
+
+                        cleanupParallelChunkFiles(
+                            parent = parent,
+                            partName = part.name,
+                        )
+
+                        meta.delete()
+                    }
+                }
+
+                /*
+                 * If a previous single-stream transfer exists, it wins over
+                 * stale parallel chunks.
+                 */
+                if (part.exists()) {
+                    cleanupParallelChunkFiles(
+                        parent = parent,
+                        partName = part.name,
+                    )
+                }
+
+                /*
+                 * ---------------------------------------------------------
+                 * Existing single-stream resumable download
+                 * ---------------------------------------------------------
+                 */
+
                 if (!probe.acceptRanges && part.exists()) {
-                    logw("Server does not advertise Accept-Ranges; restarting cleanly.")
+                    logw(
+                        "Server does not advertise Accept-Ranges; " +
+                                "restarting cleanly."
+                    )
+
                     safeDelete(part)
                     meta.delete()
                 }
 
-                // Reconcile partial state against stored validators when possible.
-                val reconciled = reconcilePartial(
-                    part = part,
-                    meta = meta,
-                    probe = probe,
-                    total = total
-                )
+                val reconciled =
+                    reconcilePartial(
+                        part = part,
+                        meta = meta,
+                        probe = probe,
+                        total = total,
+                    )
 
-                var resumeFrom = reconciled.resumeFrom
+                var resumeFrom =
+                    reconciled.resumeFrom
 
-                // Ensure meta exists whenever we are starting a new partial stream.
                 ensureMetaIfStartingFresh(
                     part = part,
                     meta = meta,
                     probe = probe,
-                    total = total
+                    total = total,
                 )
 
-                // Free space check (best-effort when total unknown).
-                val required = if (total != null) {
-                    max(0L, (total - resumeFrom)) + FREE_SPACE_MARGIN_BYTES
-                } else {
-                    // Unknown total: require a conservative margin.
-                    FREE_SPACE_MARGIN_BYTES
-                }
-                checkFreeSpaceOrThrow(parent, required)
+                val required =
+                    if (total != null) {
+                        max(
+                            0L,
+                            total - resumeFrom,
+                        ) + FREE_SPACE_MARGIN_BYTES
+                    } else {
+                        FREE_SPACE_MARGIN_BYTES
+                    }
+
+                checkFreeSpaceOrThrow(
+                    dir = parent,
+                    required = required,
+                )
 
                 var triesOnThisStream = 0
                 var unauthorizedCount = 0
@@ -171,91 +306,143 @@ class HttpUrlFileDownloader(
                 STREAM@ while (true) {
                     coroutineContext.ensureActive()
 
-                    // If we restart the stream loop (e.g., after deleting part), ensure meta again.
                     ensureMetaIfStartingFresh(
                         part = part,
                         meta = meta,
                         probe = probe,
-                        total = total
+                        total = total,
                     )
 
-                    // Apply resume overlap (truncate tail and re-download).
-                    resumeFrom = applyResumeOverlap(
-                        part = part,
-                        resumeFrom = resumeFrom,
-                        overlapBytes = resumeOverlapBytes,
-                        total = total
-                    )
+                    resumeFrom =
+                        applyResumeOverlap(
+                            part = part,
+                            resumeFrom = resumeFrom,
+                            overlapBytes = resumeOverlapBytes,
+                            total = total,
+                        )
 
-                    val ifRange = meta.read()?.let { m ->
-                        // Prefer ETag for If-Range; fallback to Last-Modified.
-                        etagForIfRange(m.etag) ?: m.lastModified
-                    }
+                    val ifRange =
+                        meta.read()?.let { stored ->
+                            etagForIfRange(stored.etag)
+                                ?: stored.lastModified
+                        }
 
-                    val conn = openGetWithRedirects(
-                        srcUrl = finalUrl,
-                        connectTimeoutMs = connectTimeoutMs,
-                        readTimeoutMs = stallTimeoutMs,
-                        rangeFrom = resumeFrom.takeIf { it > 0L && probe.acceptRanges },
-                        ifRange = ifRange,
-                        maxRedirects = 10
-                    )
+                    val conn =
+                        openGetWithRedirects(
+                            srcUrl = probe.finalUrl,
+                            connectTimeoutMs = connectTimeoutMs,
+                            readTimeoutMs = stallTimeoutMs,
+                            rangeFrom =
+                                resumeFrom.takeIf {
+                                    it > 0L &&
+                                            probe.acceptRanges
+                                },
+                            ifRange = ifRange,
+                            maxRedirects = MAX_REDIRECTS,
+                        )
 
                     try {
-                        val code = conn.responseCode
+                        val code =
+                            conn.responseCode
 
                         when (code) {
                             HttpURLConnection.HTTP_UNAUTHORIZED,
-                            HttpURLConnection.HTTP_FORBIDDEN -> {
+                            HttpURLConnection.HTTP_FORBIDDEN,
+                                -> {
                                 unauthorizedCount++
-                                val snippet = readErrorSnippet(conn)
-                                logw("GET $code: unauthorized/forbidden (count=$unauthorizedCount) ${snippet ?: ""}".trim())
-                                if (unauthorizedCount >= MAX_UNAUTHORIZED_RETRIES) {
-                                    throw IOException("GET HTTP $code: access denied. ${snippet ?: ""}".trim())
+
+                                val snippet =
+                                    readErrorSnippet(conn)
+
+                                logw(
+                                    "GET $code: unauthorized/forbidden " +
+                                            "(count=$unauthorizedCount) " +
+                                            (snippet ?: "")
+                                )
+
+                                if (
+                                    unauthorizedCount >=
+                                    MAX_UNAUTHORIZED_RETRIES
+                                ) {
+                                    throw IOException(
+                                        "GET HTTP $code: access denied. " +
+                                                (snippet ?: "")
+                                    )
                                 }
+
                                 triesOnThisStream++
-                                resumeFrom = part.length().coerceAtLeast(0L)
+
+                                resumeFrom =
+                                    part.length()
+                                        .coerceAtLeast(0L)
+
                                 continue@STREAM
                             }
 
-                            HttpURLConnection.HTTP_OK -> if (resumeFrom > 0) {
-                                // Server ignored Range; restart cleanly.
-                                logw("Server ignored Range, restarting from 0.")
-                                safeDelete(part)
-                                meta.delete()
-                                resumeFrom = 0L
-                                if (++triesOnThisStream <= 3) continue@STREAM
-                                throw IOException("Server ignored Range repeatedly.")
-                            }
+                            HttpURLConnection.HTTP_OK -> {
+                                if (resumeFrom > 0L) {
+                                    logw(
+                                        "Server ignored Range; restarting from 0."
+                                    )
 
-                            HttpURLConnection.HTTP_PARTIAL -> {
-                                // Validate Content-Range when resuming.
-                                if (resumeFrom > 0) {
-                                    validateContentRangeStart(conn, expectedStart = resumeFrom)
+                                    safeDelete(part)
+                                    meta.delete()
+                                    resumeFrom = 0L
+
+                                    if (++triesOnThisStream <= 3) {
+                                        continue@STREAM
+                                    }
+
+                                    throw IOException(
+                                        "Server ignored Range repeatedly."
+                                    )
                                 }
                             }
 
-                            416 -> {
-                                val done = handleRangeNotSatisfiable(
-                                    dst = dst,
-                                    part = part,
-                                    meta = meta,
-                                    total = total,
-                                    expectedSha256 = expectedSha256,
-                                    onProgress = onProgress
-                                )
-                                if (done) return@withContext
-
-                                // Reset and restart.
-                                resumeFrom = 0L
-                                if (++triesOnThisStream <= 3) continue@STREAM
-                                throw IOException("416 reconciliation failed repeatedly.")
+                            HttpURLConnection.HTTP_PARTIAL -> {
+                                if (resumeFrom > 0L) {
+                                    validateContentRangeStart(
+                                        conn = conn,
+                                        expectedStart = resumeFrom,
+                                    )
+                                }
                             }
 
-                            429, 503, 408 -> {
+                            HTTP_RANGE_NOT_SATISFIABLE -> {
+                                val done =
+                                    handleRangeNotSatisfiable(
+                                        dst = dst,
+                                        part = part,
+                                        meta = meta,
+                                        total = total,
+                                        expectedSha256 =
+                                            expectedSha256,
+                                        onProgress = onProgress,
+                                    )
+
+                                if (done) {
+                                    return@withContext
+                                }
+
+                                resumeFrom = 0L
+
+                                if (++triesOnThisStream <= 3) {
+                                    continue@STREAM
+                                }
+
+                                throw IOException(
+                                    "416 reconciliation failed repeatedly."
+                                )
+                            }
+
+                            HTTP_TOO_MANY_REQUESTS,
+                            HttpURLConnection.HTTP_UNAVAILABLE,
+                            HttpURLConnection.HTTP_CLIENT_TIMEOUT,
+                                -> {
                                 throw HttpExceptionWithRetryAfter(
                                     message = "GET HTTP $code",
-                                    retryAfterMs = readRetryAfterMs(conn)
+                                    retryAfterMs =
+                                        readRetryAfterMs(conn),
                                 )
                             }
                         }
@@ -263,461 +450,1220 @@ class HttpUrlFileDownloader(
                         if (code in 500..599) {
                             throw HttpExceptionWithRetryAfter(
                                 message = "GET HTTP $code",
-                                retryAfterMs = readRetryAfterMs(conn)
+                                retryAfterMs =
+                                    readRetryAfterMs(conn),
                             )
                         }
 
-                        if (code !in listOf(HttpURLConnection.HTTP_OK, HttpURLConnection.HTTP_PARTIAL)) {
-                            val snippet = readErrorSnippet(conn)
-                            throw IOException("GET HTTP $code${snippet?.let { ": $it" } ?: ""}")
+                        if (
+                            code != HttpURLConnection.HTTP_OK &&
+                            code != HttpURLConnection.HTTP_PARTIAL
+                        ) {
+                            val snippet =
+                                readErrorSnippet(conn)
+
+                            throw IOException(
+                                "GET HTTP $code" +
+                                        (
+                                                snippet?.let {
+                                                    ": $it"
+                                                } ?: ""
+                                                )
+                            )
                         }
 
-                        val bufSize = ioBufferBytes.coerceIn(64 * 1024, 2 * 1024 * 1024)
-                        var downloaded = resumeFrom
+                        val bufferSize =
+                            ioBufferBytes.coerceIn(
+                                64 * 1024,
+                                MAX_IO_BUFFER_BYTES,
+                            )
 
-                        onProgress(downloaded, total)
+                        var downloaded =
+                            resumeFrom
+
+                        val progressEmitter =
+                            ProgressEmitter(
+                                total = total,
+                                initialBytes = downloaded,
+                                callback = onProgress,
+                            )
+
+                        progressEmitter.force(
+                            downloaded
+                        )
 
                         try {
                             conn.inputStream.use { input ->
-                                FileOutputStream(part, resumeFrom > 0).use { fos ->
-                                    BufferedOutputStream(fos, bufSize).use { out ->
-                                        val buf = ByteArray(bufSize)
+
+                                FileOutputStream(
+                                    part,
+                                    resumeFrom > 0L,
+                                ).use { fos ->
+
+                                    val output =
+                                        BufferedOutputStream(
+                                            fos,
+                                            bufferSize,
+                                        )
+
+                                    try {
+                                        val buffer =
+                                            ByteArray(
+                                                bufferSize
+                                            )
+
                                         while (true) {
-                                            coroutineContext.ensureActive()
-                                            val n = input.read(buf)
-                                            if (n == -1) break
-                                            out.write(buf, 0, n)
-                                            downloaded += n.toLong()
-                                            onProgress(downloaded, total)
+                                            coroutineContext
+                                                .ensureActive()
+
+                                            val count =
+                                                input.read(buffer)
+
+                                            if (count == -1) {
+                                                break
+                                            }
+
+                                            output.write(
+                                                buffer,
+                                                0,
+                                                count,
+                                            )
+
+                                            downloaded +=
+                                                count.toLong()
+
+                                            progressEmitter.update(
+                                                downloaded
+                                            )
                                         }
-                                        out.flush()
+
+                                        output.flush()
+
+                                        /*
+                                         * Perform one durability sync after
+                                         * the complete stream has been flushed.
+                                         */
+                                        runCatching {
+                                            fos.fd.sync()
+                                        }
+                                    } finally {
+                                        runCatching {
+                                            output.close()
+                                        }
                                     }
-                                    // Best-effort durability: flush kernel buffers (may be slow on some devices).
-                                    runCatching { fos.fd.sync() }
                                 }
                             }
-                        } catch (t: SocketTimeoutException) {
-                            logw("Stall timeout; resuming.")
-                            resumeFrom = part.length().coerceAtLeast(0L)
-                            if (++triesOnThisStream <= 3) continue@STREAM
+                        } catch (
+                            t: CancellationException
+                        ) {
                             throw t
-                        } catch (t: IOException) {
-                            logw("Stream error: ${t.message}")
-                            resumeFrom = part.length().coerceAtLeast(0L)
-                            if (++triesOnThisStream <= 3) continue@STREAM
+                        } catch (
+                            t: SocketTimeoutException
+                        ) {
+                            logw(
+                                "Stall timeout; resuming."
+                            )
+
+                            resumeFrom =
+                                part.length()
+                                    .coerceAtLeast(0L)
+
+                            if (++triesOnThisStream <= 3) {
+                                continue@STREAM
+                            }
+
+                            throw t
+                        } catch (
+                            t: IOException
+                        ) {
+                            logw(
+                                "Stream error: ${t.message}"
+                            )
+
+                            resumeFrom =
+                                part.length()
+                                    .coerceAtLeast(0L)
+
+                            if (++triesOnThisStream <= 3) {
+                                continue@STREAM
+                            }
+
                             throw t
                         }
 
-                        // Promote .part → final.
-                        if (dst.exists()) safeDelete(dst)
-                        if (!part.renameTo(dst)) {
-                            part.copyTo(dst, overwrite = true)
-                            safeDelete(part)
-                        }
+                        /*
+                         * Promote .part to the final file.
+                         */
+                        promotePartToDestination(
+                            part = part,
+                            dst = dst,
+                        )
+
                         meta.delete()
 
-                        // Final validations.
-                        if (total != null && dst.length() != total) {
-                            throw IOException("Size mismatch: expected=$total got=${dst.length()}")
-                        }
-                        if (expectedSha256 != null) {
-                            val got = sha256(dst)
-                            if (!got.equals(expectedSha256, true)) {
-                                safeDelete(dst)
-                                throw IOException("SHA-256 mismatch: expected=$expectedSha256 got=$got")
-                            }
-                        }
+                        validateFinalFile(
+                            dst = dst,
+                            total = total,
+                            expectedSha256 =
+                                expectedSha256,
+                        )
 
-                        onProgress(dst.length(), total ?: dst.length())
-                        logd("Saved ${dst.name} (${dst.length()} bytes)")
+                        onProgress(
+                            dst.length(),
+                            total ?: dst.length(),
+                        )
+
+                        logd(
+                            "Saved ${dst.name} " +
+                                    "(${dst.length()} bytes)"
+                        )
+
                         return@withContext
                     } finally {
                         conn.disconnect()
                     }
                 }
+            } catch (t: CancellationException) {
+                throw t
             } catch (t: Throwable) {
                 lastError = t
-                logw("Attempt ${attempt + 1} failed: ${t::class.simpleName}: ${t.message}")
 
-                val retryAfterMs = (t as? HttpExceptionWithRetryAfter)?.retryAfterMs
+                logw(
+                    "Attempt ${attempt + 1} failed: " +
+                            "${t::class.simpleName}: ${t.message}"
+                )
+
+                val retryAfterMs =
+                    (
+                            t as?
+                                    HttpExceptionWithRetryAfter
+                            )?.retryAfterMs
 
                 if (attempt < maxRetries - 1) {
-                    val backoffMs = computeBackoffMs(attempt, retryAfterMs)
-                    logw("Retrying in ${backoffMs}ms …")
+                    val backoffMs =
+                        computeBackoffMs(
+                            attempt = attempt,
+                            retryAfterMs = retryAfterMs,
+                        )
+
+                    logw(
+                        "Retrying in ${backoffMs}ms..."
+                    )
+
                     delay(backoffMs)
                 }
             }
+
             attempt++
         }
 
         throw IOException(
-            "Download failed after $maxRetries attempts: ${lastError?.message}",
-            lastError
+            "Download failed after $maxRetries attempts: " +
+                    "${lastError?.message}",
+            lastError,
         )
     }
 
-    // ----------------------------------------------------------
-    // Probing (HEAD with manual redirects; fallback to GET Range probe)
-    // ----------------------------------------------------------
+    /* ========================================================================
+     * Parallel download
+     * ====================================================================== */
 
-    private data class Probe(
-        val total: Long?,
-        val acceptRanges: Boolean,
-        val etag: String?,
-        val lastModified: String?,
-        val finalUrl: String
-    )
-
-    /**
-     * Smart probe:
-     * - HEAD with manual redirects
-     * - If HEAD is unsupported OR Content-Length is missing, try GET Range(0-0) to infer total
-     */
-    private fun headProbeSmart(srcUrl: String, connectTimeoutMs: Int, readTimeoutMs: Int): Probe {
-        val head = headProbe(srcUrl, connectTimeoutMs, readTimeoutMs)
-        if (head.total != null) return head
-
-        // HEAD succeeded but did not provide Content-Length (chunked/unknown). Try Range probe.
-        return runCatching { probeViaRangeGet(head.finalUrl, connectTimeoutMs, readTimeoutMs) }
-            .getOrElse { head }
-    }
-
-    private fun headProbe(srcUrl: String, connectTimeoutMs: Int, readTimeoutMs: Int): Probe {
-        var current = srcUrl
-        var hops = 0
-
-        while (true) {
-            val conn = openConn(current, "HEAD", connectTimeoutMs, readTimeoutMs, false)
-            try {
-                setCommonHeaders(conn, current)
-                conn.connect()
-
-                val code = conn.responseCode
-
-                if (code in 300..399) {
-                    val loc = conn.getHeaderField("Location")
-                        ?: throw IOException("Redirect without Location.")
-                    current = URL(URL(current), loc).toString()
-                    if (++hops > 10) throw IOException("Too many redirects.")
-                    continue
-                }
-
-                if (code == 405 || code == 501) {
-                    // HEAD not supported; probe via GET Range(0-0) without downloading content.
-                    return probeViaRangeGet(current, connectTimeoutMs, readTimeoutMs)
-                }
-
-                if (code == 429 || code == 503 || code == 408 || code in 500..599) {
-                    throw HttpExceptionWithRetryAfter("HEAD HTTP $code", readRetryAfterMs(conn))
-                }
-
-                if (code !in 200..299) {
-                    throw IOException("HEAD HTTP $code${readErrorSnippet(conn)?.let { ": $it" } ?: ""}")
-                }
-
-                val total = conn.getHeaderFieldLong("Content-Length", -1L).takeIf { it >= 0 }
-                val acceptRanges =
-                    (conn.getHeaderField("Accept-Ranges") ?: "").contains("bytes", true)
-
-                val etag = etagForIfRange(conn.getHeaderField("ETag"))
-                val lastMod = conn.getHeaderField("Last-Modified")
-                val finalUrl = conn.url.toString()
-
-                return Probe(total, acceptRanges, etag, lastMod, finalUrl)
-            } finally {
-                conn.disconnect()
-            }
-        }
-    }
-
-    /**
-     * Probe via GET Range(0-0) to support servers that reject HEAD or omit Content-Length.
-     *
-     * This resolves redirects manually and tries to infer total size via Content-Range.
-     */
-    private fun probeViaRangeGet(srcUrl: String, connectTimeoutMs: Int, readTimeoutMs: Int): Probe {
-        var current = srcUrl
-        var hops = 0
-
-        while (true) {
-            val conn = openConn(current, "GET", connectTimeoutMs, readTimeoutMs, false)
-            try {
-                setCommonHeaders(conn, current)
-                conn.setRequestProperty("Range", "bytes=0-0")
-                conn.connect()
-
-                val code = conn.responseCode
-
-                if (code in 300..399) {
-                    val loc = conn.getHeaderField("Location")
-                        ?: throw IOException("Redirect without Location.")
-                    current = URL(URL(current), loc).toString()
-                    if (++hops > 10) throw IOException("Too many redirects.")
-                    continue
-                }
-
-                if (code == 429 || code == 503 || code == 408 || code in 500..599) {
-                    throw HttpExceptionWithRetryAfter("GET-probe HTTP $code", readRetryAfterMs(conn))
-                }
-
-                if (code !in 200..299) {
-                    throw IOException("GET-probe HTTP $code${readErrorSnippet(conn)?.let { ": $it" } ?: ""}")
-                }
-
-                val contentRange = conn.getHeaderField("Content-Range")
-                val totalFromCr = parseTotalFromContentRange(contentRange)
-
-                val total = totalFromCr
-                    ?: conn.getHeaderFieldLong("Content-Length", -1L).takeIf { it >= 0 }
-
-                val acceptRanges = (code == HttpURLConnection.HTTP_PARTIAL) ||
-                        (conn.getHeaderField("Accept-Ranges") ?: "").contains("bytes", true)
-
-                val etag = etagForIfRange(conn.getHeaderField("ETag"))
-                val lastMod = conn.getHeaderField("Last-Modified")
-                val finalUrl = conn.url.toString()
-
-                // Avoid any accidental full-body read.
-                runCatching { conn.inputStream.close() }
-
-                return Probe(total, acceptRanges, etag, lastMod, finalUrl)
-            } finally {
-                conn.disconnect()
-            }
-        }
-    }
-
-    private fun parseTotalFromContentRange(contentRange: String?): Long? {
-        // Examples:
-        //  - "bytes 0-0/12345"
-        //  - "bytes */12345"
-        val cr = contentRange?.trim().orEmpty()
-        val slash = cr.lastIndexOf('/')
-        if (slash < 0 || slash + 1 >= cr.length) return null
-        return cr.substring(slash + 1).trim().toLongOrNull()?.takeIf { it >= 0L }
-    }
-
-    /**
-     * Returns a safe value for If-Range usage.
-     *
-     * Note: Do not strip quotes here. For If-Range, the entity-tag should be used as received.
-     */
-    private fun etagForIfRange(etag: String?): String? =
-        etag?.trim()?.takeIf { it.isNotBlank() }
-
-    /**
-     * Returns a canonical value for comparing entity-tags across CDNs/proxies.
-     *
-     * We normalize:
-     * - Optional weak prefix "W/"
-     * - Optional surrounding quotes
-     */
-    private fun etagForCompare(etag: String?): String? {
-        var s = etagForIfRange(etag) ?: return null
-        if (s.startsWith("W/", ignoreCase = true)) {
-            s = s.substring(2).trim()
-        }
-        if (s.length >= 2 && s.first() == '"' && s.last() == '"') {
-            s = s.substring(1, s.length - 1).trim()
-        }
-        return s.takeIf { it.isNotBlank() }
-    }
-
-    // ----------------------------------------------------------
-    // Meta file / partial reconciliation
-    // ----------------------------------------------------------
-
-    private data class Meta(val etag: String?, val lastModified: String?, val total: Long?)
-
-    private class MetaFile(private val part: File) {
-        private val file = File(part.parentFile, part.name + ".meta")
-
-        fun read(): Meta? = runCatching {
-            if (!file.exists()) return@runCatching null
-            val map = file.readLines().mapNotNull {
-                val i = it.indexOf('=')
-                if (i <= 0) null else it.substring(0, i) to it.substring(i + 1)
-            }.toMap()
-            Meta(
-                etag = map["etag"],
-                lastModified = map["lastModified"],
-                total = map["total"]?.toLongOrNull()
-            )
-        }.getOrNull()
-
-        fun write(meta: Meta) {
-            // Atomic-ish write: write to tmp then rename.
-            runCatching {
-                val tmp = File(file.parentFile, file.name + ".tmp")
-                tmp.writeText(
-                    buildString {
-                        meta.etag?.let { append("etag=$it\n") }
-                        meta.lastModified?.let { append("lastModified=$it\n") }
-                        meta.total?.let { append("total=$it\n") }
-                    }
-                )
-                if (file.exists()) runCatching { file.delete() }
-                if (!tmp.renameTo(file)) {
-                    file.writeText(tmp.readText())
-                    runCatching { tmp.delete() }
-                }
-            }
-        }
-
-        fun delete() {
-            runCatching { if (file.exists()) file.delete() }
-        }
-
-        fun exists(): Boolean = file.exists()
-    }
-
-    private data class PartialReconcile(val resumeFrom: Long)
-
-    /**
-     * Ensures .part/.meta are consistent with the probed remote validators.
-     *
-     * Rules:
-     * - If .part exists but .meta is missing -> restart (delete .part).
-     * - If total mismatch or validators mismatch -> restart (when total is known).
-     * - If .part larger than total -> restart (when total is known).
-     */
-    private fun reconcilePartial(
-        part: File,
-        meta: MetaFile,
-        probe: Probe,
-        total: Long?
-    ): PartialReconcile {
-        if (!part.exists()) return PartialReconcile(0L)
-
-        val onDisk = part.length()
-        if (onDisk <= 0L) {
-            safeDelete(part)
-            meta.delete()
-            return PartialReconcile(0L)
-        }
-
-        if (total != null && onDisk > total) {
-            logw("Partial larger than total (part=$onDisk total=$total). Restarting.")
-            safeDelete(part)
-            meta.delete()
-            return PartialReconcile(0L)
-        }
-
-        val m = meta.read()
-        if (m == null) {
-            logw("Partial exists but meta missing. Restarting to avoid corruption.")
-            safeDelete(part)
-            meta.delete()
-            return PartialReconcile(0L)
-        }
-
-        if (total != null && m.total != null && m.total != total) {
-            logw("Meta total mismatch (meta=${m.total} probe=$total). Restarting.")
-            safeDelete(part)
-            meta.delete()
-            return PartialReconcile(0L)
-        }
-
-        val probeEtagCmp = etagForCompare(probe.etag)
-        val metaEtagCmp = etagForCompare(m.etag)
-        if (probeEtagCmp != null && metaEtagCmp != null && probeEtagCmp != metaEtagCmp) {
-            logw("ETag changed. Restarting.")
-            safeDelete(part)
-            meta.delete()
-            return PartialReconcile(0L)
-        }
-
-        val probeLm = probe.lastModified?.trim()
-        val metaLm = m.lastModified?.trim()
-        if (probeEtagCmp == null && metaEtagCmp == null && probeLm != null && metaLm != null && probeLm != metaLm) {
-            logw("Last-Modified changed. Restarting.")
-            safeDelete(part)
-            meta.delete()
-            return PartialReconcile(0L)
-        }
-
-        val bounded = if (total != null) onDisk.coerceIn(0L, total) else onDisk.coerceAtLeast(0L)
-        return PartialReconcile(bounded)
-    }
-
-    /**
-     * Make sure meta exists when starting from scratch (or after in-stream restart).
-     */
-    private fun ensureMetaIfStartingFresh(
-        part: File,
-        meta: MetaFile,
-        probe: Probe,
-        total: Long?
+    private data class DownloadChunk(
+        val index: Int,
+        val start: Long,
+        val endInclusive: Long,
     ) {
-        if (part.exists()) return
-        if (meta.exists()) return
-        meta.write(Meta(probe.etag, probe.lastModified, total))
+        val length: Long
+            get() =
+                endInclusive - start + 1L
     }
+
+    private fun buildChunks(
+        total: Long,
+        count: Int,
+    ): List<DownloadChunk> {
+
+        require(total > 0L)
+        require(count > 0)
+
+        val actualCount =
+            min(
+                count.toLong(),
+                total,
+            ).toInt()
+
+        val baseSize =
+            total / actualCount
+
+        val remainder =
+            total % actualCount
+
+        var start = 0L
+
+        return List(actualCount) { index ->
+
+            val size =
+                baseSize +
+                        if (
+                            index <
+                            remainder
+                        ) {
+                            1L
+                        } else {
+                            0L
+                        }
+
+            val end =
+                start + size - 1L
+
+            DownloadChunk(
+                index = index,
+                start = start,
+                endInclusive = end,
+            ).also {
+                start = end + 1L
+            }
+        }
+    }
+
+    private fun chunkFile(
+        parent: File,
+        partName: String,
+        index: Int,
+    ): File =
+        File(
+            parent,
+            "$partName.chunk.$index",
+        )
+
+    private fun cleanupParallelChunkFiles(
+        parent: File,
+        partName: String,
+    ) {
+        parent.listFiles()
+            ?.filter {
+                it.name.startsWith(
+                    "$partName.chunk."
+                )
+            }
+            ?.forEach {
+                safeDelete(it)
+            }
+    }
+
+    private fun hasParallelChunkFiles(
+        parent: File,
+        partName: String,
+    ): Boolean =
+        parent.listFiles()
+            ?.any {
+                it.name.startsWith(
+                    "$partName.chunk."
+                )
+            } == true
 
     /**
-     * Truncate the tail by overlapBytes when resuming to reduce silent corruption risk.
+     * Validate persisted parallel chunk state before reusing it.
      */
-    private fun applyResumeOverlap(
+    private fun prepareParallelState(
+        parent: File,
         part: File,
-        resumeFrom: Long,
-        overlapBytes: Int,
-        total: Long?
-    ): Long {
-        if (!part.exists()) return 0L
-        val len = part.length().coerceAtLeast(0L)
-        var from = resumeFrom.coerceIn(0L, total ?: Long.MAX_VALUE)
+        meta: MetaFile,
+        probe: Probe,
+        total: Long,
+    ) {
+        val hasChunks =
+            hasParallelChunkFiles(
+                parent = parent,
+                partName = part.name,
+            )
 
-        if (from <= 0L) return 0L
-        val overlap = overlapBytes.coerceAtLeast(0).toLong()
-        if (overlap <= 0L) return from
+        val stored =
+            meta.read()
 
-        val newFrom = (from - overlap).coerceAtLeast(0L)
-        if (newFrom < len) {
-            runCatching {
-                RandomAccessFile(part, "rw").use { raf ->
-                    raf.setLength(newFrom)
-                }
-            }
-            return newFrom
+        if (
+            hasChunks &&
+            stored == null
+        ) {
+            logw(
+                "Parallel chunks exist without metadata; restarting."
+            )
+
+            cleanupParallelChunkFiles(
+                parent = parent,
+                partName = part.name,
+            )
         }
-        return from
+
+        if (
+            stored != null &&
+            !parallelValidatorsMatch(
+                stored = stored,
+                probe = probe,
+                total = total,
+            )
+        ) {
+            logw(
+                "Parallel download validators changed; restarting chunks."
+            )
+
+            cleanupParallelChunkFiles(
+                parent = parent,
+                partName = part.name,
+            )
+
+            meta.delete()
+        }
+
+        val chunks =
+            buildChunks(
+                total = total,
+                count = PARALLEL_CHUNKS,
+            )
+
+        for (chunk in chunks) {
+            val file =
+                chunkFile(
+                    parent = parent,
+                    partName = part.name,
+                    index = chunk.index,
+                )
+
+            if (
+                file.exists() &&
+                file.length() > chunk.length
+            ) {
+                logw(
+                    "Chunk ${chunk.index} is too large; deleting."
+                )
+
+                safeDelete(file)
+            }
+        }
+
+        if (meta.read() == null) {
+            meta.write(
+                Meta(
+                    etag = probe.etag,
+                    lastModified =
+                        probe.lastModified,
+                    total = total,
+                )
+            )
+        }
     }
 
-    // ----------------------------------------------------------
-    // GET with manual redirects
-    // ----------------------------------------------------------
+    private fun parallelValidatorsMatch(
+        stored: Meta,
+        probe: Probe,
+        total: Long,
+    ): Boolean {
 
-    private fun openGetWithRedirects(
+        if (
+            stored.total != null &&
+            stored.total != total
+        ) {
+            return false
+        }
+
+        val storedEtag =
+            etagForCompare(stored.etag)
+
+        val probeEtag =
+            etagForCompare(probe.etag)
+
+        if (
+            storedEtag != null ||
+            probeEtag != null
+        ) {
+            return storedEtag == probeEtag
+        }
+
+        val storedModified =
+            stored.lastModified
+                ?.trim()
+                ?.takeIf {
+                    it.isNotEmpty()
+                }
+
+        val probeModified =
+            probe.lastModified
+                ?.trim()
+                ?.takeIf {
+                    it.isNotEmpty()
+                }
+
+        if (
+            storedModified != null ||
+            probeModified != null
+        ) {
+            return storedModified ==
+                    probeModified
+        }
+
+        return true
+    }
+
+    private suspend fun downloadParallel(
+        probe: Probe,
+        dst: File,
+        part: File,
+        meta: MetaFile,
+        total: Long,
+        expectedSha256: String?,
+        connectTimeoutMs: Int,
+        stallTimeoutMs: Int,
+        maxRetries: Int,
+        onProgress: (Long, Long?) -> Unit,
+    ) = coroutineScope {
+
+        val parent =
+            part.parentFile
+                ?: throw IOException(
+                    "Missing parent directory."
+                )
+
+        val chunks =
+            buildChunks(
+                total = total,
+                count = PARALLEL_CHUNKS,
+            )
+
+        val chunkFiles =
+            chunks.associateWith { chunk ->
+                chunkFile(
+                    parent = parent,
+                    partName = part.name,
+                    index = chunk.index,
+                )
+            }
+
+        /*
+         * Calculate how much data is already present.
+         */
+        val existingBytes =
+            chunks.sumOf { chunk ->
+                chunkFiles
+                    .getValue(chunk)
+                    .length()
+                    .coerceIn(
+                        0L,
+                        chunk.length,
+                    )
+            }
+
+        val remainingBytes =
+            max(
+                0L,
+                total - existingBytes,
+            )
+
+        /*
+         * The merge temporarily needs approximately one extra chunk because
+         * the destination grows before the source chunk is deleted.
+         */
+        val largestChunk =
+            chunks.maxOf {
+                it.length
+            }
+
+        checkFreeSpaceOrThrow(
+            dir = parent,
+            required =
+                remainingBytes +
+                        largestChunk +
+                        FREE_SPACE_MARGIN_BYTES,
+        )
+
+        val ifRange =
+            etagForIfRange(
+                probe.etag
+            ) ?: probe.lastModified
+
+        var downloaded =
+            existingBytes
+
+        val progressLock =
+            Any()
+
+        var lastEmitNs =
+            0L
+
+        var lastEmitBytes =
+            downloaded
+
+        var speedWindowNs =
+            System.nanoTime()
+
+        var speedWindowBytes =
+            downloaded
+
+        fun reportDelta(
+            delta: Long
+        ) {
+            synchronized(
+                progressLock
+            ) {
+                downloaded =
+                    (
+                            downloaded +
+                                    delta
+                            ).coerceIn(
+                            0L,
+                            total,
+                        )
+
+                val now =
+                    System.nanoTime()
+
+                val timeElapsed =
+                    now -
+                            lastEmitNs >=
+                            PARALLEL_PROGRESS_INTERVAL_NS
+
+                val bytesAdvanced =
+                    kotlin.math.abs(
+                        downloaded -
+                                lastEmitBytes
+                    ) >=
+                            PARALLEL_PROGRESS_BYTES
+
+                val finished =
+                    downloaded == total
+
+                if (
+                    timeElapsed ||
+                    bytesAdvanced ||
+                    finished
+                ) {
+                    onProgress(
+                        downloaded,
+                        total,
+                    )
+
+                    lastEmitNs = now
+                    lastEmitBytes =
+                        downloaded
+                }
+
+                if (
+                    now -
+                    speedWindowNs >=
+                    SPEED_LOG_INTERVAL_NS
+                ) {
+                    val deltaBytes =
+                        max(
+                            0L,
+                            downloaded -
+                                    speedWindowBytes,
+                        )
+
+                    val elapsedSeconds =
+                        (
+                                now -
+                                        speedWindowNs
+                                ) /
+                                1_000_000_000.0
+
+                    if (elapsedSeconds > 0.0) {
+                        val mibPerSecond =
+                            deltaBytes /
+                                    (1024.0 * 1024.0) /
+                                    elapsedSeconds
+
+                        val percent =
+                            downloaded *
+                                    100.0 /
+                                    total
+
+                        logd(
+                            "Parallel progress: " +
+                                    "%.1f%%, %.1f MiB/s, %d/%d MiB"
+                                        .format(
+                                            percent,
+                                            mibPerSecond,
+                                            bytesToMiB(
+                                                downloaded
+                                            ),
+                                            bytesToMiB(
+                                                total
+                                            ),
+                                        )
+                        )
+                    }
+
+                    speedWindowNs = now
+                    speedWindowBytes =
+                        downloaded
+                }
+            }
+        }
+
+        onProgress(
+            downloaded,
+            total,
+        )
+
+        chunks.map { chunk ->
+            async(
+                Dispatchers.IO
+            ) {
+                downloadChunk(
+                    finalUrl =
+                        probe.finalUrl,
+                    chunk = chunk,
+                    chunkFile =
+                        chunkFiles
+                            .getValue(chunk),
+                    ifRange = ifRange,
+                    connectTimeoutMs =
+                        connectTimeoutMs,
+                    stallTimeoutMs =
+                        stallTimeoutMs,
+                    maxRetries =
+                        maxRetries,
+                    onBytesDownloaded =
+                        ::reportDelta,
+                )
+            }
+        }.awaitAll()
+
+        coroutineContext.ensureActive()
+
+        /*
+         * Verify chunks before merging.
+         */
+        for (chunk in chunks) {
+            val file =
+                chunkFiles
+                    .getValue(chunk)
+
+            if (
+                file.length() !=
+                chunk.length
+            ) {
+                throw IOException(
+                    "Chunk ${chunk.index} incomplete: " +
+                            "expected=${chunk.length}, " +
+                            "got=${file.length()}"
+                )
+            }
+        }
+
+        /*
+         * Recheck disk space before merge.
+         */
+        checkFreeSpaceOrThrow(
+            dir = parent,
+            required =
+                largestChunk +
+                        FREE_SPACE_MARGIN_BYTES,
+        )
+
+        safeDelete(part)
+
+        FileOutputStream(
+            part,
+            false,
+        ).use { fos ->
+
+            val output =
+                BufferedOutputStream(
+                    fos,
+                    PARALLEL_BUFFER_BYTES,
+                )
+
+            try {
+                val buffer =
+                    ByteArray(
+                        PARALLEL_BUFFER_BYTES
+                    )
+
+                for (chunk in chunks) {
+                    coroutineContext
+                        .ensureActive()
+
+                    val file =
+                        chunkFiles
+                            .getValue(chunk)
+
+                    FileInputStream(
+                        file
+                    ).use { input ->
+
+                        while (true) {
+                            coroutineContext
+                                .ensureActive()
+
+                            val count =
+                                input.read(buffer)
+
+                            if (count == -1) {
+                                break
+                            }
+
+                            output.write(
+                                buffer,
+                                0,
+                                count,
+                            )
+                        }
+                    }
+
+                    /*
+                     * Flush before deleting the source chunk so disk usage
+                     * stays bounded during concatenation.
+                     */
+                    output.flush()
+
+                    safeDelete(file)
+                }
+
+                output.flush()
+
+                runCatching {
+                    fos.fd.sync()
+                }
+            } finally {
+                runCatching {
+                    output.close()
+                }
+            }
+        }
+
+        if (
+            part.length() != total
+        ) {
+            throw IOException(
+                "Merged size mismatch: " +
+                        "expected=$total, " +
+                        "got=${part.length()}"
+            )
+        }
+
+        if (
+            expectedSha256 != null
+        ) {
+            val actual =
+                sha256(part)
+
+            if (
+                !actual.equals(
+                    expectedSha256,
+                    ignoreCase = true,
+                )
+            ) {
+                safeDelete(part)
+
+                throw IOException(
+                    "SHA-256 mismatch after parallel download: " +
+                            "expected=$expectedSha256 got=$actual"
+                )
+            }
+        }
+
+        promotePartToDestination(
+            part = part,
+            dst = dst,
+        )
+
+        meta.delete()
+
+        cleanupParallelChunkFiles(
+            parent = parent,
+            partName = part.name,
+        )
+
+        onProgress(
+            dst.length(),
+            dst.length(),
+        )
+
+        logd(
+            "Parallel download complete: " +
+                    "${dst.name} " +
+                    "(${dst.length()} bytes)"
+        )
+    }
+
+    private suspend fun downloadChunk(
+        finalUrl: String,
+        chunk: DownloadChunk,
+        chunkFile: File,
+        ifRange: String?,
+        connectTimeoutMs: Int,
+        stallTimeoutMs: Int,
+        maxRetries: Int,
+        onBytesDownloaded: (Long) -> Unit,
+    ) {
+        var attempt = 0
+
+        while (
+            attempt <
+            maxRetries
+        ) {
+            coroutineContext.ensureActive()
+
+            var existing =
+                chunkFile.length()
+
+            if (
+                existing >
+                chunk.length
+            ) {
+                safeDelete(chunkFile)
+                existing = 0L
+            }
+
+            if (
+                existing ==
+                chunk.length
+            ) {
+                logd(
+                    "Chunk ${chunk.index} already complete."
+                )
+
+                return
+            }
+
+            /*
+             * Re-download a short tail when resuming a partially downloaded
+             * chunk.
+             */
+            if (
+                existing > 0L &&
+                PARALLEL_RESUME_OVERLAP_BYTES > 0L
+            ) {
+                val overlap =
+                    min(
+                        existing,
+                        PARALLEL_RESUME_OVERLAP_BYTES,
+                    )
+
+                val newLength =
+                    existing - overlap
+
+                RandomAccessFile(
+                    chunkFile,
+                    "rw",
+                ).use { raf ->
+                    raf.setLength(
+                        newLength
+                    )
+                }
+
+                onBytesDownloaded(
+                    -overlap
+                )
+
+                existing =
+                    newLength
+            }
+
+            val rangeStart =
+                chunk.start +
+                        existing
+
+            val conn =
+                openRangeGetWithRedirects(
+                    srcUrl = finalUrl,
+                    connectTimeoutMs =
+                        connectTimeoutMs,
+                    readTimeoutMs =
+                        stallTimeoutMs,
+                    rangeStart =
+                        rangeStart,
+                    rangeEndInclusive =
+                        chunk.endInclusive,
+                    ifRange =
+                        ifRange,
+                    maxRedirects =
+                        MAX_REDIRECTS,
+                )
+
+            try {
+                val code =
+                    conn.responseCode
+
+                when (code) {
+                    HttpURLConnection.HTTP_UNAUTHORIZED,
+                    HttpURLConnection.HTTP_FORBIDDEN,
+                        -> {
+                        val snippet =
+                            readErrorSnippet(
+                                conn
+                            )
+
+                        throw IOException(
+                            "Range GET HTTP $code: " +
+                                    "access denied. " +
+                                    (snippet ?: "")
+                        )
+                    }
+
+                    HTTP_TOO_MANY_REQUESTS,
+                    HttpURLConnection.HTTP_UNAVAILABLE,
+                    HttpURLConnection.HTTP_CLIENT_TIMEOUT,
+                        -> {
+                        throw HttpExceptionWithRetryAfter(
+                            message =
+                                "Range GET HTTP $code",
+                            retryAfterMs =
+                                readRetryAfterMs(
+                                    conn
+                                ),
+                        )
+                    }
+
+                    HttpURLConnection.HTTP_OK -> {
+                        /*
+                         * A bounded Range request should return 206.
+                         * 200 means the CDN ignored Range.
+                         */
+                        throw ParallelRangeUnsupportedException(
+                            "Server ignored Range for chunk ${chunk.index}."
+                        )
+                    }
+                }
+
+                if (
+                    code in 500..599
+                ) {
+                    throw HttpExceptionWithRetryAfter(
+                        message =
+                            "Range GET HTTP $code",
+                        retryAfterMs =
+                            readRetryAfterMs(
+                                conn
+                            ),
+                    )
+                }
+
+                if (
+                    code !=
+                    HttpURLConnection.HTTP_PARTIAL
+                ) {
+                    throw ParallelRangeUnsupportedException(
+                        "Expected HTTP 206 but got $code."
+                    )
+                }
+
+                validateContentRangeStart(
+                    conn = conn,
+                    expectedStart =
+                        rangeStart,
+                )
+
+                conn.inputStream.use { input ->
+
+                    FileOutputStream(
+                        chunkFile,
+                        existing > 0L,
+                    ).use { fos ->
+
+                        val output =
+                            BufferedOutputStream(
+                                fos,
+                                PARALLEL_BUFFER_BYTES,
+                            )
+
+                        try {
+                            val buffer =
+                                ByteArray(
+                                    PARALLEL_BUFFER_BYTES
+                                )
+
+                            while (true) {
+                                coroutineContext
+                                    .ensureActive()
+
+                                val count =
+                                    input.read(
+                                        buffer
+                                    )
+
+                                if (
+                                    count == -1
+                                ) {
+                                    break
+                                }
+
+                                output.write(
+                                    buffer,
+                                    0,
+                                    count,
+                                )
+
+                                onBytesDownloaded(
+                                    count.toLong()
+                                )
+                            }
+
+                            output.flush()
+                        } finally {
+                            runCatching {
+                                output.close()
+                            }
+                        }
+                    }
+                }
+
+                if (
+                    chunkFile.length() !=
+                    chunk.length
+                ) {
+                    throw IOException(
+                        "Chunk ${chunk.index} size mismatch: " +
+                                "expected=${chunk.length}, " +
+                                "got=${chunkFile.length()}"
+                    )
+                }
+
+                logd(
+                    "Chunk ${chunk.index} completed: " +
+                            "${bytesToMiB(chunk.length)} MiB"
+                )
+
+                return
+            } catch (
+                t: CancellationException
+            ) {
+                throw t
+            } catch (
+                t: ParallelRangeUnsupportedException
+            ) {
+                throw t
+            } catch (
+                t: Throwable
+            ) {
+                attempt++
+
+                if (
+                    attempt >=
+                    maxRetries
+                ) {
+                    throw t
+                }
+
+                val retryAfterMs =
+                    (
+                            t as?
+                                    HttpExceptionWithRetryAfter
+                            )?.retryAfterMs
+
+                val backoffMs =
+                    computeBackoffMs(
+                        attempt =
+                            attempt - 1,
+                        retryAfterMs =
+                            retryAfterMs,
+                    )
+
+                logw(
+                    "Chunk ${chunk.index} failed: " +
+                            "${t.message}; " +
+                            "retrying in ${backoffMs}ms"
+                )
+
+                delay(
+                    backoffMs
+                )
+            } finally {
+                conn.disconnect()
+            }
+        }
+
+        throw IOException(
+            "Chunk ${chunk.index} failed after $maxRetries attempts."
+        )
+    }
+
+    private fun openRangeGetWithRedirects(
         srcUrl: String,
         connectTimeoutMs: Int,
         readTimeoutMs: Int,
-        rangeFrom: Long?,
+        rangeStart: Long,
+        rangeEndInclusive: Long,
         ifRange: String?,
-        maxRedirects: Int
+        maxRedirects: Int,
     ): HttpURLConnection {
-        var current = srcUrl
+
+        var current =
+            srcUrl
+
         var hops = 0
 
         while (true) {
-            val conn = openConn(current, "GET", connectTimeoutMs, readTimeoutMs, false)
-            setCommonHeaders(conn, current)
+            val conn =
+                openConn(
+                    url = current,
+                    method = "GET",
+                    connectTimeoutMs =
+                        connectTimeoutMs,
+                    readTimeoutMs =
+                        readTimeoutMs,
+                    followRedirects = false,
+                )
 
-            if (rangeFrom != null && rangeFrom > 0L) {
-                conn.setRequestProperty("Range", "bytes=$rangeFrom-")
-                if (!ifRange.isNullOrBlank()) conn.setRequestProperty("If-Range", ifRange)
+            setCommonHeaders(
+                conn = conn,
+                url = current,
+            )
+
+            conn.setRequestProperty(
+                "Range",
+                "bytes=$rangeStart-$rangeEndInclusive",
+            )
+
+            if (
+                !ifRange.isNullOrBlank()
+            ) {
+                conn.setRequestProperty(
+                    "If-Range",
+                    ifRange,
+                )
             }
 
             conn.connect()
-            val code = conn.responseCode
 
-            if (code in 300..399) {
-                val loc = conn.getHeaderField("Location")
-                    ?: throw IOException("Redirect without Location.")
-                val next = URL(URL(current), loc).toString()
+            val code =
+                conn.responseCode
+
+            if (
+                code in
+                300..399
+            ) {
+                val location =
+                    conn.getHeaderField(
+                        "Location"
+                    )
+                        ?: run {
+                            conn.disconnect()
+
+                            throw IOException(
+                                "Redirect without Location."
+                            )
+                        }
+
+                val next =
+                    URL(
+                        URL(current),
+                        location,
+                    ).toString()
+
                 conn.disconnect()
 
                 current = next
-                if (++hops > maxRedirects) throw IOException("Too many redirects.")
+
+                if (
+                    ++hops >
+                    maxRedirects
+                ) {
+                    throw IOException(
+                        "Too many redirects."
+                    )
+                }
+
                 continue
             }
 
@@ -725,225 +1671,1689 @@ class HttpUrlFileDownloader(
         }
     }
 
-    /**
-     * Validate that Content-Range starts at expectedStart for 206 responses.
-     */
-    private fun validateContentRangeStart(conn: HttpURLConnection, expectedStart: Long) {
-        val cr = conn.getHeaderField("Content-Range")?.trim().orEmpty()
-        // Expect: "bytes <start>-<end>/<total>"
-        val lower = cr.lowercase()
-        if (!lower.startsWith("bytes ")) {
-            throw IOException("206 without Content-Range header.")
-        }
-        val space = cr.indexOf(' ')
-        val dash = cr.indexOf('-', startIndex = space + 1)
-        val slash = cr.indexOf('/', startIndex = dash + 1)
-        if (space < 0 || dash < 0 || slash < 0) {
-            throw IOException("Malformed Content-Range: $cr")
-        }
-        val startStr = cr.substring(space + 1, dash).trim()
-        val start = startStr.toLongOrNull()
-            ?: throw IOException("Malformed Content-Range start: $cr")
+    /* ========================================================================
+     * Probing
+     * ====================================================================== */
 
-        if (start != expectedStart) {
-            throw IOException("Content-Range start mismatch: expected=$expectedStart got=$start ($cr)")
+    private data class Probe(
+        val total: Long?,
+        val acceptRanges: Boolean,
+        val etag: String?,
+        val lastModified: String?,
+        val finalUrl: String,
+    )
+
+    /**
+     * Probe with HEAD first and GET Range(0-0) as a fallback.
+     */
+    private fun headProbeSmart(
+        srcUrl: String,
+        connectTimeoutMs: Int,
+        readTimeoutMs: Int,
+    ): Probe {
+
+        val head =
+            headProbe(
+                srcUrl = srcUrl,
+                connectTimeoutMs =
+                    connectTimeoutMs,
+                readTimeoutMs =
+                    readTimeoutMs,
+            )
+
+        if (
+            head.total != null
+        ) {
+            return head
+        }
+
+        return runCatching {
+            probeViaRangeGet(
+                srcUrl =
+                    head.finalUrl,
+                connectTimeoutMs =
+                    connectTimeoutMs,
+                readTimeoutMs =
+                    readTimeoutMs,
+            )
+        }.getOrElse {
+            head
         }
     }
 
-    // ----------------------------------------------------------
-    // 416 reconciliation
-    // ----------------------------------------------------------
+    private fun headProbe(
+        srcUrl: String,
+        connectTimeoutMs: Int,
+        readTimeoutMs: Int,
+    ): Probe {
 
-    /**
-     * Handle HTTP 416 by reconciling local partial state.
-     *
-     * @return true if the download can be considered complete and promoted to [dst].
-     *         false if caller should restart from 0.
-     */
+        var current =
+            srcUrl
+
+        var hops = 0
+
+        while (true) {
+            val conn =
+                openConn(
+                    url = current,
+                    method = "HEAD",
+                    connectTimeoutMs =
+                        connectTimeoutMs,
+                    readTimeoutMs =
+                        readTimeoutMs,
+                    followRedirects =
+                        false,
+                )
+
+            try {
+                setCommonHeaders(
+                    conn = conn,
+                    url = current,
+                )
+
+                conn.connect()
+
+                val code =
+                    conn.responseCode
+
+                if (
+                    code in
+                    300..399
+                ) {
+                    val location =
+                        conn.getHeaderField(
+                            "Location"
+                        )
+                            ?: throw IOException(
+                                "Redirect without Location."
+                            )
+
+                    current =
+                        URL(
+                            URL(current),
+                            location,
+                        ).toString()
+
+                    if (
+                        ++hops >
+                        MAX_REDIRECTS
+                    ) {
+                        throw IOException(
+                            "Too many redirects."
+                        )
+                    }
+
+                    continue
+                }
+
+                if (
+                    code ==
+                    HttpURLConnection.HTTP_BAD_METHOD ||
+                    code ==
+                    HttpURLConnection.HTTP_NOT_IMPLEMENTED
+                ) {
+                    return probeViaRangeGet(
+                        srcUrl = current,
+                        connectTimeoutMs =
+                            connectTimeoutMs,
+                        readTimeoutMs =
+                            readTimeoutMs,
+                    )
+                }
+
+                if (
+                    code ==
+                    HTTP_TOO_MANY_REQUESTS ||
+                    code ==
+                    HttpURLConnection.HTTP_UNAVAILABLE ||
+                    code ==
+                    HttpURLConnection.HTTP_CLIENT_TIMEOUT ||
+                    code in 500..599
+                ) {
+                    throw HttpExceptionWithRetryAfter(
+                        message =
+                            "HEAD HTTP $code",
+                        retryAfterMs =
+                            readRetryAfterMs(
+                                conn
+                            ),
+                    )
+                }
+
+                if (
+                    code !in
+                    200..299
+                ) {
+                    throw IOException(
+                        "HEAD HTTP $code" +
+                                (
+                                        readErrorSnippet(
+                                            conn
+                                        )?.let {
+                                            ": $it"
+                                        } ?: ""
+                                        )
+                    )
+                }
+
+                val total =
+                    conn.getHeaderFieldLong(
+                        "Content-Length",
+                        -1L,
+                    ).takeIf {
+                        it >= 0L
+                    }
+
+                val acceptRanges =
+                    (
+                            conn.getHeaderField(
+                                "Accept-Ranges"
+                            ) ?: ""
+                            ).contains(
+                            "bytes",
+                            ignoreCase = true,
+                        )
+
+                val etag =
+                    etagForIfRange(
+                        conn.getHeaderField(
+                            "ETag"
+                        )
+                    )
+
+                val lastModified =
+                    conn.getHeaderField(
+                        "Last-Modified"
+                    )
+
+                val finalUrl =
+                    conn.url.toString()
+
+                return Probe(
+                    total = total,
+                    acceptRanges =
+                        acceptRanges,
+                    etag = etag,
+                    lastModified =
+                        lastModified,
+                    finalUrl = finalUrl,
+                )
+            } finally {
+                conn.disconnect()
+            }
+        }
+    }
+
+    private fun probeViaRangeGet(
+        srcUrl: String,
+        connectTimeoutMs: Int,
+        readTimeoutMs: Int,
+    ): Probe {
+
+        var current =
+            srcUrl
+
+        var hops = 0
+
+        while (true) {
+            val conn =
+                openConn(
+                    url = current,
+                    method = "GET",
+                    connectTimeoutMs =
+                        connectTimeoutMs,
+                    readTimeoutMs =
+                        readTimeoutMs,
+                    followRedirects =
+                        false,
+                )
+
+            try {
+                setCommonHeaders(
+                    conn = conn,
+                    url = current,
+                )
+
+                conn.setRequestProperty(
+                    "Range",
+                    "bytes=0-0",
+                )
+
+                conn.connect()
+
+                val code =
+                    conn.responseCode
+
+                if (
+                    code in
+                    300..399
+                ) {
+                    val location =
+                        conn.getHeaderField(
+                            "Location"
+                        )
+                            ?: throw IOException(
+                                "Redirect without Location."
+                            )
+
+                    current =
+                        URL(
+                            URL(current),
+                            location,
+                        ).toString()
+
+                    if (
+                        ++hops >
+                        MAX_REDIRECTS
+                    ) {
+                        throw IOException(
+                            "Too many redirects."
+                        )
+                    }
+
+                    continue
+                }
+
+                if (
+                    code ==
+                    HTTP_TOO_MANY_REQUESTS ||
+                    code ==
+                    HttpURLConnection.HTTP_UNAVAILABLE ||
+                    code ==
+                    HttpURLConnection.HTTP_CLIENT_TIMEOUT ||
+                    code in 500..599
+                ) {
+                    throw HttpExceptionWithRetryAfter(
+                        message =
+                            "GET-probe HTTP $code",
+                        retryAfterMs =
+                            readRetryAfterMs(
+                                conn
+                            ),
+                    )
+                }
+
+                if (
+                    code !in
+                    200..299
+                ) {
+                    throw IOException(
+                        "GET-probe HTTP $code" +
+                                (
+                                        readErrorSnippet(
+                                            conn
+                                        )?.let {
+                                            ": $it"
+                                        } ?: ""
+                                        )
+                    )
+                }
+
+                val contentRange =
+                    conn.getHeaderField(
+                        "Content-Range"
+                    )
+
+                val totalFromRange =
+                    parseTotalFromContentRange(
+                        contentRange
+                    )
+
+                val total =
+                    totalFromRange
+                        ?: conn.getHeaderFieldLong(
+                            "Content-Length",
+                            -1L,
+                        ).takeIf {
+                            it >= 0L
+                        }
+
+                val acceptRanges =
+                    code ==
+                            HttpURLConnection.HTTP_PARTIAL ||
+                            (
+                                    conn.getHeaderField(
+                                        "Accept-Ranges"
+                                    ) ?: ""
+                                    ).contains(
+                                    "bytes",
+                                    ignoreCase = true,
+                                )
+
+                val etag =
+                    etagForIfRange(
+                        conn.getHeaderField(
+                            "ETag"
+                        )
+                    )
+
+                val lastModified =
+                    conn.getHeaderField(
+                        "Last-Modified"
+                    )
+
+                val finalUrl =
+                    conn.url.toString()
+
+                runCatching {
+                    conn.inputStream.close()
+                }
+
+                return Probe(
+                    total = total,
+                    acceptRanges =
+                        acceptRanges,
+                    etag = etag,
+                    lastModified =
+                        lastModified,
+                    finalUrl = finalUrl,
+                )
+            } finally {
+                conn.disconnect()
+            }
+        }
+    }
+
+    private fun parseTotalFromContentRange(
+        contentRange: String?
+    ): Long? {
+
+        val value =
+            contentRange
+                ?.trim()
+                .orEmpty()
+
+        val slash =
+            value.lastIndexOf('/')
+
+        if (
+            slash < 0 ||
+            slash + 1 >=
+            value.length
+        ) {
+            return null
+        }
+
+        return value
+            .substring(
+                slash + 1
+            )
+            .trim()
+            .toLongOrNull()
+            ?.takeIf {
+                it >= 0L
+            }
+    }
+
+    private fun etagForIfRange(
+        etag: String?
+    ): String? =
+        etag
+            ?.trim()
+            ?.takeIf {
+                it.isNotBlank()
+            }
+
+    private fun etagForCompare(
+        etag: String?
+    ): String? {
+
+        var value =
+            etagForIfRange(
+                etag
+            ) ?: return null
+
+        if (
+            value.startsWith(
+                "W/",
+                ignoreCase = true,
+            )
+        ) {
+            value =
+                value
+                    .substring(2)
+                    .trim()
+        }
+
+        if (
+            value.length >= 2 &&
+            value.first() == '"' &&
+            value.last() == '"'
+        ) {
+            value =
+                value
+                    .substring(
+                        1,
+                        value.length - 1,
+                    )
+                    .trim()
+        }
+
+        return value
+            .takeIf {
+                it.isNotBlank()
+            }
+    }
+
+    /* ========================================================================
+     * Metadata and partial state
+     * ====================================================================== */
+
+    private data class Meta(
+        val etag: String?,
+        val lastModified: String?,
+        val total: Long?,
+    )
+
+    private class MetaFile(
+        private val part: File
+    ) {
+        private val file =
+            File(
+                part.parentFile,
+                part.name + ".meta",
+            )
+
+        fun read(): Meta? =
+            runCatching {
+                if (!file.exists()) {
+                    return@runCatching null
+                }
+
+                val values =
+                    file.readLines()
+                        .mapNotNull { line ->
+                            val index =
+                                line.indexOf('=')
+
+                            if (
+                                index <= 0
+                            ) {
+                                null
+                            } else {
+                                line.substring(
+                                    0,
+                                    index,
+                                ) to
+                                        line.substring(
+                                            index + 1
+                                        )
+                            }
+                        }
+                        .toMap()
+
+                Meta(
+                    etag =
+                        values["etag"],
+                    lastModified =
+                        values["lastModified"],
+                    total =
+                        values["total"]
+                            ?.toLongOrNull(),
+                )
+            }.getOrNull()
+
+        fun write(
+            meta: Meta
+        ) {
+            runCatching {
+                val tmp =
+                    File(
+                        file.parentFile,
+                        file.name + ".tmp",
+                    )
+
+                tmp.writeText(
+                    buildString {
+                        meta.etag?.let {
+                            append(
+                                "etag=$it\n"
+                            )
+                        }
+
+                        meta.lastModified?.let {
+                            append(
+                                "lastModified=$it\n"
+                            )
+                        }
+
+                        meta.total?.let {
+                            append(
+                                "total=$it\n"
+                            )
+                        }
+                    }
+                )
+
+                if (file.exists()) {
+                    runCatching {
+                        file.delete()
+                    }
+                }
+
+                if (
+                    !tmp.renameTo(file)
+                ) {
+                    file.writeText(
+                        tmp.readText()
+                    )
+
+                    runCatching {
+                        tmp.delete()
+                    }
+                }
+            }
+        }
+
+        fun delete() {
+            runCatching {
+                if (file.exists()) {
+                    file.delete()
+                }
+            }
+        }
+
+        fun exists(): Boolean =
+            file.exists()
+    }
+
+    private data class PartialReconcile(
+        val resumeFrom: Long
+    )
+
+    private fun reconcilePartial(
+        part: File,
+        meta: MetaFile,
+        probe: Probe,
+        total: Long?,
+    ): PartialReconcile {
+
+        if (!part.exists()) {
+            return PartialReconcile(
+                0L
+            )
+        }
+
+        val onDisk =
+            part.length()
+
+        if (
+            onDisk <= 0L
+        ) {
+            safeDelete(part)
+            meta.delete()
+
+            return PartialReconcile(
+                0L
+            )
+        }
+
+        if (
+            total != null &&
+            onDisk > total
+        ) {
+            logw(
+                "Partial larger than total " +
+                        "(part=$onDisk total=$total). Restarting."
+            )
+
+            safeDelete(part)
+            meta.delete()
+
+            return PartialReconcile(
+                0L
+            )
+        }
+
+        val stored =
+            meta.read()
+
+        if (
+            stored == null
+        ) {
+            logw(
+                "Partial exists but metadata is missing. Restarting."
+            )
+
+            safeDelete(part)
+            meta.delete()
+
+            return PartialReconcile(
+                0L
+            )
+        }
+
+        if (
+            total != null &&
+            stored.total != null &&
+            stored.total != total
+        ) {
+            logw(
+                "Metadata total mismatch " +
+                        "(meta=${stored.total} probe=$total). Restarting."
+            )
+
+            safeDelete(part)
+            meta.delete()
+
+            return PartialReconcile(
+                0L
+            )
+        }
+
+        val probeEtag =
+            etagForCompare(
+                probe.etag
+            )
+
+        val storedEtag =
+            etagForCompare(
+                stored.etag
+            )
+
+        if (
+            probeEtag != null &&
+            storedEtag != null &&
+            probeEtag != storedEtag
+        ) {
+            logw(
+                "ETag changed. Restarting."
+            )
+
+            safeDelete(part)
+            meta.delete()
+
+            return PartialReconcile(
+                0L
+            )
+        }
+
+        val probeModified =
+            probe.lastModified
+                ?.trim()
+
+        val storedModified =
+            stored.lastModified
+                ?.trim()
+
+        if (
+            probeEtag == null &&
+            storedEtag == null &&
+            probeModified != null &&
+            storedModified != null &&
+            probeModified != storedModified
+        ) {
+            logw(
+                "Last-Modified changed. Restarting."
+            )
+
+            safeDelete(part)
+            meta.delete()
+
+            return PartialReconcile(
+                0L
+            )
+        }
+
+        val bounded =
+            if (
+                total != null
+            ) {
+                onDisk.coerceIn(
+                    0L,
+                    total,
+                )
+            } else {
+                onDisk.coerceAtLeast(
+                    0L
+                )
+            }
+
+        return PartialReconcile(
+            bounded
+        )
+    }
+
+    private fun ensureMetaIfStartingFresh(
+        part: File,
+        meta: MetaFile,
+        probe: Probe,
+        total: Long?,
+    ) {
+        if (part.exists()) {
+            return
+        }
+
+        if (meta.exists()) {
+            return
+        }
+
+        meta.write(
+            Meta(
+                etag = probe.etag,
+                lastModified =
+                    probe.lastModified,
+                total = total,
+            )
+        )
+    }
+
+    private fun applyResumeOverlap(
+        part: File,
+        resumeFrom: Long,
+        overlapBytes: Int,
+        total: Long?,
+    ): Long {
+
+        if (!part.exists()) {
+            return 0L
+        }
+
+        val length =
+            part.length()
+                .coerceAtLeast(0L)
+
+        val from =
+            resumeFrom.coerceIn(
+                0L,
+                total ?: Long.MAX_VALUE,
+            )
+
+        if (
+            from <= 0L
+        ) {
+            return 0L
+        }
+
+        val overlap =
+            overlapBytes
+                .coerceAtLeast(0)
+                .toLong()
+
+        if (
+            overlap <= 0L
+        ) {
+            return from
+        }
+
+        val newFrom =
+            (
+                    from -
+                            overlap
+                    ).coerceAtLeast(
+                    0L
+                )
+
+        if (
+            newFrom <
+            length
+        ) {
+            runCatching {
+                RandomAccessFile(
+                    part,
+                    "rw",
+                ).use { file ->
+                    file.setLength(
+                        newFrom
+                    )
+                }
+            }
+
+            return newFrom
+        }
+
+        return from
+    }
+
+    /* ========================================================================
+     * Single-stream GET
+     * ====================================================================== */
+
+    private fun openGetWithRedirects(
+        srcUrl: String,
+        connectTimeoutMs: Int,
+        readTimeoutMs: Int,
+        rangeFrom: Long?,
+        ifRange: String?,
+        maxRedirects: Int,
+    ): HttpURLConnection {
+
+        var current =
+            srcUrl
+
+        var hops = 0
+
+        while (true) {
+            val conn =
+                openConn(
+                    url = current,
+                    method = "GET",
+                    connectTimeoutMs =
+                        connectTimeoutMs,
+                    readTimeoutMs =
+                        readTimeoutMs,
+                    followRedirects = false,
+                )
+
+            setCommonHeaders(
+                conn = conn,
+                url = current,
+            )
+
+            if (
+                rangeFrom != null &&
+                rangeFrom > 0L
+            ) {
+                conn.setRequestProperty(
+                    "Range",
+                    "bytes=$rangeFrom-",
+                )
+
+                if (
+                    !ifRange.isNullOrBlank()
+                ) {
+                    conn.setRequestProperty(
+                        "If-Range",
+                        ifRange,
+                    )
+                }
+            }
+
+            conn.connect()
+
+            val code =
+                conn.responseCode
+
+            if (
+                code in
+                300..399
+            ) {
+                val location =
+                    conn.getHeaderField(
+                        "Location"
+                    )
+                        ?: run {
+                            conn.disconnect()
+
+                            throw IOException(
+                                "Redirect without Location."
+                            )
+                        }
+
+                val next =
+                    URL(
+                        URL(current),
+                        location,
+                    ).toString()
+
+                conn.disconnect()
+
+                current = next
+
+                if (
+                    ++hops >
+                    maxRedirects
+                ) {
+                    throw IOException(
+                        "Too many redirects."
+                    )
+                }
+
+                continue
+            }
+
+            return conn
+        }
+    }
+
+    private fun validateContentRangeStart(
+        conn: HttpURLConnection,
+        expectedStart: Long,
+    ) {
+        val contentRange =
+            conn.getHeaderField(
+                "Content-Range"
+            )
+                ?.trim()
+                .orEmpty()
+
+        if (
+            !contentRange
+                .lowercase()
+                .startsWith(
+                    "bytes "
+                )
+        ) {
+            throw IOException(
+                "206 without Content-Range header."
+            )
+        }
+
+        val space =
+            contentRange.indexOf(' ')
+
+        val dash =
+            contentRange.indexOf(
+                '-',
+                startIndex =
+                    space + 1,
+            )
+
+        val slash =
+            contentRange.indexOf(
+                '/',
+                startIndex =
+                    dash + 1,
+            )
+
+        if (
+            space < 0 ||
+            dash < 0 ||
+            slash < 0
+        ) {
+            throw IOException(
+                "Malformed Content-Range: $contentRange"
+            )
+        }
+
+        val start =
+            contentRange
+                .substring(
+                    space + 1,
+                    dash,
+                )
+                .trim()
+                .toLongOrNull()
+                ?: throw IOException(
+                    "Malformed Content-Range start: $contentRange"
+                )
+
+        if (
+            start != expectedStart
+        ) {
+            throw IOException(
+                "Content-Range start mismatch: " +
+                        "expected=$expectedStart got=$start " +
+                        "($contentRange)"
+            )
+        }
+    }
+
+    /* ========================================================================
+     * HTTP 416 reconciliation
+     * ====================================================================== */
+
     private fun handleRangeNotSatisfiable(
         dst: File,
         part: File,
         meta: MetaFile,
         total: Long?,
         expectedSha256: String?,
-        onProgress: (Long, Long?) -> Unit
+        onProgress: (Long, Long?) -> Unit,
     ): Boolean {
-        if (total == null) {
-            logw("416 but total unknown; restarting cleanly.")
+
+        if (
+            total == null
+        ) {
+            logw(
+                "416 but total unknown; restarting."
+            )
+
             safeDelete(part)
             meta.delete()
+
             return false
         }
 
-        val onDisk = part.length()
+        val onDisk =
+            part.length()
 
-        if (onDisk == total) {
-            if (dst.exists()) safeDelete(dst)
-            if (!part.renameTo(dst)) {
-                part.copyTo(dst, overwrite = true)
-                safeDelete(part)
-            }
+        if (
+            onDisk == total
+        ) {
+            promotePartToDestination(
+                part = part,
+                dst = dst,
+            )
+
             meta.delete()
 
-            if (expectedSha256 != null) {
-                val got = sha256(dst)
-                if (!got.equals(expectedSha256, true)) {
+            if (
+                expectedSha256 != null
+            ) {
+                val actual =
+                    sha256(dst)
+
+                if (
+                    !actual.equals(
+                        expectedSha256,
+                        ignoreCase = true,
+                    )
+                ) {
                     safeDelete(dst)
-                    throw IOException("SHA mismatch after 416 reconciliation.")
+
+                    throw IOException(
+                        "SHA mismatch after 416 reconciliation."
+                    )
                 }
             }
 
-            onProgress(total, total)
-            logd("Completed via 416 reconciliation.")
+            onProgress(
+                total,
+                total,
+            )
+
+            logd(
+                "Completed via 416 reconciliation."
+            )
+
             return true
         }
 
-        logw("416 mismatch (part=$onDisk, total=$total), restarting from 0.")
+        logw(
+            "416 mismatch " +
+                    "(part=$onDisk total=$total); restarting."
+        )
+
         safeDelete(part)
         meta.delete()
+
         return false
     }
 
-    // ----------------------------------------------------------
-    // Utility functions
-    // ----------------------------------------------------------
+    /* ========================================================================
+     * File validation
+     * ====================================================================== */
 
-    private fun sha256(f: File): String {
-        val md = MessageDigest.getInstance("SHA-256")
-        FileInputStream(f).use { fis ->
-            val buf = ByteArray(128 * 1024)
-            while (true) {
-                val n = fis.read(buf)
-                if (n <= 0) break
-                md.update(buf, 0, n)
+    private fun promotePartToDestination(
+        part: File,
+        dst: File,
+    ) {
+        if (
+            dst.exists()
+        ) {
+            safeDelete(dst)
+        }
+
+        if (
+            !part.renameTo(dst)
+        ) {
+            part.copyTo(
+                target = dst,
+                overwrite = true,
+            )
+
+            safeDelete(part)
+        }
+    }
+
+    private fun validateFinalFile(
+        dst: File,
+        total: Long?,
+        expectedSha256: String?,
+    ) {
+        if (
+            total != null &&
+            dst.length() != total
+        ) {
+            throw IOException(
+                "Size mismatch: " +
+                        "expected=$total got=${dst.length()}"
+            )
+        }
+
+        if (
+            expectedSha256 != null
+        ) {
+            val actual =
+                sha256(dst)
+
+            if (
+                !actual.equals(
+                    expectedSha256,
+                    ignoreCase = true,
+                )
+            ) {
+                safeDelete(dst)
+
+                throw IOException(
+                    "SHA-256 mismatch: " +
+                            "expected=$expectedSha256 got=$actual"
+                )
             }
         }
-        return md.digest().joinToString("") { "%02x".format(it) }
     }
+
+    private fun sha256(
+        file: File
+    ): String {
+        val digest =
+            MessageDigest.getInstance(
+                "SHA-256"
+            )
+
+        FileInputStream(
+            file
+        ).use { input ->
+
+            val buffer =
+                ByteArray(
+                    128 * 1024
+                )
+
+            while (true) {
+                val count =
+                    input.read(
+                        buffer
+                    )
+
+                if (
+                    count <= 0
+                ) {
+                    break
+                }
+
+                digest.update(
+                    buffer,
+                    0,
+                    count,
+                )
+            }
+        }
+
+        return digest
+            .digest()
+            .joinToString(
+                ""
+            ) {
+                "%02x".format(
+                    it
+                )
+            }
+    }
+
+    /* ========================================================================
+     * HTTP helpers
+     * ====================================================================== */
 
     private fun openConn(
         url: String,
         method: String,
         connectTimeoutMs: Int,
         readTimeoutMs: Int,
-        followRedirects: Boolean
+        followRedirects: Boolean,
     ): HttpURLConnection {
-        val u = URL(url)
-        return (u.openConnection() as HttpURLConnection).apply {
-            instanceFollowRedirects = followRedirects
-            requestMethod = method
-            connectTimeout = connectTimeoutMs
-            readTimeout = readTimeoutMs
-            useCaches = false
-            doInput = true
-            doOutput = false
+
+        val parsed =
+            URL(url)
+
+        return (
+                parsed.openConnection()
+                        as HttpURLConnection
+                ).apply {
+
+                instanceFollowRedirects =
+                    followRedirects
+
+                requestMethod =
+                    method
+
+                connectTimeout =
+                    connectTimeoutMs
+
+                readTimeout =
+                    readTimeoutMs
+
+                useCaches =
+                    false
+
+                doInput =
+                    true
+
+                doOutput =
+                    false
+            }
+    }
+
+    /**
+     * Do not force "Connection: close".
+     *
+     * HttpURLConnection may reuse HTTP connections internally. This is useful
+     * for Range requests and avoids unnecessary TCP/TLS setup overhead.
+     */
+    private fun setCommonHeaders(
+        conn: HttpURLConnection,
+        url: String,
+    ) {
+        conn.setRequestProperty(
+            "User-Agent",
+            USER_AGENT,
+        )
+
+        conn.setRequestProperty(
+            "Accept",
+            "application/octet-stream",
+        )
+
+        conn.setRequestProperty(
+            "Accept-Charset",
+            "UTF-8",
+        )
+
+        conn.setRequestProperty(
+            "Accept-Encoding",
+            "identity",
+        )
+
+        if (
+            isHfHost(url) &&
+            !hfToken.isNullOrBlank()
+        ) {
+            conn.setRequestProperty(
+                "Authorization",
+                "Bearer $hfToken",
+            )
         }
     }
 
-    private fun setCommonHeaders(conn: HttpURLConnection, url: String) {
-        conn.setRequestProperty("User-Agent", "AndroidSLM/1.0 (HttpUrlFileDownloader)")
-        conn.setRequestProperty("Accept", "application/octet-stream")
-        conn.setRequestProperty("Accept-Charset", "UTF-8")
-        conn.setRequestProperty("Accept-Encoding", "identity")
-        conn.setRequestProperty("Connection", "close")
+    private fun readErrorSnippet(
+        conn: HttpURLConnection,
+        maxBytes: Int = 2048,
+    ): String? {
 
-        if (isHfHost(url) && !hfToken.isNullOrBlank()) {
-            conn.setRequestProperty("Authorization", "Bearer $hfToken")
-        }
-    }
-
-    private fun readErrorSnippet(conn: HttpURLConnection, maxBytes: Int = 2048): String? {
         return try {
-            val es = conn.errorStream ?: return null
-            es.use { stream ->
-                val buf = ByteArray(maxBytes)
-                val n = stream.read(buf)
-                if (n <= 0) return null
-                buf.copyOf(n).decodeToString()
-                    .replace("\n", " ")
-                    .replace("\r", " ")
+            val stream =
+                conn.errorStream
+                    ?: return null
+
+            stream.use {
+                val buffer =
+                    ByteArray(
+                        maxBytes
+                    )
+
+                val count =
+                    it.read(
+                        buffer
+                    )
+
+                if (
+                    count <= 0
+                ) {
+                    return null
+                }
+
+                buffer
+                    .copyOf(count)
+                    .decodeToString()
+                    .replace(
+                        "\n",
+                        " ",
+                    )
+                    .replace(
+                        "\r",
+                        " ",
+                    )
                     .trim()
             }
-        } catch (_: Throwable) {
+        } catch (
+            _: Throwable
+        ) {
             null
         }
     }
 
-    /**
-     * Parse Retry-After for both delta-seconds and HTTP-date formats.
-     */
-    private fun readRetryAfterMs(conn: HttpURLConnection): Long? {
-        val v = conn.getHeaderField("Retry-After")?.trim()?.takeIf { it.isNotBlank() } ?: return null
+    private fun readRetryAfterMs(
+        conn: HttpURLConnection
+    ): Long? {
 
-        // delta-seconds
-        v.toLongOrNull()?.let { secs ->
-            return (secs.coerceAtLeast(0L) * 1000L)
-        }
+        val value =
+            conn.getHeaderField(
+                "Retry-After"
+            )
+                ?.trim()
+                ?.takeIf {
+                    it.isNotBlank()
+                }
+                ?: return null
 
-        // HTTP-date (RFC 1123)
+        value
+            .toLongOrNull()
+            ?.let { seconds ->
+                return seconds
+                    .coerceAtLeast(0L) *
+                        1000L
+            }
+
         return runCatching {
-            val zdt = ZonedDateTime.parse(v, DateTimeFormatter.RFC_1123_DATE_TIME)
-            val targetMs = zdt.toInstant().toEpochMilli()
-            val nowMs = Instant.now().toEpochMilli()
-            (targetMs - nowMs).coerceAtLeast(0L)
+            val date =
+                ZonedDateTime.parse(
+                    value,
+                    DateTimeFormatter
+                        .RFC_1123_DATE_TIME,
+                )
+
+            val target =
+                date.toInstant()
+                    .toEpochMilli()
+
+            val now =
+                Instant.now()
+                    .toEpochMilli()
+
+            (
+                    target -
+                            now
+                    ).coerceAtLeast(
+                    0L
+                )
         }.getOrNull()
     }
 
-    private fun computeBackoffMs(attempt: Int, retryAfterMs: Long?): Long {
+    private fun computeBackoffMs(
+        attempt: Int,
+        retryAfterMs: Long?,
+    ): Long {
+
         retryAfterMs?.let {
-            return it.coerceIn(500L, MAX_BACKOFF_MS)
+            return it.coerceIn(
+                500L,
+                MAX_BACKOFF_MS,
+            )
         }
 
-        // Exponential backoff with cap + jitter.
-        val base = (BASE_BACKOFF_MS * 2.0.pow(attempt.toDouble())).toLong()
-        val capped = base.coerceAtMost(MAX_BACKOFF_MS)
-        val jitter = Random.nextLong(0L, 300L)
-        return (capped + jitter).coerceAtMost(MAX_BACKOFF_MS)
+        val base =
+            (
+                    BASE_BACKOFF_MS *
+                            2.0.pow(
+                                attempt.toDouble()
+                            )
+                    ).toLong()
+
+        val capped =
+            base.coerceAtMost(
+                MAX_BACKOFF_MS
+            )
+
+        val jitter =
+            Random.nextLong(
+                0L,
+                300L,
+            )
+
+        return (
+                capped +
+                        jitter
+                ).coerceAtMost(
+                MAX_BACKOFF_MS
+            )
     }
 
-    private fun checkFreeSpaceOrThrow(dir: File, required: Long) {
-        val fs = StatFs(dir.absolutePath)
-        val avail = max(0L, fs.availableBytes)
-        if (avail < required) {
-            throw IOException("Not enough space: need ${required}B, available ${avail}B")
+    /* ========================================================================
+     * Progress
+     * ====================================================================== */
+
+    /**
+     * Throttle single-stream progress callbacks to avoid dispatching one UI
+     * callback for every network buffer.
+     */
+    private class ProgressEmitter(
+        private val total: Long?,
+        initialBytes: Long,
+        private val callback: (Long, Long?) -> Unit,
+    ) {
+        private var lastBytes =
+            initialBytes
+
+        private var lastNs =
+            0L
+
+        fun update(
+            downloaded: Long
+        ) {
+            val now =
+                System.nanoTime()
+
+            val bytesChanged =
+                kotlin.math.abs(
+                    downloaded -
+                            lastBytes
+                ) >=
+                        PROGRESS_EMIT_BYTES
+
+            val timeChanged =
+                now -
+                        lastNs >=
+                        PROGRESS_EMIT_INTERVAL_NS
+
+            val complete =
+                total != null &&
+                        downloaded >= total
+
+            if (
+                bytesChanged ||
+                timeChanged ||
+                complete
+            ) {
+                callback(
+                    downloaded,
+                    total,
+                )
+
+                lastBytes =
+                    downloaded
+
+                lastNs =
+                    now
+            }
+        }
+
+        fun force(
+            downloaded: Long
+        ) {
+            callback(
+                downloaded,
+                total,
+            )
+
+            lastBytes =
+                downloaded
+
+            lastNs =
+                System.nanoTime()
         }
     }
 
-    private fun isHfHost(u: String): Boolean {
-        val host = runCatching { URL(u).host ?: "" }.getOrElse { "" }
-        return host == "huggingface.co" || host.endsWith(".huggingface.co")
+    /* ========================================================================
+     * Filesystem helpers
+     * ====================================================================== */
+
+    private fun checkFreeSpaceOrThrow(
+        dir: File,
+        required: Long,
+    ) {
+        val filesystem =
+            StatFs(
+                dir.absolutePath
+            )
+
+        val available =
+            max(
+                0L,
+                filesystem.availableBytes,
+            )
+
+        if (
+            available <
+            required
+        ) {
+            throw IOException(
+                "Not enough space: " +
+                        "need=$required bytes, " +
+                        "available=$available bytes"
+            )
+        }
     }
 
-    private fun safeDelete(f: File) {
+    private fun safeDelete(
+        file: File
+    ) {
         runCatching {
-            if (f.exists() && !f.delete()) {
-                logw("Failed to delete: ${f.absolutePath}")
+            if (
+                file.exists() &&
+                !file.delete()
+            ) {
+                logw(
+                    "Failed to delete: ${file.absolutePath}"
+                )
             }
         }
     }
 
-    private fun logd(msg: String) {
-        if (debugLogs) Log.d(tag, msg)
+    /* ========================================================================
+     * Hugging Face
+     * ====================================================================== */
+
+    private fun isHfHost(
+        url: String
+    ): Boolean {
+
+        val host =
+            runCatching {
+                URL(url).host ?: ""
+            }.getOrElse {
+                ""
+            }
+
+        return host ==
+                "huggingface.co" ||
+                host.endsWith(
+                    ".huggingface.co"
+                )
     }
 
-    private fun logw(msg: String) {
-        if (debugLogs) Log.w(tag, msg)
+    /* ========================================================================
+     * Logging
+     * ====================================================================== */
+
+    private fun logd(
+        message: String
+    ) {
+        if (
+            debugLogs
+        ) {
+            Log.d(
+                tag,
+                message,
+            )
+        }
     }
+
+    private fun logw(
+        message: String
+    ) {
+        if (
+            debugLogs
+        ) {
+            Log.w(
+                tag,
+                message,
+            )
+        }
+    }
+
+    private fun bytesToMiB(
+        bytes: Long
+    ): Long =
+        bytes /
+                (1024L * 1024L)
+
+    /* ========================================================================
+     * Exceptions
+     * ====================================================================== */
 
     private class HttpExceptionWithRetryAfter(
         message: String,
-        val retryAfterMs: Long?
+        val retryAfterMs: Long?,
+    ) : IOException(message)
+
+    private class ParallelRangeUnsupportedException(
+        message: String
     ) : IOException(message)
 
     companion object {
-        /** Maximum number of in-stream retries for 401/403 to avoid infinite loops. */
-        private const val MAX_UNAUTHORIZED_RETRIES = 2
+        private const val USER_AGENT =
+            "AndroidSLM/1.1 (HttpUrlFileDownloader)"
 
-        /** Extra safety margin (50 MiB) to avoid running out of space mid-download. */
-        private const val FREE_SPACE_MARGIN_BYTES = 50L * 1024L * 1024L
+        private const val MAX_REDIRECTS =
+            10
 
-        /** Backoff defaults. */
-        private const val BASE_BACKOFF_MS = 500L
-        private const val MAX_BACKOFF_MS = 20_000L
+        private const val MAX_UNAUTHORIZED_RETRIES =
+            2
+
+        private const val HTTP_RANGE_NOT_SATISFIABLE =
+            416
+
+        private const val HTTP_TOO_MANY_REQUESTS =
+            429
+
+        /*
+         * Enable parallel download only for large files.
+         */
+        private const val PARALLEL_MIN_FILE_BYTES =
+            256L * 1024L * 1024L
+
+        /*
+         * Four simultaneous HTTP Range requests.
+         *
+         * 4 is a conservative default for mobile devices and large HF models.
+         * If testing shows the CDN and device can sustain more throughput,
+         * this can later be tested with 6 or 8.
+         */
+        private const val PARALLEL_CHUNKS =
+            4
+
+        private const val PARALLEL_BUFFER_BYTES =
+            2 * 1024 * 1024
+
+        private const val MAX_IO_BUFFER_BYTES =
+            2 * 1024 * 1024
+
+        /*
+         * Re-download 64 KiB when resuming a parallel chunk.
+         */
+        private const val PARALLEL_RESUME_OVERLAP_BYTES =
+            64L * 1024L
+
+        /*
+         * Progress callback throttling.
+         */
+        private const val PROGRESS_EMIT_BYTES =
+            2L * 1024L * 1024L
+
+        private const val PROGRESS_EMIT_INTERVAL_NS =
+            250_000_000L
+
+        private const val PARALLEL_PROGRESS_BYTES =
+            2L * 1024L * 1024L
+
+        private const val PARALLEL_PROGRESS_INTERVAL_NS =
+            250_000_000L
+
+        private const val SPEED_LOG_INTERVAL_NS =
+            2_000_000_000L
+
+        /*
+         * Keep extra free space for metadata, filesystem overhead and
+         * temporary merge data.
+         */
+        private const val FREE_SPACE_MARGIN_BYTES =
+            50L * 1024L * 1024L
+
+        private const val BASE_BACKOFF_MS =
+            500L
+
+        private const val MAX_BACKOFF_MS =
+            20_000L
     }
 }

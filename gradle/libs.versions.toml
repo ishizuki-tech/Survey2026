@@ -1,54 +1,53 @@
 [versions]
-agp = "9.0.0"
+agp = "9.3.2"
 
 # Kotlin
-kotlin = "2.3.10"
+kotlin = "2.4.10"
 
 # Compose (BOM controls Compose artifact versions)
-composeBom = "2026.02.00"
+composeBom = "2026.08.00"
 
 # AndroidX core / app compat
-coreKtx = "1.17.0"
-appcompat = "1.7.1"
+coreKtx = "1.19.0"
+appcompat = "1.8.0"
 documentfile = "1.1.0"
 
 # Serialization / YAML
 kaml = "0.104.0"
-kotlinxSerializationJson = "1.10.0"
+kotlinxSerializationJson = "1.11.0"
 
 # Coroutines
-kotlinxCoroutinesAndroid = "1.10.2"
-coroutinesTest = "1.10.2"
+kotlinxCoroutinesAndroid = "1.11.0"
+coroutinesTest = "1.11.0"
 
 # Activity
-activityCompose = "1.12.4"
-activityKtx = "1.12.4"
+activityCompose = "1.13.0"
+activityKtx = "1.13.0"
 
 # Lifecycle (stable)
-lifecycleRuntimeKtx = "2.10.0"
-lifecycleRuntimeCompose = "2.10.0"
-lifecycleViewmodelCompose = "2.10.0"
-lifecycleViewmodelNavigation3Android = "2.10.0"
-lifecycleProcess = "2.10.0"
+lifecycleRuntimeKtx = "2.11.0"
+lifecycleRuntimeCompose = "2.11.0"
+lifecycleViewmodelCompose = "2.11.0"
+lifecycleViewmodelNavigation3Android = "2.11.0"
+lifecycleProcess = "2.11.0"
 
 # Navigation
-navigationCompose = "2.9.7"
-navigation3 = "1.0.1"
+navigationCompose = "2.9.8"
+navigation3 = "1.1.6"
 
 # Media3
-media3Exoplayer = "1.9.2"
-media3Ui = "1.9.2"
+media3Exoplayer = "1.11.0"
+media3Ui = "1.11.0"
 
 # MediaPipe / LiteRT-LM
-mediapipeTasksGenai = "0.10.32"
-litertlm = "0.9.0-alpha04"
+litertlm = "0.16.1"
 
 # Networking
-okhttp = "5.3.2"
-okhttpDnsoverhttps = "5.3.2"
+okhttp = "5.5.0"
+okhttpDnsoverhttps = "5.5.0"
 
 # WorkManager
-workRuntimeKtx = "2.11.1"
+workRuntimeKtx = "2.11.2"
 
 # Testing
 junit = "4.13.2"
@@ -58,12 +57,12 @@ orchestrator = "1.6.1"
 androidxTestRunner = "1.7.0"
 
 # Mocking
-mockitoAndroid = "5.21.0"
-mockk = "1.14.9"
+mockitoAndroid = "5.23.0"
+mockk = "1.14.11"
 
 # Misc
 accompanistNavigationAnimation = "0.36.0"
-material = "1.13.0"
+material = "1.14.0"
 
 # Security
 securityCrypto = "1.1.0"
@@ -130,7 +129,7 @@ okhttp = { module = "com.squareup.okhttp3:okhttp", version.ref = "okhttp" }
 okhttp-dnsoverhttps = { module = "com.squareup.okhttp3:okhttp-dnsoverhttps", version.ref = "okhttpDnsoverhttps" }
 
 # MediaPipe / LiteRT-LM
-mediapipe-tasks-genai = { group = "com.google.mediapipe", name = "tasks-genai", version.ref = "mediapipeTasksGenai" }
+# mediapipe-tasks-genai = { group = "com.google.mediapipe", name = "tasks-genai", version.ref = "mediapipeTasksGenai" }
 litertlm = { group = "com.google.ai.edge.litertlm", name = "litertlm-android", version.ref = "litertlm" }
 
 # Testing libs

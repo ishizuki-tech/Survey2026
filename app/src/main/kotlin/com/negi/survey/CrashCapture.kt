@@ -22,6 +22,7 @@ import android.os.Looper
 import android.os.Process
 import android.os.SystemClock
 import android.util.Log
+import androidx.annotation.RequiresApi
 import androidx.work.BackoffPolicy
 import androidx.work.Constraints
 import androidx.work.ExistingWorkPolicy
@@ -38,13 +39,16 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.io.InputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.min
 import kotlin.system.exitProcess
 
@@ -70,6 +74,12 @@ object CrashCapture {
     private const val MAX_FILES_TO_KEEP = 120
     private const val MAX_FILES_TO_ENQUEUE = 30
 
+    /** Maximum number of new ApplicationExitInfo records staged per launch. */
+    private const val MAX_EXIT_INFOS_TO_STAGE = 16
+
+    /** Preserve only a bounded amount of system-provided trace data per exit. */
+    private const val MAX_EXIT_TRACE_BYTES = 768 * 1024
+
     /**
      * Limit ring uploads to avoid enqueue storms.
      * Increase if your ring is intentionally large.
@@ -88,7 +98,7 @@ object CrashCapture {
     /** Try to force logcat process shutdown quickly (best-effort). */
     private const val LOGCAT_WAITFOR_MS = 90L
 
-    /** Prevent ensure storms (handler re-wrap). */
+    /** Prevent ensure storms (handler-chain verification). */
     private const val ENSURE_COOLDOWN_MS = 800L
 
     /** SharedPreferences for previous-session staging state. */
@@ -106,6 +116,13 @@ object CrashCapture {
     private val enqueueing = AtomicBoolean(false)
     private val selfHealingRegistered = AtomicBoolean(false)
 
+    /**
+     * Once our handler has been installed, a later different default handler
+     * may be an SDK wrapper that already delegates to us. Re-parenting our
+     * delegate to that wrapper would create a handler cycle.
+     */
+    private val handlerInstalledOnce = AtomicBoolean(false)
+
     private val lastEnqueueAt = AtomicLong(0L)
     private val lastEnsureAt = AtomicLong(0L)
 
@@ -117,28 +134,35 @@ object CrashCapture {
     @Volatile
     private var handler: CrashHandler? = null
 
+    /**
+     * SimpleDateFormat is not thread-safe.
+     *
+     * Crash capture, startup staging, and enqueue work can execute on different
+     * threads, so all formatter access is serialized through [timestampLock].
+     */
+    private val timestampLock = Any()
+
     /** UTC timestamp used in filenames to keep ordering stable across devices/locales. */
-    private val FILE_TS_UTC = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).apply {
+    private val fileTsUtc = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).apply {
         timeZone = TimeZone.getTimeZone("UTC")
     }
 
     /** Local timestamp for human-friendly header info. */
-    private val HEADER_TS_LOCAL = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US)
+    private val headerTsLocal = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US)
 
     /**
      * Marker for `logcat -T`.
      *
      * Use a year-inclusive format to avoid ambiguity around year boundaries.
-     * logcat accepts "YYYY-MM-DD HH:MM:SS.mmm" on modern Android.
      */
-    private val LOGCAT_MARKER = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
+    private val logcatMarkerFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
 
     // -----------------------------------------------------------------------------
     // Public API
     // -----------------------------------------------------------------------------
 
     /**
-     * Install (or re-wrap) the default uncaught exception handler.
+     * Install the uncaught exception handler while preserving a safe delegate chain.
      *
      * Notes:
      * - Native SIGSEGV will NOT reach this handler.
@@ -156,7 +180,7 @@ object CrashCapture {
     /**
      * Install with a caller label.
      *
-     * This helps identify unexpected re-installs (e.g., self-healing, receivers, SDK overrides).
+     * This helps identify repeated install calls (e.g., self-healing, receivers, SDK activity).
      */
     fun install(context: Context, where: String) {
         installInternal(context = context, where = where.ifBlank { "install(custom)" })
@@ -191,7 +215,7 @@ object CrashCapture {
     }
 
     /**
-     * Ensure we are the default handler (best-effort) with a small cooldown.
+     * Verify/restore a safe handler chain (best-effort) with a small cooldown.
      *
      * Note:
      * - This only ensures handler installation; it does NOT enqueue WorkManager uploads.
@@ -308,8 +332,11 @@ object CrashCapture {
                 .isSuccess
             if (!wmOk) return
 
-            val dir = crashDir(root).apply { mkdirs() }
-            val ghMirrorDir = crashGitHubMirrorDir(root).apply { mkdirs() }
+            val dir = crashDir(root)
+            val ghMirrorDir = crashGitHubMirrorDir(root)
+
+            ensureDirectory(dir)
+            ensureDirectory(ghMirrorDir)
 
             purgeOldFiles(dir, MAX_FILES_TO_KEEP)
 
@@ -384,7 +411,7 @@ object CrashCapture {
 
         filesDirRoot = root
 
-        // Create the handler once, then keep re-wrapping the delegate as needed.
+        // Create one stable handler instance for the lifetime of the process.
         val h = handler ?: synchronized(this) {
             handler ?: CrashHandler(
                 filesDir = root,
@@ -404,12 +431,55 @@ object CrashCapture {
 
     private fun ensureDefaultHandlerInstalled(h: CrashHandler) {
         val current = Thread.getDefaultUncaughtExceptionHandler()
-        if (current === h) return
 
-        // Always delegate to what is currently installed (if any), avoiding self-loop.
-        h.updateDelegate(current)
+        if (current === h) {
+            handlerInstalledOnce.set(true)
+            return
+        }
 
-        Thread.setDefaultUncaughtExceptionHandler(h)
+        /**
+         * First installation is safe: capture the handler that existed before us
+         * and place CrashCapture at the top of the chain.
+         */
+        if (handlerInstalledOnce.compareAndSet(false, true)) {
+            h.updateDelegate(current)
+            Thread.setDefaultUncaughtExceptionHandler(h)
+            return
+        }
+
+        /**
+         * If the current handler is exactly our known delegate, something restored
+         * the pre-CrashCapture handler. Reinstalling ourselves is safe because that
+         * handler cannot be an outer wrapper around us.
+         */
+        if (current === h.delegateSnapshot()) {
+            Thread.setDefaultUncaughtExceptionHandler(h)
+            return
+        }
+
+        /**
+         * Do NOT blindly re-wrap an unknown later handler.
+         *
+         * A common SDK pattern is:
+         *
+         *     sdkHandler.delegate = CrashCapture
+         *
+         * If we then set:
+         *
+         *     CrashCapture.delegate = sdkHandler
+         *
+         * the chain becomes CrashCapture -> SDK -> CrashCapture and recurses.
+         *
+         * Leave the later handler in place. Well-behaved crash SDKs normally keep
+         * the previous handler in their delegate chain, so CrashCapture remains
+         * reachable without risking a cycle.
+         */
+        Log.w(
+            TAG,
+            "Default uncaught handler changed after CrashCapture installation; " +
+                    "leaving outer handler in place to avoid a delegate cycle. " +
+                    "current=${describeHandler(current)}"
+        )
     }
 
     // -----------------------------------------------------------------------------
@@ -422,91 +492,341 @@ object CrashCapture {
      * Returns:
      * - The previous process pid (if known and a crash-like exit was found), else null.
      */
-    private fun stageLastExitInfoIfNeeded(context: Context, filesDir: File): Int? {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return null
-        if (!stagedExitInfoThisProcess.compareAndSet(false, true)) return null
-
-        val appCtx = safeAppContext(context)
-        val prefs = appCtx.getSharedPreferences(STATE_PREF_NAME, Context.MODE_PRIVATE)
-        val lastTs = prefs.getLong(KEY_LAST_EXIT_TS, 0L)
-
-        val am = appCtx.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager ?: return null
-        val reasons: List<ApplicationExitInfo> = runCatching {
-            am.getHistoricalProcessExitReasons(appCtx.packageName, 0, 16)
-        }.getOrDefault(emptyList())
-
-        if (reasons.isEmpty()) return null
-
-        // Sort newest-first defensively (OEMs should already do this, but don't trust it).
-        val sorted = reasons.sortedByDescending { it.timestamp }
-
-        // Update last processed timestamp to the newest item we observed (even if not crash-like),
-        // so we don't redo this scan on every launch.
-        val newestTs = sorted.firstOrNull()?.timestamp ?: 0L
-        if (newestTs > 0L && newestTs != lastTs) {
-            prefs.edit().putLong(KEY_LAST_EXIT_TS, newestTs).apply()
+    private fun stageLastExitInfoIfNeeded(
+        context: Context,
+        filesDir: File
+    ): Int? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            return null
         }
 
-        // Find the newest crash-like entry that is newer than lastTs.
-        val crashLike = sorted.firstOrNull { info ->
-            val ts = info.timestamp
-            if (ts <= 0L) return@firstOrNull false
-            if (ts == lastTs) return@firstOrNull false
-            val r = info.reason
-            r == ApplicationExitInfo.REASON_CRASH_NATIVE || r == ApplicationExitInfo.REASON_SIGNALED
-        } ?: return null
+        if (!stagedExitInfoThisProcess.compareAndSet(false, true)) {
+            return null
+        }
 
-        val ts = crashLike.timestamp
-        val reason = crashLike.reason
-        val pid = crashLike.pid
-        val status = crashLike.status
-        val desc = crashLike.description ?: ""
+        try {
+            val appCtx = safeAppContext(context)
+            val prefs = appCtx.getSharedPreferences(
+                STATE_PREF_NAME,
+                Context.MODE_PRIVATE
+            )
 
-        // Persist last exit pid to help previous-session logcat filtering.
-        prefs.edit().putInt(KEY_LAST_EXIT_PID, pid).apply()
+            val lastProcessedTs =
+                prefs.getLong(KEY_LAST_EXIT_TS, 0L)
 
+            val am =
+                appCtx.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
+                    ?: return null
+
+            val reasons =
+                am.getHistoricalProcessExitReasons(
+                    appCtx.packageName,
+                    0,
+                    MAX_EXIT_INFOS_TO_STAGE
+                )
+
+            if (reasons.isEmpty()) {
+                return null
+            }
+
+            /**
+             * Work only on records newer than the marker from the previous scan.
+             *
+             * The previous implementation compared `ts != lastTs`, which could
+             * repeatedly stage an older crash record whenever the newest exit was
+             * a non-crash exit. The ordering marker must be a strict `>` boundary.
+             */
+            val newRecords = reasons
+                .asSequence()
+                .filter { it.timestamp > lastProcessedTs }
+                .sortedByDescending { it.timestamp }
+                .toList()
+
+            if (newRecords.isEmpty()) {
+                return null
+            }
+
+            val newestObservedTs =
+                newRecords.maxOf { it.timestamp }
+
+            val diagnosticRecords =
+                newRecords.filter { isDiagnosticExitReason(it.reason) }
+
+            val dir = crashDir(filesDir)
+            ensureDirectory(dir)
+
+            for (info in diagnosticRecords) {
+                stageApplicationExitInfo(
+                    info = info,
+                    dir = dir
+                )
+            }
+
+            /**
+             * Persist the marker only after all selected records were staged
+             * successfully. commit() is intentional here because this state controls
+             * de-duplication across process restarts.
+             */
+            val newestDiagnosticPid =
+                diagnosticRecords.firstOrNull()
+                    ?.pid
+                    ?.takeIf { it > 0 }
+
+            val editor = prefs.edit()
+                .putLong(KEY_LAST_EXIT_TS, newestObservedTs)
+
+            if (newestDiagnosticPid != null) {
+                editor.putInt(
+                    KEY_LAST_EXIT_PID,
+                    newestDiagnosticPid
+                )
+            } else {
+                editor.remove(KEY_LAST_EXIT_PID)
+            }
+
+            if (!editor.commit()) {
+                Log.w(
+                    TAG,
+                    "Failed to persist ApplicationExitInfo staging marker."
+                )
+            }
+
+            return newestDiagnosticPid
+        } catch (t: Throwable) {
+            /**
+             * A transient platform/filesystem error should not permanently disable
+             * staging for the remainder of this process.
+             */
+            stagedExitInfoThisProcess.set(false)
+            throw t
+        }
+    }
+
+    /**
+     * Stage one ApplicationExitInfo record.
+     *
+     * System traces are preserved as raw bytes. In particular, Android 12+
+     * exposes native tombstones through traceInputStream as protobuf; decoding
+     * that stream as UTF-8 text would corrupt the diagnostic payload.
+     */
+    @RequiresApi(Build.VERSION_CODES.R)
+    private fun stageApplicationExitInfo(
+        info: ApplicationExitInfo,
+        dir: File
+    ) {
         val now = Date()
-        val stampUtc = FILE_TS_UTC.format(now)
-        val stampLocal = HEADER_TS_LOCAL.format(now)
+        val capturedUtc = formatFileTimestampUtc(now)
+        val capturedLocal = formatHeaderTimestampLocal(now)
 
-        val traceText = runCatching {
-            val ins = crashLike.traceInputStream ?: return@runCatching ""
-            ins.bufferedReader().use { it.readText().take(320_000) }
-        }.getOrDefault("")
+        val exitTs = info.timestamp
+        val exitStampUtc =
+            if (exitTs > 0L) {
+                formatFileTimestampUtc(Date(exitTs))
+            } else {
+                capturedUtc
+            }
+
+        val reason = info.reason
+        val pid = info.pid
+        val baseName =
+            "exit_${exitStampUtc}_${exitTs}_pid${pid}_r${reason}"
+
+        val traceResult =
+            stageApplicationExitTrace(
+                info = info,
+                dir = dir,
+                baseName = baseName
+            )
 
         val text = buildString {
             appendLine("=== Previous Process Exit (API30+) ===")
-            appendLine("captured_time_utc=$stampUtc")
-            appendLine("captured_time_local=$stampLocal")
-            appendLine("exit_timestamp_ms=$ts")
+            appendLine("captured_time_utc=$capturedUtc")
+            appendLine("captured_time_local=$capturedLocal")
+            appendLine("exit_timestamp_ms=$exitTs")
             appendLine("exit_reason=$reason")
-            appendLine("exit_status=$status")
+            appendLine("exit_reason_name=${exitReasonName(reason)}")
+            appendLine("exit_status=${info.status}")
             appendLine("exit_pid=$pid")
-            appendLine("description=$desc")
+            appendLine("process_name=${info.processName.orEmpty()}")
+            appendLine("importance=${info.importance}")
+            appendLine("pss_kb=${info.pss}")
+            appendLine("rss_kb=${info.rss}")
+            appendLine("description=${sanitizeSingleLine(info.description.orEmpty())}")
             appendLine("sdk=${Build.VERSION.SDK_INT}")
             appendLine("device=${Build.MANUFACTURER} ${Build.MODEL}")
             appendLine("appId=${BuildConfig.APPLICATION_ID}")
             appendLine("versionName=${BuildConfig.VERSION_NAME}")
             appendLine("versionCode=${BuildConfig.VERSION_CODE}")
-            if (traceText.isNotBlank()) {
-                appendLine()
-                appendLine("=== trace (capped) ===")
-                appendLine(traceText)
+
+            if (traceResult != null) {
+                appendLine("trace_file=${traceResult.file.name}")
+                appendLine("trace_bytes=${traceResult.file.length()}")
+                appendLine("trace_truncated=${traceResult.truncated}")
+                appendLine("trace_format=${traceResult.format}")
             }
         }.toByteArray(Charsets.UTF_8)
 
-        val dir = crashDir(filesDir).apply { mkdirs() }
-        val name = "exit_${stampUtc}_pid${pid}_r${reason}.log"
-        val outFile = File(dir, name)
+        val outFile =
+            File(dir, "$baseName.log")
 
-        FileOutputStream(outFile).use { fos ->
-            fos.write(text)
-            fos.flush()
-            runCatching { fos.fd.sync() }
+        writeBytesDurably(
+            file = outFile,
+            bytes = text
+        )
+
+        Log.d(
+            TAG,
+            "Staged exit info: ${outFile.absolutePath} " +
+                    "bytes=${outFile.length()} reason=$reason pid=$pid"
+        )
+    }
+
+    private data class StagedTrace(
+        val file: File,
+        val truncated: Boolean,
+        val format: String
+    )
+
+    private data class CappedRead(
+        val bytes: ByteArray,
+        val truncated: Boolean
+    )
+
+    @RequiresApi(Build.VERSION_CODES.R)
+    private fun stageApplicationExitTrace(
+        info: ApplicationExitInfo,
+        dir: File,
+        baseName: String
+    ): StagedTrace? {
+        val input =
+            runCatching { info.traceInputStream }
+                .getOrNull()
+                ?: return null
+
+        val capped =
+            input.use {
+                readInputStreamCapped(
+                    input = it,
+                    maxBytes = MAX_EXIT_TRACE_BYTES
+                )
+            }
+
+        if (capped.bytes.isEmpty()) {
+            return null
         }
 
-        Log.d(TAG, "Staged exit info: ${outFile.absolutePath} bytes=${outFile.length()} reason=$reason pid=$pid")
-        return pid
+        val isNativeTombstoneProto =
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+                    info.reason == ApplicationExitInfo.REASON_CRASH_NATIVE
+
+        val suffix =
+            if (isNativeTombstoneProto) {
+                ".tombstone.pb"
+            } else {
+                ".trace"
+            }
+
+        val format =
+            if (isNativeTombstoneProto) {
+                "android_native_tombstone_protobuf"
+            } else {
+                "raw_system_trace"
+            }
+
+        val file =
+            File(dir, "$baseName$suffix")
+
+        writeBytesDurably(
+            file = file,
+            bytes = capped.bytes
+        )
+
+        return StagedTrace(
+            file = file,
+            truncated = capped.truncated,
+            format = format
+        )
+    }
+
+    private fun readInputStreamCapped(
+        input: InputStream,
+        maxBytes: Int
+    ): CappedRead {
+        val safeMax = maxBytes.coerceAtLeast(0)
+
+        if (safeMax == 0) {
+            return CappedRead(
+                bytes = ByteArray(0),
+                truncated = true
+            )
+        }
+
+        val out =
+            ByteArrayOutputStream(
+                min(safeMax, 64 * 1024)
+            )
+
+        val buffer = ByteArray(16 * 1024)
+        var truncated = false
+
+        while (out.size() < safeMax) {
+            val remaining = safeMax - out.size()
+            val count = input.read(
+                buffer,
+                0,
+                min(buffer.size, remaining)
+            )
+
+            if (count <= 0) {
+                break
+            }
+
+            out.write(buffer, 0, count)
+        }
+
+        /**
+         * Probe one additional byte to distinguish exact-size input from a
+         * truncated payload.
+         */
+        if (out.size() >= safeMax) {
+            truncated =
+                runCatching { input.read() >= 0 }
+                    .getOrDefault(false)
+        }
+
+        return CappedRead(
+            bytes = out.toByteArray(),
+            truncated = truncated
+        )
+    }
+
+    private fun isDiagnosticExitReason(reason: Int): Boolean {
+        return reason == ApplicationExitInfo.REASON_CRASH ||
+                reason == ApplicationExitInfo.REASON_CRASH_NATIVE ||
+                reason == ApplicationExitInfo.REASON_SIGNALED ||
+                reason == ApplicationExitInfo.REASON_ANR ||
+                reason == ApplicationExitInfo.REASON_INITIALIZATION_FAILURE ||
+                reason == ApplicationExitInfo.REASON_LOW_MEMORY
+    }
+
+    private fun exitReasonName(reason: Int): String {
+        return when (reason) {
+            ApplicationExitInfo.REASON_UNKNOWN -> "UNKNOWN"
+            ApplicationExitInfo.REASON_EXIT_SELF -> "EXIT_SELF"
+            ApplicationExitInfo.REASON_SIGNALED -> "SIGNALED"
+            ApplicationExitInfo.REASON_LOW_MEMORY -> "LOW_MEMORY"
+            ApplicationExitInfo.REASON_CRASH -> "CRASH"
+            ApplicationExitInfo.REASON_CRASH_NATIVE -> "CRASH_NATIVE"
+            ApplicationExitInfo.REASON_ANR -> "ANR"
+            ApplicationExitInfo.REASON_INITIALIZATION_FAILURE -> "INITIALIZATION_FAILURE"
+            ApplicationExitInfo.REASON_PERMISSION_CHANGE -> "PERMISSION_CHANGE"
+            ApplicationExitInfo.REASON_EXCESSIVE_RESOURCE_USAGE -> "EXCESSIVE_RESOURCE_USAGE"
+            ApplicationExitInfo.REASON_USER_REQUESTED -> "USER_REQUESTED"
+            ApplicationExitInfo.REASON_USER_STOPPED -> "USER_STOPPED"
+            ApplicationExitInfo.REASON_DEPENDENCY_DIED -> "DEPENDENCY_DIED"
+            ApplicationExitInfo.REASON_OTHER -> "OTHER"
+            else -> "REASON_$reason"
+        }
     }
 
     /**
@@ -530,8 +850,8 @@ object CrashCapture {
         val pid = preferredPid ?: savedExitPid
 
         val now = Date()
-        val stampUtc = FILE_TS_UTC.format(now)
-        val stampLocal = HEADER_TS_LOCAL.format(now)
+        val stampUtc = formatFileTimestampUtc(now)
+        val stampLocal = formatHeaderTimestampLocal(now)
 
         val header = buildString {
             appendLine("=== Previous Session Logcat ===")
@@ -556,16 +876,21 @@ object CrashCapture {
             maxMs = LOGCAT_MAX_MS
         )
 
-        val dir = crashDir(filesDir).apply { mkdirs() }
+        val dir = crashDir(filesDir)
+        ensureDirectory(dir)
+
         val name = "prevlog_${stampUtc}_pid${Process.myPid()}.log"
         val outFile = File(dir, name)
 
-        FileOutputStream(outFile).use { fos ->
-            fos.write(header)
-            fos.write(logBytes)
-            fos.flush()
-            runCatching { fos.fd.sync() }
-        }
+        val payload = ByteArrayOutputStream(header.size + logBytes.size).apply {
+            write(header)
+            write(logBytes)
+        }.toByteArray()
+
+        writeBytesDurably(
+            file = outFile,
+            bytes = payload
+        )
 
         Log.d(TAG, "Staged prev session logcat: ${outFile.absolutePath} bytes=${outFile.length()} marker=$marker pid=${pid ?: -1}")
     }
@@ -576,9 +901,17 @@ object CrashCapture {
     private fun persistCurrentLogcatMarker(context: Context) {
         val appCtx = safeAppContext(context)
         val prefs = appCtx.getSharedPreferences(STATE_PREF_NAME, Context.MODE_PRIVATE)
-        val marker = runCatching { LOGCAT_MARKER.format(Date()) }.getOrDefault("")
+        val marker = runCatching { formatLogcatMarker(Date()) }.getOrDefault("")
         if (marker.isBlank()) return
-        prefs.edit().putString(KEY_LAST_LOGCAT_MARKER, marker).apply()
+        val ok = prefs.edit()
+            .putString(KEY_LAST_LOGCAT_MARKER, marker)
+            .commit()
+
+        if (!ok) {
+            Log.w(TAG, "Failed to persist logcat marker for next run.")
+            return
+        }
+
         Log.d(TAG, "Persisted logcat marker for next run: $marker")
     }
 
@@ -587,20 +920,12 @@ object CrashCapture {
     // -----------------------------------------------------------------------------
 
     /**
-     * Upload AppRingLogStore "ring body" (raw files) as-is.
+     * Upload the raw AppRingLogStore segment files.
      *
-     * Implementation:
-     * - Discover ring directory using reflection first (if AppRingLogStore provides it),
-     *   then fall back to common candidate paths under filesDir.
-     * - Recursively enumerate files.
-     * - Copy each file into a timestamped mirror subdir under CRASH_GH_MIRROR_DIR_REL.
-     * - Enqueue GitHubUploadWorker per file using a timestamped remote path:
-     *     <cfg.pathPrefix>/<REMOTE_RING_SUBDIR>/<stampUtc>/<relativePath>
-     *
-     * Why timestamped remote path:
-     * - Ring segment filenames are typically stable (segment_0001.log, index.json, ...).
-     * - WorkManager enqueueUniqueWork(KEEP) uses the work name; if the remote path is stable,
-     *   it would only upload once forever. Timestamp makes it unique per capture.
+     * The ring store is part of this application module, so use its typed API
+     * directly instead of reflection. A per-capture remote directory keeps
+     * concurrently unfinished unique WorkManager jobs from colliding on stable
+     * segment names.
      */
     private fun stageAndEnqueueRingStoreUploads(
         context: Context,
@@ -610,144 +935,143 @@ object CrashCapture {
         where: String
     ) {
         if (!stagedRingUploadThisProcess.compareAndSet(false, true)) {
-            Log.d(TAG, "Ring store upload already staged in this process; skipping. where=$where")
+            Log.d(
+                TAG,
+                "Ring store upload already staged in this process; skipping. where=$where"
+            )
             return
         }
 
-        val ringDir = findRingDirectoryBestEffort(context, filesDir)
-        if (ringDir == null || !ringDir.exists() || !ringDir.isDirectory) {
-            Log.d(TAG, "Ring store dir not found; skipping ring upload. where=$where")
-            return
-        }
+        try {
+            val ringDir =
+                runCatching {
+                    AppRingLogStore.ringDir(context)
+                }.getOrElse {
+                    File(filesDir, "diagnostics/applog_ring")
+                }
 
-        val all = listFilesRecursively(ringDir)
-            .filter { it.isFile && it.length() > 0L && !it.name.startsWith(".") }
+            if (!ringDir.isDirectory) {
+                stagedRingUploadThisProcess.set(false)
+                Log.d(
+                    TAG,
+                    "Ring store dir not found; skipping ring upload. where=$where"
+                )
+                return
+            }
 
-        if (all.isEmpty()) {
-            Log.d(TAG, "Ring store dir empty; skipping ring upload. dir=${ringDir.absolutePath} where=$where")
-            return
-        }
+            val all =
+                listFilesRecursively(ringDir)
+                    .filter {
+                        it.isFile &&
+                                it.length() > 0L &&
+                                !it.name.startsWith(".")
+                    }
 
-        // Prefer newest-first so we keep the most relevant context if capped.
-        val sorted = all.sortedByDescending { it.lastModified() }
+            if (all.isEmpty()) {
+                /**
+                 * The logger may have been installed but its first async write may
+                 * not have reached disk yet. Allow a later enqueue call to retry.
+                 */
+                stagedRingUploadThisProcess.set(false)
+                Log.d(
+                    TAG,
+                    "Ring store dir empty; retry allowed. " +
+                            "dir=${ringDir.absolutePath} where=$where"
+                )
+                return
+            }
 
-        val now = Date()
-        val stampUtc = FILE_TS_UTC.format(now)
+            val sorted =
+                all.sortedByDescending { it.lastModified() }
 
-        val remoteBase = "${REMOTE_RING_SUBDIR}/${stampUtc}"
-        val mirrorBaseDir = File(ghMirrorDir, remoteBase).apply { mkdirs() }
+            val stampUtc =
+                formatFileTimestampUtc(Date())
 
-        var uploadedCount = 0
-        var uploadedBytes = 0L
+            val remoteCaptureId =
+                "${stampUtc}_pid${Process.myPid()}_" +
+                        "u${SystemClock.elapsedRealtime() % 1_000_000L}"
 
-        for (src in sorted) {
-            if (uploadedCount >= MAX_RING_FILES_TO_ENQUEUE) break
-            if (uploadedBytes >= MAX_RING_TOTAL_BYTES_TO_ENQUEUE) break
+            val remoteBase =
+                "${REMOTE_RING_SUBDIR}/${remoteCaptureId}"
 
-            val rel = safeRelativePathOrNull(root = ringDir, file = src) ?: continue
-            val relNorm = rel.replace('\\', '/').trimStart('/')
+            val mirrorBaseDir =
+                File(ghMirrorDir, remoteBase)
 
-            // Mirror path preserves the ring directory structure.
-            val mirror = runCatching { mirrorCopyPreserveRelPath(src, mirrorBaseDir, relNorm) }
-                .onFailure { e -> Log.w(TAG, "Ring mirror copy failed: ${src.name} err=${e.message}", e) }
-                .getOrNull() ?: continue
+            ensureDirectory(mirrorBaseDir)
 
-            val remoteRelativePath = "${remoteBase}/${relNorm}"
+            var enqueuedCount = 0
+            var enqueuedBytes = 0L
+
+            for (src in sorted) {
+                if (enqueuedCount >= MAX_RING_FILES_TO_ENQUEUE) {
+                    break
+                }
+
+                if (enqueuedBytes >= MAX_RING_TOTAL_BYTES_TO_ENQUEUE) {
+                    break
+                }
+
+                val rel =
+                    safeRelativePathOrNull(
+                        root = ringDir,
+                        file = src
+                    ) ?: continue
+
+                val relNorm =
+                    rel.replace('\\', '/')
+                        .trimStart('/')
+
+                if (relNorm.isBlank()) {
+                    continue
+                }
+
+                val mirror =
+                    runCatching {
+                        mirrorCopyPreserveRelPath(
+                            src = src,
+                            mirrorBaseDir = mirrorBaseDir,
+                            relNorm = relNorm
+                        )
+                    }.onFailure { e ->
+                        Log.w(
+                            TAG,
+                            "Ring mirror copy failed: ${src.name} err=${e.message}",
+                            e
+                        )
+                    }.getOrNull() ?: continue
+
+                val remoteRelativePath =
+                    "${remoteBase}/${relNorm}"
+
+                Log.d(
+                    TAG,
+                    "GitHub enqueue(ring file): bytes=${mirror.length()} " +
+                            "remote=$remoteRelativePath src=${src.name} where=$where"
+                )
+
+                enqueueGitHubWorkerFileUpload(
+                    context = context,
+                    cfg = cfg,
+                    localFile = mirror,
+                    remoteRelativePath = remoteRelativePath,
+                    kindTag = "ring"
+                )
+
+                enqueuedCount++
+                enqueuedBytes += mirror.length()
+            }
 
             Log.d(
                 TAG,
-                "GitHub enqueue(ring file): bytes=${mirror.length()} remote=$remoteRelativePath src=${src.name} where=$where"
+                "Ring store enqueue done. dir=${ringDir.absolutePath} " +
+                        "files=$enqueuedCount bytes=$enqueuedBytes " +
+                        "capFiles=$MAX_RING_FILES_TO_ENQUEUE " +
+                        "capBytes=$MAX_RING_TOTAL_BYTES_TO_ENQUEUE where=$where"
             )
-
-            enqueueGitHubWorkerFileUpload(
-                context = context,
-                cfg = cfg,
-                localFile = mirror,
-                remoteRelativePath = remoteRelativePath,
-                kindTag = "ring"
-            )
-
-            uploadedCount++
-            uploadedBytes += mirror.length()
+        } catch (t: Throwable) {
+            stagedRingUploadThisProcess.set(false)
+            throw t
         }
-
-        Log.d(
-            TAG,
-            "Ring store enqueue done. dir=${ringDir.absolutePath} files=$uploadedCount bytes=$uploadedBytes " +
-                    "capFiles=$MAX_RING_FILES_TO_ENQUEUE capBytes=$MAX_RING_TOTAL_BYTES_TO_ENQUEUE where=$where"
-        )
-    }
-
-    /**
-     * Discover ring directory best-effort.
-     *
-     * Reflection candidates (if AppRingLogStore provides APIs):
-     * - getRingDir(Context)
-     * - getDir(Context)
-     * - ringDir(Context)
-     * - getRootDir(Context)
-     * - getBaseDir(Context)
-     *
-     * Fallback path candidates (common patterns):
-     * - filesDir/diagnostics/applog_ring  (AppRingLogStore default)
-     * - filesDir/diagnostics/ring
-     * - filesDir/diagnostics/ring_store
-     * - filesDir/diagnostics/app_ring
-     * - filesDir/diagnostics/ring_logs
-     */
-    private fun findRingDirectoryBestEffort(context: Context, filesDir: File): File? {
-        val appCtx = safeAppContext(context)
-
-        // 1) Reflection on AppRingLogStore methods.
-        val cls = runCatching { Class.forName("${appCtx.packageName}.AppRingLogStore") }.getOrNull()
-            ?: runCatching { Class.forName("com.negi.survey.AppRingLogStore") }.getOrNull()
-
-        if (cls != null) {
-            val receiver: Any? = runCatching {
-                cls.getDeclaredField("INSTANCE").apply { isAccessible = true }.get(null)
-            }.getOrNull()
-
-            val methodNames = listOf(
-                "getRingDir",
-                "getDir",
-                "ringDir",
-                "getRootDir",
-                "getBaseDir",
-                "dir",
-                "rootDir",
-                "baseDir"
-            )
-
-            for (mn in methodNames) {
-                val m = runCatching {
-                    cls.methods.firstOrNull { it.name == mn && it.parameterTypes.size == 1 && Context::class.java.isAssignableFrom(it.parameterTypes[0]) }
-                }.getOrNull()
-
-                if (m != null) {
-                    val out = runCatching { m.invoke(receiver, appCtx) }.getOrNull()
-                    when (out) {
-                        is File -> return out
-                        is String -> if (out.isNotBlank()) return File(out)
-                    }
-                }
-            }
-        }
-
-        // 2) Fallback candidates.
-        val candidates = listOf(
-            // AppRingLogStore default location (most important fallback).
-            File(filesDir, "diagnostics/applog_ring"),
-
-            File(filesDir, "diagnostics/ring"),
-            File(filesDir, "diagnostics/ring_store"),
-            File(filesDir, "diagnostics/app_ring"),
-            File(filesDir, "diagnostics/ring_logs"),
-            File(filesDir, "diagnostics/ringlog"),
-            File(filesDir, "diagnostics/appring")
-        )
-
-        return candidates.firstOrNull { it.exists() && it.isDirectory }
-            ?: candidates.firstOrNull { it.parentFile?.exists() == true } // best-effort even if not yet created
     }
 
     private fun listFilesRecursively(dir: File): List<File> {
@@ -776,7 +1100,7 @@ object CrashCapture {
 
     private fun mirrorCopyPreserveRelPath(src: File, mirrorBaseDir: File, relNorm: String): File {
         val dst = File(mirrorBaseDir, relNorm)
-        dst.parentFile?.mkdirs()
+        dst.parentFile?.let(::ensureDirectory)
 
         // Reuse existing mirror if identical.
         if (dst.exists() && dst.length() == src.length() && dst.lastModified() == src.lastModified()) {
@@ -804,7 +1128,7 @@ object CrashCapture {
     // -----------------------------------------------------------------------------
 
     private fun makeGitHubMirrorCopy(src: File, mirrorDir: File): File {
-        mirrorDir.mkdirs()
+        ensureDirectory(mirrorDir)
 
         val dst = File(mirrorDir, src.name)
 
@@ -852,52 +1176,105 @@ object CrashCapture {
         }
     }
 
-    private fun captureCrashToFile(filesDir: File, thread: Thread, throwable: Throwable): File {
-        val dir = crashDir(filesDir).apply { mkdirs() }
-        purgeOldFiles(dir, MAX_FILES_TO_KEEP)
+    private fun captureCrashToFile(
+        filesDir: File,
+        thread: Thread,
+        throwable: Throwable
+    ): File {
+        val dir = crashDir(filesDir)
+        ensureDirectory(dir)
+
+        purgeOldFiles(
+            dir = dir,
+            maxKeep = MAX_FILES_TO_KEEP
+        )
 
         val now = Date()
-        val stampUtc = FILE_TS_UTC.format(now)
-        val stampLocal = HEADER_TS_LOCAL.format(now)
+        val stampUtc = formatFileTimestampUtc(now)
+        val stampLocal = formatHeaderTimestampLocal(now)
 
         val pid = Process.myPid()
         val tid = Process.myTid()
-        val uptimeTail = (SystemClock.elapsedRealtime() % 1_000_000L)
+        val uptimeTail =
+            SystemClock.elapsedRealtime() % 1_000_000L
 
-        val name = "crash_${stampUtc}_pid${pid}_tid${tid}_u${uptimeTail}.log"
+        val name =
+            "crash_${stampUtc}_pid${pid}_tid${tid}_u${uptimeTail}.log"
+
         val outFile = File(dir, name)
 
-        FileOutputStream(outFile).use { fos ->
-            val header = buildString {
-                appendLine("=== Crash Report ===")
-                appendLine("time_utc=$stampUtc")
-                appendLine("time_local=$stampLocal")
-                appendLine("pid=$pid")
-                appendLine("tid=$tid")
-                appendLine("thread=${thread.name}")
-                appendLine("sdk=${Build.VERSION.SDK_INT}")
-                appendLine("device=${Build.MANUFACTURER} ${Build.MODEL}")
-                appendLine("appId=${BuildConfig.APPLICATION_ID}")
-                appendLine("versionName=${BuildConfig.VERSION_NAME}")
-                appendLine("versionCode=${BuildConfig.VERSION_CODE}")
-                appendLine()
-                appendLine("=== Exception ===")
-                appendLine(Log.getStackTraceString(throwable))
-                appendLine()
-                appendLine("=== Logcat (best-effort) ===")
-            }.toByteArray(Charsets.UTF_8)
+        /**
+         * Put the uncaught exception itself into the app-owned ring first. The
+         * snapshot method performs a short best-effort drain of queued writes.
+         */
+        runCatching {
+            AppRingLogStore.log(
+                level = "E",
+                tag = TAG,
+                msg = "uncaughtException thread=${thread.name}",
+                tr = throwable
+            )
+        }
 
-            fos.write(header)
+        /**
+         * Capture the app-owned ring snapshot before spawning logcat. It is more
+         * deterministic and survives cases where logcat is unavailable or already
+         * overwritten.
+         */
+        val ringSnapshot =
+            runCatching {
+                AppRingLogStore.stageSnapshotForCrash(
+                    crashDir = dir,
+                    prefix = "applog"
+                )
+            }.onFailure { e ->
+                Log.w(
+                    TAG,
+                    "App ring crash snapshot failed: ${e.message}",
+                    e
+                )
+            }.getOrNull()
 
-            val logBytes = collectLogcatBytesCurrentPid(
+        val header = buildString {
+            appendLine("=== Crash Report ===")
+            appendLine("time_utc=$stampUtc")
+            appendLine("time_local=$stampLocal")
+            appendLine("pid=$pid")
+            appendLine("tid=$tid")
+            appendLine("thread=${sanitizeSingleLine(thread.name)}")
+            appendLine("sdk=${Build.VERSION.SDK_INT}")
+            appendLine("device=${Build.MANUFACTURER} ${Build.MODEL}")
+            appendLine("appId=${BuildConfig.APPLICATION_ID}")
+            appendLine("versionName=${BuildConfig.VERSION_NAME}")
+            appendLine("versionCode=${BuildConfig.VERSION_CODE}")
+
+            if (ringSnapshot != null) {
+                appendLine("app_ring_snapshot=${ringSnapshot.name}")
+                appendLine("app_ring_snapshot_bytes=${ringSnapshot.length()}")
+            }
+
+            appendLine()
+            appendLine("=== Exception ===")
+            appendLine(Log.getStackTraceString(throwable))
+            appendLine()
+            appendLine("=== Logcat (best-effort) ===")
+        }.toByteArray(Charsets.UTF_8)
+
+        val logBytes =
+            collectLogcatBytesCurrentPid(
                 pid = pid,
                 maxBytes = MAX_LOGCAT_BYTES,
                 maxMs = LOGCAT_MAX_MS
             )
-            fos.write(logBytes)
 
+        FileOutputStream(outFile).use { fos ->
+            fos.write(header)
+            fos.write(logBytes)
             fos.flush()
-            runCatching { fos.fd.sync() }
+
+            runCatching {
+                fos.fd.sync()
+            }
         }
 
         return outFile
@@ -920,7 +1297,11 @@ object CrashCapture {
     // Logcat capture
     // -----------------------------------------------------------------------------
 
-    private fun collectLogcatBytesCurrentPid(pid: Int, maxBytes: Int, maxMs: Long): ByteArray {
+    private fun collectLogcatBytesCurrentPid(
+        pid: Int,
+        maxBytes: Int,
+        maxMs: Long
+    ): ByteArray {
         val primary = listOf(
             "logcat", "-d",
             "-v", "threadtime",
@@ -936,11 +1317,22 @@ object CrashCapture {
             "-t", LOGCAT_TAIL_LINES_FALLBACK
         )
 
-        return runCatching { execAndReadCapped(primary, maxBytes, maxMs) }
-            .recoverCatching { execAndReadCapped(fallback, maxBytes, maxMs) }
-            .getOrElse { e ->
-                ("(logcat capture failed: ${e.message})\n").toByteArray(Charsets.UTF_8)
-            }
+        return runCatching {
+            execAndReadCapped(
+                cmd = primary,
+                maxBytes = maxBytes,
+                maxMs = maxMs
+            ).requireUsefulLogcat()
+        }.recoverCatching {
+            execAndReadCapped(
+                cmd = fallback,
+                maxBytes = maxBytes,
+                maxMs = maxMs
+            ).requireUsefulLogcat()
+        }.getOrElse { e ->
+            ("(logcat capture failed: ${e.message})\n")
+                .toByteArray(Charsets.UTF_8)
+        }
     }
 
     private fun collectLogcatBytesSinceMarker(
@@ -949,16 +1341,19 @@ object CrashCapture {
         maxBytes: Int,
         maxMs: Long
     ): ByteArray {
-        val withPid = preferredPid?.takeIf { it > 0 }?.let { pid ->
-            listOf(
-                "logcat", "-d",
-                "-v", "threadtime",
-                "-b", "main", "-b", "system", "-b", "crash",
-                "--pid=$pid",
-                "-T", marker,
-                "-t", LOGCAT_TAIL_LINES_SINCE
-            )
-        }
+        val withPid =
+            preferredPid
+                ?.takeIf { it > 0 }
+                ?.let { pid ->
+                    listOf(
+                        "logcat", "-d",
+                        "-v", "threadtime",
+                        "-b", "main", "-b", "system", "-b", "crash",
+                        "--pid=$pid",
+                        "-T", marker,
+                        "-t", LOGCAT_TAIL_LINES_SINCE
+                    )
+                }
 
         val noPid = listOf(
             "logcat", "-d",
@@ -976,48 +1371,191 @@ object CrashCapture {
         )
 
         return runCatching {
-            if (withPid != null) execAndReadCapped(withPid, maxBytes, maxMs) else execAndReadCapped(noPid, maxBytes, maxMs)
+            val first =
+                if (withPid != null) {
+                    execAndReadCapped(
+                        cmd = withPid,
+                        maxBytes = maxBytes,
+                        maxMs = maxMs
+                    )
+                } else {
+                    execAndReadCapped(
+                        cmd = noPid,
+                        maxBytes = maxBytes,
+                        maxMs = maxMs
+                    )
+                }
+
+            first.requireUsefulLogcat()
         }.recoverCatching {
-            execAndReadCapped(noPid, maxBytes, maxMs)
+            execAndReadCapped(
+                cmd = noPid,
+                maxBytes = maxBytes,
+                maxMs = maxMs
+            ).requireUsefulLogcat()
         }.recoverCatching {
-            execAndReadCapped(fallback, maxBytes, maxMs)
+            execAndReadCapped(
+                cmd = fallback,
+                maxBytes = maxBytes,
+                maxMs = maxMs
+            ).requireUsefulLogcat()
         }.getOrElse { e ->
-            ("(prev-session logcat capture failed: ${e.message})\n").toByteArray(Charsets.UTF_8)
+            ("(prev-session logcat capture failed: ${e.message})\n")
+                .toByteArray(Charsets.UTF_8)
         }
     }
 
-    private fun execAndReadCapped(cmd: List<String>, maxBytes: Int, maxMs: Long): ByteArray {
-        val start = SystemClock.elapsedRealtime()
+    /**
+     * Execute logcat with a real wall-clock timeout.
+     *
+     * The previous implementation checked elapsed time only before calling
+     * InputStream.read(). A blocked read could therefore exceed maxMs
+     * indefinitely. Reading on a daemon thread lets the caller enforce a hard
+     * wait bound and terminate the subprocess when necessary.
+     */
+    private fun execAndReadCapped(
+        cmd: List<String>,
+        maxBytes: Int,
+        maxMs: Long
+    ): ByteArray {
+        val safeMaxBytes =
+            maxBytes.coerceAtLeast(0)
 
-        val proc = ProcessBuilder(cmd)
-            .redirectErrorStream(true)
-            .start()
+        if (safeMaxBytes == 0) {
+            return ByteArray(0)
+        }
 
-        return try {
-            proc.inputStream.use { input ->
-                val out = ByteArrayOutputStream(min(maxBytes, 128 * 1024))
-                val buf = ByteArray(16 * 1024)
+        val process =
+            ProcessBuilder(cmd)
+                .redirectErrorStream(true)
+                .start()
 
-                while (out.size() < maxBytes) {
-                    if (SystemClock.elapsedRealtime() - start > maxMs) break
-                    val remaining = maxBytes - out.size()
-                    val n = input.read(buf, 0, min(buf.size, remaining))
-                    if (n <= 0) break
-                    out.write(buf, 0, n)
+        val collector =
+            CappedByteCollector(safeMaxBytes)
+
+        val readerError =
+            AtomicReference<Throwable?>(null)
+
+        val readerDone =
+            CountDownLatch(1)
+
+        val readerThread =
+            Thread(
+                {
+                    try {
+                        process.inputStream.use { input ->
+                            val buffer = ByteArray(16 * 1024)
+
+                            while (collector.remaining() > 0) {
+                                val count =
+                                    input.read(
+                                        buffer,
+                                        0,
+                                        min(
+                                            buffer.size,
+                                            collector.remaining()
+                                        )
+                                    )
+
+                                if (count <= 0) {
+                                    break
+                                }
+
+                                collector.write(
+                                    buffer = buffer,
+                                    offset = 0,
+                                    count = count
+                                )
+                            }
+                        }
+                    } catch (t: Throwable) {
+                        readerError.set(t)
+                    } finally {
+                        readerDone.countDown()
+                    }
+                },
+                "CrashCapture-LogcatReader"
+            ).apply {
+                isDaemon = true
+            }
+
+        readerThread.start()
+
+        val completed =
+            runCatching {
+                readerDone.await(
+                    maxMs.coerceAtLeast(1L),
+                    TimeUnit.MILLISECONDS
+                )
+            }.getOrDefault(false)
+
+        if (!completed) {
+            runCatching {
+                process.destroy()
+            }
+
+            runCatching {
+                process.waitFor(
+                    LOGCAT_WAITFOR_MS,
+                    TimeUnit.MILLISECONDS
+                )
+            }
+
+            if (process.isAlive) {
+                runCatching {
+                    process.destroyForcibly()
                 }
+            }
 
-                out.toByteArray()
-            }
-        } finally {
-            runCatching { proc.waitFor(LOGCAT_WAITFOR_MS, TimeUnit.MILLISECONDS) }
             runCatching {
-                proc.destroy()
-                proc.waitFor(LOGCAT_WAITFOR_MS, TimeUnit.MILLISECONDS)
+                readerDone.await(
+                    LOGCAT_WAITFOR_MS,
+                    TimeUnit.MILLISECONDS
+                )
             }
+
+            collector.appendUtf8(
+                "\n(logcat capture timed out after ${maxMs}ms)\n"
+            )
+        } else {
             runCatching {
-                if (proc.isAlive) proc.destroyForcibly()
+                process.waitFor(
+                    LOGCAT_WAITFOR_MS,
+                    TimeUnit.MILLISECONDS
+                )
             }
         }
+
+        runCatching {
+            if (process.isAlive) {
+                process.destroy()
+            }
+        }
+
+        runCatching {
+            if (process.isAlive) {
+                process.destroyForcibly()
+            }
+        }
+
+        val error = readerError.get()
+
+        if (
+            error != null &&
+            collector.size() == 0
+        ) {
+            throw error
+        }
+
+        return collector.toByteArray()
+    }
+
+    private fun ByteArray.requireUsefulLogcat(): ByteArray {
+        if (isEmpty()) {
+            throw IllegalStateException("logcat returned no data")
+        }
+
+        return this
     }
 
     // -----------------------------------------------------------------------------
@@ -1031,17 +1569,68 @@ object CrashCapture {
      *  1) GitHubDiagnosticsConfigStore (user-configured token/prefs)
      *  2) BuildConfig (gradle-injected secrets/config)
      */
-    private fun buildCrashGitHubConfigOrNull(context: Context): GitHubUploader.GitHubConfig? {
-        val fromStore = runCatching { GitHubDiagnosticsConfigStore.buildGitHubConfigOrNull(context) }.getOrNull()
-        val base = fromStore ?: runCatching { buildCrashGitHubConfigFromBuildConfig() }.getOrNull()
-        if (base == null) return null
+    private fun buildCrashGitHubConfigOrNull(
+        context: Context
+    ): GitHubUploader.GitHubConfig? {
+        val fromStore =
+            runCatching {
+                GitHubDiagnosticsConfigStore
+                    .buildGitHubConfigOrNull(context)
+            }.getOrNull()
 
-        val crashPrefix = computeCrashPrefix(base.pathPrefix)
+        val base =
+            fromStore
+                ?: runCatching {
+                    buildCrashGitHubConfigFromBuildConfig()
+                }.getOrNull()
+                ?: return null
 
-        return base.copy(
-            repo = base.repo.substringAfterLast('/').trim(),
-            branch = base.branch.ifBlank { "main" },
-            pathPrefix = crashPrefix
+        return normalizeCrashGitHubConfig(base)
+    }
+
+    private fun normalizeCrashGitHubConfig(
+        cfg: GitHubUploader.GitHubConfig
+    ): GitHubUploader.GitHubConfig? {
+        var owner = cfg.owner.trim()
+        var repo = cfg.repo.trim()
+        val token = cfg.token.trim()
+        val branch = cfg.branch.trim().ifBlank { "main" }
+
+        if (repo.contains('/')) {
+            val inferredOwner =
+                repo.substringBefore('/').trim()
+
+            val inferredRepo =
+                repo.substringAfterLast('/').trim()
+
+            if (owner.isBlank()) {
+                owner = inferredOwner
+            }
+
+            repo = inferredRepo
+        }
+
+        if (
+            owner.isBlank() ||
+            repo.isBlank() ||
+            token.isBlank()
+        ) {
+            return null
+        }
+
+        if (
+            owner.any(Char::isWhitespace) ||
+            repo.any(Char::isWhitespace)
+        ) {
+            return null
+        }
+
+        return cfg.copy(
+            owner = owner,
+            repo = repo,
+            token = token,
+            branch = branch,
+            pathPrefix = computeCrashPrefix(cfg.pathPrefix)
         )
     }
 
@@ -1053,18 +1642,34 @@ object CrashCapture {
     }
 
     private fun buildCrashGitHubConfigFromBuildConfig(): GitHubUploader.GitHubConfig? {
-        if (BuildConfig.GH_TOKEN.isBlank()) return null
-        if (BuildConfig.GH_OWNER.isBlank() || BuildConfig.GH_REPO.isBlank()) return null
+        val token = BuildConfig.GH_TOKEN.trim()
+        val rawRepo = BuildConfig.GH_REPO.trim()
 
-        val repoName = BuildConfig.GH_REPO.substringAfterLast('/').trim()
-        if (repoName.isBlank()) return null
+        if (token.isBlank() || rawRepo.isBlank()) {
+            return null
+        }
+
+        var owner = BuildConfig.GH_OWNER.trim()
+        var repo = rawRepo
+
+        if (rawRepo.contains('/')) {
+            if (owner.isBlank()) {
+                owner = rawRepo.substringBefore('/').trim()
+            }
+
+            repo = rawRepo.substringAfterLast('/').trim()
+        }
+
+        if (owner.isBlank() || repo.isBlank()) {
+            return null
+        }
 
         return GitHubUploader.GitHubConfig(
-            owner = BuildConfig.GH_OWNER,
-            repo = repoName,
-            branch = BuildConfig.GH_BRANCH.ifBlank { "main" },
+            owner = owner,
+            repo = repo,
+            branch = BuildConfig.GH_BRANCH.trim().ifBlank { "main" },
             pathPrefix = BuildConfig.GH_PATH_PREFIX.trim().trim('/'),
-            token = BuildConfig.GH_TOKEN
+            token = token
         )
     }
 
@@ -1085,7 +1690,6 @@ object CrashCapture {
                         GitHubUploadWorker.KEY_MODE to "file",
                         GitHubUploadWorker.KEY_OWNER to cfg.owner,
                         GitHubUploadWorker.KEY_REPO to cfg.repo,
-                        GitHubUploadWorker.KEY_TOKEN to cfg.token,
                         GitHubUploadWorker.KEY_BRANCH to cfg.branch,
                         GitHubUploadWorker.KEY_PATH_PREFIX to cfg.pathPrefix,
                         GitHubUploadWorker.KEY_FILE_PATH to localFile.absolutePath,
@@ -1109,9 +1713,143 @@ object CrashCapture {
     }
 
     private fun sanitizeWorkName(value: String): String {
-        return value.trim()
-            .replace(Regex("""[^\w\-.]+"""), "_")
+        val raw = value.trim()
+
+        val hash =
+            Integer.toHexString(raw.hashCode())
+
+        val stem =
+            raw.replace(
+                Regex("""[^\w\-.]+"""),
+                "_"
+            )
+                .trim('_')
+                .take(96)
+                .ifBlank { "work" }
+
+        return "${stem}_$hash"
             .take(120)
+    }
+
+    private fun formatFileTimestampUtc(date: Date): String {
+        return synchronized(timestampLock) {
+            fileTsUtc.format(date)
+        }
+    }
+
+    private fun formatHeaderTimestampLocal(date: Date): String {
+        return synchronized(timestampLock) {
+            headerTsLocal.format(date)
+        }
+    }
+
+    private fun formatLogcatMarker(date: Date): String {
+        return synchronized(timestampLock) {
+            logcatMarkerFormat.format(date)
+        }
+    }
+
+    private fun sanitizeSingleLine(value: String): String {
+        return value
+            .replace('\r', ' ')
+            .replace('\n', ' ')
+            .replace('\u0000', ' ')
+    }
+
+    private fun ensureDirectory(dir: File) {
+        if (dir.isDirectory) {
+            return
+        }
+
+        if (dir.exists() && !dir.isDirectory) {
+            throw IllegalStateException(
+                "Path exists but is not a directory: ${dir.absolutePath}"
+            )
+        }
+
+        if (!dir.mkdirs() && !dir.isDirectory) {
+            throw IllegalStateException(
+                "Failed to create directory: ${dir.absolutePath}"
+            )
+        }
+    }
+
+    private fun writeBytesDurably(
+        file: File,
+        bytes: ByteArray
+    ) {
+        file.parentFile?.let(::ensureDirectory)
+
+        FileOutputStream(file).use { fos ->
+            fos.write(bytes)
+            fos.flush()
+
+            runCatching {
+                fos.fd.sync()
+            }
+        }
+    }
+
+    /**
+     * Thread-safe bounded collector for subprocess output.
+     */
+    private class CappedByteCollector(
+        capacity: Int
+    ) {
+        private val buffer =
+            ByteArray(capacity.coerceAtLeast(0))
+
+        private var size = 0
+
+        @Synchronized
+        fun remaining(): Int =
+            buffer.size - size
+
+        @Synchronized
+        fun size(): Int =
+            size
+
+        @Synchronized
+        fun write(
+            buffer: ByteArray,
+            offset: Int,
+            count: Int
+        ) {
+            if (count <= 0 || size >= this.buffer.size) {
+                return
+            }
+
+            val safeCount =
+                min(
+                    count,
+                    this.buffer.size - size
+                )
+
+            System.arraycopy(
+                buffer,
+                offset,
+                this.buffer,
+                size,
+                safeCount
+            )
+
+            size += safeCount
+        }
+
+        fun appendUtf8(text: String) {
+            val bytes =
+                text.toByteArray(Charsets.UTF_8)
+
+            write(
+                buffer = bytes,
+                offset = 0,
+                count = bytes.size
+            )
+        }
+
+        @Synchronized
+        fun toByteArray(): ByteArray =
+            buffer.copyOfRange(0, size)
     }
 
     private fun safeAppContext(context: Context): Context {
@@ -1138,35 +1876,84 @@ object CrashCapture {
         private var delegate: Thread.UncaughtExceptionHandler? = null
 
         fun updateDelegate(newDelegate: Thread.UncaughtExceptionHandler?) {
-            // Avoid self-loop.
+            // Avoid an immediate self-loop.
             if (newDelegate === this) return
             delegate = newDelegate
         }
 
-        override fun uncaughtException(thread: Thread, throwable: Throwable) {
+        fun delegateSnapshot(): Thread.UncaughtExceptionHandler? = delegate
+
+        override fun uncaughtException(
+            thread: Thread,
+            throwable: Throwable
+        ) {
             if (!capturing.compareAndSet(false, true)) {
                 try {
-                    delegate?.uncaughtException(thread, throwable)
+                    val currentDelegate = delegate
+
+                    if (currentDelegate != null) {
+                        currentDelegate.uncaughtException(
+                            thread,
+                            throwable
+                        )
+                    } else {
+                        onHardKill()
+                    }
                 } catch (_: Throwable) {
                     onHardKill()
                 }
+
                 return
             }
 
             try {
-                val file = runCatching { captureCrashToFile(filesDir, thread, throwable) }
-                    .onFailure { e -> Log.e(TAG, "Crash capture failed: ${e.message}", e) }
-                    .getOrNull()
+                val file =
+                    runCatching {
+                        captureCrashToFile(
+                            filesDir = filesDir,
+                            thread = thread,
+                            throwable = throwable
+                        )
+                    }.onFailure { e ->
+                        Log.e(
+                            TAG,
+                            "Crash capture failed: ${e.message}",
+                            e
+                        )
+                    }.getOrNull()
 
                 if (file != null) {
-                    Log.e(TAG, "Crash captured: ${file.absolutePath} bytes=${file.length()}")
+                    Log.e(
+                        TAG,
+                        "Crash captured: ${file.absolutePath} " +
+                                "bytes=${file.length()}"
+                    )
                 }
             } catch (t: Throwable) {
-                Log.e(TAG, "Crash capture unexpected failure: ${t.message}", t)
+                Log.e(
+                    TAG,
+                    "Crash capture unexpected failure: ${t.message}",
+                    t
+                )
             } finally {
                 try {
-                    val d = delegate
-                    if (d != null) d.uncaughtException(thread, throwable) else onHardKill()
+                    val currentDelegate = delegate
+
+                    if (currentDelegate != null) {
+                        currentDelegate.uncaughtException(
+                            thread,
+                            throwable
+                        )
+
+                        /**
+                         * The platform's default handler normally terminates the
+                         * process and never returns. If a custom delegate does
+                         * return, allow a future uncaught exception to be captured.
+                         */
+                        capturing.set(false)
+                    } else {
+                        onHardKill()
+                    }
                 } catch (_: Throwable) {
                     onHardKill()
                 }

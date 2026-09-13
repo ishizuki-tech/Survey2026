@@ -61,8 +61,16 @@ data class Node(
     val title: String = "",
     val question: String = "",
     val options: List<String> = emptyList(),
-    val nextId: String? = null
+    val nextId: String? = null,
+    val nextIdByAnswer: Map<String, String> = emptyMap()
 )
+
+internal fun Node.resolveNextId(answer: String?): String? =
+    if (type == NodeType.SINGLE_CHOICE && answer != null) {
+        nextIdByAnswer[answer] ?: nextId
+    } else {
+        nextId
+    }
 
 /* ───────────────────────────── Nav Keys ───────────────────────────── */
 
@@ -583,6 +591,31 @@ open class SurveyViewModel(
         return rendered
     }
 
+    /**
+     * Render the existing one-step prompt with the original main answer, then append
+     * answered follow-up pairs so the model evaluates the accumulated information.
+     */
+    fun getAccumulatedPrompt(nodeId: String, question: String, mainAnswer: String): String {
+        val base = getPrompt(nodeId, question, mainAnswer)
+        val answered = followups.value[nodeId.trim()].orEmpty().filter { !it.answer.isNullOrBlank() }
+        if (answered.isEmpty()) return base
+
+        return buildString {
+            append(base)
+            append("\n\nAdditional clarification (evaluate together with the original Answer):")
+            answered.forEachIndexed { index, entry ->
+                append("\nFollow-up ")
+                append(index + 1)
+                append(": ")
+                append(entry.question.trim())
+                append("\nAnswer ")
+                append(index + 1)
+                append(": ")
+                append(entry.answer!!.trim())
+            }
+        }
+    }
+
     fun getEvalPrompt(nodeId: String, question: String, answer: String): String {
         val k = nodeId.trim()
         require(k.isNotBlank()) { "getEvalPrompt: nodeId is blank" }
@@ -852,7 +885,7 @@ open class SurveyViewModel(
     @Synchronized
     fun advanceToNext() {
         val cur = _currentNode.value
-        val nextId = cur.nextId?.trim().orEmpty()
+        val nextId = cur.resolveNextId(getAnswer(cur.id)).orEmpty().trim()
         if (nextId.isBlank()) {
             RuntimeLogStore.d(TAG, "advanceToNext: no nextId from ${cur.id}")
             return
@@ -929,7 +962,8 @@ open class SurveyViewModel(
             title = this.title,
             question = this.question,
             options = this.options,
-            nextId = this.nextId?.trim()
+            nextId = this.nextId?.trim(),
+            nextIdByAnswer = this.nextIdByAnswer.mapValues { (_, destination) -> destination.trim() }
         )
     }
 
@@ -982,7 +1016,10 @@ open class SurveyViewModel(
         }
 
         val missingNext = dtos.asSequence()
-            .mapNotNull { it.nextId?.trim() }
+            .flatMap { dto ->
+                (listOfNotNull(dto.nextId) + dto.nextIdByAnswer.values).asSequence()
+            }
+            .map(String::trim)
             .filter { it.isNotBlank() }
             .filter { !idSet.contains(it) }
             .distinct()

@@ -10,37 +10,43 @@
  *
  *  Summary:
  *  ---------------------------------------------------------------------
- *  One-shot, single-flight initializer for large model files or heavy assets.
- *  Handles download, resume, integrity check, and atomic replacement with
- *  coroutine cancellation propagation and friendly error reporting.
+ *  Coordinates preparation of large local model files before LiteRT-LM
+ *  initialization. Network transfer details, HTTP validation, resumable
+ *  partial files, parallel range downloads, and final promotion are owned by
+ *  HttpUrlFileDownloader.
  *
- *  Key properties:
+ *  Design goals:
  *  ---------------------------------------------------------------------
- *  - Single-flight:
- *      Concurrent callers share the same in-flight Deferred<Result<File>>.
- *  - Resume:
- *      Partial files are preserved across cancellations/timeouts when forceFresh=false.
- *  - Integrity:
- *      If Content-Length is known, final size must match exactly.
- *  - Replacement:
- *      Uses rename within the same directory when possible; falls back to
- *      a stream copy if rename fails.
+ *  - Fast local startup:
+ *      A non-empty, previously completed local model is accepted immediately.
+ *      Model URLs/filenames should therefore be versioned or forceFresh should
+ *      be used when a remote replacement must be fetched.
+ *  - Keyed single-flight:
+ *      Concurrent callers targeting the same destination share one operation,
+ *      while unrelated model files are not accidentally coupled together.
+ *  - Resume preservation:
+ *      Network failures, timeouts, and normal cancellation preserve resumable
+ *      transfer artifacts unless forceFresh=true.
+ *  - Structured cancellation:
+ *      Owner cancellation propagates as CancellationException. Waiting callers
+ *      still receive a failure Result through the shared Deferred.
+ *  - Diagnostic timing:
+ *      Coarse phase timings are logged without exposing credentials.
  * =====================================================================
  */
 
 package com.negi.survey.utils
 
 import android.content.Context
+import android.os.SystemClock
 import android.util.Log
 import com.negi.survey.BuildConfig
 import com.negi.survey.net.HttpUrlFileDownloader
 import java.io.File
 import java.io.IOException
 import java.io.InterruptedIOException
-import java.net.HttpURLConnection
-import java.net.URL
-import java.util.concurrent.atomic.AtomicReference
-import kotlin.math.max
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Job
@@ -50,71 +56,132 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withTimeout
 
 /**
- * Manages single-flight initialization for heavy assets (e.g., model download).
+ * Coordinates one model-file preparation operation per destination path.
  *
- * This object is designed to be called from ViewModels or other lifecycle-
- * aware layers. The "owner" caller performs the work; all other callers wait
- * on the same [CompletableDeferred].
+ * This object intentionally does NOT own LiteRT-LM Engine or Conversation
+ * instances. Its responsibility ends when the requested local model file is
+ * ready for use.
  */
 object HeavyInitializer {
 
     private const val TAG = "HeavyInitializer"
 
     /**
-     * A small safety buffer to reduce the risk of out-of-space errors during
-     * filesystem metadata updates or temporary allocations.
-     */
-    private const val FREE_SPACE_MARGIN_BYTES = 64L * 1024L * 1024L // 64 MiB
-
-    /**
-     * Upper bound for manual redirect following on HEAD requests.
-     */
-    private const val MAX_REDIRECTS = 10
-
-    /**
-     * Tracks a single in-flight initialization for all concurrent callers.
-     */
-    private val inFlight = AtomicReference<CompletableDeferred<Result<File>>?>(null)
-
-    /**
-     * The Job of the "owner" coroutine currently performing the initialization.
+     * Upper bound for one stalled network read inside HttpUrlFileDownloader.
      *
-     * cancel() will cancel this Job.
+     * Coroutine cancellation cannot preempt a blocking HttpURLConnection read
+     * immediately. Keeping this lower than the downloader's historical 90 s
+     * default bounds the worst-case delay before cancellation becomes visible.
      */
-    @Volatile
-    private var runningJob: Job? = null
+    private const val DOWNLOAD_STALL_TIMEOUT_MS = 45_000
+
+    /** Connection setup timeout passed to HttpUrlFileDownloader. */
+    private const val DOWNLOAD_CONNECT_TIMEOUT_MS = 20_000
+
+    /** Timeout for the downloader's initial HEAD/range probe. */
+    private const val DOWNLOAD_FIRST_BYTE_TIMEOUT_MS = 30_000
+
+    /** Default number of full transfer attempts inside the downloader. */
+    private const val DOWNLOAD_MAX_RETRIES = 3
 
     /**
-     * Returns true if a download/initialization is currently in progress.
+     * One in-flight operation for a canonical destination path.
+     *
+     * The previous implementation had one global Deferred for all files. That
+     * could return model A's result to a caller requesting model B. Keying by
+     * destination prevents that class of cross-model race.
      */
+    private val flights =
+        ConcurrentHashMap<String, Flight>()
+
+    /** Shared state for one destination-specific initialization. */
+    private class Flight(
+        val deferred: CompletableDeferred<Result<File>>,
+    ) {
+        /** Owner coroutine performing the actual transfer. */
+        @Volatile
+        var ownerJob: Job? = null
+    }
+
+    /** Returns true when any model-file preparation is currently active. */
     @JvmStatic
-    fun isInFlight(): Boolean = inFlight.get() != null
+    fun isInFlight(): Boolean =
+        flights.isNotEmpty()
 
     /**
-     * Checks if a valid file already exists and (when possible) matches remote size.
+     * Fast local gate check.
      *
-     * This is a synchronous best-effort probe used for quick gate checks.
+     * IMPORTANT:
+     * This method intentionally performs no network I/O. The old implementation
+     * issued a synchronous HEAD request, which could block the main thread and
+     * added duplicate network probes before HttpUrlFileDownloader performed its
+     * own validation.
+     *
+     * A non-empty local file is treated as complete. Use a versioned filename
+     * or call ensureInitialized(..., forceFresh=true) when the remote object is
+     * intentionally replaced under the same URL.
+     *
+     * [modelUrl] and [hfToken] remain in the signature for source compatibility
+     * with existing callers.
      */
     fun isAlreadyComplete(
         context: Context,
+        @Suppress("UNUSED_PARAMETER")
         modelUrl: String,
+        @Suppress("UNUSED_PARAMETER")
         hfToken: String?,
-        fileName: String
+        fileName: String,
     ): Boolean {
-        val dst = resolveSafeFileUnder(context.filesDir, fileName)
-        if (!dst.exists() || !dst.isFile || dst.length() <= 0L) return false
 
-        val token = hfToken?.takeIf { it.isNotBlank() }
-        val remoteLen = runCatching { headContentLengthForVerify(modelUrl, token) }.getOrNull()
+        val app =
+            context.applicationContext
 
-        return when {
-            remoteLen != null -> remoteLen == dst.length()
-            else -> true
+        val file =
+            resolveSafeFileUnder(
+                app.filesDir,
+                fileName,
+            )
+
+        val complete =
+            file.exists() &&
+                    file.isFile &&
+                    file.length() > 0L
+
+        if (complete) {
+            Log.d(
+                TAG,
+                "isAlreadyComplete: local hit " +
+                        "file=${file.name} " +
+                        "bytes=${file.length()}",
+            )
         }
+
+        return complete
     }
 
     /**
-     * Ensure that the model or asset is initialized, downloading it if needed.
+     * Ensures that [fileName] exists locally and is ready for LiteRT-LM.
+     *
+     * Behavior:
+     * - Existing non-empty local files are accepted immediately when
+     *   [forceFresh] is false.
+     * - Concurrent callers for the same destination share one operation.
+     * - HttpUrlFileDownloader owns HTTP probing, authorization, parallel range
+     *   transfer, resume validation, free-space checks, and final promotion.
+     * - Partial transfer state is preserved on normal failure/cancellation so a
+     *   later call can resume instead of redownloading a multi-gigabyte model.
+     *
+     * @param context Android context; application context is retained only for
+     * file resolution.
+     * @param modelUrl Remote model URL.
+     * @param hfToken Optional Hugging Face bearer token. The token value is
+     * never logged.
+     * @param fileName Relative destination path under application filesDir.
+     * @param timeoutMs Overall transfer timeout. Must be positive.
+     * @param forceFresh When true, remove the completed file and all known
+     * resumable transfer artifacts before starting.
+     * @param onProgress Progress callback. Exceptions thrown by the callback are
+     * isolated so UI code cannot abort the network transfer.
      */
     suspend fun ensureInitialized(
         context: Context,
@@ -123,345 +190,999 @@ object HeavyInitializer {
         fileName: String,
         timeoutMs: Long,
         forceFresh: Boolean,
-        onProgress: (downloaded: Long, total: Long?) -> Unit
+        onProgress: (
+            downloaded: Long,
+            total: Long?,
+        ) -> Unit,
     ): Result<File> {
-        // Fast path: someone else is already doing the work.
-        inFlight.get()?.let { return it.await() }
 
-        // Attempt to become the single-flight owner.
-        val deferred = CompletableDeferred<Result<File>>()
-        if (!inFlight.compareAndSet(null, deferred)) {
-            return inFlight.get()!!.await()
+        require(timeoutMs > 0L) {
+            "timeoutMs must be > 0"
         }
 
-        // We are the owner.
-        val ownerJob = currentCoroutineContext()[Job]
-        runningJob = ownerJob
+        val app =
+            context.applicationContext
 
-        val app = context.applicationContext
-        val token = hfToken?.takeIf { it.isNotBlank() }
-
-        val dir = app.filesDir
-        val finalFile = resolveSafeFileUnder(dir, fileName)
-        val tmpFile = resolveSafeFileUnder(dir, "$fileName.tmp")
-
-        // HttpUrlFileDownloader uses: dst.name + ".part" and ".part.meta"
-        val tmpPartFile = File(tmpFile.parentFile, tmpFile.name + ".part")
-        val tmpMetaFile = File(tmpFile.parentFile, tmpPartFile.name + ".meta")
-
-        try {
-            currentCoroutineContext().ensureActive()
-
-            if (forceFresh) {
-                runCatching { tmpFile.delete() }
-                runCatching { tmpPartFile.delete() }
-                runCatching { tmpMetaFile.delete() }
-                runCatching { finalFile.delete() }
-            }
-
-            val downloader = HttpUrlFileDownloader(
-                hfToken = token,
-                debugLogs = BuildConfig.DEBUG
+        val finalFile =
+            resolveSafeFileUnder(
+                app.filesDir,
+                fileName,
             )
 
-            val remoteLen = runCatching { headContentLength(modelUrl, token) }
-                .onFailure { e -> Log.w(TAG, "HEAD content-length failed (non-fatal)", e) }
-                .getOrNull()
-                ?.takeIf { it > 0L }
+        val flightKey =
+            finalFile.canonicalPath
 
-            // Short-circuit if the final file is already valid.
-            if (!forceFresh && finalFile.exists() && finalFile.length() > 0L) {
-                val ok = when {
-                    remoteLen != null -> finalFile.length() == remoteLen
-                    else -> true
+        /*
+         * Install a destination-specific single-flight entry. If another
+         * coroutine already owns this destination, simply await its result.
+         */
+        val candidate =
+            Flight(
+                deferred =
+                    CompletableDeferred(),
+            )
+
+        val existing =
+            flights.putIfAbsent(
+                flightKey,
+                candidate,
+            )
+
+        if (existing != null) {
+            Log.d(
+                TAG,
+                "ensureInitialized: joining existing flight " +
+                        "file=${finalFile.name}",
+            )
+
+            return existing.deferred.await()
+        }
+
+        val flight =
+            candidate
+
+        flight.ownerJob =
+            currentCoroutineContext()[Job]
+
+        val startedAtMs =
+            SystemClock.elapsedRealtime()
+
+        val token =
+            hfToken
+                ?.trim()
+                ?.takeIf {
+                    it.isNotEmpty()
                 }
-                if (ok) {
-                    val len = finalFile.length()
-                    onProgress(len, remoteLen ?: len)
-                    deferred.complete(Result.success(finalFile))
-                    return deferred.await()
-                }
-            }
 
-            // Resume logic: validate partial if remoteLen is known.
-            if (!forceFresh && tmpPartFile.exists() && tmpPartFile.length() > 0L) {
-                if (remoteLen != null && tmpPartFile.length() > remoteLen) {
-                    Log.w(
-                        TAG,
-                        "part is larger than remoteLen -> discarding part " +
-                                "(part=${tmpPartFile.length()}, remote=$remoteLen)"
-                    )
-                    runCatching { tmpPartFile.delete() }
-                    runCatching { tmpMetaFile.delete() }
-                }
-            }
+        val progressCallbackFailed =
+            AtomicBoolean(false)
 
-            val existingPartial = tmpPartFile.takeIf { it.exists() }?.length() ?: 0L
+        val safeProgress:
+                    (Long, Long?) -> Unit =
+            { downloaded, total ->
 
-            // Free-space validation based on remaining bytes (when remoteLen is known).
-            if (remoteLen != null) {
-                val remaining = max(0L, remoteLen - existingPartial)
-                val needed = remaining + FREE_SPACE_MARGIN_BYTES
-                if (dir.usableSpace < needed) {
-                    val msg =
-                        "Not enough free space. " +
-                                "needed=${needed}B (remaining=$remaining + margin), " +
-                                "usable=${dir.usableSpace}B"
-                    deferred.complete(Result.failure(IOException(msg)))
-                    return deferred.await()
-                }
-            }
-
-            withTimeout(timeoutMs) {
-                currentCoroutineContext().ensureActive()
-
-                val safeProgressBridge: (Long, Long?) -> Unit = { cur, total ->
-                    // Never throw from callbacks. Just stop emitting when cancelled.
-                    if (ownerJob?.isActive != false) {
-                        onProgress(cur, total)
+                if (
+                    flight.ownerJob?.isActive !=
+                    false
+                ) {
+                    try {
+                        onProgress(
+                            downloaded,
+                            total,
+                        )
+                    } catch (
+                        t: Throwable
+                    ) {
+                        /*
+                         * Progress rendering is observational. It must never
+                         * abort a large model transfer. Log only the first
+                         * callback error to avoid flooding Logcat on every
+                         * progress update.
+                         */
+                        if (
+                            progressCallbackFailed
+                                .compareAndSet(
+                                    false,
+                                    true,
+                                )
+                        ) {
+                            Log.w(
+                                TAG,
+                                "Progress callback failed; " +
+                                        "transfer will continue: ${t.message}",
+                                t,
+                            )
+                        }
                     }
                 }
+            }
 
-                // NOTE: downloadToFile is suspend -> do NOT wrap with runInterruptible here.
-                // Cancellation responsiveness is handled inside HttpUrlFileDownloader via runInterruptible(read/write).
-                downloader.downloadToFile(
-                    url = modelUrl,
-                    dst = tmpFile,
-                    onProgress = safeProgressBridge
+        try {
+            currentCoroutineContext()
+                .ensureActive()
+
+            if (forceFresh) {
+                Log.i(
+                    TAG,
+                    "phase=cleanup-fresh " +
+                            "file=${finalFile.name}",
                 )
 
-                currentCoroutineContext().ensureActive()
+                cleanupTransferState(
+                    finalFile = finalFile,
+                    deleteFinal = true,
+                    includeLegacyTmpState = true,
+                )
+            } else {
+                /*
+                 * Preserve resume compatibility with the previous
+                 * HeavyInitializer implementation, which downloaded into
+                 * <file>.tmp before performing a second rename.
+                 */
+                migrateLegacyTransferState(
+                    finalFile
+                )
             }
 
-            // Integrity check when we know expected size.
-            if (remoteLen != null) {
-                val got = tmpFile.length()
-                if (got != remoteLen) {
-                    throw IOException("Downloaded size mismatch. expected=$remoteLen, got=$got")
+            /*
+             * Fast local path.
+             *
+             * This deliberately avoids HTTP. Once a known model is installed,
+             * restarting the application should not require a remote HEAD
+             * request before LiteRT-LM can start loading the local model.
+             */
+            if (
+                !forceFresh &&
+                finalFile.exists() &&
+                finalFile.isFile &&
+                finalFile.length() > 0L
+            ) {
+                val length =
+                    finalFile.length()
+
+                safeProgress(
+                    length,
+                    length,
+                )
+
+                val result =
+                    Result.success(
+                        finalFile
+                    )
+
+                flight.deferred
+                    .complete(result)
+
+                Log.i(
+                    TAG,
+                    "phase=local-hit " +
+                            "file=${finalFile.name} " +
+                            "bytes=$length " +
+                            "totalMs=${elapsedMs(startedAtMs)}",
+                )
+
+                return result
+            }
+
+            val downloader =
+                HttpUrlFileDownloader(
+                    hfToken = token,
+                    debugLogs =
+                        BuildConfig.DEBUG,
+                )
+
+            val downloadStartedAtMs =
+                SystemClock.elapsedRealtime()
+
+            Log.i(
+                TAG,
+                "phase=download-start " +
+                        "file=${finalFile.name} " +
+                        "tokenConfigured=${token != null} " +
+                        "forceFresh=$forceFresh",
+            )
+
+            withTimeout(
+                timeoutMs
+            ) {
+                currentCoroutineContext()
+                    .ensureActive()
+
+                /*
+                 * Download directly to the final destination name.
+                 *
+                 * HttpUrlFileDownloader already stages data into:
+                 *
+                 *     <dst>.part
+                 *
+                 * and promotes the file only after successful transfer and
+                 * validation. A second <dst>.tmp layer in HeavyInitializer is
+                 * therefore redundant and makes resumable state harder to
+                 * manage.
+                 */
+                downloader.downloadToFile(
+                    url = modelUrl,
+                    dst = finalFile,
+                    onProgress =
+                        safeProgress,
+                    connectTimeoutMs =
+                        DOWNLOAD_CONNECT_TIMEOUT_MS,
+                    firstByteTimeoutMs =
+                        DOWNLOAD_FIRST_BYTE_TIMEOUT_MS,
+                    stallTimeoutMs =
+                        minOf(
+                            DOWNLOAD_STALL_TIMEOUT_MS
+                                .toLong(),
+                            timeoutMs,
+                        )
+                            .coerceAtLeast(
+                                1_000L
+                            )
+                            .toInt(),
+                    maxRetries =
+                        DOWNLOAD_MAX_RETRIES,
+                )
+
+                currentCoroutineContext()
+                    .ensureActive()
+            }
+
+            if (
+                !finalFile.exists() ||
+                !finalFile.isFile ||
+                finalFile.length() <= 0L
+            ) {
+                throw IOException(
+                    "Downloader completed but destination " +
+                            "is missing or empty: " +
+                            finalFile.absolutePath,
+                )
+            }
+
+            val outputLength =
+                finalFile.length()
+
+            safeProgress(
+                outputLength,
+                outputLength,
+            )
+
+            val result =
+                Result.success(
+                    finalFile
+                )
+
+            flight.deferred
+                .complete(result)
+
+            Log.i(
+                TAG,
+                "phase=download-complete " +
+                        "file=${finalFile.name} " +
+                        "bytes=$outputLength " +
+                        "downloadMs=${elapsedMs(downloadStartedAtMs)} " +
+                        "totalMs=${elapsedMs(startedAtMs)}",
+            )
+
+            return result
+
+        } catch (
+            te: TimeoutCancellationException
+        ) {
+            /*
+             * IMPORTANT:
+             *
+             * TimeoutCancellationException extends CancellationException.
+             * Therefore this catch must appear BEFORE the general
+             * CancellationException handler.
+             */
+            if (forceFresh) {
+                cleanupTransferState(
+                    finalFile = finalFile,
+                    deleteFinal = false,
+                    includeLegacyTmpState = true,
+                )
+            }
+
+            val error =
+                IOException(
+                    "Timeout ($timeoutMs ms)",
+                    te,
+                )
+
+            val result =
+                Result.failure<File>(
+                    error
+                )
+
+            flight.deferred
+                .complete(result)
+
+            Log.w(
+                TAG,
+                "phase=timeout " +
+                        "file=${finalFile.name} " +
+                        "timeoutMs=$timeoutMs " +
+                        "totalMs=${elapsedMs(startedAtMs)}",
+                te,
+            )
+
+            return result
+
+        } catch (
+            ie: InterruptedIOException
+        ) {
+            if (forceFresh) {
+                cleanupTransferState(
+                    finalFile = finalFile,
+                    deleteFinal = false,
+                    includeLegacyTmpState = true,
+                )
+            }
+
+            val error =
+                IOException(
+                    "Canceled",
+                    ie,
+                )
+
+            val result =
+                Result.failure<File>(
+                    error
+                )
+
+            flight.deferred
+                .complete(result)
+
+            Log.w(
+                TAG,
+                "phase=interrupted " +
+                        "file=${finalFile.name} " +
+                        "totalMs=${elapsedMs(startedAtMs)}",
+                ie,
+            )
+
+            return result
+
+        } catch (
+            ce: CancellationException
+        ) {
+            if (forceFresh) {
+                cleanupTransferState(
+                    finalFile = finalFile,
+                    deleteFinal = false,
+                    includeLegacyTmpState = true,
+                )
+            }
+
+            /*
+             * Release other callers waiting on this shared operation before
+             * propagating structured cancellation to the owner coroutine.
+             */
+            flight.deferred.complete(
+                Result.failure(
+                    IOException(
+                        "Canceled",
+                        ce,
+                    )
+                )
+            )
+
+            Log.w(
+                TAG,
+                "phase=cancelled " +
+                        "file=${finalFile.name} " +
+                        "totalMs=${elapsedMs(startedAtMs)}",
+                ce,
+            )
+
+            throw ce
+
+        } catch (
+            t: Throwable
+        ) {
+            val message =
+                userFriendlyMessage(t)
+
+            /*
+             * Preserve partial/chunk state on normal failures.
+             *
+             * HttpUrlFileDownloader validates metadata, Content-Range, ETag,
+             * chunk length, and remote size before reusing resumable state.
+             * Deleting all partial files here would defeat that recovery logic
+             * and restart a multi-gigabyte model from byte zero.
+             */
+            if (forceFresh) {
+                cleanupTransferState(
+                    finalFile = finalFile,
+                    deleteFinal = false,
+                    includeLegacyTmpState = true,
+                )
+            } else if (
+                finalFile.exists() &&
+                finalFile.length() <= 0L
+            ) {
+                runCatching {
+                    finalFile.delete()
                 }
             }
 
-            replaceFinalAtomic(tmpFile, finalFile)
+            val error =
+                IOException(
+                    message,
+                    t,
+                )
 
-            val outLen = finalFile.length()
-            onProgress(outLen, remoteLen ?: outLen)
+            val result =
+                Result.failure<File>(
+                    error
+                )
 
-            deferred.complete(Result.success(finalFile))
+            flight.deferred
+                .complete(result)
 
-        } catch (ce: CancellationException) {
-            Log.w(TAG, "ensureInitialized: cancelled", ce)
-            if (forceFresh) {
-                runCatching { tmpFile.delete() }
-                runCatching { tmpPartFile.delete() }
-                runCatching { tmpMetaFile.delete() }
-            }
-            deferred.complete(Result.failure(IOException("Canceled", ce)))
+            Log.w(
+                TAG,
+                "phase=failed " +
+                        "file=${finalFile.name} " +
+                        "message=$message " +
+                        "totalMs=${elapsedMs(startedAtMs)}",
+                t,
+            )
 
-        } catch (ie: InterruptedIOException) {
-            Log.w(TAG, "ensureInitialized: interrupted", ie)
-            if (forceFresh) {
-                runCatching { tmpFile.delete() }
-                runCatching { tmpPartFile.delete() }
-                runCatching { tmpMetaFile.delete() }
-            }
-            deferred.complete(Result.failure(IOException("Canceled", ie)))
-
-        } catch (te: TimeoutCancellationException) {
-            Log.w(TAG, "ensureInitialized: timeout after ${timeoutMs}ms", te)
-            if (forceFresh) {
-                runCatching { tmpFile.delete() }
-                runCatching { tmpPartFile.delete() }
-                runCatching { tmpMetaFile.delete() }
-            }
-            deferred.complete(Result.failure(IOException("Timeout ($timeoutMs ms)", te)))
-
-        } catch (t: Throwable) {
-            val msg = userFriendlyMessage(t)
-            Log.w(TAG, "Initialization error: $msg", t)
-
-            // Discard partials on unexpected errors to avoid corrupted resume loops.
-            runCatching { tmpFile.delete() }
-            runCatching { tmpPartFile.delete() }
-            runCatching { tmpMetaFile.delete() }
-
-            deferred.complete(Result.failure(IOException(msg, t)))
+            return result
 
         } finally {
-            if (inFlight.get() === deferred) {
-                inFlight.set(null)
-            }
-            runningJob = null
-        }
+            flight.ownerJob =
+                null
 
-        return deferred.await()
+            flights.remove(
+                flightKey,
+                flight,
+            )
+        }
     }
 
     /**
-     * Cancels any running initialization.
+     * Requests cancellation of every active HeavyInitializer owner.
      *
-     * This requests cancellation of the owner coroutine that is currently
-     * performing the download. Awaiters will receive a failure Result.
+     * The owner coroutine receives CancellationException. Other callers waiting
+     * on that destination's shared Deferred receive Result.failure.
      */
     fun cancel() {
-        runningJob?.cancel(CancellationException("canceled by user"))
-        Log.w(TAG, "Initialization cancel requested.")
-    }
+        val snapshot =
+            flights.values.toSet()
 
-    /**
-     * Clears all in-flight and debug state.
-     *
-     * This is intended for development/testing only.
-     */
-    fun resetForDebug() {
-        inFlight.get()?.complete(Result.failure(IOException("resetForDebug")))
-        runningJob?.cancel(CancellationException("resetForDebug"))
-        runningJob = null
-        Log.w(TAG, "resetForDebug(): cleared in-flight state")
-    }
+        if (snapshot.isEmpty()) {
+            Log.d(
+                TAG,
+                "cancel: no active initialization",
+            )
 
-    // ---------------------------------------------------------------------
-    // Safe file resolution
-    // ---------------------------------------------------------------------
-
-    /**
-     * Resolves a relative path under [baseDir] safely.
-     *
-     * Rules:
-     * - Allows subdirectories (e.g., "models/foo.bin")
-     * - Rejects absolute paths and any ".." traversal segments
-     * - Ensures canonical target stays under baseDir
-     */
-    private fun resolveSafeFileUnder(baseDir: File, relativePath: String): File {
-        val p = relativePath.trim()
-        require(p.isNotEmpty()) { "fileName must not be empty" }
-        require(!p.startsWith("/")) { "absolute paths are not allowed: $p" }
-
-        val segments = p.split('/', '\\')
-        require(segments.none { it == ".." }) { "path traversal is not allowed: $p" }
-
-        val base = baseDir.canonicalFile
-        val f = File(baseDir, p)
-        val canon = f.canonicalFile
-
-        val basePath = base.path
-        val canonPath = canon.path
-        val ok = canonPath == basePath || canonPath.startsWith(basePath + File.separator)
-        require(ok) { "resolved path escapes baseDir: $p" }
-
-        return canon
-    }
-
-    // ---------------------------------------------------------------------
-    // HEAD probe for strict content-length validation
-    // ---------------------------------------------------------------------
-
-    private fun headContentLength(srcUrl: String, hfToken: String?): Long? =
-        headContentLengthForVerify(srcUrl, hfToken)
-
-    /**
-     * HEAD request with manual redirect handling.
-     */
-    private fun headContentLengthForVerify(srcUrl: String, hfToken: String?): Long? {
-        var current = srcUrl
-
-        repeat(MAX_REDIRECTS) {
-            val u = URL(current)
-            val conn = (u.openConnection() as HttpURLConnection).apply {
-                requestMethod = "HEAD"
-                instanceFollowRedirects = false
-                connectTimeout = 20_000
-                readTimeout = 20_000
-                setRequestProperty("User-Agent", "SurveyNav/1.0 (Android)")
-                setRequestProperty("Accept", "application/octet-stream")
-                setRequestProperty("Accept-Encoding", "identity")
-                if (
-                    (u.host == "huggingface.co" || u.host.endsWith(".huggingface.co")) &&
-                    !hfToken.isNullOrBlank()
-                ) {
-                    setRequestProperty("Authorization", "Bearer $hfToken")
-                }
-            }
-
-            try {
-                val code = conn.responseCode
-
-                if (code in 300..399) {
-                    val loc = conn.getHeaderField("Location") ?: return null
-                    current = URL(u, loc).toString()
-                    return@repeat
-                }
-
-                if (code !in 200..299) return null
-
-                val len = conn.getHeaderFieldLong("Content-Length", -1L)
-                return len.takeIf { it >= 0L }
-
-            } finally {
-                conn.disconnect()
-            }
-        }
-
-        return null
-    }
-
-    // ---------------------------------------------------------------------
-    // Error messaging
-    // ---------------------------------------------------------------------
-
-    private fun userFriendlyMessage(t: Throwable): String {
-        val raw = t.message ?: t::class.java.simpleName
-        val s = raw.lowercase()
-
-        return when {
-            "unauthorized" in s || "401" in s -> "Authorization failed (HF token?)"
-            "forbidden" in s || "403" in s -> "Access denied (token/permissions?)"
-            "timeout" in s -> "Network timeout"
-            "space" in s -> "Not enough free space"
-            "content-range" in s || "416" in s || "range" in s ->
-                "Resume failed (server refused range)"
-            "unknown host" in s || "dns" in s -> "Unknown host (check connectivity)"
-            else -> raw
-        }
-    }
-
-    // ---------------------------------------------------------------------
-    // Replacement
-    // ---------------------------------------------------------------------
-
-    /**
-     * Approximates atomic replace within the same directory.
-     */
-    private fun replaceFinalAtomic(tmp: File, dst: File) {
-        if (!tmp.exists() || tmp.length() <= 0L) {
-            throw IOException("Temp file missing or empty: ${tmp.absolutePath}")
-        }
-
-        dst.parentFile?.mkdirs()
-
-        if (dst.exists() && !dst.delete()) {
-            Log.w(TAG, "replaceFinalAtomic: failed to delete existing ${dst.absolutePath}")
-        }
-
-        if (tmp.renameTo(dst)) {
             return
         }
 
-        Log.w(TAG, "replaceFinalAtomic: rename failed, falling back to copy")
+        snapshot.forEach { flight ->
+            flight.ownerJob?.cancel(
+                CancellationException(
+                    "canceled by user"
+                )
+            )
+        }
 
-        try {
-            tmp.inputStream().use { input ->
-                dst.outputStream().use { output ->
-                    input.copyTo(output)
+        Log.w(
+            TAG,
+            "Initialization cancel requested for " +
+                    "${snapshot.size} flight(s).",
+        )
+    }
+
+    /**
+     * Clears shared debug state and cancels all current owners.
+     *
+     * This method is intended only for development/instrumentation tests.
+     */
+    fun resetForDebug() {
+        val snapshot =
+            flights.entries.toList()
+
+        snapshot.forEach { (key, flight) ->
+            flights.remove(
+                key,
+                flight,
+            )
+
+            flight.deferred.complete(
+                Result.failure(
+                    IOException(
+                        "resetForDebug"
+                    )
+                )
+            )
+
+            flight.ownerJob?.cancel(
+                CancellationException(
+                    "resetForDebug"
+                )
+            )
+        }
+
+        Log.w(
+            TAG,
+            "resetForDebug(): cleared " +
+                    "${snapshot.size} in-flight operation(s)",
+        )
+    }
+
+    // ---------------------------------------------------------------------
+    // Transfer-state migration / cleanup
+    // ---------------------------------------------------------------------
+
+    /**
+     * Migrates resumable files created by the previous two-stage
+     * <final>.tmp-based HeavyInitializer into the downloader's current
+     * <final>.part naming scheme.
+     *
+     * Migration is best-effort and only occurs when the new destination file
+     * does not already exist. All files live in the same directory, so rename
+     * should normally be atomic and inexpensive.
+     */
+    private fun migrateLegacyTransferState(
+        finalFile: File,
+    ) {
+        val parent =
+            finalFile.parentFile
+                ?: return
+
+        val legacyTmp =
+            File(
+                parent,
+                finalFile.name + ".tmp",
+            )
+
+        val legacyPart =
+            File(
+                parent,
+                legacyTmp.name + ".part",
+            )
+
+        val legacyMeta =
+            File(
+                parent,
+                legacyPart.name + ".meta",
+            )
+
+        val currentPart =
+            File(
+                parent,
+                finalFile.name + ".part",
+            )
+
+        val currentMeta =
+            File(
+                parent,
+                currentPart.name + ".meta",
+            )
+
+        if (
+            !finalFile.exists() &&
+            legacyTmp.exists() &&
+            legacyTmp.isFile &&
+            legacyTmp.length() > 0L
+        ) {
+            moveBestEffort(
+                source =
+                    legacyTmp,
+                destination =
+                    finalFile,
+            )
+
+            Log.d(
+                TAG,
+                "Migrated legacy completed temp file " +
+                        "to ${finalFile.name}",
+            )
+        }
+
+        if (
+            !currentPart.exists() &&
+            legacyPart.exists()
+        ) {
+            moveBestEffort(
+                source =
+                    legacyPart,
+                destination =
+                    currentPart,
+            )
+        }
+
+        if (
+            !currentMeta.exists() &&
+            legacyMeta.exists()
+        ) {
+            moveBestEffort(
+                source =
+                    legacyMeta,
+                destination =
+                    currentMeta,
+            )
+        }
+
+        /*
+         * Parallel downloader chunks use:
+         *
+         *     <part>.chunk.<index>
+         *
+         * Rename old:
+         *
+         *     <final>.tmp.part.chunk.*
+         *
+         * to:
+         *
+         *     <final>.part.chunk.*
+         *
+         * so interrupted parallel transfers remain resumable.
+         */
+        parent.listFiles()
+            ?.filter { file ->
+                file.name.startsWith(
+                    legacyPart.name +
+                            ".chunk."
+                )
+            }
+            ?.forEach { oldChunk ->
+
+                val suffix =
+                    oldChunk.name
+                        .removePrefix(
+                            legacyPart.name
+                        )
+
+                val newChunk =
+                    File(
+                        parent,
+                        currentPart.name +
+                                suffix,
+                    )
+
+                if (
+                    !newChunk.exists()
+                ) {
+                    moveBestEffort(
+                        source =
+                            oldChunk,
+                        destination =
+                            newChunk,
+                    )
                 }
             }
-        } catch (e: IOException) {
-            throw IOException("replaceFinalAtomic: copy fallback failed", e)
-        } finally {
-            runCatching { tmp.delete() }
+    }
+
+    /**
+     * Removes completed/partial/chunk files associated with one destination.
+     */
+    private fun cleanupTransferState(
+        finalFile: File,
+        deleteFinal: Boolean,
+        includeLegacyTmpState: Boolean,
+    ) {
+        val parent =
+            finalFile.parentFile
+                ?: return
+
+        if (deleteFinal) {
+            safeDelete(
+                finalFile
+            )
         }
 
-        if (!dst.exists() || dst.length() <= 0L) {
-            throw IOException("replaceFinalAtomic: destination invalid after copy: ${dst.absolutePath}")
+        val currentPart =
+            File(
+                parent,
+                finalFile.name +
+                        ".part",
+            )
+
+        val currentMeta =
+            File(
+                parent,
+                currentPart.name +
+                        ".meta",
+            )
+
+        val currentMetaTmp =
+            File(
+                parent,
+                currentMeta.name +
+                        ".tmp",
+            )
+
+        safeDelete(
+            currentPart
+        )
+
+        safeDelete(
+            currentMeta
+        )
+
+        safeDelete(
+            currentMetaTmp
+        )
+
+        deleteFilesWithPrefix(
+            parent = parent,
+            prefix =
+                currentPart.name +
+                        ".chunk.",
+        )
+
+        if (
+            includeLegacyTmpState
+        ) {
+            val legacyTmp =
+                File(
+                    parent,
+                    finalFile.name +
+                            ".tmp",
+                )
+
+            val legacyPart =
+                File(
+                    parent,
+                    legacyTmp.name +
+                            ".part",
+                )
+
+            val legacyMeta =
+                File(
+                    parent,
+                    legacyPart.name +
+                            ".meta",
+                )
+
+            val legacyMetaTmp =
+                File(
+                    parent,
+                    legacyMeta.name +
+                            ".tmp",
+                )
+
+            safeDelete(
+                legacyTmp
+            )
+
+            safeDelete(
+                legacyPart
+            )
+
+            safeDelete(
+                legacyMeta
+            )
+
+            safeDelete(
+                legacyMetaTmp
+            )
+
+            deleteFilesWithPrefix(
+                parent = parent,
+                prefix =
+                    legacyPart.name +
+                            ".chunk.",
+            )
         }
     }
+
+    private fun deleteFilesWithPrefix(
+        parent: File,
+        prefix: String,
+    ) {
+        parent.listFiles()
+            ?.filter {
+                it.name.startsWith(
+                    prefix
+                )
+            }
+            ?.forEach(
+                ::safeDelete
+            )
+    }
+
+    /**
+     * Moves a file within the application's private directory.
+     *
+     * renameTo() is preferred because source and destination normally share the
+     * same filesystem. Copy is retained only as a defensive fallback.
+     */
+    private fun moveBestEffort(
+        source: File,
+        destination: File,
+    ) {
+        if (
+            !source.exists() ||
+            destination.exists()
+        ) {
+            return
+        }
+
+        destination.parentFile
+            ?.mkdirs()
+
+        if (
+            source.renameTo(
+                destination
+            )
+        ) {
+            return
+        }
+
+        source.copyTo(
+            target =
+                destination,
+            overwrite =
+                false,
+        )
+
+        if (
+            !source.delete()
+        ) {
+            Log.w(
+                TAG,
+                "moveBestEffort: copied but failed " +
+                        "to delete ${source.absolutePath}",
+            )
+        }
+    }
+
+    private fun safeDelete(
+        file: File,
+    ) {
+        runCatching {
+            if (
+                file.exists() &&
+                !file.delete()
+            ) {
+                Log.w(
+                    TAG,
+                    "Failed to delete " +
+                            file.absolutePath,
+                )
+            }
+        }.onFailure { error ->
+            Log.w(
+                TAG,
+                "Delete failed for " +
+                        "${file.absolutePath}: " +
+                        "${error.message}",
+                error,
+            )
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Safe path resolution
+    // ---------------------------------------------------------------------
+
+    /**
+     * Resolves a relative path under [baseDir] without allowing directory
+     * traversal outside the application's private files directory.
+     */
+    private fun resolveSafeFileUnder(
+        baseDir: File,
+        relativePath: String,
+    ): File {
+        val path =
+            relativePath.trim()
+
+        require(
+            path.isNotEmpty()
+        ) {
+            "fileName must not be empty"
+        }
+
+        require(
+            !File(path).isAbsolute
+        ) {
+            "absolute paths are not allowed: $path"
+        }
+
+        val segments =
+            path.split(
+                '/',
+                '\\',
+            )
+
+        require(
+            segments.none { segment ->
+                segment == ".."
+            }
+        ) {
+            "path traversal is not allowed: $path"
+        }
+
+        val base =
+            baseDir.canonicalFile
+
+        val resolved =
+            File(
+                base,
+                path,
+            ).canonicalFile
+
+        val basePath =
+            base.path
+
+        val resolvedPath =
+            resolved.path
+
+        val insideBase =
+            resolvedPath == basePath ||
+                    resolvedPath.startsWith(
+                        basePath +
+                                File.separator
+                    )
+
+        require(
+            insideBase
+        ) {
+            "resolved path escapes baseDir: $path"
+        }
+
+        return resolved
+    }
+
+    // ---------------------------------------------------------------------
+    // Error mapping / diagnostics
+    // ---------------------------------------------------------------------
+
+    /**
+     * Converts low-level transport errors into concise messages suitable for
+     * the download gate UI while preserving the original Throwable as cause.
+     */
+    private fun userFriendlyMessage(
+        throwable: Throwable,
+    ): String {
+        val raw =
+            throwable.message
+                ?: throwable::class
+                    .java
+                    .simpleName
+
+        val normalized =
+            raw.lowercase()
+
+        return when {
+            "unauthorized" in normalized ||
+                    "401" in normalized ->
+                "Authorization failed (HF token?)"
+
+            "forbidden" in normalized ||
+                    "403" in normalized ->
+                "Access denied (token/permissions?)"
+
+            "timeout" in normalized ->
+                "Network timeout"
+
+            "space" in normalized ->
+                "Not enough free space"
+
+            "content-range" in normalized ||
+                    "416" in normalized ||
+                    "range" in normalized ->
+                "Resume failed (server refused range)"
+
+            "unknown host" in normalized ||
+                    "dns" in normalized ->
+                "Unknown host (check connectivity)"
+
+            else ->
+                raw
+        }
+    }
+
+    /** Returns milliseconds elapsed since [startedAtMs]. */
+    private fun elapsedMs(
+        startedAtMs: Long,
+    ): Long =
+        SystemClock.elapsedRealtime() -
+                startedAtMs
 }

@@ -6,7 +6,7 @@
  *  File: SlmHelperInstrumentationTest.kt
  *  Author: Shu Ishizuki (石附 支)
  *  License: MIT License
- *  © 2025 IshizukiTech LLC. All rights reserved.
+ *  © 2025-2026 IshizukiTech LLC. All rights reserved.
  * =====================================================================
  */
 
@@ -19,24 +19,50 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.filters.LargeTest
 import androidx.test.platform.app.InstrumentationRegistry
 import com.negi.survey.ModelAssetRule
-import org.junit.*
-import org.junit.Assert.*
-import org.junit.rules.Timeout
-import org.junit.runner.RunWith
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
-import kotlin.math.min
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.async
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
+import org.junit.After
+import org.junit.AfterClass
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
+import org.junit.Before
+import org.junit.BeforeClass
+import org.junit.Rule
+import org.junit.Test
+import org.junit.rules.Timeout
+import org.junit.runner.RunWith
 
 /**
- * Instrumentation tests for SLM helper behavior.
+ * Real-device instrumentation tests for the current [SLM] facade.
  *
- * Guarantees to assert:
- *  - Robust initialize with GPU->CPU fallback; wait for model.instance.
- *  - Busy flag toggling: true during generation, false after completion/cancel+cleanup.
- *  - Cancellation: after cancel, wait for a terminal signal (finished or onClean),
- *    then reset the session before the next run.
- *  - Stream reconstruction: tolerate finish-time behaviors using overlap-safe append.
+ * Current contracts under test:
+ * - Initialization is idempotent and supports GPU -> CPU fallback.
+ * - [SLM.runInference] emits DELTA chunks.
+ * - resultListener(done=true) is logical generation completion.
+ * - cleanUpListener is the native termination / safe-point signal.
+ * - Cancellation eventually reaches native termination and does not poison the
+ *   next request.
+ * - Conversation reset keeps the model reusable.
+ *
+ * Historical APIs intentionally no longer tested:
+ * - Model.instance
+ * - SLM.resetSession()
+ * - listener=/onClean= legacy named parameters
+ * - SLM.isBusy(model) as a runInference lifecycle oracle
+ *
+ * Why SLM.isBusy(model) is not used here:
+ * The current LiteRtLM public busy flag is not the authoritative lifecycle
+ * state for callback-based runInference work. Native completion is represented
+ * by cleanUpListener, which is the correct signal for these tests.
  */
 @RunWith(AndroidJUnit4::class)
 @LargeTest
@@ -44,532 +70,1453 @@ class SlmHelperInstrumentationTest {
 
     companion object {
         private const val TAG = "SlmHelperInstrTest"
+
+        /** Global JUnit watchdog. */
         private const val TIMEOUT_SEC = 180L
+
+        /** Initialization timeout. */
+        private const val INIT_TIMEOUT_MS = 60_000L
+
+        /** Normal generation logical-completion timeout. */
+        private const val GENERATION_TIMEOUT_MS = 120_000L
+
+        /** Native cleanup grace after logical completion. */
+        private const val NATIVE_CLEANUP_TIMEOUT_MS = 20_000L
+
+        /** Cancellation must reach native termination within this window. */
+        private const val CANCEL_TIMEOUT_MS = 15_000L
+
+        /** Best-effort wait for a first partial before a cancellation test. */
+        private const val FIRST_PARTIAL_WAIT_MS = 5_000L
+
+        /** Tiny scheduling grace used only after fire-and-forget control calls. */
+        private const val CONTROL_SETTLE_MS = 300L
+
+        /** Keep instrumentation output bounded and reasonably fast. */
+        private const val TEST_MAX_TOKENS = 512
 
         private lateinit var appCtx: Context
         private lateinit var model: Model
-        private val initialized = AtomicBoolean(false)
+
+        private val initialized =
+            AtomicBoolean(false)
+
+        private val initLock =
+            Any()
 
         @BeforeClass
         @JvmStatic
         fun beforeClass() {
-            appCtx = InstrumentationRegistry.getInstrumentation().targetContext
-            Log.i(TAG, "targetContext=${appCtx.packageName}")
+            appCtx =
+                InstrumentationRegistry
+                    .getInstrumentation()
+                    .targetContext
+                    .applicationContext
+
+            SLM.setApplicationContext(appCtx)
+
+            Log.i(
+                TAG,
+                "targetContext=${appCtx.packageName}"
+            )
         }
 
         @AfterClass
         @JvmStatic
         fun afterClass() {
-            // Best-effort cleanup (only if model was actually initialized).
-            runCatching {
-                if (this::model.isInitialized) {
-                    SLM.cleanUp(model) {}
-                }
-            }.onFailure {
-                Log.w(TAG, "cleanUp failed in @AfterClass: ${it.message}")
+            if (!::model.isInitialized) {
+                return
             }
+
+            runCatching {
+                forceCleanUpBlocking(
+                    targetModel = model,
+                    timeoutMs = NATIVE_CLEANUP_TIMEOUT_MS,
+                )
+            }.onFailure { error ->
+                Log.w(
+                    TAG,
+                    "forceCleanUp failed in @AfterClass: ${error.message}",
+                    error,
+                )
+            }
+        }
+
+        /**
+         * Convert callback-style force cleanup into a bounded blocking helper.
+         *
+         * Instrumentation tests run off the app UI thread, so a bounded latch is
+         * appropriate here.
+         */
+        private fun forceCleanUpBlocking(
+            targetModel: Model,
+            timeoutMs: Long,
+        ): Boolean {
+            val latch =
+                CountDownLatch(1)
+
+            SLM.forceCleanUp(targetModel) {
+                latch.countDown()
+            }
+
+            return latch.await(
+                timeoutMs,
+                TimeUnit.MILLISECONDS,
+            )
         }
     }
 
     @get:Rule
-    val modelRule = ModelAssetRule()
+    val modelRule =
+        ModelAssetRule()
 
-    // Global watchdog for hangs (CI safety).
-    // Align with TIMEOUT_SEC so askMeta() and rule agree.
     @get:Rule
-    val globalTimeout: Timeout = Timeout.seconds(TIMEOUT_SEC)
+    val globalTimeout: Timeout =
+        Timeout.seconds(TIMEOUT_SEC)
 
     @Before
     fun setUp() {
-        if (initialized.compareAndSet(false, true)) {
-            Log.i(TAG, "Initial model setup (first test)")
-
-            // Try GPU first.
-            model = Model(
-                name = "gemma3-local-test",
-                taskPath = modelRule.internalModel.absolutePath,
-                config = mapOf(
-                    ConfigKey.ACCELERATOR to Accelerator.GPU.label,
-                    ConfigKey.MAX_TOKENS to 512,
-                    ConfigKey.TOP_K to 40,
-                    ConfigKey.TOP_P to 0.9f,
-                    ConfigKey.TEMPERATURE to 0.7f
-                )
-            )
-
-            var initErr = initModel(model)
-            if (!initErr.isNullOrEmpty()) {
-                Log.w(TAG, "GPU init failed: $initErr — retrying with CPU")
-
-                // CPU fallback.
-                model = Model(
-                    name = "gemma3-local-test",
-                    taskPath = modelRule.internalModel.absolutePath,
-                    config = mapOf(
-                        ConfigKey.ACCELERATOR to Accelerator.CPU.label,
-                        ConfigKey.MAX_TOKENS to 512,
-                        ConfigKey.TOP_K to 40,
-                        ConfigKey.TOP_P to 0.9f,
-                        ConfigKey.TEMPERATURE to 0.7f
-                    )
-                )
-                initErr = initModel(model)
-            }
-
-            assertTrue("Init error: $initErr", initErr.isNullOrEmpty())
-
-            // model.instance may be set asynchronously; poll briefly.
-            assertTrue(
-                "Model instance must be created",
-                waitUntil(timeoutMs = 15_000) { model.instance != null }
-            )
-            Log.i(TAG, "Model initialized: instance=${model.instance}")
-        } else {
-            assertNotNull("Model instance must exist", model.instance)
-        }
-
-        // Ensure each test starts from a non-busy state.
-        assertFalse("busy should be false at test start", SLM.isBusy(model))
+        ensureModelInitialized()
     }
 
     @After
     fun tearDown() {
-        // Defensive: cancel any leftover generation and reset the session when idle.
-        runCatching { SLM.cancel(model) }
-        if (!SLM.isBusy(model)) {
-            runCatching { SLM.resetSession(model) }
+        LiteRtLM.runControlTestHooks = null
+        LiteRtLM.nativeLifecycleTestHooks = null
+        LiteRtLM.initializationTestHooks = null
+
+        /**
+         * Best-effort defensive cancellation.
+         *
+         * A correctly written test should already have observed native cleanup.
+         * This call only protects the following test if an assertion aborted
+         * midway through a generation.
+         */
+        runCatching {
+            SLM.cancel(model)
         }
     }
 
-    // ---------------------------------------------------------------------
-    // Utilities
-    // ---------------------------------------------------------------------
-
-    private fun initModel(m: Model): String? {
-        val initDone = CountDownLatch(1)
-        var initErr: String? = null
-        SLM.initialize(appCtx, m) { err ->
-            initErr = err
-            initDone.countDown()
-        }
-        assertTrue(
-            "initialize did not return within 12s",
-            initDone.await(12, TimeUnit.SECONDS)
-        )
-        return initErr
-    }
+    // =====================================================================
+    // Initialization helpers
+    // =====================================================================
 
     /**
-     * Polls until [cond] becomes true or the timeout elapses.
-     * Uses a small sleep to avoid busy-waiting.
+     * Initialize once per test class.
+     *
+     * GPU is preferred unless instrumentation args explicitly request CPU.
+     * If GPU initialization fails, tear down partial state and retry on CPU.
+     *
+     * We intentionally do not poll Model.instance; runtime ownership now lives
+     * inside LiteRtLM rather than Model.
      */
-    private fun waitUntil(timeoutMs: Long = 2_000, cond: () -> Boolean): Boolean {
-        val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)
-        while (System.nanoTime() < deadline) {
-            if (cond()) return true
-            SystemClock.sleep(15)
-        }
-        return false
-    }
-
-    /**
-     * Waits until SLM.isBusy(model) equals [expectBusy], or the timeout elapses.
-     * NOTE: "busy=false" alone does NOT guarantee that the underlying session is
-     * fully cleaned up. For cancellation, always wait for a terminal signal too.
-     */
-    private fun waitUntilBusy(expectBusy: Boolean, timeoutMs: Long = 5_000): Boolean {
-        return waitUntil(timeoutMs) { SLM.isBusy(model) == expectBusy }
-    }
-
-    /**
-     * Computes the maximum overlap length where the suffix of [base] matches
-     * the prefix of [next]. Capped to keep worst-case from exploding on
-     * very long strings.
-     */
-    private fun computeOverlap(base: CharSequence, next: CharSequence, cap: Int = 2048): Int {
-        if (base.isEmpty() || next.isEmpty()) return 0
-        val maxCheck = min(cap, min(base.length, next.length))
-        for (len in maxCheck downTo 1) {
-            var match = true
-            val startBase = base.length - len
-            for (i in 0 until len) {
-                if (base[startBase + i] != next[i]) {
-                    match = false
-                    break
-                }
-            }
-            if (match) return len
-        }
-        return 0
-    }
-
-    /**
-     * Overlap-safe append at finish-time:
-     *  - If [maybeFull] looks like a complete final text (and starts with current buffer),
-     *    replace the buffer with it (robust "full text at finish" handling).
-     *  - Otherwise append only the non-overlapping suffix.
-     *  - If empty, do nothing.
-     */
-    private fun appendFinishChunkSafely(sb: StringBuilder, maybeFull: String) {
-        if (maybeFull.isEmpty()) return
-        val current = sb.toString()
-        if (maybeFull.length >= current.length && maybeFull.startsWith(current)) {
-            sb.clear()
-            sb.append(maybeFull)
+    private fun ensureModelInitialized() {
+        if (initialized.get()) {
             return
         }
-        val overlap = computeOverlap(sb, maybeFull)
-        sb.append(maybeFull.substring(overlap))
+
+        synchronized(initLock) {
+            if (initialized.get()) {
+                return
+            }
+
+            val preferred =
+                defaultAccelerator()
+
+            var candidate =
+                createModel(preferred)
+
+            Log.i(
+                TAG,
+                "Initial model setup accelerator=${preferred.label}"
+            )
+
+            try {
+                initializeModelBlocking(candidate)
+            } catch (firstError: Throwable) {
+                if (preferred == Accelerator.CPU) {
+                    throw firstError
+                }
+
+                Log.w(
+                    TAG,
+                    "GPU init failed: ${firstError.message}; retrying with CPU",
+                    firstError,
+                )
+
+                /**
+                 * Runtime identity is model-name/path based, so remove any
+                 * partially-created GPU runtime before CPU retry.
+                 */
+                runCatching {
+                    forceCleanUpBlocking(
+                        targetModel = candidate,
+                        timeoutMs = NATIVE_CLEANUP_TIMEOUT_MS,
+                    )
+                }.onFailure { cleanupError ->
+                    Log.w(
+                        TAG,
+                        "Cleanup before CPU fallback failed: ${cleanupError.message}",
+                        cleanupError,
+                    )
+                }
+
+                candidate =
+                    createModel(Accelerator.CPU)
+
+                try {
+                    initializeModelBlocking(candidate)
+                } catch (cpuError: Throwable) {
+                    cpuError.addSuppressed(firstError)
+                    throw cpuError
+                }
+            }
+
+            model = candidate
+            initialized.set(true)
+
+            Log.i(
+                TAG,
+                "Model initialized: " +
+                        "name=${model.name} " +
+                        "accelerator=${model.getStringConfigValue(ConfigKey.ACCELERATOR, "")}"
+            )
+        }
     }
 
-    /**
-     * A longer prompt to keep the stream alive for a while.
-     */
-    private fun longPrompt(): String =
-        "Write a very long, multi-paragraph explanation about Android instrumentation testing, " +
-                "including test runners, rules, IdlingResource, synchronization pitfalls, best practices, " +
-                "and code snippets. Make it detailed and comprehensive."
+    private fun createModel(
+        accelerator: Accelerator,
+    ): Model =
+        Model(
+            name = "gemma3-local-test",
+            taskPath = modelRule.internalModel.absolutePath,
+            config =
+                mapOf(
+                    ConfigKey.ACCELERATOR to accelerator.label,
+                    ConfigKey.MAX_TOKENS to TEST_MAX_TOKENS,
+                    ConfigKey.TOP_K to 1,
+                    ConfigKey.TOP_P to 0.0f,
+                    ConfigKey.TEMPERATURE to 0.0f,
+                ),
+        )
+
+    private fun initializeModelBlocking(
+        targetModel: Model,
+    ) {
+        runBlocking {
+            withTimeout(INIT_TIMEOUT_MS) {
+                SLM.initializeIfNeeded(
+                    context = appCtx,
+                    model = targetModel,
+                    supportImage = false,
+                    supportAudio = false,
+                    systemMessage = null,
+                    tools = emptyList(),
+                )
+            }
+        }
+    }
+
+    private fun defaultAccelerator(): Accelerator {
+        val args =
+            InstrumentationRegistry.getArguments()
+
+        val configured =
+            (
+                    args.getString("ACCELERATOR")
+                        ?: System.getenv("ACCELERATOR")
+                    )
+                ?.trim()
+                ?.uppercase()
+
+        return if (
+            configured == Accelerator.CPU.label
+        ) {
+            Accelerator.CPU
+        } else {
+            Accelerator.GPU
+        }
+    }
+
+    // =====================================================================
+    // Streaming helpers
+    // =====================================================================
 
     private data class AskResult(
         val text: String,
         val partials: Int,
-        val onClean: Boolean,
-        val durationMs: Long
+        val logicalDone: Boolean,
+        val nativeClean: Boolean,
+        val durationMs: Long,
     )
 
-    /**
-     * Collects streaming output until completion, reconstructing the final text robustly.
-     * Returns meta info, used by some tests.
-     *
-     * - Best-effort checks busy=true/false, but does not hard-fail if the model
-     *   short-circuits too quickly (e.g., immediate error or synchronous finish).
-     * - Dedicated tests (busy_flag_toggles_correctly, cancel_*) still assert
-     *   strict busy semantics where appropriate.
-     */
-    private fun askMeta(
+    private data class ObservedRun(
+        val runId: AtomicLong = AtomicLong(0L),
+        val started: CountDownLatch = CountDownLatch(1),
+        val logicalDone: CountDownLatch = CountDownLatch(1),
+        val nativeClean: CountDownLatch = CountDownLatch(1),
+        val outputSeen: AtomicBoolean = AtomicBoolean(false),
+        val error: AtomicReference<String?> = AtomicReference(null),
+    )
+
+    private fun startObservedRun(
         prompt: String,
-        timeoutSec: Long = TIMEOUT_SEC,
-        requireNotBlank: Boolean = true,
-        logPrefix: String = ""
-    ): AskResult {
-        val done = CountDownLatch(1)
-        val sb = StringBuilder()
-        var partialCount = 0
-        var onCleanCalled = false
-        val t0 = SystemClock.elapsedRealtime()
+        releaseRunStart: CountDownLatch? = null,
+    ): ObservedRun {
+        val observed = ObservedRun()
 
         SLM.runInference(
             model = model,
             input = prompt,
-            listener = { partial, finished ->
-                if (partial.isNotEmpty()) {
-                    partialCount++
-                    Log.i(
-                        TAG,
-                        "${logPrefix}partial[$partialCount](${partial.length})=" +
-                                "${partial.take(160)} ..."
-                    )
-                    if (!finished) {
-                        val overlap = computeOverlap(sb, partial)
-                        sb.append(partial.substring(overlap))
-                    } else {
-                        appendFinishChunkSafely(sb, partial)
-                    }
-                }
-                if (finished) done.countDown()
+            resultListener = { delta, done ->
+                if (delta.isNotBlank()) observed.outputSeen.set(true)
+                if (done) observed.logicalDone.countDown()
             },
-            onClean = {
-                onCleanCalled = true
-                done.countDown()
-            }
+            cleanUpListener = {
+                observed.nativeClean.countDown()
+            },
+            onError = { message ->
+                observed.error.compareAndSet(null, message)
+            },
+            onRunStarted = { runId ->
+                observed.runId.set(runId)
+                observed.started.countDown()
+                releaseRunStart?.await(
+                    GENERATION_TIMEOUT_MS,
+                    TimeUnit.MILLISECONDS,
+                )
+            },
         )
 
-        // Best-effort: we expect busy to turn true, but do not fail if it does not.
-        val becameBusy = waitUntilBusy(true)
-        if (!becameBusy) {
-            Log.w(
-                TAG,
-                "${logPrefix}busy never observed as true after start; " +
-                        "proceeding (possible immediate finish or error short-circuit)."
+        return observed
+    }
+
+    private fun assertObservedRunCompleted(
+        label: String,
+        run: ObservedRun,
+    ) {
+        assertTrue(
+            "$label did not reach logical completion",
+            run.logicalDone.await(GENERATION_TIMEOUT_MS, TimeUnit.MILLISECONDS),
+        )
+        assertTrue(
+            "$label did not reach native cleanup",
+            run.nativeClean.await(NATIVE_CLEANUP_TIMEOUT_MS, TimeUnit.MILLISECONDS),
+        )
+        assertTrue(
+            "$label should emit non-blank output",
+            run.outputSeen.get(),
+        )
+        assertEquals(
+            "$label should not report an error",
+            null,
+            run.error.get(),
+        )
+    }
+
+    /**
+     * Run one normal inference and wait for BOTH lifecycle milestones:
+     *
+     * 1. resultListener(done=true): logical generation complete.
+     * 2. cleanUpListener: native stream termination/safe point reached.
+     *
+     * DELTA contract:
+     * Every non-empty partial is appended exactly once in encounter order.
+     * We intentionally do not apply overlap suppression because doing so could
+     * hide duplicate-delta bugs in the runtime.
+     */
+    private fun askMeta(
+        prompt: String,
+        timeoutMs: Long = GENERATION_TIMEOUT_MS,
+        requireNotBlank: Boolean = true,
+        logPrefix: String = "",
+    ): AskResult {
+        val logicalDoneLatch =
+            CountDownLatch(1)
+
+        val nativeCleanLatch =
+            CountDownLatch(1)
+
+        val errorLatch =
+            CountDownLatch(1)
+
+        val output =
+            StringBuilder()
+
+        val outputLock =
+            Any()
+
+        val partialCount =
+            AtomicInteger(0)
+
+        val logicalDoneSeen =
+            AtomicBoolean(false)
+
+        val nativeCleanSeen =
+            AtomicBoolean(false)
+
+        val errorRef =
+            AtomicReference<String?>(null)
+
+        val startedAt =
+            SystemClock.elapsedRealtime()
+
+        SLM.runInference(
+            model = model,
+            input = prompt,
+            resultListener = { delta, done ->
+                if (delta.isNotEmpty()) {
+                    val index =
+                        partialCount.incrementAndGet()
+
+                    synchronized(outputLock) {
+                        output.append(delta)
+                    }
+
+                    Log.i(
+                        TAG,
+                        "${logPrefix}delta[$index](${delta.length})=" +
+                                "${delta.take(160)}"
+                    )
+                }
+
+                if (done) {
+                    logicalDoneSeen.set(true)
+                    logicalDoneLatch.countDown()
+                }
+            },
+            cleanUpListener = {
+                nativeCleanSeen.set(true)
+                nativeCleanLatch.countDown()
+            },
+            onError = { message ->
+                errorRef.compareAndSet(
+                    null,
+                    message.ifBlank { "Unknown LiteRT-LM error" },
+                )
+                errorLatch.countDown()
+
+                /**
+                 * Release the logical waiter. The test will inspect errorRef and
+                 * fail with the backend message below.
+                 */
+                logicalDoneLatch.countDown()
+            },
+            images = emptyList(),
+            audioClips = emptyList(),
+        )
+
+        val logicalOrError =
+            logicalDoneLatch.await(
+                timeoutMs,
+                TimeUnit.MILLISECONDS,
+            )
+
+        assertTrue(
+            "generation did not reach logical completion/error within ${timeoutMs}ms",
+            logicalOrError,
+        )
+
+        val backendError =
+            errorRef.get()
+
+        if (backendError != null) {
+            /**
+             * Give native cleanup a short chance before failing the assertion so
+             * the following test is less likely to inherit an active run.
+             */
+            nativeCleanLatch.await(
+                NATIVE_CLEANUP_TIMEOUT_MS,
+                TimeUnit.MILLISECONDS,
+            )
+
+            throw AssertionError(
+                "SLM generation failed: $backendError"
             )
         }
 
         assertTrue(
-            "generation did not finish within $timeoutSec sec",
-            done.await(timeoutSec, TimeUnit.SECONDS)
+            "resultListener(done=true) was not observed",
+            logicalDoneSeen.get(),
         )
 
-        // Best-effort wait for idle; do not assert here because some error paths
-        // may already be idle or flip quickly.
-        val backToIdle = waitUntilBusy(false)
-        if (!backToIdle) {
-            Log.w(TAG, "${logPrefix}busy did not converge to false within wait window")
+        val nativeClean =
+            nativeCleanLatch.await(
+                NATIVE_CLEANUP_TIMEOUT_MS,
+                TimeUnit.MILLISECONDS,
+            )
+
+        assertTrue(
+            "native cleanup/safe-point callback not observed within " +
+                    "${NATIVE_CLEANUP_TIMEOUT_MS}ms after logical completion",
+            nativeClean,
+        )
+
+        /**
+         * If onError raced with successful logical completion, surface it.
+         */
+        if (errorLatch.count == 0L) {
+            val lateError =
+                errorRef.get()
+
+            if (lateError != null) {
+                throw AssertionError(
+                    "SLM reported an error after logical completion: $lateError"
+                )
+            }
         }
 
-        val out = sb.toString().trim()
-        val dur = SystemClock.elapsedRealtime() - t0
+        val finalText =
+            synchronized(outputLock) {
+                output.toString().trim()
+            }
+
+        val durationMs =
+            SystemClock.elapsedRealtime() -
+                    startedAt
+
         Log.i(
             TAG,
-            "${logPrefix}final(len=${out.length}, partials=$partialCount, " +
-                    "onClean=$onCleanCalled, dur=${dur}ms) :: ${out.take(200)}"
+            "${logPrefix}final(" +
+                    "len=${finalText.length}, " +
+                    "partials=${partialCount.get()}, " +
+                    "logicalDone=${logicalDoneSeen.get()}, " +
+                    "nativeClean=${nativeCleanSeen.get()}, " +
+                    "dur=${durationMs}ms" +
+                    ") :: ${finalText.take(200)}"
         )
 
         if (requireNotBlank) {
-            assertTrue("output should not be blank", out.isNotBlank())
+            assertTrue(
+                "output should not be blank",
+                finalText.isNotBlank(),
+            )
         }
 
-        // Reset session eagerly when possible to avoid cross-test interference.
-        if (!SLM.isBusy(model)) {
-            SLM.resetSession(model)
-        }
-        return AskResult(out, partialCount, onCleanCalled, dur)
+        return AskResult(
+            text = finalText,
+            partials = partialCount.get(),
+            logicalDone = logicalDoneSeen.get(),
+            nativeClean = nativeCleanSeen.get(),
+            durationMs = durationMs,
+        )
     }
 
     private fun ask(
         prompt: String,
-        timeoutSec: Long = TIMEOUT_SEC,
+        timeoutMs: Long = GENERATION_TIMEOUT_MS,
         requireNotBlank: Boolean = true,
-        logPrefix: String = ""
-    ): String = askMeta(prompt, timeoutSec, requireNotBlank, logPrefix).text
+        logPrefix: String = "",
+    ): String =
+        askMeta(
+            prompt = prompt,
+            timeoutMs = timeoutMs,
+            requireNotBlank = requireNotBlank,
+            logPrefix = logPrefix,
+        ).text
 
-    // ---------------------------------------------------------------------
-    // Test cases (existing + additional)
-    // ---------------------------------------------------------------------
+    /**
+     * Start inference, optionally wait for the first partial, cancel, and then
+     * wait for native cleanup.
+     */
+    private fun cancelRunAndAwaitNativeCleanup(
+        prompt: String,
+        waitForFirstPartial: Boolean,
+    ) {
+        val firstPartialLatch =
+            CountDownLatch(1)
+
+        val nativeCleanLatch =
+            CountDownLatch(1)
+
+        val errorRef =
+            AtomicReference<String?>(null)
+
+        SLM.runInference(
+            model = model,
+            input = prompt,
+            resultListener = { delta, _ ->
+                if (delta.isNotEmpty()) {
+                    firstPartialLatch.countDown()
+                }
+            },
+            cleanUpListener = {
+                nativeCleanLatch.countDown()
+            },
+            onError = { message ->
+                errorRef.compareAndSet(
+                    null,
+                    message,
+                )
+            },
+            images = emptyList(),
+            audioClips = emptyList(),
+        )
+
+        if (waitForFirstPartial) {
+            firstPartialLatch.await(
+                FIRST_PARTIAL_WAIT_MS,
+                TimeUnit.MILLISECONDS,
+            )
+        }
+
+        val cancelAt =
+            SystemClock.elapsedRealtime()
+
+        SLM.cancel(model)
+
+        val cleaned =
+            nativeCleanLatch.await(
+                CANCEL_TIMEOUT_MS,
+                TimeUnit.MILLISECONDS,
+            )
+
+        val elapsed =
+            SystemClock.elapsedRealtime() -
+                    cancelAt
+
+        Log.i(
+            TAG,
+            "cancel -> native cleanup elapsed=${elapsed}ms " +
+                    "firstPartial=${firstPartialLatch.count == 0L} " +
+                    "error=${errorRef.get()}"
+        )
+
+        assertTrue(
+            "native cleanup was not observed after cancel within ${CANCEL_TIMEOUT_MS}ms",
+            cleaned,
+        )
+    }
+
+    private fun longPrompt(): String =
+        "Write a detailed multi-paragraph explanation about Android " +
+                "instrumentation testing, including test runners, rules, " +
+                "synchronization pitfalls, best practices, and code examples."
+
+    // =====================================================================
+    // Tests
+    // =====================================================================
 
     @Test
     fun generate_short_prompt_multiple_times() {
-        repeat(4) { i ->
-            val out = ask(
-                prompt = "100文字でラーメンの作り方を教えて下さい",
-                logPrefix = "[run#$i] "
+        repeat(4) { index ->
+            val result =
+                askMeta(
+                    prompt = "100文字でラーメンの作り方を教えて下さい",
+                    logPrefix = "[run#$index] ",
+                )
+
+            assertTrue(
+                "[$index] output should not be blank",
+                result.text.isNotBlank(),
             )
-            assertTrue("[$i] output should not be blank", out.isNotBlank())
+
+            assertTrue(
+                "[$index] logical completion expected",
+                result.logicalDone,
+            )
+
+            assertTrue(
+                "[$index] native cleanup expected",
+                result.nativeClean,
+            )
         }
     }
 
     @Test
     fun cancel_stops_generation_and_allows_next() {
-        val terminated = CountDownLatch(1)   // finished OR onClean
-        val firstPartial = CountDownLatch(1) // wait for an actual streaming start
-        var onCleanCalled = false
-        var finishedSeen = false
-        var partialSeen = false
+        cancelRunAndAwaitNativeCleanup(
+            prompt = longPrompt(),
+            waitForFirstPartial = true,
+        )
 
-        SLM.runInference(
-            model = model,
-            input = longPrompt(),
-            listener = { partial, finished ->
-                if (partial.isNotEmpty()) {
-                    partialSeen = true
-                    firstPartial.countDown()
+        val next =
+            ask(
+                prompt = "Confirm you can respond after a cancel.",
+                logPrefix = "[post-cancel] ",
+            )
+
+        assertTrue(
+            "output after cancel should not be blank",
+            next.isNotBlank(),
+        )
+    }
+
+    @Test
+    fun stale_scoped_cancel_does_not_cancel_newer_run() =
+        runBlocking {
+            withTimeout(GENERATION_TIMEOUT_MS) {
+                val cancelPaused = CompletableDeferred<Unit>()
+                val releaseCancel = CompletableDeferred<Unit>()
+                val releaseFirstRunStart = CountDownLatch(1)
+
+                try {
+                    val first =
+                        startObservedRun(
+                            prompt = "R1: answer ONE briefly.",
+                            releaseRunStart = releaseFirstRunStart,
+                        )
+                    assertTrue(
+                        "R1 did not publish its run ID",
+                        first.started.await(GENERATION_TIMEOUT_MS, TimeUnit.MILLISECONDS),
+                    )
+
+                    val firstRunId = first.runId.get()
+                    assertTrue("R1 run ID must be positive", firstRunId > 0L)
+
+                    LiteRtLM.runControlTestHooks =
+                        LiteRtLM.RunControlTestHooks(
+                            beforeScopedCancelValidation = { expectedRunId ->
+                                if (expectedRunId == firstRunId) {
+                                    cancelPaused.complete(Unit)
+                                    releaseCancel.await()
+                                }
+                            },
+                        )
+
+                    SLM.cancel(
+                        model = model,
+                        expectedRunId = firstRunId,
+                    )
+
+                    cancelPaused.await()
+                    releaseFirstRunStart.countDown()
+                    assertObservedRunCompleted("R1", first)
+
+                    SLM.resetConversationAndWait(
+                        model = model,
+                        supportImage = false,
+                        supportAudio = false,
+                    )
+
+                    val second = startObservedRun("R2: answer TWO briefly.")
+                    assertTrue(
+                        "R2 did not publish its run ID",
+                        second.started.await(GENERATION_TIMEOUT_MS, TimeUnit.MILLISECONDS),
+                    )
+                    assertTrue(
+                        "R2 must have a different run ID",
+                        second.runId.get() != firstRunId,
+                    )
+
+                    releaseCancel.complete(Unit)
+                    assertObservedRunCompleted("R2", second)
+                } finally {
+                    releaseFirstRunStart.countDown()
+                    releaseCancel.complete(Unit)
+                    LiteRtLM.runControlTestHooks = null
                 }
-                if (finished) {
-                    finishedSeen = true
-                    terminated.countDown()
-                }
-            },
-            onClean = {
-                onCleanCalled = true
-                terminated.countDown()
             }
-        )
-
-        assertTrue("busy should become true", waitUntilBusy(true))
-        firstPartial.await(3, TimeUnit.SECONDS) // best-effort
-
-        val tCancel = SystemClock.elapsedRealtime()
-        SLM.cancel(model = model)
-
-        assertTrue(
-            "previous invocation did not terminate after cancel",
-            terminated.await(5, TimeUnit.SECONDS)
-        )
-        assertTrue("busy should drop after cancel/termination", waitUntilBusy(false))
-
-        val tDone = SystemClock.elapsedRealtime()
-        Log.i(
-            TAG,
-            "cancel → terminated+idle elapsed = ${tDone - tCancel} ms " +
-                    "(partialSeen=$partialSeen, finishedSeen=$finishedSeen, onCleanCalled=$onCleanCalled)"
-        )
-        assertTrue("Either finished or onClean must be seen", finishedSeen || onCleanCalled)
-
-        runCatching { SLM.resetSession(model) }
-        assertTrue("still idle after reset", waitUntilBusy(false))
-
-        val out2 = ask(
-            prompt = "Confirm you can respond after a cancel.",
-            logPrefix = "[post-cancel] "
-        )
-        assertTrue("output after cancel should not be blank", out2.isNotBlank())
-    }
-
-    @Test
-    fun busy_flag_toggles_correctly() {
-        val done = CountDownLatch(1)
-        SLM.runInference(
-            model = model,
-            input = longPrompt(),
-            listener = { _, finished -> if (finished) done.countDown() },
-            onClean = { done.countDown() }
-        )
-
-        assertTrue("busy must turn true soon after start", waitUntilBusy(true))
-        assertTrue(
-            "generation must finish within $TIMEOUT_SEC sec",
-            done.await(TIMEOUT_SEC, TimeUnit.SECONDS)
-        )
-        assertTrue("busy must return to false after finish", waitUntilBusy(false))
-    }
-
-    @Test
-    fun overlap_and_append_safety_smoke() {
-        val sb = StringBuilder()
-
-        // Case A: partial-only stream
-        listOf("Hel", "llo", ", w", "orld").forEach { part ->
-            val overlap = computeOverlap(sb, part)
-            sb.append(part.substring(overlap))
         }
-        assertEquals("Hello, world", sb.toString())
 
-        // Case C-like: finish delivers full text
-        appendFinishChunkSafely(sb, "Hello, world! This is final.")
-        assertEquals("Hello, world! This is final.", sb.toString())
+    @Test
+    fun stale_hard_close_does_not_close_newer_run() =
+        runBlocking {
+            withTimeout(GENERATION_TIMEOUT_MS) {
+                val hardClosePaused = CompletableDeferred<Unit>()
+                val releaseHardClose = CompletableDeferred<Unit>()
+                val secondHardClosePaused = CompletableDeferred<Unit>()
+                val releaseSecondHardClose = CompletableDeferred<Unit>()
 
-        // Case B: small tail-delta at finish
-        val sb2 = StringBuilder("ABCDEF")
-        appendFinishChunkSafely(sb2, "DEFGH")
-        assertEquals("ABCDEFGH", sb2.toString())
+                try {
+                    val firstRunId = AtomicLong(0L)
+                    val secondRunId = AtomicLong(0L)
+
+                    LiteRtLM.runControlTestHooks =
+                        LiteRtLM.RunControlTestHooks(
+                            armHardCloseOnRunStart = { runId ->
+                                when {
+                                    firstRunId.compareAndSet(0L, runId) -> true
+                                    secondRunId.compareAndSet(0L, runId) -> true
+                                    else -> false
+                                }
+                            },
+                            awaitHardCloseAction = { expectedRunId ->
+                                when (expectedRunId) {
+                                    firstRunId.get() -> {
+                                        hardClosePaused.complete(Unit)
+                                        releaseHardClose.await()
+                                    }
+
+                                    secondRunId.get() -> {
+                                        secondHardClosePaused.complete(Unit)
+                                        releaseSecondHardClose.await()
+                                    }
+                                }
+                            },
+                        )
+
+                    val first =
+                        startObservedRun(
+                            "R1 watchdog: answer ONE briefly.",
+                        )
+                    assertTrue(
+                        "R1 did not publish its run ID",
+                        first.started.await(GENERATION_TIMEOUT_MS, TimeUnit.MILLISECONDS),
+                    )
+                    assertTrue("R1 run ID must be positive", firstRunId.get() > 0L)
+
+                    hardClosePaused.await()
+                    assertObservedRunCompleted("R1 watchdog owner", first)
+
+                    SLM.resetConversationAndWait(
+                        model = model,
+                        supportImage = false,
+                        supportAudio = false,
+                    )
+
+                    val second = startObservedRun("R2 watchdog: answer TWO briefly.")
+                    assertTrue(
+                        "R2 did not publish its run ID",
+                        second.started.await(GENERATION_TIMEOUT_MS, TimeUnit.MILLISECONDS),
+                    )
+                    assertTrue(
+                        "R2 must have a different run ID",
+                        second.runId.get() != firstRunId.get(),
+                    )
+                    assertEquals(
+                        "R2 watchdog must own R2's run ID",
+                        second.runId.get(),
+                        secondRunId.get(),
+                    )
+
+                    secondHardClosePaused.await()
+
+                    releaseHardClose.complete(Unit)
+                    assertObservedRunCompleted("R2 watchdog successor", second)
+                    releaseSecondHardClose.complete(Unit)
+                } finally {
+                    releaseHardClose.complete(Unit)
+                    releaseSecondHardClose.complete(Unit)
+                    LiteRtLM.runControlTestHooks = null
+                }
+            }
+        }
+
+    @Test
+    fun normal_terminal_handoff_cannot_mutate_successor_run() =
+        runBlocking {
+            withTimeout(GENERATION_TIMEOUT_MS) {
+                val beforeRelease = CountDownLatch(1)
+                val releaseBefore = CountDownLatch(1)
+                val afterRelease = CountDownLatch(1)
+                val releaseAfter = CountDownLatch(1)
+                val releaseFirstRunStart = CountDownLatch(1)
+                val firstRunId = AtomicLong(0L)
+
+                try {
+                    LiteRtLM.runControlTestHooks =
+                        LiteRtLM.RunControlTestHooks(
+                            beforeTerminalRelease = { runId ->
+                                if (runId == firstRunId.get()) {
+                                    beforeRelease.countDown()
+                                    check(
+                                        releaseBefore.await(
+                                            GENERATION_TIMEOUT_MS,
+                                            TimeUnit.MILLISECONDS,
+                                        )
+                                    )
+                                }
+                            },
+                            afterTerminalReleaseBeforeCallbacks = { runId ->
+                                if (runId == firstRunId.get()) {
+                                    afterRelease.countDown()
+                                    check(
+                                        releaseAfter.await(
+                                            GENERATION_TIMEOUT_MS,
+                                            TimeUnit.MILLISECONDS,
+                                        )
+                                    )
+                                }
+                            },
+                        )
+
+                    val first =
+                        startObservedRun(
+                            prompt = "R1 terminal handoff: answer ONE briefly.",
+                            releaseRunStart = releaseFirstRunStart,
+                        )
+                    assertTrue(
+                        "R1 did not publish its run ID",
+                        first.started.await(GENERATION_TIMEOUT_MS, TimeUnit.MILLISECONDS),
+                    )
+                    firstRunId.set(first.runId.get())
+                    releaseFirstRunStart.countDown()
+                    assertTrue(
+                        "R1 did not pause before active release",
+                        beforeRelease.await(GENERATION_TIMEOUT_MS, TimeUnit.MILLISECONDS),
+                    )
+
+                    val rejected = startObservedRun("This run must be rejected while R1 is active.")
+                    assertTrue(
+                        "The pre-release attempt did not terminate",
+                        rejected.logicalDone.await(GENERATION_TIMEOUT_MS, TimeUnit.MILLISECONDS),
+                    )
+                    assertTrue(
+                        "The pre-release attempt did not clean up",
+                        rejected.nativeClean.await(GENERATION_TIMEOUT_MS, TimeUnit.MILLISECONDS),
+                    )
+                    assertEquals(
+                        "The pre-release attempt must not claim a run ID",
+                        1L,
+                        rejected.started.count,
+                    )
+                    assertTrue(
+                        "The pre-release attempt must report the active run",
+                        rejected.error.get()?.contains("already active") == true,
+                    )
+
+                    releaseBefore.countDown()
+                    assertTrue(
+                        "R1 did not pause after active release",
+                        afterRelease.await(GENERATION_TIMEOUT_MS, TimeUnit.MILLISECONDS),
+                    )
+
+                    val second = startObservedRun("R2 terminal handoff: answer TWO briefly.")
+                    assertTrue(
+                        "R2 did not claim the released run",
+                        second.started.await(GENERATION_TIMEOUT_MS, TimeUnit.MILLISECONDS),
+                    )
+                    assertTrue(
+                        "R2 must have a different run ID",
+                        second.runId.get() != firstRunId.get(),
+                    )
+
+                    releaseAfter.countDown()
+                    assertObservedRunCompleted("R1 terminal owner", first)
+                    assertObservedRunCompleted("R2 successor", second)
+                } finally {
+                    releaseBefore.countDown()
+                    releaseAfter.countDown()
+                    releaseFirstRunStart.countDown()
+                    LiteRtLM.runControlTestHooks = null
+                }
+            }
+        }
+
+    @Test
+    fun force_cleanup_joins_hard_close_flight_after_instance_removal() {
+        val releaseNativeClose = CompletableDeferred<Unit>()
+        val nativeCloseEntered = CompletableDeferred<Unit>()
+        val cleanupJoined = CompletableDeferred<Unit>()
+        val hardCloseClaimed = CountDownLatch(1)
+
+        try {
+            runBlocking {
+                withTimeout(GENERATION_TIMEOUT_MS) {
+                    LiteRtLM.nativeLifecycleTestHooks =
+                        LiteRtLM.NativeLifecycleTestHooks(
+                            beforeNativeClose = { label ->
+                                if (label == "hardClose-conversation") {
+                                    nativeCloseEntered.complete(Unit)
+                                    releaseNativeClose.await()
+                                }
+                            },
+                            onCleanupJoin = { _, _ ->
+                                cleanupJoined.complete(Unit)
+                            },
+                        )
+                    LiteRtLM.runControlTestHooks =
+                        LiteRtLM.RunControlTestHooks(
+                            armHardCloseOnRunStart = { true },
+                            awaitHardCloseAction = {},
+                            beforeTerminalClaim = {
+                                check(
+                                    hardCloseClaimed.await(
+                                        GENERATION_TIMEOUT_MS,
+                                        TimeUnit.MILLISECONDS,
+                                    )
+                                )
+                            },
+                            afterHardCloseTerminalClaim = {
+                                hardCloseClaimed.countDown()
+                            },
+                        )
+
+                    val run = startObservedRun(longPrompt())
+                    assertTrue(
+                        "Hard-close run did not publish its run ID",
+                        run.started.await(GENERATION_TIMEOUT_MS, TimeUnit.MILLISECONDS),
+                    )
+                    nativeCloseEntered.await()
+                    assertEquals(
+                        "Native cleanup hook must wait for terminal teardown",
+                        1L,
+                        run.nativeClean.count,
+                    )
+
+                    val cleanup =
+                        async {
+                            runCatching {
+                                SLM.forceCleanUpAndWait(model)
+                            }
+                        }
+                    cleanupJoined.await()
+                    assertFalse(
+                        "forceCleanUpAndWait must not report success while close is blocked",
+                        cleanup.isCompleted,
+                    )
+                    assertEquals(
+                        "Native cleanup hook must remain blocked with native close",
+                        1L,
+                        run.nativeClean.count,
+                    )
+
+                    releaseNativeClose.complete(Unit)
+                    val cleanupResult = cleanup.await()
+                    assertTrue(
+                        "forceCleanUpAndWait should succeed after confirmed close",
+                        cleanupResult.isSuccess,
+                    )
+                    assertTrue(
+                        "Hard-close native cleanup hook did not fire after teardown",
+                        run.nativeClean.await(NATIVE_CLEANUP_TIMEOUT_MS, TimeUnit.MILLISECONDS),
+                    )
+                }
+            }
+        } finally {
+            releaseNativeClose.complete(Unit)
+            hardCloseClaimed.countDown()
+            LiteRtLM.runControlTestHooks = null
+            LiteRtLM.nativeLifecycleTestHooks = null
+            initializeModelBlocking(model)
+        }
     }
 
-    /** Empty prompt is allowed when requireNotBlank=false, and busy toggles correctly. */
+    @Test
+    fun warm_initialize_revalidates_active_before_teardown() =
+        runBlocking {
+            withTimeout(GENERATION_TIMEOUT_MS) {
+                val planPaused = CompletableDeferred<Unit>()
+                val releasePlan = CompletableDeferred<Unit>()
+                val sessionLockAcquired = CompletableDeferred<Unit>()
+                val releaseRunStart = CountDownLatch(1)
+                val terminalPaused = CountDownLatch(1)
+                val releaseTerminal = CountDownLatch(1)
+                val secondRunId = AtomicLong(0L)
+                val warmModel =
+                    Model(
+                        name = model.name,
+                        taskPath = model.taskPath,
+                        config =
+                            mapOf(
+                                ConfigKey.ACCELERATOR to
+                                        model.getStringConfigValue(
+                                            ConfigKey.ACCELERATOR,
+                                            Accelerator.CPU.label,
+                                        ),
+                                ConfigKey.MAX_TOKENS to TEST_MAX_TOKENS,
+                                ConfigKey.TOP_K to 2,
+                                ConfigKey.TOP_P to 0.0f,
+                                ConfigKey.TEMPERATURE to 0.0f,
+                            ),
+                    )
+
+                try {
+                    LiteRtLM.initializationTestHooks =
+                        LiteRtLM.InitializationTestHooks(
+                            beforeWarmTeardownPlan = {
+                                planPaused.complete(Unit)
+                                releasePlan.await()
+                            },
+                            onWarmTeardownSessionLockAcquired = {
+                                sessionLockAcquired.complete(Unit)
+                            },
+                        )
+                    LiteRtLM.runControlTestHooks =
+                        LiteRtLM.RunControlTestHooks(
+                            beforeTerminalClaim = { runId ->
+                                if (runId == secondRunId.get()) {
+                                    terminalPaused.countDown()
+                                    check(
+                                        releaseTerminal.await(
+                                            GENERATION_TIMEOUT_MS,
+                                            TimeUnit.MILLISECONDS,
+                                        )
+                                    )
+                                }
+                            },
+                        )
+
+                    val initializeResult =
+                        async {
+                            runCatching {
+                                SLM.initializeIfNeeded(
+                                    context = appCtx,
+                                    model = warmModel,
+                                    supportImage = false,
+                                    supportAudio = false,
+                                )
+                            }
+                        }
+                    planPaused.await()
+
+                    val activeRun =
+                        startObservedRun(
+                            prompt = "R2 active revalidation: answer TWO briefly.",
+                            releaseRunStart = releaseRunStart,
+                        )
+                    assertTrue(
+                        "R2 did not claim active ownership",
+                        activeRun.started.await(GENERATION_TIMEOUT_MS, TimeUnit.MILLISECONDS),
+                    )
+                    secondRunId.set(activeRun.runId.get())
+
+                    releasePlan.complete(Unit)
+                    releaseRunStart.countDown()
+                    sessionLockAcquired.await()
+
+                    val initFailure = initializeResult.await().exceptionOrNull()
+                    assertTrue(
+                        "Warm initialize must fail after inference wins the active race",
+                        initFailure?.message?.contains("active native stream") == true,
+                    )
+
+                    releaseTerminal.countDown()
+                    assertObservedRunCompleted("R2 active owner", activeRun)
+                } finally {
+                    releasePlan.complete(Unit)
+                    releaseRunStart.countDown()
+                    releaseTerminal.countDown()
+                    LiteRtLM.initializationTestHooks = null
+                    LiteRtLM.runControlTestHooks = null
+                }
+            }
+        }
+
+    /**
+     * Replacement for the old busy_flag_toggles_correctly test.
+     *
+     * For runInference, the meaningful lifecycle contract is:
+     * logical completion -> native cleanup.
+     */
+    @Test
+    fun logical_completion_is_followed_by_native_cleanup() {
+        val result =
+            askMeta(
+                prompt = "Return a short answer.",
+                logPrefix = "[lifecycle] ",
+            )
+
+        assertTrue(
+            "logical completion callback expected",
+            result.logicalDone,
+        )
+
+        assertTrue(
+            "native cleanup callback expected",
+            result.nativeClean,
+        )
+    }
+
+    /**
+     * Validate the current DELTA contract.
+     *
+     * We do not attempt to deduplicate/overlap-correct chunks. The reconstructed
+     * text is the direct concatenation of exactly what SLM emitted.
+     */
+    @Test
+    fun delta_stream_reconstructs_non_empty_output() {
+        val result =
+            askMeta(
+                prompt = "Explain in two short sentences why local AI can work offline.",
+                logPrefix = "[delta] ",
+            )
+
+        assertTrue(
+            "at least one non-empty delta expected",
+            result.partials > 0,
+        )
+
+        assertTrue(
+            "reconstructed output should not be blank",
+            result.text.isNotBlank(),
+        )
+    }
+
     @Test
     fun empty_prompt_allows_blank_when_flag_false() {
-        val res = askMeta(
-            prompt = "",
-            requireNotBlank = false,
-            logPrefix = "[empty] "
-        )
-        assertNotNull(res.text) // may be blank
-        assertTrue("busy should be false now", waitUntilBusy(false))
-    }
-
-    /** Cancel immediately before any partial arrives: must still observe terminal (finished|onClean). */
-    @Test
-    fun cancel_before_first_partial() {
-        val terminated = CountDownLatch(1)
-        var partialSeen = false
-        var finishedSeen = false
-        var onCleanCalled = false
-
-        SLM.runInference(
-            model = model,
-            input = longPrompt(),
-            listener = { partial, finished ->
-                if (partial.isNotEmpty()) partialSeen = true
-                if (finished) {
-                    finishedSeen = true
-                    terminated.countDown()
-                }
-            },
-            onClean = {
-                onCleanCalled = true
-                terminated.countDown()
-            }
-        )
-
-        assertTrue("busy should become true", waitUntilBusy(true))
-
-        // Cancel ASAP (before first partial if possible).
-        SLM.cancel(model)
+        val result =
+            askMeta(
+                prompt = "",
+                requireNotBlank = false,
+                logPrefix = "[empty] ",
+            )
 
         assertTrue(
-            "previous invocation did not terminate after immediate cancel",
-            terminated.await(5, TimeUnit.SECONDS)
+            "logical completion expected for empty prompt path",
+            result.logicalDone,
         )
-        assertTrue("busy should drop after cancel/termination", waitUntilBusy(false))
-        assertTrue("Either finished or onClean must be seen", finishedSeen || onCleanCalled)
 
-        // Subsequent run should work, but may short-circuit quickly;
-        // busy is checked in askMeta only as best-effort.
-        val res = askMeta(
-            prompt = "Ping after immediate cancel.",
-            logPrefix = "[after-immediate-cancel] "
+        assertTrue(
+            "native cleanup expected for empty prompt path",
+            result.nativeClean,
         )
-        assertTrue(res.text.isNotBlank())
-        Log.i(TAG, "cancel_before_first_partial: partialSeen=$partialSeen")
     }
 
-    /** Calling cancel after completion should be a no-op and keep idle state. */
+    @Test
+    fun cancel_before_first_partial() {
+        cancelRunAndAwaitNativeCleanup(
+            prompt = longPrompt(),
+            waitForFirstPartial = false,
+        )
+
+        val next =
+            ask(
+                prompt = "Ping after immediate cancel.",
+                logPrefix = "[after-immediate-cancel] ",
+            )
+
+        assertTrue(
+            "model should remain usable after immediate cancel",
+            next.isNotBlank(),
+        )
+    }
+
     @Test
     fun cancel_after_finish_is_noop() {
-        val txt = ask("Short answer please.", logPrefix = "[finish-then-cancel] ")
-        assertTrue(txt.isNotBlank())
-        assertTrue("should be idle", waitUntilBusy(false))
+        val first =
+            ask(
+                prompt = "Short answer please.",
+                logPrefix = "[finish-then-cancel] ",
+            )
 
-        // Cancel after finish: should not throw nor flip busy=true.
-        runCatching { SLM.cancel(model) }
-        assertTrue("still idle after post-finish cancel", waitUntilBusy(false))
+        assertTrue(
+            "first output should not be blank",
+            first.isNotBlank(),
+        )
+
+        runCatching {
+            SLM.cancel(model)
+        }.getOrElse { error ->
+            throw AssertionError(
+                "Cancel after completion should not throw",
+                error,
+            )
+        }
+
+        /**
+         * Behavioral assertion:
+         * the backend must still accept another request.
+         */
+        val second =
+            ask(
+                prompt = "Answer OK.",
+                logPrefix = "[after-post-finish-cancel] ",
+            )
+
+        assertTrue(
+            "backend should remain usable after post-finish cancel",
+            second.isNotBlank(),
+        )
     }
 
-    /** Re-initialization should be idempotent (no error, instance remains valid). */
     @Test
     fun reinitialize_is_idempotent() {
-        val err = initModel(model)
-        assertTrue("Second initialize should not error: $err", err.isNullOrEmpty())
-        assertNotNull("Model instance should still exist", model.instance)
+        runCatching {
+            initializeModelBlocking(model)
+        }.getOrElse { error ->
+            throw AssertionError(
+                "Second initializeIfNeeded should succeed",
+                error,
+            )
+        }
+
+        /**
+         * Verify real usability rather than checking the removed Model.instance.
+         */
+        val output =
+            ask(
+                prompt = "Answer READY.",
+                logPrefix = "[reinit] ",
+            )
+
+        assertTrue(
+            "model should remain usable after idempotent initialize",
+            output.isNotBlank(),
+        )
     }
 
-    /** Repeated runs with explicit resets in between to catch lingering state issues. */
     @Test
     fun repeated_runs_with_intermediate_resets() {
-        repeat(5) { i ->
-            val res = askMeta(
-                prompt = "Run #$i: say hello briefly.",
-                logPrefix = "[repeat-$i] "
+        repeat(5) { index ->
+            val result =
+                askMeta(
+                    prompt = "Run #$index: say hello briefly.",
+                    logPrefix = "[repeat-$index] ",
+                )
+
+            assertTrue(
+                "[$index] non-blank output expected",
+                result.text.isNotBlank(),
             )
-            assertTrue("[$i] non-blank", res.text.isNotBlank())
-            assertTrue("[$i] idle before reset", waitUntilBusy(false))
-            runCatching { SLM.resetSession(model) }
-            assertTrue("[$i] idle after reset", waitUntilBusy(false))
+
+            /**
+             * askMeta() has already observed native cleanup, so it is now safe
+             * to reset the conversation.
+             */
+            SLM.resetConversation(
+                model = model,
+                supportImage = false,
+                supportAudio = false,
+                systemMessage = null,
+                tools = emptyList(),
+            )
+
+            /**
+             * resetConversation is a control operation whose implementation may
+             * schedule internal work. Give it a small scheduling grace. The
+             * next inference is still the real correctness check.
+             */
+            SystemClock.sleep(CONTROL_SETTLE_MS)
         }
+
+        val after =
+            ask(
+                prompt = "Final request after repeated resets: answer OK.",
+                logPrefix = "[after-resets] ",
+            )
+
+        assertTrue(
+            "backend should remain usable after repeated resets",
+            after.isNotBlank(),
+        )
     }
 
-    /** Very long prompt smoke: should complete within timeout and produce non-empty output. */
+    @Test
+    fun explicit_reset_keeps_model_usable() {
+        val before =
+            ask(
+                prompt = "Before reset: answer BEFORE.",
+                logPrefix = "[before-reset] ",
+            )
+
+        assertTrue(
+            "pre-reset output should not be blank",
+            before.isNotBlank(),
+        )
+
+        SLM.resetConversation(
+            model = model,
+            supportImage = false,
+            supportAudio = false,
+            systemMessage = null,
+            tools = emptyList(),
+        )
+
+        SystemClock.sleep(CONTROL_SETTLE_MS)
+
+        val after =
+            ask(
+                prompt = "After reset: answer AFTER.",
+                logPrefix = "[after-reset] ",
+            )
+
+        assertTrue(
+            "post-reset output should not be blank",
+            after.isNotBlank(),
+        )
+    }
+
     @Test
     fun long_prompt_completes_and_non_empty() {
-        val res = askMeta(
-            prompt = longPrompt(),
-            timeoutSec = TIMEOUT_SEC,
-            logPrefix = "[long] "
+        val result =
+            askMeta(
+                prompt = longPrompt(),
+                timeoutMs = GENERATION_TIMEOUT_MS,
+                logPrefix = "[long] ",
+            )
+
+        assertTrue(
+            "long prompt output should not be blank",
+            result.text.isNotBlank(),
         )
-        assertTrue("long prompt output should not be blank", res.text.isNotBlank())
-        assertTrue("should be idle after long", waitUntilBusy(false))
-        assertTrue("should have streamed >0 partials", res.partials > 0)
+
+        assertTrue(
+            "long prompt should stream at least one delta",
+            result.partials > 0,
+        )
+
+        assertTrue(
+            "long prompt must reach logical completion",
+            result.logicalDone,
+        )
+
+        assertTrue(
+            "long prompt must reach native cleanup",
+            result.nativeClean,
+        )
     }
 
-    /** Overlap function edge cases. */
+    /**
+     * Control-only smoke test: force cleanup then initialize again.
+     *
+     * This exercises the strongest teardown path and verifies reusability.
+     */
     @Test
-    fun compute_overlap_edge_cases() {
-        assertEquals(0, computeOverlap("", "abc"))
-        assertEquals(0, computeOverlap("abc", ""))
-        assertEquals(3, computeOverlap("abc", "abc"))
-        assertEquals(2, computeOverlap("zzab", "abxx"))
-        assertEquals(1, computeOverlap("xy", "y"))
-        assertEquals(0, computeOverlap("abcd", "efgh"))
+    fun force_cleanup_then_reinitialize_succeeds() {
+        val cleaned =
+            forceCleanUpBlocking(
+                targetModel = model,
+                timeoutMs = NATIVE_CLEANUP_TIMEOUT_MS,
+            )
+
+        assertTrue(
+            "forceCleanUp callback expected",
+            cleaned,
+        )
+
+        initializeModelBlocking(model)
+
+        val output =
+            ask(
+                prompt = "After force cleanup and reinitialize, answer OK.",
+                logPrefix = "[force-reinit] ",
+            )
+
+        assertTrue(
+            "model should be usable after force cleanup + reinitialize",
+            output.isNotBlank(),
+        )
     }
 
-    /** appendFinishChunkSafely edge cases (non-prefix full, partial tail). */
+    /**
+     * Sanity check for test assumptions.
+     *
+     * The current deterministic test configuration should remain stable.
+     */
     @Test
-    fun append_finish_chunk_edge_cases() {
-        val sb1 = StringBuilder("Hello")
-        appendFinishChunkSafely(sb1, "") // no-op
-        assertEquals("Hello", sb1.toString())
+    fun test_model_configuration_is_deterministic() {
+        assertEquals(
+            1,
+            model.getIntConfigValue(
+                ConfigKey.TOP_K,
+                -1,
+            ),
+        )
 
-        // Full text that does NOT start with current buffer: should append tail-only via overlap.
-        val sb2 = StringBuilder("Hello, ")
-        appendFinishChunkSafely(sb2, "llo, world!") // overlaps "llo, "
-        assertEquals("Hello, world!", sb2.toString())
+        assertEquals(
+            0.0f,
+            model.getFloatConfigValue(
+                ConfigKey.TOP_P,
+                -1f,
+            ),
+            0.0001f,
+        )
+
+        assertEquals(
+            0.0f,
+            model.getFloatConfigValue(
+                ConfigKey.TEMPERATURE,
+                -1f,
+            ),
+            0.0001f,
+        )
+
+        assertFalse(
+            "model path must not be blank",
+            model.taskPath.isBlank(),
+        )
+
     }
 }

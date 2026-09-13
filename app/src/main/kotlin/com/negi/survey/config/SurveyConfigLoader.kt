@@ -29,8 +29,7 @@
  *
  *  Notes:
  *  ---------------------------------------------------------------------
- *   • Validation assumes a single-successor graph using nextId.
- *     If you later introduce branching (per-option next ids), update validation.
+ *   • Validation follows nextId and optional SINGLE_CHOICE answer routes.
  * =====================================================================
  */
 
@@ -76,6 +75,7 @@ data class SurveyConfig(
     val graph: Graph,
     val slm: SlmMeta = SlmMeta(),
     val whisper: WhisperMeta = WhisperMeta(),
+    val tts: TtsMeta = TtsMeta(),
     @SerialName("model_defaults") val modelDefaults: ModelDefaults = ModelDefaults()
 ) {
 
@@ -142,14 +142,31 @@ data class SurveyConfig(
     enum class FollowupOutputMode { JSON, TEXT;
 
         companion object {
-            fun parse(raw: String?): FollowupOutputMode {
-                val norm = raw?.trim()?.uppercase().orEmpty()
-                return when (norm) {
-                    "TEXT", "PLAIN", "PLAIN_TEXT", "PLAINTEXT" -> TEXT
-                    "JSON" -> JSON
-                    else -> JSON
+            private val textAliases = setOf("TEXT", "PLAIN", "PLAIN_TEXT", "PLAINTEXT")
+
+            fun parseOrNull(raw: String?): FollowupOutputMode? {
+                if (raw == null) return JSON
+
+                val norm = raw.trim().uppercase()
+                return when {
+                    norm.isEmpty() -> null
+                    norm == "JSON" -> JSON
+                    norm in textAliases -> TEXT
+                    else -> null
                 }
             }
+
+            /**
+             * Backward-compatible resolver.
+             *
+             * Unknown values still resolve to JSON so existing unvalidated callers
+             * keep deterministic behavior. validate() reports unknown values.
+             */
+            fun parse(raw: String?): FollowupOutputMode =
+                parseOrNull(raw) ?: JSON
+
+            fun isRecognized(raw: String?): Boolean =
+                parseOrNull(raw) != null
         }
     }
 
@@ -221,6 +238,19 @@ data class SurveyConfig(
         @SerialName("target_sample_rate") val targetSampleRate: Int? = null,
         @SerialName("record_sample_rates") val recordSampleRates: List<Int>? = null,
         @SerialName("compute_checksum") val computeChecksum: Boolean? = null
+    )
+
+    /**
+     * Text-to-speech configuration: whether/how survey questions are read aloud
+     * using the Android platform TextToSpeech engine.
+     */
+    @Serializable
+    data class TtsMeta(
+        @SerialName("enabled") val enabled: Boolean? = null,
+        @SerialName("language") val language: String? = null,
+        @SerialName("auto_play") val autoPlay: Boolean? = null,
+        @SerialName("speech_rate") val speechRate: Float? = null,
+        @SerialName("pitch") val pitch: Float? = null
     )
 
     @Serializable
@@ -466,6 +496,13 @@ data class SurveyConfig(
         val ids = rawIds.map { it.trim() }
         val idSet = ids.filter { it.isNotBlank() }.toSet()
 
+        fun NodeDTO.outgoingIds(): List<String> = buildList {
+            nextId?.trim()?.takeIf { it.isNotBlank() }?.let(::add)
+            nextIdByAnswer.values.forEach { destination ->
+                destination.trim().takeIf { it.isNotBlank() }?.let(::add)
+            }
+        }
+
         val blankIds = rawIds.filter { it.isBlank() }.distinct()
         if (blankIds.isNotEmpty()) {
             issues += "graph.nodes contains blank id entries"
@@ -481,6 +518,9 @@ data class SurveyConfig(
         }
 
         val startIdNorm = graph.startId.trim()
+        if (graph.startId.isNotBlank() && graph.startId != startIdNorm) {
+            issues += "graph.startId has leading/trailing whitespace: '${graph.startId}'"
+        }
         if (startIdNorm.isNotBlank() && startIdNorm !in idSet) {
             issues += "graph.startId='${graph.startId}' not found in node ids: ${idSet.joinToString(",")}"
         }
@@ -558,6 +598,32 @@ data class SurveyConfig(
         if (legacyDuplicateTargets.isNotEmpty()) {
             issues += "multiple prompts defined for nodeIds: ${legacyDuplicateTargets.joinToString(",")}"
         }
+
+        fun validateSplitEntries(list: List<NodePrompt>, label: String) {
+            val blankIds = list.count { it.nodeId.isBlank() }
+            if (blankIds > 0) {
+                issues += "$label contains blank nodeId entries (count=$blankIds)"
+            }
+
+            val whitespaceIds = list
+                .map { it.nodeId }
+                .filter { it.isNotBlank() && it != it.trim() }
+                .distinct()
+            if (whitespaceIds.isNotEmpty()) {
+                issues += "$label contains nodeIds with leading/trailing whitespace: ${whitespaceIds.joinToString(",")}"
+            }
+
+            val blankPromptIds = list
+                .filter { it.nodeId.isNotBlank() && it.prompt.isBlank() }
+                .map { it.nodeId.trim() }
+                .distinct()
+            if (blankPromptIds.isNotEmpty()) {
+                issues += "$label contains blank prompts for nodeIds: ${blankPromptIds.joinToString(",")}"
+            }
+        }
+
+        validateSplitEntries(promptsEval, "prompts_eval")
+        validateSplitEntries(promptsFollowup, "prompts_followup")
 
         fun duplicateNodeIds(list: List<NodePrompt>, label: String) {
             val dup = list
@@ -645,6 +711,11 @@ data class SurveyConfig(
             if (isTwoStepForId) hasAnyTwoStep = true
         }
 
+        if (!FollowupOutputMode.isRecognized(slm.followupOutputMode)) {
+            issues += "slm.followup_output_mode must be JSON or TEXT " +
+                    "(accepted text aliases: PLAIN, PLAIN_TEXT, PLAINTEXT; got '${slm.followupOutputMode}')"
+        }
+
         if (hasAnyTwoStep) {
             val hasEvalContract = !(slm.keyContractEval.isNullOrBlank() && slm.keyContract.isNullOrBlank())
             val hasFollowContract = !(slm.keyContractFollowup.isNullOrBlank() && slm.keyContract.isNullOrBlank())
@@ -656,14 +727,26 @@ data class SurveyConfig(
             if (mode == FollowupOutputMode.TEXT) {
                 val followContract = (slm.keyContractFollowup ?: slm.keyContract).orEmpty()
                 val strict = (slm.strictOutputFollowup ?: slm.strictOutput).orEmpty()
-                val hasJsonHints =
-                    followContract.contains("RAW JSON", ignoreCase = true) ||
-                            followContract.contains("JSON", ignoreCase = true) ||
-                            followContract.contains("\"followup_question\"", ignoreCase = true) ||
-                            followContract.contains("Keys", ignoreCase = true)
-                val strictHasJsonHints =
-                    strict.contains("RAW JSON", ignoreCase = true) ||
-                            strict.contains("COMPACT JSON", ignoreCase = true)
+                fun appearsToRequireJson(text: String): Boolean {
+                    val t = text.lowercase()
+                    val explicitlyNegatesJson =
+                        "no json" in t ||
+                                "not json" in t ||
+                                "do not output json" in t ||
+                                "don't output json" in t ||
+                                "without json" in t
+
+                    if (explicitlyNegatesJson) return false
+
+                    return "raw json" in t ||
+                            "compact json" in t ||
+                            "\"followup_question\"" in t ||
+                            "json object" in t ||
+                            "json keys" in t
+                }
+
+                val hasJsonHints = appearsToRequireJson(followContract)
+                val strictHasJsonHints = appearsToRequireJson(strict)
 
                 if (hasJsonHints) {
                     issues += "followup_output_mode=TEXT but key_contract_followup appears JSON-oriented (update contract to plain text only)"
@@ -696,6 +779,29 @@ data class SurveyConfig(
                         issues += "node '${node.id}' references unknown nextId='$next'"
                     }
                 }
+
+            if (node.nextIdByAnswer.isNotEmpty() && node.nodeType() != NodeType.SINGLE_CHOICE) {
+                issues += "node '${node.id}' defines nextIdByAnswer but is not SINGLE_CHOICE"
+            }
+
+            node.nextIdByAnswer.forEach { (answer, destination) ->
+                when {
+                    answer.isBlank() ->
+                        issues += "node '${node.id}' nextIdByAnswer contains a blank answer key"
+
+                    answer !in node.options ->
+                        issues += "node '${node.id}' nextIdByAnswer key '$answer' does not exactly match an option"
+                }
+
+                val target = destination.trim()
+                when {
+                    target.isBlank() ->
+                        issues += "node '${node.id}' nextIdByAnswer for '$answer' has a blank destination"
+
+                    target !in idSet ->
+                        issues += "node '${node.id}' nextIdByAnswer for '$answer' references unknown destination '$target'"
+                }
+            }
         }
 
         graph.nodes
@@ -716,6 +822,17 @@ data class SurveyConfig(
                     val blankOpts = node.options.filter { it.isBlank() }.distinct()
                     if (blankOpts.isNotEmpty()) {
                         issues += "Choice node '${node.id}' contains blank option entries"
+                    }
+
+                    val duplicateOptions = node.options
+                        .map { it.trim() }
+                        .filter { it.isNotBlank() }
+                        .groupingBy { it }
+                        .eachCount()
+                        .filterValues { it > 1 }
+                        .keys
+                    if (duplicateOptions.isNotEmpty()) {
+                        issues += "Choice node '${node.id}' contains duplicate options: ${duplicateOptions.joinToString(",")}"
                     }
                 }
             }
@@ -757,8 +874,9 @@ data class SurveyConfig(
                 val cur = queue.removeFirst()
                 if (!visited.add(cur)) continue
                 val node = nodeById[cur] ?: continue
-                val next = node.nextId?.trim()?.takeIf { it.isNotBlank() }
-                if (next != null && next in idSet) queue.add(next)
+                node.outgoingIds()
+                    .filter { it in idSet }
+                    .forEach(queue::add)
             }
 
             val unreachable = idSet - visited
@@ -774,19 +892,27 @@ data class SurveyConfig(
             }
 
             run {
-                val seen = HashSet<String>()
-                var cur: String? = startIdNorm
-                var cycle = false
-                while (cur != null && cur in idSet) {
-                    if (!seen.add(cur)) {
-                        cycle = true
-                        break
-                    }
-                    val n = nodeById[cur]
-                    cur = n?.nextId?.trim()?.takeIf { it.isNotBlank() }
+                val visiting = HashSet<String>()
+                val visitedForCycles = HashSet<String>()
+
+                fun hasCycle(nodeId: String): Boolean {
+                    if (nodeId in visiting) return true
+                    if (nodeId in visitedForCycles) return false
+
+                    visiting += nodeId
+                    val cycleFound = nodeById[nodeId]
+                        ?.outgoingIds()
+                        .orEmpty()
+                        .asSequence()
+                        .filter { it in idSet }
+                        .any(::hasCycle)
+                    visiting -= nodeId
+                    visitedForCycles += nodeId
+                    return cycleFound
                 }
-                if (cycle) {
-                    issues += "cycle detected in nextId chain starting from startId='$startIdNorm'"
+
+                if (hasCycle(startIdNorm)) {
+                    issues += "cycle detected in survey graph starting from startId='$startIdNorm'"
                 }
             }
         }
@@ -817,6 +943,15 @@ data class SurveyConfig(
             }
         }
 
+        tts.language?.let { lang ->
+            val norm = lang.trim().lowercase()
+            if (norm !in setOf("auto", "en", "ja", "sw")) {
+                issues += "tts.language should be one of 'auto','en','ja','sw' (got '$lang')"
+            }
+        }
+        tts.speechRate?.let { if (it <= 0f) issues += "tts.speech_rate must be > 0 (got $it)" }
+        tts.pitch?.let { if (it <= 0f) issues += "tts.pitch must be > 0 (got $it)" }
+
         modelDefaults.modelName?.let { if (it.isBlank()) issues += "model_defaults.model_name is blank" }
         modelDefaults.defaultModelUrl?.let { if (it.isBlank()) issues += "model_defaults.default_model_url is blank" }
         modelDefaults.defaultFileName?.let { if (it.isBlank()) issues += "model_defaults.default_file_name is blank" }
@@ -827,8 +962,7 @@ data class SurveyConfig(
         return issues
     }
 
-    fun requireValid() {
-        val issues = validate()
+    fun requireValid(issues: List<String> = validate()) {
         require(issues.isEmpty()) {
             "SurveyConfig validation failed:\n- " + issues.joinToString("\n- ")
         }
@@ -853,7 +987,8 @@ data class NodeDTO(
     val title: String = "",
     val question: String = "",
     val options: List<String> = emptyList(),
-    val nextId: String? = null
+    val nextId: String? = null,
+    val nextIdByAnswer: Map<String, String> = emptyMap()
 ) {
     fun nodeType(): NodeType = NodeType.from(type)
 }
@@ -942,6 +1077,19 @@ object SurveyConfigLoader {
         explicitNulls = false
     }
 
+    /**
+     * Strict JSON parser for configuration validation.
+     *
+     * Unknown keys and non-standard JSON syntax are rejected so configuration
+     * typos cannot silently disappear.
+     */
+    private val jsonStrict: Json = Json {
+        ignoreUnknownKeys = false
+        prettyPrint = false
+        isLenient = false
+        explicitNulls = false
+    }
+
     private fun createYaml(strict: Boolean): Yaml =
         Yaml(
             configuration = YamlConfiguration(
@@ -987,14 +1135,37 @@ object SurveyConfigLoader {
         format: ConfigFormat = ConfigFormat.AUTO
     ): SurveyConfig =
         fromAssets(context, fileName, charset, format).also {
-            if (debugPrompts) Log.d(TAG, "Loaded config (assets/$fileName): ${it.debugSummary()}")
-            if (debugValidate) {
-                val issues = it.validate()
-                Log.d(TAG, "fromAssetsValidated -> issues=${issues.size} (${it.debugSummary()})")
-                issues.forEach { msg -> Log.d(TAG, "  - $msg") }
+            val issues = it.validate()
+            logValidation("fromAssetsValidated", it, issues)
+            it.requireValid(issues)
+        }
+
+    /**
+     * Strict schema + structural validation for asset configs.
+     *
+     * Unlike fromAssetsValidated(), this rejects unknown JSON/YAML keys.
+     */
+    fun fromAssetsStrictValidated(
+        context: Context,
+        fileName: String,
+        charset: Charset = Charsets.UTF_8,
+        format: ConfigFormat = ConfigFormat.AUTO
+    ): SurveyConfig =
+        try {
+            context.assets.open(fileName).bufferedReader(charset).use { reader ->
+                fromStringStrictValidated(
+                    text = reader.readText(),
+                    format = format,
+                    fileNameHint = fileName
+                )
             }
-            if (debugDumpSystemPrompts) Log.d(TAG, it.debugDump())
-            it.requireValid()
+        } catch (ex: IllegalArgumentException) {
+            throw ex
+        } catch (ex: Exception) {
+            throw IllegalArgumentException(
+                "Failed to load strict SurveyConfig from assets/$fileName: ${ex.message}",
+                ex
+            )
         }
 
     fun fromFile(
@@ -1022,15 +1193,39 @@ object SurveyConfigLoader {
         format: ConfigFormat = ConfigFormat.AUTO
     ): SurveyConfig =
         fromFile(path, charset, format).also {
-            if (debugPrompts) Log.d(TAG, "Loaded config (file/$path): ${it.debugSummary()}")
-            if (debugValidate) {
-                val issues = it.validate()
-                Log.d(TAG, "fromFileValidated -> issues=${issues.size} (${it.debugSummary()})")
-                issues.forEach { msg -> Log.d(TAG, "  - $msg") }
-            }
-            if (debugDumpSystemPrompts) Log.d(TAG, it.debugDump())
-            it.requireValid()
+            val issues = it.validate()
+            logValidation("fromFileValidated", it, issues)
+            it.requireValid(issues)
         }
+
+    /**
+     * Strict schema + structural validation for filesystem configs.
+     */
+    fun fromFileStrictValidated(
+        path: String,
+        charset: Charset = Charsets.UTF_8,
+        format: ConfigFormat = ConfigFormat.AUTO
+    ): SurveyConfig {
+        val file = File(path)
+        require(file.exists()) { "Config file not found: $path" }
+
+        return try {
+            file.bufferedReader(charset).use { reader ->
+                fromStringStrictValidated(
+                    text = reader.readText(),
+                    format = format,
+                    fileNameHint = file.name
+                )
+            }
+        } catch (ex: IllegalArgumentException) {
+            throw ex
+        } catch (ex: Exception) {
+            throw IllegalArgumentException(
+                "Failed to load strict SurveyConfig from file '$path': ${ex.message}",
+                ex
+            )
+        }
+    }
 
     fun toFile(
         config: SurveyConfig,
@@ -1041,7 +1236,13 @@ object SurveyConfigLoader {
         strictYaml: Boolean = false
     ) {
         val file = File(path)
-        file.parentFile?.mkdirs()
+        file.parentFile?.let { parent ->
+            if (!parent.exists()) {
+                check(parent.mkdirs()) {
+                    "Failed to create parent directory: ${parent.absolutePath}"
+                }
+            }
+        }
 
         val chosen = when (format) {
             ConfigFormat.JSON -> ConfigFormat.JSON
@@ -1109,43 +1310,126 @@ object SurveyConfigLoader {
         return cfg
     }
 
+    /**
+     * Structural validation using the lenient parser.
+     *
+     * Unknown keys remain ignored for backward compatibility.
+     * Use fromStringStrictValidated() when configuration typos must fail fast.
+     */
     fun fromStringValidated(
         text: String,
         format: ConfigFormat = ConfigFormat.AUTO,
         fileNameHint: String? = null
     ): SurveyConfig =
         fromString(text, format, fileNameHint).also {
-            if (debugValidate) {
-                val issues = it.validate()
-                Log.d(TAG, "fromStringValidated -> issues=${issues.size} (${it.debugSummary()})")
-                issues.forEach { msg -> Log.d(TAG, "  - $msg") }
-            }
-            if (debugDumpSystemPrompts) Log.d(TAG, it.debugDump())
-            it.requireValid()
+            val issues = it.validate()
+            logValidation("fromStringValidated", it, issues)
+            it.requireValid(issues)
         }
 
-    fun fromStringYamlStrictValidated(
+    /**
+     * Strict schema parsing + structural validation for either JSON or YAML.
+     *
+     * - JSON: rejects unknown keys and non-standard lenient syntax.
+     * - YAML: rejects unknown keys through Kaml strictMode.
+     */
+    fun fromStringStrictValidated(
         text: String,
+        format: ConfigFormat = ConfigFormat.AUTO,
         fileNameHint: String? = null
     ): SurveyConfig {
         val sanitized = text.normalizeText()
-        try {
-            val cfg = yamlStrict.decodeFromString(SurveyConfig.serializer(), sanitized)
-            if (debugPrompts) Log.d(TAG, "strictYaml loaded (${fileNameHint.orEmpty()}): ${cfg.debugSummary()}")
-            if (debugValidate) {
-                val issues = cfg.validate()
-                Log.d(TAG, "fromStringYamlStrictValidated -> issues=${issues.size} (${cfg.debugSummary()})")
-                issues.forEach { msg -> Log.d(TAG, "  - $msg") }
+        val decision = decideFormat(
+            desired = format,
+            fileName = fileNameHint,
+            text = sanitized
+        )
+
+        if (debugFormat) {
+            Log.d(
+                TAG,
+                "fromStringStrictValidated -> ${decision.debugString()} " +
+                        "file='${fileNameHint.orEmpty()}'"
+            )
+        }
+
+        val cfg = try {
+            when (decision.format) {
+                ConfigFormat.JSON ->
+                    jsonStrict.decodeFromString(SurveyConfig.serializer(), sanitized)
+
+                ConfigFormat.YAML ->
+                    yamlStrict.decodeFromString(SurveyConfig.serializer(), sanitized)
+
+                ConfigFormat.AUTO ->
+                    error("AUTO should have been resolved before decoding; this is a bug.")
             }
-            if (debugDumpSystemPrompts) Log.d(TAG, cfg.debugDump())
-            cfg.requireValid()
-            return cfg
         } catch (ex: Exception) {
             val preview = sanitized.safePreview()
             throw IllegalArgumentException(
-                "Failed strict YAML parse (file='${fileNameHint.orEmpty()}'). First 200 chars: $preview :: ${ex.message}",
+                "Strict parsing error (${decision.debugString()}, " +
+                        "file='${fileNameHint.orEmpty()}'). " +
+                        "First 200 chars: $preview :: ${ex.message}",
                 ex
             )
+        }
+
+        if (debugPrompts) {
+            Log.d(
+                TAG,
+                "strict config loaded (${fileNameHint.orEmpty()}): ${cfg.debugSummary()}"
+            )
+        }
+        if (debugDumpSystemPrompts) {
+            Log.d(TAG, cfg.debugDump())
+        }
+
+        val issues = cfg.validate()
+        logValidation("fromStringStrictValidated", cfg, issues)
+        cfg.requireValid(issues)
+
+        return cfg
+    }
+
+    /**
+     * Backward-compatible YAML-specific strict entry point.
+     */
+    fun fromStringYamlStrictValidated(
+        text: String,
+        fileNameHint: String? = null
+    ): SurveyConfig =
+        fromStringStrictValidated(
+            text = text,
+            format = ConfigFormat.YAML,
+            fileNameHint = fileNameHint
+        )
+
+    /**
+     * JSON-specific strict entry point.
+     */
+    fun fromStringJsonStrictValidated(
+        text: String,
+        fileNameHint: String? = null
+    ): SurveyConfig =
+        fromStringStrictValidated(
+            text = text,
+            format = ConfigFormat.JSON,
+            fileNameHint = fileNameHint
+        )
+
+    private fun logValidation(
+        source: String,
+        config: SurveyConfig,
+        issues: List<String>
+    ) {
+        if (!debugValidate) return
+
+        Log.d(
+            TAG,
+            "$source -> issues=${issues.size} (${config.debugSummary()})"
+        )
+        issues.forEach { msg ->
+            Log.d(TAG, "  - $msg")
         }
     }
 

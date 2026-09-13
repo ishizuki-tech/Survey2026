@@ -220,7 +220,6 @@ object WhisperEngine {
 
             val previous = engineState
             val previousKey = previous?.key
-            val current = previous?.ctx
 
             // Double-check inside the lock.
             val st1 = engineState
@@ -258,20 +257,21 @@ object WhisperEngine {
             )
             logMemory("[$requestId][init:file]")
 
+            // Stop publishing the previous context before its suspending release begins.
+            engineState = null
+
             var releasePrevMs = 0L
-            if (current != null) {
+            if (previous != null) {
                 val r0 = SystemClock.elapsedRealtime()
                 runCatching {
                     Log.i(LOG_TAG, "[$requestId][init:file] Releasing previous WhisperContext for key=$previousKey")
-                    current.release()
+                    previous.ctx.release()
                 }.onFailure { e ->
                     Log.w(LOG_TAG, "[$requestId][init:file] Error while releasing previous WhisperContext", e)
                 }
                 releasePrevMs = SystemClock.elapsedRealtime() - r0
                 Log.i(LOG_TAG, "[$requestId][init:file] Released previous context. releasePrevMs=$releasePrevMs")
             }
-
-            engineState = null
 
             val c0 = SystemClock.elapsedRealtime()
             val createdResult = runCatching {
@@ -422,7 +422,6 @@ object WhisperEngine {
 
             val previous = engineState
             val previousKey = previous?.key
-            val current = previous?.ctx
 
             // Double-check inside the lock.
             val st1 = engineState
@@ -460,20 +459,21 @@ object WhisperEngine {
             )
             logMemory("[$requestId][init:asset]")
 
+            // Stop publishing the previous context before its suspending release begins.
+            engineState = null
+
             var releasePrevMs = 0L
-            if (current != null) {
+            if (previous != null) {
                 val r0 = SystemClock.elapsedRealtime()
                 runCatching {
                     Log.i(LOG_TAG, "[$requestId][init:asset] Releasing previous WhisperContext for key=$previousKey")
-                    current.release()
+                    previous.ctx.release()
                 }.onFailure { e ->
                     Log.w(LOG_TAG, "[$requestId][init:asset] Error while releasing previous WhisperContext", e)
                 }
                 releasePrevMs = SystemClock.elapsedRealtime() - r0
                 Log.i(LOG_TAG, "[$requestId][init:asset] Released previous context. releasePrevMs=$releasePrevMs")
             }
-
-            engineState = null
 
             val c0 = SystemClock.elapsedRealtime()
             val createdResult = runCatching {
