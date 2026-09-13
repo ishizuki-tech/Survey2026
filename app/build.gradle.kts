@@ -534,7 +534,7 @@ extensions.configure<ApplicationExtension> {
 
     defaultConfig {
         applicationId = appId
-        minSdk = 26
+        minSdk = 36
         targetSdk = 36
 
         val resolvedVersionName =

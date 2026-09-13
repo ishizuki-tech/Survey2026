@@ -17,14 +17,10 @@
  *
  *  Platform support:
  *  ---------------------------------------------------------------------
- *  Uses MediaStore.Downloads, available without any runtime permission on
- *  API 29+ (an app may freely manage files it created there under scoped
- *  storage). On API < 29 this store is a no-op (returns as "unavailable"):
- *  the app behaves exactly as it did before this feature — private-storage
- *  only, redownloading after every uninstall. Extending this to legacy
- *  storage would need a WRITE_EXTERNAL_STORAGE runtime-permission prompt
- *  (the manifest already declares it, capped at maxSdkVersion 28) and was
- *  intentionally left out to keep this change small and verifiable.
+ *  Uses MediaStore.Downloads, available without any runtime permission
+ *  under scoped storage. This app's minSdk (36) is well above the API 29
+ *  floor MediaStore.Downloads requires, so no legacy/pre-scoped-storage
+ *  fallback is needed.
  * =====================================================================
  */
 
@@ -34,12 +30,9 @@ import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Context
 import android.net.Uri
-import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
 import android.util.Log
-import androidx.annotation.ChecksSdkIntAtLeast
-import androidx.annotation.RequiresApi
 import java.io.File
 
 object PersistentModelStore {
@@ -59,10 +52,6 @@ object PersistentModelStore {
         val size: Long
     )
 
-    /** True when this API level supports the MediaStore-based persistent store. */
-    @ChecksSdkIntAtLeast(api = Build.VERSION_CODES.Q)
-    fun isSupported(): Boolean = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
-
     /**
      * Attempts to satisfy [targetFileName] entirely from persisted storage.
      *
@@ -73,8 +62,8 @@ object PersistentModelStore {
      *   version), [onReplacing] fires with that old file's name and the stale
      *   entry is deleted, then this returns false so the caller proceeds to
      *   download the new one normally.
-     * - If persisted storage is empty, or unsupported on this API level, this
-     *   returns false with neither callback invoked.
+     * - If persisted storage is empty, this returns false with neither
+     *   callback invoked.
      *
      * Never throws: any I/O failure is logged and treated as "not available".
      */
@@ -85,8 +74,6 @@ object PersistentModelStore {
         onReused: (bytes: Long) -> Unit,
         onReplacing: (oldFileName: String) -> Unit
     ): Boolean {
-        if (!isSupported()) return false
-
         return runCatching {
             val entries = listEntries(context)
             val match = entries.firstOrNull { it.displayName == targetFileName }
@@ -129,7 +116,6 @@ object PersistentModelStore {
      * run either way.
      */
     fun persistFromPrivate(context: Context, fileName: String, sourceFile: File): Boolean {
-        if (!isSupported()) return false
         if (!sourceFile.exists() || sourceFile.length() <= 0L) return false
 
         return runCatching {
@@ -183,7 +169,6 @@ object PersistentModelStore {
     // MediaStore helpers
     // ---------------------------------------------------------------------
 
-    @RequiresApi(Build.VERSION_CODES.Q)
     private fun listEntries(context: Context): List<PersistedEntry> {
         val resolver = context.contentResolver
         val projection = arrayOf(
@@ -221,7 +206,6 @@ object PersistentModelStore {
         return out
     }
 
-    @RequiresApi(Build.VERSION_CODES.Q)
     private fun findEntry(context: Context, fileName: String): PersistedEntry? =
         listEntries(context).firstOrNull { it.displayName == fileName }
 

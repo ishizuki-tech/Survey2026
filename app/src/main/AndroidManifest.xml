@@ -102,34 +102,6 @@
 
 
     <!-- ============================================================= -->
-    <!-- Legacy shared-storage compatibility -->
-    <!-- ============================================================= -->
-
-    <!--
-        Legacy read access for Android 12L / API 32 and older.
-
-        Android 13+ replaced broad media access with media-specific permissions
-        and modern document/media APIs. If all file access uses app-private
-        storage, app-specific storage, MediaStore-owned content, or the Storage
-        Access Framework, this permission can eventually be removed.
-    -->
-    <uses-permission
-        android:name="android.permission.READ_EXTERNAL_STORAGE"
-        android:maxSdkVersion="32" />
-
-    <!--
-        Legacy write access for Android 9 / API 28 and older.
-
-        Android 10 introduced scoped-storage behavior and modern code should
-        not depend on WRITE_EXTERNAL_STORAGE.
-    -->
-    <uses-permission
-        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
-        android:maxSdkVersion="28"
-        tools:ignore="ScopedStorage" />
-
-
-    <!-- ============================================================= -->
     <!-- Optional hardware capabilities -->
     <!-- ============================================================= -->
 
