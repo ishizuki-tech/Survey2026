@@ -226,13 +226,18 @@ internal fun canAdvanceAiTurn(
     speechRecording: Boolean,
     speechTranscribing: Boolean,
     hasUnansweredFollowup: Boolean,
-): Boolean =
-    turnCompleted &&
-            !aiLoading &&
+): Boolean {
+    // Next is intentionally always available regardless of the main answer's
+    // submission state (turnCompleted) or an unanswered AI follow-up
+    // (hasUnansweredFollowup) -- the user can move on without resolving
+    // those. It still waits out in-flight work that Next shouldn't race:
+    // an AI response streaming in, a pending submission, or active speech
+    // capture/transcription.
+    return !aiLoading &&
             !mainSubmissionPending &&
             !speechRecording &&
-            !speechTranscribing &&
-            !hasUnansweredFollowup
+            !speechTranscribing
+}
 
 /**
  * Simple abstraction for a speech-to-text controller (e.g., Whisper.cpp).

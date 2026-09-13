@@ -7,24 +7,22 @@ import org.junit.Test
 class AiTurnPolicyTest {
 
     @Test
-    fun fresh_or_typed_but_unsubmitted_main_turn_cannot_advance() {
-        assertFalse(nextEnabled(turnCompleted = false))
-        assertFalse(nextEnabled(turnCompleted = false))
+    fun unsubmitted_main_turn_or_unanswered_followup_can_still_advance() {
+        assertTrue(nextEnabled(turnCompleted = false))
+        assertTrue(nextEnabled(turnCompleted = false, hasUnansweredFollowup = true))
+        assertTrue(nextEnabled(turnCompleted = true, hasUnansweredFollowup = true))
     }
 
     @Test
-    fun pending_submission_loading_or_speech_cannot_advance() {
+    fun pending_submission_loading_or_speech_cannot_advance_regardless_of_turn_state() {
         assertFalse(nextEnabled(turnCompleted = true, mainSubmissionPending = true))
         assertFalse(nextEnabled(turnCompleted = true, aiLoading = true))
         assertFalse(nextEnabled(turnCompleted = true, speechRecording = true))
         assertFalse(nextEnabled(turnCompleted = true, speechTranscribing = true))
-    }
-
-    @Test
-    fun generated_or_typed_followup_cannot_advance_until_persisted_answer_completes_turn() {
-        assertFalse(nextEnabled(turnCompleted = false, hasUnansweredFollowup = true))
-        assertFalse(nextEnabled(turnCompleted = false, hasUnansweredFollowup = true))
-        assertTrue(nextEnabled(turnCompleted = true, hasUnansweredFollowup = false))
+        assertFalse(nextEnabled(turnCompleted = false, mainSubmissionPending = true))
+        assertFalse(nextEnabled(turnCompleted = false, aiLoading = true))
+        assertFalse(nextEnabled(turnCompleted = false, speechRecording = true))
+        assertFalse(nextEnabled(turnCompleted = false, speechTranscribing = true))
     }
 
     @Test
