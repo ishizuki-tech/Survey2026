@@ -153,6 +153,7 @@ import com.negi.survey.vm.FlowMulti
 import com.negi.survey.vm.FlowReview
 import com.negi.survey.vm.FlowSingle
 import com.negi.survey.vm.FlowText
+import com.negi.survey.vm.ModelPersistenceDialog
 import com.negi.survey.vm.NoOpQuestionSpeaker
 import com.negi.survey.vm.QuestionSpeaker
 import com.negi.survey.vm.SurveyViewModel
@@ -821,6 +822,7 @@ fun AppNav() {
     )
 
     val state by appVm.state.collectAsStateWithLifecycle()
+    val persistenceNotice by appVm.persistenceNotice.collectAsStateWithLifecycle()
 
     LaunchedEffect(state) {
         if (state is DlState.Idle) {
@@ -828,6 +830,11 @@ fun AppNav() {
             appVm.ensureModelDownloaded(appContext)
         }
     }
+
+    ModelPersistenceDialog(
+        notice = persistenceNotice,
+        onDismiss = { appVm.dismissPersistenceNotice() }
+    )
 
     DownloadGate(
         state = state,

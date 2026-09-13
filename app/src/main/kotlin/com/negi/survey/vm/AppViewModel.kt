@@ -14,6 +14,7 @@
 package com.negi.survey.vm
 
 import android.content.Context
+import android.util.Log
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
@@ -21,9 +22,11 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
@@ -32,6 +35,7 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.negi.survey.BuildConfig
 import com.negi.survey.utils.HeavyInitializer
+import com.negi.survey.utils.PersistentModelStore
 import java.io.File
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -61,6 +65,21 @@ sealed class DlState {
     ) : DlState()
 }
 
+/* ───────────────────────────── Persistence Notice ───────────────────────────── */
+
+/**
+ * One-shot notice describing an interaction with the on-device persisted
+ * (survives-uninstall) model cache, meant to be surfaced to the user via a
+ * dialog and then dismissed.
+ */
+sealed class ModelPersistenceNotice {
+    /** A previously persisted copy of [fileName] was reused with no network call. */
+    data class Reused(val fileName: String, val bytes: Long) : ModelPersistenceNotice()
+
+    /** A stale persisted copy [oldFileName] was removed to make room for [newFileName]. */
+    data class Replacing(val oldFileName: String, val newFileName: String) : ModelPersistenceNotice()
+}
+
 /* ───────────────────────────── ViewModel ───────────────────────────── */
 
 class AppViewModel(
@@ -78,6 +97,16 @@ class AppViewModel(
 
     @Volatile
     private var downloadJob: Job? = null
+
+    private val _persistenceNotice = MutableStateFlow<ModelPersistenceNotice?>(null)
+
+    /** Exposes a one-shot persisted-storage reuse/replace notice for the UI to show and dismiss. */
+    val persistenceNotice: StateFlow<ModelPersistenceNotice?> = _persistenceNotice.asStateFlow()
+
+    /** Call after the UI has shown [persistenceNotice] to clear it. */
+    fun dismissPersistenceNotice() {
+        _persistenceNotice.value = null
+    }
 
     /**
      * Ensures the target model exists locally, downloading if needed.
@@ -124,6 +153,34 @@ class AppViewModel(
                 }
 
                 val safeName = suggestFileName(modelUrl, fileName)
+
+                if (!forceFresh) {
+                    val privateDestination = File(app.filesDir, safeName)
+                    val reused = runCatching {
+                        PersistentModelStore.reuseOrReplace(
+                            context = app,
+                            targetFileName = safeName,
+                            privateDestination = privateDestination,
+                            onReused = { bytes ->
+                                Log.i("AppViewModel", "Reused persisted model '$safeName' ($bytes bytes)")
+                                _persistenceNotice.value = ModelPersistenceNotice.Reused(safeName, bytes)
+                            },
+                            onReplacing = { oldFileName ->
+                                Log.i("AppViewModel", "Removing stale persisted model '$oldFileName' before downloading '$safeName'")
+                                _persistenceNotice.value = ModelPersistenceNotice.Replacing(oldFileName, safeName)
+                            }
+                        )
+                    }.getOrElse { e ->
+                        Log.w("AppViewModel", "Persisted model store check failed: ${e.message}")
+                        false
+                    }
+
+                    if (reused && privateDestination.exists() && privateDestination.length() > 0L) {
+                        _state.value = DlState.Done(privateDestination)
+                        return@launch
+                    }
+                }
+
                 val token = BuildConfig.HF_TOKEN.takeIf { it.isNotBlank() }
 
                 _state.value = DlState.Downloading(downloaded = 0L, total = null)
@@ -163,7 +220,11 @@ class AppViewModel(
                 if (!isActive) return@launch
 
                 _state.value = result.fold(
-                    onSuccess = { file -> DlState.Done(file) },
+                    onSuccess = { file ->
+                        runCatching { PersistentModelStore.persistFromPrivate(app, safeName, file) }
+                            .onFailure { e -> Log.w("AppViewModel", "Failed to persist model to shared storage: ${e.message}") }
+                        DlState.Done(file)
+                    },
                     onFailure = { error -> DlState.Error(error.message ?: "Download failed") }
                 )
             } catch (ce: CancellationException) {
@@ -367,6 +428,56 @@ fun DownloadGate(
 
         is DlState.Done -> {
             content(state.file)
+        }
+    }
+}
+
+/* ───────────────────────────── Persistence Dialog ───────────────────────────── */
+
+/**
+ * Surfaces [notice] (a one-shot reuse/replace event from the persisted,
+ * survives-uninstall model cache) to the user as an alert dialog, then
+ * calls [onDismiss] to clear it.
+ */
+@Composable
+fun ModelPersistenceDialog(
+    notice: ModelPersistenceNotice?,
+    onDismiss: () -> Unit
+) {
+    when (notice) {
+        null -> Unit
+
+        is ModelPersistenceNotice.Reused -> {
+            val mb = notice.bytes / (1024L * 1024L)
+            AlertDialog(
+                onDismissRequest = onDismiss,
+                title = { Text("Using saved model") },
+                text = {
+                    Text(
+                        "Found \"${notice.fileName}\" already saved on this device " +
+                            "(${mb} MB). Loading it from local storage — no download needed."
+                    )
+                },
+                confirmButton = {
+                    TextButton(onClick = onDismiss) { Text("OK") }
+                }
+            )
+        }
+
+        is ModelPersistenceNotice.Replacing -> {
+            AlertDialog(
+                onDismissRequest = onDismiss,
+                title = { Text("Updating model") },
+                text = {
+                    Text(
+                        "A different saved model (\"${notice.oldFileName}\") is no longer needed. " +
+                            "Removing it and downloading \"${notice.newFileName}\" instead."
+                    )
+                },
+                confirmButton = {
+                    TextButton(onClick = onDismiss) { Text("OK") }
+                }
+            )
         }
     }
 }
