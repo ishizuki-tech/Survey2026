@@ -38,6 +38,8 @@ import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
 import android.util.Log
+import androidx.annotation.ChecksSdkIntAtLeast
+import androidx.annotation.RequiresApi
 import java.io.File
 
 object PersistentModelStore {
@@ -58,6 +60,7 @@ object PersistentModelStore {
     )
 
     /** True when this API level supports the MediaStore-based persistent store. */
+    @ChecksSdkIntAtLeast(api = Build.VERSION_CODES.Q)
     fun isSupported(): Boolean = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
 
     /**
@@ -180,6 +183,7 @@ object PersistentModelStore {
     // MediaStore helpers
     // ---------------------------------------------------------------------
 
+    @RequiresApi(Build.VERSION_CODES.Q)
     private fun listEntries(context: Context): List<PersistedEntry> {
         val resolver = context.contentResolver
         val projection = arrayOf(
@@ -217,6 +221,7 @@ object PersistentModelStore {
         return out
     }
 
+    @RequiresApi(Build.VERSION_CODES.Q)
     private fun findEntry(context: Context, fileName: String): PersistedEntry? =
         listEntries(context).firstOrNull { it.displayName == fileName }
 
