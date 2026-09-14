@@ -58,6 +58,31 @@ interface QuestionSpeaker {
 }
 
 /**
+ * Returns whether a question may begin automatic read-aloud.
+ *
+ * Voice capture and transcription take priority so a question is never played
+ * through the speaker while the microphone flow is active.
+ */
+internal fun shouldAutoPlayQuestion(
+    autoPlayEnabled: Boolean,
+    speechRecording: Boolean = false,
+    speechTranscribing: Boolean = false
+): Boolean = autoPlayEnabled && !speechRecording && !speechTranscribing
+
+/** Performs the action represented by the question speaker button. */
+internal fun toggleQuestionSpeaker(
+    speaker: QuestionSpeaker,
+    text: String,
+    utteranceId: String
+) {
+    if (speaker.isSpeaking.value) {
+        speaker.stop()
+    } else {
+        speaker.speak(text, utteranceId)
+    }
+}
+
+/**
  * [QuestionSpeaker] backed by [android.speech.tts.TextToSpeech].
  *
  * Notes:
@@ -198,6 +223,9 @@ class TtsController(
     }
 
     override fun stop() {
+        // A stop before initialization must also cancel the deferred auto-play.
+        pendingText = null
+        pendingUtteranceId = null
         runCatching { engine?.stop() }
         _isSpeaking.value = false
     }

@@ -166,6 +166,7 @@ import com.negi.survey.slm.PromptPhase
 import com.negi.survey.vm.AiViewModel
 import com.negi.survey.vm.QuestionSpeaker
 import com.negi.survey.vm.SurveyViewModel
+import com.negi.survey.vm.toggleQuestionSpeaker
 import java.security.MessageDigest
 import java.util.Locale
 import kotlin.collections.ArrayDeque
@@ -272,6 +273,23 @@ interface SpeechController {
      */
     fun toggleRecording() {
         if (isRecording.value) stopRecording() else startRecording()
+    }
+}
+
+/**
+ * Toggles microphone capture while keeping question read-aloud out of the
+ * recording path. A recording may not start until the current TTS request has
+ * been stopped and any pending utterance cleared.
+ */
+internal fun toggleSpeechRecordingWithTtsInterlock(
+    speechController: SpeechController,
+    ttsController: QuestionSpeaker?
+) {
+    if (speechController.isRecording.value) {
+        speechController.stopRecording()
+    } else if (!speechController.isTranscribing.value) {
+        ttsController?.stop()
+        speechController.startRecording()
     }
 }
 
@@ -948,7 +966,7 @@ fun AiScreen(
         topBar = {
             CompactTopBar(
                 title = title,
-                onReplay = { ttsController?.speak(rootQuestion, nid) },
+                onReplay = { ttsController?.let { toggleQuestionSpeaker(it, rootQuestion, nid) } },
                 isSpeaking = ttsSpeaking
             )
         },
@@ -1051,7 +1069,9 @@ fun AiScreen(
                             speechTranscribing = speechTranscribing,
                             speechStatusText = speechStatusText,
                             speechStatusIsError = speechStatusIsError,
-                            onToggleSpeech = speechController?.let { sc -> { sc.toggleRecording() } }
+                            onToggleSpeech = speechController?.let { sc ->
+                                { toggleSpeechRecordingWithTtsInterlock(sc, ttsController) }
+                            }
                         )
 
                         HorizontalDivider(
