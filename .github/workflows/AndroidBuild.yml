@@ -71,6 +71,7 @@ jobs:
         with:
           accept-android-sdk-licenses: true
           log-accepted-android-sdk-licenses: false
+          packages: platform-tools
 
       - name: Install Android CLI
         run: |
