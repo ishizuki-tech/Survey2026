@@ -164,7 +164,14 @@ slm:
     Return only compact JSON {"score":N,"missing_points":[],"followup_needed":false}.
     N must be an integer 1-100 for relevance, completeness and accuracy against the original target.
     Evaluate the original answer and all answered followup pairs together.
-    Score 90-100 only when all target-required information is satisfied; otherwise score below 90.
+    Tofautisha uhusiano na ukamilifu. Jibu linaweza kuwa kuhusu mada husika lakini bado lisikamilike.
+    Toa alama 90-100 tu wakati mhojiwa ametoa kwa wazi kila kipengele muhimu kinachohitajika katika Lengo la jibu na Swali.
+    Usikisie maelezo yanayokosekana kutokana na maarifa ya jumla, uwezekano, au kauli tupu kwamba tukio lilitokea.
+    Jibu fupi linaweza kuwa kamili. Jibu refu au linalohusu mada lakini linaloacha kipengele chochote muhimu kinachohitajika lipate chini ya 90.
+    Kwa mfano, kusema kwamba tukio lilitokea bila kueleza athari iliyoombwa ni jibu lisilokamilika.
+    Kanuni ya ulinganifu: ikiwa missing_points si tupu au followup_needed ni true, score lazima iwe nambari kamili kutoka 1 hadi 89.
+    Alama 90-100 zinaruhusiwa tu wakati missing_points=[] na followup_needed=false.
+    Usitumie score 90 kama alama ya mpaka wakati kuna kitu chochote kinachokosekana.
     For score below 90, missing_points must contain the specific missing or ambiguous target-required information
     and followup_needed must be true. Otherwise missing_points is empty and followup_needed is false.
     Do not generate a question. Do not penalize style or request information outside the target.
@@ -173,23 +180,25 @@ slm:
   length_budget_eval: "Keep missing_points concise."
   followup_output_mode: TEXT
   key_contract_followup: >-
-    Generate exactly one short Swahili question addressing one unresolved target-required deficiency in EVAL_JSON.
-    Use the original target, original answer and accumulated answered followup pairs.
-    Do not repeat an earlier question or ask for information already provided. Never add new objectives.
-    Output only the question on one line; no JSON, score, analysis, labels, or quotes.
-  strict_output_followup: "Exactly one Swahili question on one line."
-  length_budget_followup: "Keep the question short and single-scope."
+    Uliza swali moja tu la Kiswahili, fupi na la mazungumzo ya kawaida kwa mhojiwa.
+    Uliza moja kwa moja taarifa moja tu ambayo imeorodheshwa kuwa inakosekana katika EVAL_JSON.
+    Tumia Lengo la jibu, jibu la awali na majibu ya ufuatiliaji yaliyopo kwa muktadha pekee.
+    Usirudie au kufafanua tena swali lote la awali, wala usiulize taarifa ambayo tayari imetolewa.
+    Tumia sentensi moja rahisi; usieleze kwa nini taarifa inahitajika, usitumie maneno ya kujaza kama "ili kujua" au "ili kuelewa",
+    na usirudie nomino, dhana au kifungu bila sababu. Usiongeze malengo mapya, usibuni ukweli, wala usikisie jibu linalokosekana.
+    Usichanganye taarifa nyingi zisizohusiana katika sentensi ndefu. Toa swali pekee kwenye mstari mmoja; hakuna JSON, alama, uchambuzi, lebo au nukuu.
+  strict_output_followup: "Swali moja la Kiswahili (Swahili), fupi, la mazungumzo na sentensi moja tu."
+  length_budget_followup: "Liwe fupi, la moja kwa moja na lenye jambo moja tu."
 
 prompts:
   - nodeId: Q8
     eval_prompt: |-
-      Lengo la jibu: kama FAW iliathiri mazao, na maelezo ya athari hiyo (upotevu wa mavuno, aina ya uharibifu, n.k.).
+      Lengo la jibu: kama FAW iliathiri zao na, kama ndiyo, angalau maelezo moja mahususi ya athari yake, kama vile upotevu wa mavuno au aina ya uharibifu wa zao.
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
     followup_prompt: |-
-      Lengo la jibu: kama FAW iliathiri mazao, na maelezo ya athari hiyo (upotevu wa mavuno, aina ya uharibifu, n.k.).
-      Question: {{QUESTION}}
+      Lengo la jibu: Uliza jinsi minyoo ya majani ilivyoathiri mahindi.
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
       EVAL_JSON: {{EVAL_JSON}}
