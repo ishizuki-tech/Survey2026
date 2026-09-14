@@ -47,7 +47,8 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
     @get:Rule
     val composeRule = createComposeRule()
 
-    override fun configAssetName(): String = "survey_config10.yaml"
+    override fun configAssetName(): String =
+        instrumentationString("configAsset") ?: "survey_config10.yaml"
 
     @Test
     fun q8_real_model_two_step_acceptance() {
