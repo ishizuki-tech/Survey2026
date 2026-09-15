@@ -163,8 +163,15 @@ slm:
     Return only compact JSON {"score":N,"missing_points":[],"followup_needed":false}.
     N must be an integer 1-100 for relevance, completeness and accuracy against the original target.
     Evaluate the original answer and all answered followup pairs together.
-    Score 90-100 only when all target-required information is satisfied; otherwise score below 90.
-    For score below 90, missing_points must contain the specific missing or ambiguous target-required information
+    Separate relevance from completeness. An answer can discuss the right topic but still be incomplete.
+    Score 90-100 only when the respondent explicitly provides every material component requested by the Expected answer target and Question.
+    Do not infer missing details from general knowledge, plausibility, or a bare statement that an event occurred.
+    A concise answer may be complete. A verbose or relevant answer that omits any material requested component must score below 90.
+    For example, saying that an event occurred without describing its requested effect is incomplete.
+    Consistency rule: if missing_points is non-empty or followup_needed is true, score must be an integer from 1 to 89.
+    Scores 90-100 are allowed only when missing_points=[] and followup_needed=false.
+    Never use score 90 as a borderline value when anything is missing.
+    For any score below 90, missing_points must contain the specific missing or ambiguous target-required information
     and followup_needed must be true. Otherwise missing_points is empty and followup_needed is false.
     Do not generate a question. Do not penalize style or request information outside the target.
     Write missing_points in English.
@@ -182,12 +189,12 @@ slm:
 prompts:
   - nodeId: Q8
     eval_prompt: |-
-      Expected answer target: Whether FAW affected the crop, and if so, a description of the effect (yield loss, damage type, etc.).
+      Expected answer target: Whether FAW affected the crop and, if yes, at least one concrete description of its effect, such as yield loss or a type of crop damage.
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
     followup_prompt: |-
-      Expected answer target: Whether FAW affected the crop, and if so, a description of the effect (yield loss, damage type, etc.).
+      Expected answer target: Whether FAW affected the crop and, if yes, at least one concrete description of its effect, such as yield loss or a type of crop damage.
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
