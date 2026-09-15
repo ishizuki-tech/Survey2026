@@ -99,7 +99,7 @@ enum class PromptMode {
 /* ───────────────────────────── Main ViewModel ───────────────────────────── */
 
 open class SurveyViewModel(
-    private val nav: NavBackStack<NavKey>,
+    private var nav: NavBackStack<NavKey>,
     private val config: SurveyConfig
 ) : ViewModel() {
 
@@ -239,6 +239,31 @@ open class SurveyViewModel(
 
     val currentNodeId: String
         get() = _currentNode.value.id
+
+    /*
+     * TTS auto-play is a one-shot event for the currently displayed question.
+     *
+     * The SurveyViewModel survives Activity recreation, while the Compose
+     * LaunchedEffect that requests TTS is recreated. Keep the most recently
+     * auto-played node here so configuration changes do not replay the same
+     * question.
+     *
+     * This state is intentionally not persisted across process death.
+     */
+    private var lastAutoPlayedTtsNodeId: String? = null
+
+    @Synchronized
+    fun claimTtsAutoPlay(nodeId: String): Boolean {
+        val normalizedNodeId = nodeId.trim()
+        if (normalizedNodeId.isBlank()) return false
+
+        if (lastAutoPlayedTtsNodeId == normalizedNodeId) {
+            return false
+        }
+
+        lastAutoPlayedTtsNodeId = normalizedNodeId
+        return true
+    }
 
     private val _canGoBack = MutableStateFlow(false)
     val canGoBack: StateFlow<Boolean> = _canGoBack.asStateFlow()
@@ -809,6 +834,18 @@ open class SurveyViewModel(
         }
     }
 
+    /**
+     * Navigation3 restores a new back-stack object after an Activity recreation.
+     * Keep this logical session ViewModel pointed at that restored object rather
+     * than the disposed composition's stack.
+     */
+    @Synchronized
+    fun attachNavigation(restoredNav: NavBackStack<NavKey>) {
+        if (nav === restoredNav) return
+        nav = restoredNav
+        RuntimeLogStore.d(TAG, "attachNavigation -> navSize=${nav.size}")
+    }
+
     @Synchronized
     fun goto(nodeId: String) {
         val k = nodeId.trim()
@@ -868,6 +905,9 @@ open class SurveyViewModel(
         resetFollowups()
         resetAudioRefs()
         clearSelections()
+
+        // A new run may visit the same node IDs, so allow their TTS to auto-play again.
+        lastAutoPlayedTtsNodeId = null
 
         // Reset run lifecycle.
         _isRunActive.value = false
