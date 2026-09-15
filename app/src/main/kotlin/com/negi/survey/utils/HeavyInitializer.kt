@@ -298,6 +298,8 @@ object HeavyInitializer {
             }
 
         try {
+            return ModelDestinationLock.withLock(finalFile) {
+                try {
             currentCoroutineContext()
                 .ensureActive()
 
@@ -361,7 +363,7 @@ object HeavyInitializer {
                             "totalMs=${elapsedMs(startedAtMs)}",
                 )
 
-                return result
+                return@withLock result
             }
 
             val downloader =
@@ -464,7 +466,7 @@ object HeavyInitializer {
                         "totalMs=${elapsedMs(startedAtMs)}",
             )
 
-            return result
+            return@withLock result
 
         } catch (
             te: TimeoutCancellationException
@@ -507,7 +509,7 @@ object HeavyInitializer {
                 te,
             )
 
-            return result
+            return@withLock result
 
         } catch (
             ie: InterruptedIOException
@@ -542,7 +544,7 @@ object HeavyInitializer {
                 ie,
             )
 
-            return result
+            return@withLock result
 
         } catch (
             ce: CancellationException
@@ -630,7 +632,7 @@ object HeavyInitializer {
                 t,
             )
 
-            return result
+            return@withLock result
 
         } finally {
             flight.ownerJob =
@@ -640,6 +642,14 @@ object HeavyInitializer {
                 flightKey,
                 flight,
             )
+        }
+            }
+        } catch (ce: CancellationException) {
+            /* The coroutine may be cancelled while waiting for the destination lock. */
+            flight.ownerJob = null
+            flight.deferred.complete(Result.failure(IOException("Canceled", ce)))
+            flights.remove(flightKey, flight)
+            throw ce
         }
     }
 
