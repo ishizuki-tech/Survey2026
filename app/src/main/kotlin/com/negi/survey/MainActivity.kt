@@ -136,6 +136,7 @@ import com.negi.survey.screens.DoneScreen
 import com.negi.survey.screens.IntroScreen
 import com.negi.survey.screens.ReviewScreen
 import com.negi.survey.screens.SpeechController
+import com.negi.survey.screens.toggleSpeechRecordingWithTtsInterlock
 import com.negi.survey.slm.LiteRtLM
 import com.negi.survey.slm.LiteRtRepository
 import com.negi.survey.slm.Model
@@ -159,6 +160,8 @@ import com.negi.survey.vm.QuestionSpeaker
 import com.negi.survey.vm.SurveyViewModel
 import com.negi.survey.vm.TtsController
 import com.negi.survey.vm.WhisperSpeechController
+import com.negi.survey.vm.shouldAutoPlayQuestion
+import com.negi.survey.vm.toggleQuestionSpeaker
 import java.util.Locale
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
@@ -1213,6 +1216,7 @@ fun SurveyNavHost(
                     HomeScreen(
                         vmSurvey = vmSurvey,
                         speechController = speechController,
+                        ttsController = ttsController,
                         speechEnabled = voiceEnabled,
                         onStart = {
                             /** Snapshot the home note text before resetting the run. */
@@ -1269,7 +1273,7 @@ fun SurveyNavHost(
                         onValueChange = { vmSurvey.setAnswer(it, node.id) },
                         onNext = { vmSurvey.advanceToNext() },
                         onBack = { vmSurvey.backToPrevious() },
-                        onReplay = { ttsController.speak(node.question, node.id) },
+                        onReplay = { toggleQuestionSpeaker(ttsController, node.question, node.id) },
                         isSpeaking = ttsSpeaking
                     )
                 }
@@ -1300,7 +1304,7 @@ fun SurveyNavHost(
                             vmSurvey.advanceToNext()
                         },
                         onBack = { vmSurvey.backToPrevious() },
-                        onReplay = { ttsController.speak(node.question, node.id) },
+                        onReplay = { toggleQuestionSpeaker(ttsController, node.question, node.id) },
                         isSpeaking = ttsSpeaking
                     )
                 }
@@ -1328,16 +1332,18 @@ fun SurveyNavHost(
                             vmSurvey.advanceToNext()
                         },
                         onBack = { vmSurvey.backToPrevious() },
-                        onReplay = { ttsController.speak(node.question, node.id) },
+                        onReplay = { toggleQuestionSpeaker(ttsController, node.question, node.id) },
                         isSpeaking = ttsSpeaking
                     )
                 }
 
                 entry<FlowAI> {
                     val node by vmSurvey.currentNode.collectAsStateWithLifecycle()
+                    val speechRecording by speechController.isRecording.collectAsStateWithLifecycle()
+                    val speechTranscribing by speechController.isTranscribing.collectAsStateWithLifecycle()
 
                     LaunchedEffect(node.id, node.question, ttsAutoPlay) {
-                        if (ttsAutoPlay) {
+                        if (shouldAutoPlayQuestion(ttsAutoPlay, speechRecording, speechTranscribing)) {
                             runCatching { ttsController.speak(node.question, node.id) }
                         }
                     }
@@ -1855,6 +1861,7 @@ private fun HomeFreeTextComposer(
 private fun HomeScreen(
     vmSurvey: SurveyViewModel,
     speechController: SpeechController,
+    ttsController: QuestionSpeaker,
     speechEnabled: Boolean,
     onStart: () -> Unit,
     onUpdateFreeText: (String) -> Unit
@@ -2086,7 +2093,7 @@ private fun HomeScreen(
                                 )
                             }
                             runCatching {
-                                speechController.toggleRecording()
+                                toggleSpeechRecordingWithTtsInterlock(speechController, ttsController)
                             }
                         }
                     } else {
