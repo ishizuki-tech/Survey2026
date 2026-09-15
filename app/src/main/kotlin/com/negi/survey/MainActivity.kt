@@ -83,6 +83,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
@@ -115,7 +116,6 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
-import androidx.lifecycle.ViewModelStore
 import androidx.lifecycle.ViewModelStoreOwner
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -157,6 +157,7 @@ import com.negi.survey.vm.FlowText
 import com.negi.survey.vm.NoOpQuestionSpeaker
 import com.negi.survey.vm.QuestionSpeaker
 import com.negi.survey.vm.SurveyViewModel
+import com.negi.survey.vm.SurveySessionStore
 import com.negi.survey.vm.TtsController
 import com.negi.survey.vm.WhisperSpeechController
 import com.negi.survey.vm.shouldAutoPlayQuestion
@@ -609,6 +610,13 @@ private fun AppRoot() {
 @Composable
 fun AppNav() {
     val appContext = LocalContext.current.applicationContext
+    val activityVmOwner = checkNotNull(LocalViewModelStoreOwner.current) {
+        "AppNav requires an Activity ViewModelStoreOwner"
+    }
+    val sessionStore: SurveySessionStore = viewModel(
+        viewModelStoreOwner = activityVmOwner,
+        key = "SurveySessionStore"
+    )
 
     val options = remember(appContext) {
         val assetManager = appContext.assets
@@ -777,6 +785,7 @@ fun AppNav() {
                         OutlinedButton(
                             onClick = {
                                 Log.d(MainActivity.TAG, "Error -> Back to selector. session=$sessionKey")
+                                sessionStore.clearSession(sessionKey)
                                 chosenId = null
                             }
                         ) {
@@ -791,24 +800,8 @@ fun AppNav() {
 
     val cfg = config!!
 
-    /*
-     * Session ViewModels are intentionally composition-scoped here.
-     * A full Activity recreation creates a new store; if survey progress must
-     * survive configuration changes, move navigation + session state into a
-     * retained state holder rather than retaining this store alone.
-     */
-    val sessionVmStore = remember(sessionKey) { ViewModelStore() }
-    val sessionVmOwner = remember(sessionVmStore) {
-        object : ViewModelStoreOwner {
-            override val viewModelStore: ViewModelStore = sessionVmStore
-        }
-    }
-
-    DisposableEffect(sessionKey) {
-        onDispose {
-            Log.d(MainActivity.TAG, "Session dispose -> clearing ViewModelStore. session=$sessionKey")
-            sessionVmStore.clear()
-        }
+    val sessionVmOwner = remember(sessionStore, sessionKey) {
+        sessionStore.ownerFor(sessionKey)
     }
 
     val appVm: AppViewModel = viewModel(
@@ -883,7 +876,7 @@ fun AppNav() {
         ) {
             val backStack = rememberNavBackStack(FlowHome)
 
-            val repo: Repository = remember(sessionKey, slmModel, cfg) {
+            val repo: Repository = sessionStore.repositoryFor(sessionKey) {
                 LiteRtRepository(
                     model = slmModel,
                     config = cfg,
@@ -958,6 +951,10 @@ fun AppNav() {
                 }
             )
 
+            SideEffect {
+                vmSurvey.attachNavigation(backStack)
+            }
+
             val vmAI: AiViewModel = viewModel(
                 viewModelStoreOwner = sessionVmOwner,
                 key = "AiViewModel_${sessionKey}_${slmModel.name}",
@@ -971,6 +968,7 @@ fun AppNav() {
 
             val resetToSelector: () -> Unit = {
                 Log.d(MainActivity.TAG, "resetToSelector invoked. session=$sessionKey")
+                sessionStore.clearSession(sessionKey)
                 chosenId = null
             }
 
@@ -1265,7 +1263,7 @@ fun SurveyNavHost(
                     val ttsSpeaking by ttsController.isSpeaking.collectAsStateWithLifecycle()
 
                     LaunchedEffect(node.id, node.question, ttsAutoPlay) {
-                        if (ttsAutoPlay) {
+                        if (ttsAutoPlay && vmSurvey.claimTtsAutoPlay(node.id)) {
                             runCatching { ttsController.speak(node.question, node.id) }
                         }
                     }
@@ -1287,7 +1285,7 @@ fun SurveyNavHost(
                     val ttsSpeaking by ttsController.isSpeaking.collectAsStateWithLifecycle()
 
                     LaunchedEffect(node.id, node.question, ttsAutoPlay) {
-                        if (ttsAutoPlay) {
+                        if (ttsAutoPlay && vmSurvey.claimTtsAutoPlay(node.id)) {
                             runCatching { ttsController.speak(node.question, node.id) }
                         }
                     }
@@ -1319,7 +1317,7 @@ fun SurveyNavHost(
                     val ttsSpeaking by ttsController.isSpeaking.collectAsStateWithLifecycle()
 
                     LaunchedEffect(node.id, node.question, ttsAutoPlay) {
-                        if (ttsAutoPlay) {
+                        if (ttsAutoPlay && vmSurvey.claimTtsAutoPlay(node.id)) {
                             runCatching { ttsController.speak(node.question, node.id) }
                         }
                     }
@@ -1346,8 +1344,21 @@ fun SurveyNavHost(
                     val speechRecording by speechController.isRecording.collectAsStateWithLifecycle()
                     val speechTranscribing by speechController.isTranscribing.collectAsStateWithLifecycle()
 
-                    LaunchedEffect(node.id, node.question, ttsAutoPlay) {
-                        if (shouldAutoPlayQuestion(ttsAutoPlay, speechRecording, speechTranscribing)) {
+                    LaunchedEffect(
+                        node.id,
+                        node.question,
+                        ttsAutoPlay,
+                        speechRecording,
+                        speechTranscribing
+                    ) {
+                        if (
+                            shouldAutoPlayQuestion(
+                                ttsAutoPlay,
+                                speechRecording,
+                                speechTranscribing
+                            ) &&
+                            vmSurvey.claimTtsAutoPlay(node.id)
+                        ) {
                             runCatching { ttsController.speak(node.question, node.id) }
                         }
                     }

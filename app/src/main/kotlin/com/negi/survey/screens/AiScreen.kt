@@ -222,13 +222,14 @@ internal fun canAcceptFollowupCandidate(
 
 internal fun canAdvanceAiTurn(
     turnCompleted: Boolean,
+    mainAnswerBlank: Boolean,
     aiLoading: Boolean,
     mainSubmissionPending: Boolean,
     speechRecording: Boolean,
     speechTranscribing: Boolean,
     hasUnansweredFollowup: Boolean,
 ): Boolean =
-    turnCompleted &&
+    (turnCompleted || mainAnswerBlank) &&
             !aiLoading &&
             !mainSubmissionPending &&
             !speechRecording &&
@@ -385,7 +386,7 @@ fun AiScreen(
     val aiReasons by vmSurvey.aiReasons.collectAsState()
     val aiReason = aiReasons[nid]
     val hasUnansweredFollowup = aiReason != com.negi.survey.vm.SurveyAiReason.UNABLE_REFUSED &&
-        persistedFollowups[nid].orEmpty().any { it.answer == null }
+            persistedFollowups[nid].orEmpty().any { it.answer == null }
     var submissionPending by remember(contextKey) { mutableStateOf(false) }
 
     // ---------------------------------------------------------------------
@@ -1087,7 +1088,7 @@ fun AiScreen(
                             }
                             TextButton(
                                 enabled = !loading && !submissionPending && !conv.turnCompleted &&
-                                    !speechRecording && !speechTranscribing,
+                                        !speechRecording && !speechTranscribing,
                                 onClick = {
                                     vmSurvey.setAiReason(nid, com.negi.survey.vm.SurveyAiReason.UNABLE_REFUSED)
                                     vmAI.completeValidationTurn(contextKey, rootQuestion)
@@ -1105,7 +1106,7 @@ fun AiScreen(
                             },
                             onSend = ::submit,
                             enabled = textFieldEnabled && !loading && !submissionPending &&
-                                !(isTwoStepNode && (conv.validationFailed || conv.turnCompleted)),
+                                    !(isTwoStepNode && (conv.validationFailed || conv.turnCompleted)),
                             focusRequester = focusRequester,
                             speechEnabled = speechController != null,
                             speechRecording = speechRecording,
@@ -1140,6 +1141,7 @@ fun AiScreen(
                             OutlinedButton(
                                 enabled = canAdvanceAiTurn(
                                     turnCompleted = conv.turnCompleted,
+                                    mainAnswerBlank = vmSurvey.getAnswer(nid).isBlank(),
                                     aiLoading = loading,
                                     mainSubmissionPending = submissionPending,
                                     speechRecording = speechRecording,
@@ -1149,6 +1151,7 @@ fun AiScreen(
                                 onClick = {
                                     if (!canAdvanceAiTurn(
                                             turnCompleted = conv.turnCompleted,
+                                            mainAnswerBlank = vmSurvey.getAnswer(nid).isBlank(),
                                             aiLoading = loading,
                                             mainSubmissionPending = submissionPending,
                                             speechRecording = speechRecording,
