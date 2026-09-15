@@ -41,6 +41,21 @@ class AiFollowupPersistenceTest {
     }
 
     @Test
+    fun blank_followup_is_rejected_at_the_persistence_boundary() {
+        lateinit var vm: SurveyViewModel
+
+        composeRule.setContent {
+            val backStack = rememberNavBackStack(FlowHome)
+            vm = remember { SurveyViewModel(backStack, aiConfig()) }
+        }
+
+        composeRule.runOnIdle {
+            assertFalse(vm.addFollowupQuestion(AI_NODE_ID, " \n\t "))
+            assertTrue(vm.followups.value[AI_NODE_ID].isNullOrEmpty())
+        }
+    }
+
+    @Test
     fun accumulated_prompt_keeps_main_answer_and_only_includes_answered_followups() {
         lateinit var vm: SurveyViewModel
 

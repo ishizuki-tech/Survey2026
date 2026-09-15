@@ -33,5 +33,16 @@ class AiFollowupIterationPolicyTest {
         assertFalse(canAcceptFollowupCandidate("Distinct third question?", existing))
     }
 
+    @Test
+    fun configured_caps_count_accepted_entries_including_unanswered_questions() {
+        for (cap in listOf(0, 1, 3)) {
+            for (count in 0..4) {
+                val entries = (1..count).map { entry("Question $it?") }
+                assertTrue(followupCapacityRemaining(entries, cap) == (cap - count).coerceAtLeast(0))
+                assertTrue(canAcceptFollowupCandidate("New?", entries, cap) == (count < cap))
+            }
+        }
+    }
+
     private fun entry(question: String) = SurveyViewModel.FollowupEntry(question = question)
 }

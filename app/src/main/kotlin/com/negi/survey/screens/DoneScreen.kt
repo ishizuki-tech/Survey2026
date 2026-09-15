@@ -147,6 +147,7 @@ fun DoneScreen(
     val questions by vm.questions.collectAsState(initial = emptyMap())
     val answers by vm.answers.collectAsState(initial = emptyMap())
     val followups by vm.followups.collectAsState(initial = emptyMap())
+    val aiReasons by vm.aiReasons.collectAsState()
     val recordedAudioRefs by vm.recordedAudioRefs.collectAsState(initial = emptyMap())
     val surveyUuid by vm.surveyUuid.collectAsState()
 
@@ -212,6 +213,7 @@ fun DoneScreen(
         questions,
         answers,
         followups,
+        aiReasons,
         audioRefsForRun,
         flatAudioRefsForRun,
         surveyUuid,
@@ -286,6 +288,8 @@ fun DoneScreen(
                 append("\n")
             }
             append("  },\n")
+
+            append("  \"ai_outcomes\": ").append(vm.aiReasonsJson()).append(",\n")
 
             append("  \"followups\": {\n")
             val fEntries = sortedFollowups.entries.toList()

@@ -360,7 +360,8 @@ class AiViewModel(
         val role: ComposerRole,
         val activePromptQuestion: String,
         val composerDraft: String,
-        val turnCompleted: Boolean = false
+        val turnCompleted: Boolean = false,
+        val validationFailed: Boolean = false
     )
 
     private val chatStore = ConcurrentHashMap<String, MutableStateFlow<List<ChatItem>>>()
@@ -459,7 +460,8 @@ class AiViewModel(
                 role = ComposerRole.FOLLOWUP,
                 activePromptQuestion = q,
                 composerDraft = "",
-                turnCompleted = false
+                turnCompleted = false,
+                validationFailed = false
             )
         }
     }
@@ -467,7 +469,7 @@ class AiViewModel(
     /** Mark a main-answer or follow-up validation turn as in progress before inference begins. */
     fun beginValidationTurn(contextKey: String) {
         conversationStore[contextKey]?.update { cur ->
-            cur.copy(turnCompleted = false)
+            cur.copy(turnCompleted = false, validationFailed = false)
         }
     }
 
@@ -478,9 +480,70 @@ class AiViewModel(
                 role = ComposerRole.MAIN,
                 activePromptQuestion = rootQuestion,
                 composerDraft = "",
-                turnCompleted = true
+                turnCompleted = true,
+                validationFailed = false
             )
         }
+    }
+
+    fun failValidationTurn(contextKey: String) {
+        conversationStore[contextKey]?.update { it.copy(turnCompleted = false, validationFailed = true) }
+    }
+
+    /** Both submission roles use this chain; retry reads saved data without resubmitting it. */
+    fun evaluateSurveyTwoStepAsync(
+        survey: SurveyViewModel,
+        nodeId: String,
+        contextKey: String,
+        rootQuestion: String
+    ): Job = synchronized(executionLock) {
+        evalJobRef.get()?.takeIf { it.isActive }?.let { return@synchronized it }
+        val runUuid = survey.surveyUuid.value
+        val answer = survey.getAnswer(nodeId)
+        val remaining = survey.remainingFollowups(nodeId)
+        beginValidationTurn(contextKey)
+        // A navigation cancellation leaves a retryable saved state rather than implying completion.
+        survey.setAiReason(nodeId, SurveyAiReason.FAILURE)
+        evaluateConditionalTwoStepAsync(
+            firstPrompt = survey.getEvalPrompt(nodeId, rootQuestion, answer),
+            proceedOnTimeout = false,
+            shouldRunSecond = { result ->
+                SurveyAiPolicy.evaluate(result.raw, result.timedOut, result.error, remaining) == SurveyAiDecision.GENERATE
+            },
+            buildSecondPrompt = { result ->
+                survey.getFollowupPrompt(nodeId, rootQuestion, answer, result.raw)
+            },
+            onFinished = { evaluation, generation ->
+                if (survey.surveyUuid.value == runUuid) {
+                    upsertChatItem(contextKey, ChatItem(
+                        id = "eval-$nodeId-${evaluation.runId}", sender = ChatSender.AI, json = evaluation.raw
+                    ))
+                    val decision = SurveyAiPolicy.evaluate(evaluation.raw, evaluation.timedOut, evaluation.error, remaining)
+                    val reason = when (decision) {
+                        SurveyAiDecision.ACHIEVED -> SurveyAiReason.ACHIEVED
+                        SurveyAiDecision.LIMIT_REACHED -> SurveyAiReason.LIMIT_REACHED
+                        SurveyAiDecision.FAILURE -> SurveyAiReason.FAILURE
+                        SurveyAiDecision.GENERATE -> {
+                            val question = generation?.let {
+                                SurveyAiPolicy.acceptQuestion(it.raw, it.timedOut, it.error,
+                                    survey.followups.value[nodeId].orEmpty().map { entry -> entry.question })
+                            }
+                            if (question != null && survey.addFollowupQuestion(nodeId, question)) {
+                                upsertChatItem(contextKey, ChatItem(
+                                    id = "fu-$nodeId-${generation.runId}", sender = ChatSender.AI, text = question
+                                ))
+                                setFollowupMode(contextKey, question)
+                                null
+                            } else SurveyAiReason.FAILURE
+                        }
+                    }
+                    survey.setAiReason(nodeId, reason)
+                    if (reason?.terminal == true) completeValidationTurn(contextKey, rootQuestion)
+                    else if (reason == SurveyAiReason.FAILURE) failValidationTurn(contextKey)
+                    removeTypingMessage(contextKey, nodeId)
+                }
+            }
+        )
     }
 
     /**
@@ -796,7 +859,8 @@ class AiViewModel(
         timeoutMs: Long = defaultTimeoutMs,
         proceedOnTimeout: Boolean = true,
         shouldRunSecond: (EvalResult) -> Boolean,
-        buildSecondPrompt: (EvalResult) -> String
+        buildSecondPrompt: (EvalResult) -> String,
+        onFinished: (EvalResult, EvalResult?) -> Unit = { _, _ -> }
     ): Job {
         val p1 = firstPrompt.trim()
         if (p1.isEmpty()) {
@@ -831,6 +895,9 @@ class AiViewModel(
                             "chain2: step1 timed out -> skipping step2 (proceedOnTimeout=false)"
                         )
                     }
+                    synchronized(executionLock) {
+                        if (evalJobRef.get() === chainJob) onFinished(step1, null)
+                    }
                     return@launch
                 }
 
@@ -853,6 +920,9 @@ class AiViewModel(
                                     "rawPreview='${debugVisible(preview(step1.raw))}')"
                         )
                     }
+                    synchronized(executionLock) {
+                        if (evalJobRef.get() === chainJob) onFinished(step1, null)
+                    }
                     return@launch
                 }
 
@@ -865,6 +935,9 @@ class AiViewModel(
 
                 if (p2.isEmpty()) {
                     if (DEBUG_LOGS) logW(TAG, "chain2: step2 prompt is blank -> done")
+                    synchronized(executionLock) {
+                        if (evalJobRef.get() === chainJob) onFinished(step1, null)
+                    }
                     return@launch
                 }
 
@@ -877,7 +950,7 @@ class AiViewModel(
                     throw CancellationException("chain-owner-lost-before-step2")
                 }
 
-                runEvaluationCore(
+                val step2 = runEvaluationCore(
                     runId = runId2,
                     userPrompt = p2,
                     timeoutMs = timeoutMs,
@@ -885,6 +958,10 @@ class AiViewModel(
                     phase = PromptPhase.FOLLOWUP,
                     commitToPrimaryState = false
                 )
+                currentCoroutineContext().ensureActive()
+                synchronized(executionLock) {
+                    if (evalJobRef.get() === chainJob) onFinished(step1, step2)
+                }
             } finally {
                 // Owner identity is critical here. An old cancelled chain must never clear the
                 // flags of a replacement inference that started while this coroutine unwound.

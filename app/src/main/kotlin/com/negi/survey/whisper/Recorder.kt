@@ -44,6 +44,15 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 
+/** Minimal recorder lifecycle contract for controller-level deterministic tests. */
+interface RecorderBackend : Closeable {
+    fun isActive(): Boolean
+
+    fun startRecording(output: File, rates: IntArray = intArrayOf(16_000, 48_000, 44_100))
+
+    suspend fun stopRecording()
+}
+
 /**
  * Recorder — High-reliability WAV recorder.
  *
@@ -55,7 +64,7 @@ import kotlinx.coroutines.withTimeoutOrNull
 class Recorder(
     private val context: Context,
     private val onError: (Exception) -> Unit
-) : Closeable {
+) : RecorderBackend {
 
     // -------------------------------------------------------------------------
     // Control dispatcher (single thread)
@@ -79,7 +88,7 @@ class Recorder(
     private val state = AtomicReference(State.Idle)
 
     /** Returns true if recording or transitioning between recording states. */
-    fun isActive(): Boolean = when (state.get()) {
+    override fun isActive(): Boolean = when (state.get()) {
         State.Starting, State.Recording, State.Stopping -> true
         else -> false
     }
@@ -93,9 +102,9 @@ class Recorder(
      * @param output Target WAV file (will be overwritten on stop)
      * @param rates Prioritized sample rate candidates
      */
-    fun startRecording(
+    override fun startRecording(
         output: File,
-        rates: IntArray = intArrayOf(16_000, 48_000, 44_100)
+        rates: IntArray
     ) {
         if (!state.compareAndSet(State.Idle, State.Starting)) {
             Log.w(TAG, "startRecording ignored: current=${state.get()}")
@@ -215,7 +224,7 @@ class Recorder(
      *
      * Runs on RecorderThread (control dispatcher) so state transitions are serialized.
      */
-    suspend fun stopRecording(): Unit = withContext(controlDispatcher) {
+    override suspend fun stopRecording(): Unit = withContext(controlDispatcher) {
         Log.d(TAG, "stopRecording() invoked (state=${state.get()})")
 
         val s = state.get()

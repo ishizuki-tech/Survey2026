@@ -23,6 +23,31 @@ class AiFollowupRepairPolicyTest {
     }
 
     @Test
+    fun contract_invalid_blank_low_score_keeps_repair_eligible_and_cannot_admit_followup_composer() {
+        assertTrue(
+            AiViewModel.needsFollowupRepair(
+                phase = PromptPhase.ONE_STEP,
+                score = 85,
+                followups = emptyList(),
+                timedOut = false,
+                error = null,
+                capacityRemaining = 1,
+            )
+        )
+
+        val vm = AiViewModel(CountingRepository())
+        val contextKey = "survey:Q8"
+        val rootQuestion = "Root question"
+        vm.ensureConversationContext(contextKey, rootQuestion, "main answer")
+        vm.setFollowupMode(contextKey, "   ")
+
+        val state = vm.conversationStateFlow(contextKey).value
+        assertEquals(AiViewModel.ComposerRole.MAIN, state.role)
+        assertEquals(rootQuestion, state.activePromptQuestion)
+        assertFalse(state.turnCompleted)
+    }
+
+    @Test
     fun repair_success_uses_a_clean_followup_composer_and_revalidation_starts_no_inference_itself() {
         val repository = CountingRepository()
         val vm = AiViewModel(repository)
