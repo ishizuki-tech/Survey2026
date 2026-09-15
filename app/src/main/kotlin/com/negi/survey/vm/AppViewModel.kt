@@ -14,6 +14,7 @@
 package com.negi.survey.vm
 
 import android.content.Context
+import android.net.Uri
 import android.util.Log
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -22,11 +23,9 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
@@ -35,7 +34,7 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.negi.survey.BuildConfig
 import com.negi.survey.utils.HeavyInitializer
-import com.negi.survey.utils.PersistentModelStore
+import com.negi.survey.utils.SafModelImporter
 import java.io.File
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -51,6 +50,10 @@ import kotlinx.coroutines.launch
 sealed class DlState {
     data object Idle : DlState()
 
+    data class NeedsModelSource(val validationError: String? = null) : DlState()
+
+    data object Importing : DlState()
+
     data class Downloading(
         val downloaded: Long,
         val total: Long?
@@ -65,21 +68,6 @@ sealed class DlState {
     ) : DlState()
 }
 
-/* ───────────────────────────── Persistence Notice ───────────────────────────── */
-
-/**
- * One-shot notice describing an interaction with the on-device persisted
- * (survives-uninstall) model cache, meant to be surfaced to the user via a
- * dialog and then dismissed.
- */
-sealed class ModelPersistenceNotice {
-    /** A previously persisted copy of [fileName] was reused with no network call. */
-    data class Reused(val fileName: String, val bytes: Long) : ModelPersistenceNotice()
-
-    /** A stale persisted copy [oldFileName] was removed to make room for [newFileName]. */
-    data class Replacing(val oldFileName: String, val newFileName: String) : ModelPersistenceNotice()
-}
-
 /* ───────────────────────────── ViewModel ───────────────────────────── */
 
 class AppViewModel(
@@ -87,7 +75,9 @@ class AppViewModel(
     private val fileName: String = DEFAULT_FILE_NAME,
     private val timeoutMs: Long = DEFAULT_TIMEOUT_MS,
     private val uiThrottleMs: Long = DEFAULT_UI_THROTTLE_MS,
-    private val uiMinDeltaBytes: Long = DEFAULT_UI_MIN_DELTA_BYTES
+    private val uiMinDeltaBytes: Long = DEFAULT_UI_MIN_DELTA_BYTES,
+    /** Test-only identity override; production always uses the configured Gemma identity. */
+    private val importIdentityOverride: SafModelImporter.ModelIdentity? = null,
 ) : ViewModel() {
 
     private val _state = MutableStateFlow<DlState>(DlState.Idle)
@@ -98,14 +88,72 @@ class AppViewModel(
     @Volatile
     private var downloadJob: Job? = null
 
-    private val _persistenceNotice = MutableStateFlow<ModelPersistenceNotice?>(null)
+    private fun modelIdentity(name: String): SafModelImporter.ModelIdentity? =
+        importIdentityOverride?.takeIf { it.fileName == name } ?: configuredModelIdentity(name)
 
-    /** Exposes a one-shot persisted-storage reuse/replace notice for the UI to show and dismiss. */
-    val persistenceNotice: StateFlow<ModelPersistenceNotice?> = _persistenceNotice.asStateFlow()
+    private fun findExistingModelFile(context: Context, name: String): File? {
+        val candidate = File(context.filesDir, name)
+        val expectedBytes = modelIdentity(name)?.expectedBytes
+        return candidate.takeIf { file ->
+            file.exists() && file.isFile &&
+                (expectedBytes == null || file.length() == expectedBytes)
+        }
+    }
 
-    /** Call after the UI has shown [persistenceNotice] to clear it. */
-    fun dismissPersistenceNotice() {
-        _persistenceNotice.value = null
+    /** Checks only app-private storage. Public Downloads files are imported explicitly via SAF. */
+    fun prepareModel(appContext: Context) {
+        val app = appContext.applicationContext
+        val safeName = suggestFileName(modelUrl, fileName)
+        findExistingModelFile(app, safeName)?.let { existing ->
+            Log.i("AppViewModel", "private model reused: name=$safeName bytes=${existing.length()}")
+            _state.value = DlState.Done(existing)
+            return
+        }
+        Log.i("AppViewModel", "private model missing: name=$safeName; awaiting source selection")
+        _state.value = DlState.NeedsModelSource()
+    }
+
+    fun onExistingModelSelectionCancelled() {
+        Log.i("AppViewModel", "SAF import cancelled by user")
+        if (_state.value !is DlState.Done) _state.value = DlState.NeedsModelSource()
+    }
+
+    fun importExistingModel(appContext: Context, uri: Uri) {
+        val app = appContext.applicationContext
+        val safeName = suggestFileName(modelUrl, fileName)
+        val identity = modelIdentity(safeName)
+        if (identity == null) {
+            Log.w("AppViewModel", "SAF import rejected: unsupported configured model name=$safeName")
+            _state.value = DlState.NeedsModelSource("This configured model cannot be imported from a saved file.")
+            return
+        }
+        if (downloadJob?.isActive == true) return
+
+        downloadJob = viewModelScope.launch(Dispatchers.IO) {
+            try {
+                _state.value = DlState.Importing
+                when (val result = SafModelImporter.importUri(
+                    context = app,
+                    uri = uri,
+                    destination = File(app.filesDir, safeName),
+                    identity = identity,
+                )) {
+                    is SafModelImporter.Result.Imported -> _state.value = DlState.Done(result.file)
+                    is SafModelImporter.Result.ExistingPrivateModel -> _state.value = DlState.Done(result.file)
+                    is SafModelImporter.Result.Rejected -> {
+                        Log.w("AppViewModel", "SAF import rejected: ${result.reason}")
+                        _state.value = DlState.NeedsModelSource(result.reason)
+                    }
+                }
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (t: Throwable) {
+                Log.w("AppViewModel", "SAF import failed", t)
+                _state.value = DlState.NeedsModelSource("Unable to import the selected model.")
+            } finally {
+                if (downloadJob === coroutineContext[Job]) downloadJob = null
+            }
+        }
     }
 
     /**
@@ -154,35 +202,9 @@ class AppViewModel(
 
                 val safeName = suggestFileName(modelUrl, fileName)
 
-                if (!forceFresh) {
-                    val privateDestination = File(app.filesDir, safeName)
-                    val reused = runCatching {
-                        PersistentModelStore.reuseOrReplace(
-                            context = app,
-                            targetFileName = safeName,
-                            privateDestination = privateDestination,
-                            onReused = { bytes ->
-                                Log.i("AppViewModel", "Reused persisted model '$safeName' ($bytes bytes)")
-                                _persistenceNotice.value = ModelPersistenceNotice.Reused(safeName, bytes)
-                            },
-                            onReplacing = { oldFileName ->
-                                Log.i("AppViewModel", "Removing stale persisted model '$oldFileName' before downloading '$safeName'")
-                                _persistenceNotice.value = ModelPersistenceNotice.Replacing(oldFileName, safeName)
-                            }
-                        )
-                    }.getOrElse { e ->
-                        Log.w("AppViewModel", "Persisted model store check failed: ${e.message}")
-                        false
-                    }
-
-                    if (reused && privateDestination.exists() && privateDestination.length() > 0L) {
-                        _state.value = DlState.Done(privateDestination)
-                        return@launch
-                    }
-                }
-
                 val token = BuildConfig.HF_TOKEN.takeIf { it.isNotBlank() }
 
+                Log.i("AppViewModel", "network download selected: name=$safeName forceFresh=$forceFresh")
                 _state.value = DlState.Downloading(downloaded = 0L, total = null)
 
                 var lastEmitNs = System.nanoTime()
@@ -220,11 +242,7 @@ class AppViewModel(
                 if (!isActive) return@launch
 
                 _state.value = result.fold(
-                    onSuccess = { file ->
-                        runCatching { PersistentModelStore.persistFromPrivate(app, safeName, file) }
-                            .onFailure { e -> Log.w("AppViewModel", "Failed to persist model to shared storage: ${e.message}") }
-                        DlState.Done(file)
-                    },
+                    onSuccess = { file -> DlState.Done(file) },
                     onFailure = { error -> DlState.Error(error.message ?: "Download failed") }
                 )
             } catch (ce: CancellationException) {
@@ -279,6 +297,9 @@ class AppViewModel(
         private const val DEFAULT_TIMEOUT_MS: Long = 30L * 60L * 1000L
         private const val DEFAULT_UI_THROTTLE_MS: Long = 250L
         private const val DEFAULT_UI_MIN_DELTA_BYTES: Long = 1L * 1024L * 1024L
+        private const val GEMMA_FILE_NAME = "gemma-3n-E4B-it-int4.litertlm"
+        private const val GEMMA_BYTES = 4_919_541_760L
+        private const val GEMMA_SHA256 = "2e67a6cd51dfe0f793431e6bd4ed8d029c88e10f52ca0469ad38445e3cd3c1f4"
 
         fun factory(): ViewModelProvider.Factory =
             object : ViewModelProvider.Factory {
@@ -334,22 +355,12 @@ class AppViewModel(
             return sb.toString().take(160).ifBlank { DEFAULT_FILE_NAME }
         }
 
-        private fun findExistingModelFile(context: Context, name: String): File? {
-            val privateModelsDir = runCatching { context.getDir("models", Context.MODE_PRIVATE) }
-                .getOrNull()
-
-            val candidates = buildList {
-                add(File(context.filesDir, name))
-                add(File(context.filesDir, "models/$name"))
-                if (privateModelsDir != null) add(File(privateModelsDir, name))
-                add(File(context.cacheDir, name))
-                add(File(context.cacheDir, "models/$name"))
+        private fun configuredModelIdentity(name: String): SafModelImporter.ModelIdentity? =
+            if (name == GEMMA_FILE_NAME) {
+                SafModelImporter.ModelIdentity(GEMMA_FILE_NAME, GEMMA_BYTES, GEMMA_SHA256)
+            } else {
+                null
             }
-
-            return candidates.firstOrNull { f ->
-                f.exists() && f.isFile && f.length() > 0L
-            }
-        }
     }
 }
 
@@ -358,7 +369,8 @@ class AppViewModel(
 @Composable
 fun DownloadGate(
     state: DlState,
-    onRetry: () -> Unit,
+    onUseExisting: () -> Unit,
+    onDownload: () -> Unit,
     content: @Composable (modelFile: File) -> Unit
 ) {
     when (state) {
@@ -374,6 +386,30 @@ fun DownloadGate(
                 LinearProgressIndicator(
                     modifier = Modifier.fillMaxWidth()
                 )
+            }
+        }
+
+        is DlState.NeedsModelSource -> {
+            Column(
+                modifier = Modifier.fillMaxSize().padding(24.dp),
+                verticalArrangement = Arrangement.Center
+            ) {
+                Text(state.validationError ?: "A local model is required to continue.")
+                Spacer(Modifier.height(12.dp))
+                Button(onClick = onUseExisting) { Text("Use existing downloaded model") }
+                Spacer(Modifier.height(8.dp))
+                Button(onClick = onDownload) { Text("Download model") }
+            }
+        }
+
+        is DlState.Importing -> {
+            Column(
+                modifier = Modifier.fillMaxSize().padding(24.dp),
+                verticalArrangement = Arrangement.Center
+            ) {
+                Text("Importing and verifying the selected model…")
+                Spacer(Modifier.height(12.dp))
+                LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
             }
         }
 
@@ -420,64 +456,14 @@ fun DownloadGate(
             ) {
                 Text("Failed to download model: ${state.message}")
                 Spacer(Modifier.height(12.dp))
-                Button(onClick = onRetry) {
-                    Text("Retry")
-                }
+                Button(onClick = onUseExisting) { Text("Use existing downloaded model") }
+                Spacer(Modifier.height(8.dp))
+                Button(onClick = onDownload) { Text("Download model") }
             }
         }
 
         is DlState.Done -> {
             content(state.file)
-        }
-    }
-}
-
-/* ───────────────────────────── Persistence Dialog ───────────────────────────── */
-
-/**
- * Surfaces [notice] (a one-shot reuse/replace event from the persisted,
- * survives-uninstall model cache) to the user as an alert dialog, then
- * calls [onDismiss] to clear it.
- */
-@Composable
-fun ModelPersistenceDialog(
-    notice: ModelPersistenceNotice?,
-    onDismiss: () -> Unit
-) {
-    when (notice) {
-        null -> Unit
-
-        is ModelPersistenceNotice.Reused -> {
-            val mb = notice.bytes / (1024L * 1024L)
-            AlertDialog(
-                onDismissRequest = onDismiss,
-                title = { Text("Using saved model") },
-                text = {
-                    Text(
-                        "Found \"${notice.fileName}\" already saved on this device " +
-                            "(${mb} MB). Loading it from local storage — no download needed."
-                    )
-                },
-                confirmButton = {
-                    TextButton(onClick = onDismiss) { Text("OK") }
-                }
-            )
-        }
-
-        is ModelPersistenceNotice.Replacing -> {
-            AlertDialog(
-                onDismissRequest = onDismiss,
-                title = { Text("Updating model") },
-                text = {
-                    Text(
-                        "A different saved model (\"${notice.oldFileName}\") is no longer needed. " +
-                            "Removing it and downloading \"${notice.newFileName}\" instead."
-                    )
-                },
-                confirmButton = {
-                    TextButton(onClick = onDismiss) { Text("OK") }
-                }
-            )
         }
     }
 }
