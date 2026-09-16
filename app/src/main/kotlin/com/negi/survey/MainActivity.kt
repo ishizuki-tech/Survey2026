@@ -154,6 +154,7 @@ import com.negi.survey.vm.FlowMulti
 import com.negi.survey.vm.FlowReview
 import com.negi.survey.vm.FlowSingle
 import com.negi.survey.vm.FlowText
+import com.negi.survey.vm.ModelPersistenceDialog
 import com.negi.survey.vm.NoOpQuestionSpeaker
 import com.negi.survey.vm.QuestionSpeaker
 import com.negi.survey.vm.SurveyViewModel
@@ -817,29 +818,24 @@ fun AppNav() {
     )
 
     val state by appVm.state.collectAsStateWithLifecycle()
-    val modelImportLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenDocument()
-    ) { uri ->
-        if (uri == null) {
-            appVm.onExistingModelSelectionCancelled()
-        } else {
-            appVm.importExistingModel(appContext, uri)
+    val persistenceNotice by appVm.persistenceNotice.collectAsStateWithLifecycle()
+
+    LaunchedEffect(state) {
+        if (state is DlState.Idle) {
+            Log.d(MainActivity.TAG, "DownloadGate idle -> start download. session=$sessionKey")
+            appVm.ensureModelDownloaded(appContext)
         }
     }
 
-    LaunchedEffect(sessionKey) {
-        Log.d(MainActivity.TAG, "Preparing private SLM model. session=$sessionKey")
-        appVm.prepareModel(appContext)
-    }
+    ModelPersistenceDialog(
+        notice = persistenceNotice,
+        onDismiss = { appVm.dismissPersistenceNotice() }
+    )
 
     DownloadGate(
         state = state,
-        onUseExisting = {
-            Log.d(MainActivity.TAG, "User requested SAF model import. session=$sessionKey")
-            modelImportLauncher.launch(arrayOf("application/octet-stream", "*/*"))
-        },
-        onDownload = {
-            Log.d(MainActivity.TAG, "User selected network model download. session=$sessionKey")
+        onRetry = {
+            Log.d(MainActivity.TAG, "DownloadGate retry. session=$sessionKey")
             appVm.ensureModelDownloaded(appContext)
         }
     ) { modelFile ->
