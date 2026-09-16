@@ -1,11 +1,11 @@
 {
   "original_branch": "feature/branch-apk-preview",
   "branch_slug": "feature-branch-apk-preview",
-  "commit_sha": "2c6e0dad61aafe88b1740bd77f761dbf2efb2a40",
-  "short_sha": "2c6e0da",
-  "apk_name": "Survey2026-feature-branch-apk-preview-2c6e0da.apk",
-  "apk_sha256": "21ca18ff670596eab16f7edca413f31c76238dc9fb860601de5126d67b433d8b",
+  "commit_sha": "593db5ad2c83b5f28c7ff5619cb4ec60ed5529b5",
+  "short_sha": "593db5a",
+  "apk_name": "Survey2026-feature-branch-apk-preview-593db5a.apk",
+  "apk_sha256": "a0964bf37f45bb9bbf3f0153b8ff900c8d7e4141f180774e9a7361eccc249bb9",
   "page_url": "https://ishizuki-tech.github.io/Survey2026/branches/feature-branch-apk-preview/",
-  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/35137195709",
-  "generated_utc": "2026-09-16T18:58:32Z"
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/35140387438",
+  "generated_utc": "2026-09-16T19:30:01Z"
 }
