@@ -257,7 +257,161 @@ jobs:
           mkdir -p "$(dirname "$TARGET_DIR")"
           mv "$PREVIEW_DIR" "$TARGET_DIR"
 
+          # Regenerate the dashboard from the checked-out gh-pages content after
+          # adding this build, so it reflects every currently published preview.
+          python3 - "$PAGES_DIR" "$REPOSITORY" "$SERVER_URL" <<'PY'
+          import datetime as dt
+          import html
+          import json
+          import re
+          import sys
+          from pathlib import Path
+
+          pages_dir = Path(sys.argv[1])
+          repository = sys.argv[2]
+          server_url = sys.argv[3].rstrip("/")
+          owner, repository_name = repository.split("/", 1)
+          branches_dir = pages_dir / "branches"
+          page_base_url = (
+              f"https://{owner}.github.io/{repository_name}/branches/"
+          )
+          run_url_prefix = f"{server_url}/{repository}/actions/runs/"
+          slug_pattern = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
+          short_sha_pattern = re.compile(r"[0-9a-f]{7}")
+          commit_sha_pattern = re.compile(r"[0-9a-f]{40}")
+          checksum_pattern = re.compile(r"[0-9a-f]{64}")
+
+          def warning(path: Path) -> None:
+              print(
+                  "::warning file="
+                  f"{path.as_posix()}::Skipping malformed branch preview metadata."
+              )
+
+          entries = []
+          for metadata_path in sorted(branches_dir.glob("*/build.json")):
+              try:
+                  metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                  if not isinstance(metadata, dict):
+                      raise ValueError
+
+                  required = (
+                      "original_branch",
+                      "branch_slug",
+                      "commit_sha",
+                      "short_sha",
+                      "apk_name",
+                      "apk_sha256",
+                      "page_url",
+                      "run_url",
+                      "generated_utc",
+                  )
+                  if any(
+                      not isinstance(metadata.get(field), str)
+                      or not metadata[field]
+                      for field in required
+                  ):
+                      raise ValueError
+
+                  slug = metadata["branch_slug"]
+                  short_sha = metadata["short_sha"]
+                  if (
+                      metadata_path.parent.name != slug
+                      or not slug_pattern.fullmatch(slug)
+                      or not short_sha_pattern.fullmatch(short_sha)
+                      or not commit_sha_pattern.fullmatch(metadata["commit_sha"])
+                      or not checksum_pattern.fullmatch(metadata["apk_sha256"])
+                  ):
+                      raise ValueError
+
+                  expected_apk_name = f"Survey2026-{slug}-{short_sha}.apk"
+                  expected_page_url = f"{page_base_url}{slug}/"
+                  if (
+                      metadata["apk_name"] != expected_apk_name
+                      or metadata["page_url"] != expected_page_url
+                      or not metadata["run_url"].startswith(run_url_prefix)
+                      or not metadata["run_url"][len(run_url_prefix):].isdigit()
+                  ):
+                      raise ValueError
+
+                  timestamp = dt.datetime.strptime(
+                      metadata["generated_utc"], "%Y-%m-%dT%H:%M:%SZ"
+                  ).replace(tzinfo=dt.timezone.utc)
+              except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                  warning(metadata_path)
+                  continue
+
+              entries.append((timestamp, metadata))
+
+          entries.sort(key=lambda entry: entry[0], reverse=True)
+
+          cards = []
+          for timestamp, metadata in entries:
+              def escaped(field: str) -> str:
+                  return html.escape(metadata[field], quote=True)
+
+              page_url = escaped("page_url")
+              apk_url = f"{page_url}{escaped('apk_name')}"
+              cards.append(
+                  "<article class=\"card\">"
+                  f"<h2>{escaped('original_branch')}</h2>"
+                  "<dl>"
+                  f"<dt>Branch slug</dt><dd><code>{escaped('branch_slug')}</code></dd>"
+                  f"<dt>Commit</dt><dd><code>{escaped('short_sha')}</code></dd>"
+                  f"<dt>Built</dt><dd><time datetime=\"{escaped('generated_utc')}\">{escaped('generated_utc')}</time></dd>"
+                  f"<dt>APK</dt><dd><code>{escaped('apk_name')}</code></dd>"
+                  f"<dt>SHA-256</dt><dd><code>{escaped('apk_sha256')}</code></dd>"
+                  "</dl>"
+                  "<p class=\"actions\">"
+                  f"<a class=\"button\" href=\"{page_url}\">Open Build Page</a>"
+                  f"<a class=\"button secondary\" href=\"{apk_url}\">Download APK</a>"
+                  f"<a class=\"run\" href=\"{escaped('run_url')}\">Actions run</a>"
+                  "</p>"
+                  "</article>"
+              )
+
+          cards_html = "\n".join(cards) or (
+              "<p class=\"empty\">No valid branch preview builds are published yet.</p>"
+          )
+          dashboard = f"""<!doctype html>
+          <html lang=\"en\">
+          <head>
+            <meta charset=\"utf-8\">
+            <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+            <meta name=\"robots\" content=\"noindex,nofollow\">
+            <title>Survey2026 Branch Builds</title>
+            <style>
+              :root {{ color-scheme: dark; font-family: system-ui, sans-serif; background: #07111d; color: #eef6ff; }}
+              body {{ margin: 0; min-height: 100vh; padding: 24px; }}
+              main {{ width: min(980px, 100%); margin: 0 auto; }}
+              header {{ margin-bottom: 24px; }} h1 {{ margin-bottom: 8px; }}
+              .count, .empty {{ color: #bdd0e4; }}
+              .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 18px; }}
+              .card {{ padding: 22px; border: 1px solid #35506c; border-radius: 16px; background: #102238; }}
+              .card h2 {{ margin: 0 0 18px; overflow-wrap: anywhere; }}
+              dl {{ display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 8px 14px; margin: 0; }}
+              dt {{ color: #a8c6e6; font-weight: 700; }} dd {{ margin: 0; overflow-wrap: anywhere; }}
+              code {{ font-size: .88rem; }} .actions {{ display: flex; flex-wrap: wrap; gap: 10px; margin: 22px 0 0; }}
+              .button {{ padding: 10px 14px; border-radius: 9px; background: #e9f3ff; color: #07111d; font-weight: 800; text-decoration: none; }}
+              .secondary {{ background: #91c8ff; }} .run {{ align-self: center; color: #9dccff; }}
+              @media (max-width: 480px) {{ body {{ padding: 16px; }} .card {{ padding: 18px; }} dl {{ grid-template-columns: 1fr; gap: 3px; }} dd {{ margin-bottom: 10px; }} }}
+            </style>
+          </head>
+          <body>
+            <main>
+              <header>
+                <h1>Survey2026 Branch Builds</h1>
+                <p class=\"count\">Active branch builds: {len(entries)}</p>
+              </header>
+              <section class=\"grid\">{cards_html}</section>
+            </main>
+          </body>
+          </html>
+          """
+          (branches_dir / "index.html").write_text(dashboard, encoding="utf-8")
+          PY
+
           git -C "$PAGES_DIR" add -- "branches/$BRANCH_SLUG"
+          git -C "$PAGES_DIR" add -- branches/index.html
           if git -C "$PAGES_DIR" diff --cached --quiet; then
             echo "No branch preview changes to publish."
             exit 0
