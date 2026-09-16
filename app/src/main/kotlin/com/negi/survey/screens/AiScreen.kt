@@ -221,15 +221,12 @@ internal fun canAcceptFollowupCandidate(
     followupCapacityRemaining(existing, maxFollowups) > 0 && isDistinctFollowupQuestion(candidate, existing)
 
 internal fun canAdvanceAiTurn(
-    turnCompleted: Boolean,
-    mainAnswerBlank: Boolean,
     aiLoading: Boolean,
     mainSubmissionPending: Boolean,
     speechRecording: Boolean,
     speechTranscribing: Boolean,
 ): Boolean =
-    (turnCompleted || mainAnswerBlank) &&
-            !aiLoading &&
+    !aiLoading &&
             !mainSubmissionPending &&
             !speechRecording &&
             !speechTranscribing
@@ -1074,7 +1071,9 @@ fun AiScreen(
                         }
 
                         if (isTwoStepNode) {
-                            aiReason?.let { Text("Status: ${it.wireValue.replace('_', ' ')}", modifier = Modifier.padding(horizontal = 12.dp)) }
+                            if (BuildConfig.DEBUG) {
+                                aiReason?.let { Text("Status: ${it.wireValue.replace('_', ' ')}", modifier = Modifier.padding(horizontal = 12.dp)) }
+                            }
                             if (conv.validationFailed) {
                                 OutlinedButton(
                                     enabled = !loading && !submissionPending && !speechRecording && !speechTranscribing,
@@ -1127,8 +1126,6 @@ fun AiScreen(
 
                             OutlinedButton(
                                 enabled = canAdvanceAiTurn(
-                                    turnCompleted = conv.turnCompleted,
-                                    mainAnswerBlank = vmSurvey.getAnswer(nid).isBlank(),
                                     aiLoading = loading,
                                     mainSubmissionPending = submissionPending,
                                     speechRecording = speechRecording,
@@ -1136,8 +1133,6 @@ fun AiScreen(
                                 ),
                                 onClick = {
                                     if (!canAdvanceAiTurn(
-                                            turnCompleted = conv.turnCompleted,
-                                            mainAnswerBlank = vmSurvey.getAnswer(nid).isBlank(),
                                             aiLoading = loading,
                                             mainSubmissionPending = submissionPending,
                                             speechRecording = speechRecording,
