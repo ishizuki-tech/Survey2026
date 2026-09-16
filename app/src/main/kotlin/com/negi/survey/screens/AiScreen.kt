@@ -227,14 +227,12 @@ internal fun canAdvanceAiTurn(
     mainSubmissionPending: Boolean,
     speechRecording: Boolean,
     speechTranscribing: Boolean,
-    hasUnansweredFollowup: Boolean,
 ): Boolean =
     (turnCompleted || mainAnswerBlank) &&
             !aiLoading &&
             !mainSubmissionPending &&
             !speechRecording &&
-            !speechTranscribing &&
-            !hasUnansweredFollowup
+            !speechTranscribing
 
 /**
  * Simple abstraction for a speech-to-text controller (e.g., Whisper.cpp).
@@ -382,11 +380,8 @@ fun AiScreen(
     val loading by vmAI.loading.collectAsState()
     val stream by vmAI.stream.collectAsState()
     val error by vmAI.error.collectAsState()
-    val persistedFollowups by vmSurvey.followups.collectAsState()
     val aiReasons by vmSurvey.aiReasons.collectAsState()
     val aiReason = aiReasons[nid]
-    val hasUnansweredFollowup = aiReason != com.negi.survey.vm.SurveyAiReason.UNABLE_REFUSED &&
-            persistedFollowups[nid].orEmpty().any { it.answer == null }
     var submissionPending by remember(contextKey) { mutableStateOf(false) }
 
     // ---------------------------------------------------------------------
@@ -1086,14 +1081,6 @@ fun AiScreen(
                                     onClick = { runTwoStep(retry = true) }
                                 ) { Text("Retry saved answers") }
                             }
-                            TextButton(
-                                enabled = !loading && !submissionPending && !conv.turnCompleted &&
-                                        !speechRecording && !speechTranscribing,
-                                onClick = {
-                                    vmSurvey.setAiReason(nid, com.negi.survey.vm.SurveyAiReason.UNABLE_REFUSED)
-                                    vmAI.completeValidationTurn(contextKey, rootQuestion)
-                                }
-                            ) { Text("Unable to answer / prefer not to answer") }
                         }
 
                         ChatComposer(
@@ -1146,7 +1133,6 @@ fun AiScreen(
                                     mainSubmissionPending = submissionPending,
                                     speechRecording = speechRecording,
                                     speechTranscribing = speechTranscribing,
-                                    hasUnansweredFollowup = hasUnansweredFollowup,
                                 ),
                                 onClick = {
                                     if (!canAdvanceAiTurn(
@@ -1156,7 +1142,6 @@ fun AiScreen(
                                             mainSubmissionPending = submissionPending,
                                             speechRecording = speechRecording,
                                             speechTranscribing = speechTranscribing,
-                                            hasUnansweredFollowup = hasUnansweredFollowup,
                                         )
                                     ) {
                                         return@OutlinedButton

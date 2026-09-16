@@ -63,36 +63,11 @@ class AiTurnPolicyTest {
     }
 
     @Test
-    fun unanswered_followup_cannot_advance_until_completed() {
-        assertFalse(
-            nextEnabled(
-                turnCompleted = false,
-                mainAnswerBlank = false,
-                hasUnansweredFollowup = true,
-            )
-        )
+    fun completed_main_turn_can_advance() {
         assertTrue(
             nextEnabled(
                 turnCompleted = true,
                 mainAnswerBlank = false,
-                hasUnansweredFollowup = false,
-            )
-        )
-    }
-
-    @Test
-    fun completed_main_turn_without_followup_can_advance() {
-        assertTrue(
-            nextEnabled(
-                turnCompleted = true,
-                mainAnswerBlank = false,
-            )
-        )
-        assertTrue(
-            nextEnabled(
-                turnCompleted = true,
-                mainAnswerBlank = false,
-                hasUnansweredFollowup = false,
             )
         )
     }
@@ -137,7 +112,6 @@ class AiTurnPolicyTest {
         mainSubmissionPending: Boolean = false,
         speechRecording: Boolean = false,
         speechTranscribing: Boolean = false,
-        hasUnansweredFollowup: Boolean = false,
     ): Boolean =
         canAdvanceAiTurn(
             turnCompleted = turnCompleted,
@@ -146,7 +120,6 @@ class AiTurnPolicyTest {
             mainSubmissionPending = mainSubmissionPending,
             speechRecording = speechRecording,
             speechTranscribing = speechTranscribing,
-            hasUnansweredFollowup = hasUnansweredFollowup,
         )
 
     private class FakeSpeechController(
