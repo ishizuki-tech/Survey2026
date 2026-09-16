@@ -1,0 +1,11 @@
+{
+  "original_branch": "test/branch-preview-second-v2",
+  "branch_slug": "test-branch-preview-second-v2",
+  "commit_sha": "17de39dfe91465a625f4438ae4e3cd6017703091",
+  "short_sha": "17de39d",
+  "apk_name": "Survey2026-test-branch-preview-second-v2-17de39d.apk",
+  "apk_sha256": "3d3451259a80c6431089d5eaab3d1e11026d0a5aa971606fc0cb976d5a30f22e",
+  "page_url": "https://ishizuki-tech.github.io/Survey2026/branches/test-branch-preview-second-v2/",
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/35138715179",
+  "generated_utc": "2026-09-16T19:13:44Z"
+}
