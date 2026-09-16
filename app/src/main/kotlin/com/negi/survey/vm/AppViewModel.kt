@@ -28,6 +28,7 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
@@ -40,6 +41,7 @@ import java.io.File
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -128,20 +130,28 @@ class AppViewModel(
             return
         }
 
-        if (!forceFresh) {
-            val safeName = suggestFileName(modelUrl, fileName)
-            findExistingModelFile(app, safeName)?.let { existing ->
-                _state.value = DlState.Done(existing)
-                return
-            }
-        }
-
         // Single job policy (Job-based, avoids AtomicBoolean races).
         val running = downloadJob
         if (running?.isActive == true) {
             if (!forceFresh) return
             running.cancel(CancellationException("forceFresh requested"))
             HeavyInitializer.cancel()
+        }
+
+        if (!forceFresh) {
+            val safeName = suggestFileName(modelUrl, fileName)
+            findExistingModelFile(app, safeName)?.let { existing ->
+                Log.i("AppViewModel", "private model reused: name=$safeName bytes=${existing.length()}")
+                _persistenceNotice.value = ModelPersistenceNotice.Reused(safeName, existing.length())
+                downloadJob = viewModelScope.launch {
+                    // Hold here so the "Using saved model" notice is fully visible
+                    // before the UI advances to model initialization.
+                    delay(REUSED_NOTICE_DISPLAY_MS)
+                    _state.value = DlState.Done(existing)
+                    downloadJob = null
+                }
+                return
+            }
         }
 
         downloadJob = viewModelScope.launch(Dispatchers.IO) {
@@ -176,6 +186,9 @@ class AppViewModel(
                     }
 
                     if (reused && privateDestination.exists() && privateDestination.length() > 0L) {
+                        // Hold here so the "Using saved model" notice is fully visible
+                        // before the UI advances to model initialization.
+                        delay(REUSED_NOTICE_DISPLAY_MS)
                         _state.value = DlState.Done(privateDestination)
                         return@launch
                     }
@@ -363,18 +376,8 @@ fun DownloadGate(
 ) {
     when (state) {
         is DlState.Idle -> {
-            Column(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(24.dp),
-                verticalArrangement = Arrangement.Center
-            ) {
-                Text("Checking local model cache…")
-                Spacer(Modifier.height(12.dp))
-                LinearProgressIndicator(
-                    modifier = Modifier.fillMaxWidth()
-                )
-            }
+            // Transient: ensureModelDownloaded() runs immediately after this frame
+            // and moves state on, so nothing is rendered here to avoid a one-frame flash.
         }
 
         is DlState.Downloading -> {
@@ -434,6 +437,9 @@ fun DownloadGate(
 
 /* ───────────────────────────── Persistence Dialog ───────────────────────────── */
 
+/** How long the "Using saved model" notice blocks/displays before model init proceeds. */
+private const val REUSED_NOTICE_DISPLAY_MS: Long = 3_000L
+
 /**
  * Surfaces [notice] (a one-shot reuse/replace event from the persisted,
  * survives-uninstall model cache) to the user as an alert dialog, then
@@ -448,6 +454,11 @@ fun ModelPersistenceDialog(
         null -> Unit
 
         is ModelPersistenceNotice.Reused -> {
+            LaunchedEffect(notice) {
+                delay(REUSED_NOTICE_DISPLAY_MS)
+                onDismiss()
+            }
+
             val mb = notice.bytes / (1024L * 1024L)
             AlertDialog(
                 onDismissRequest = onDismiss,
