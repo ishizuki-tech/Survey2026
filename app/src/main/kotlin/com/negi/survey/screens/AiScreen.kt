@@ -221,20 +221,15 @@ internal fun canAcceptFollowupCandidate(
     followupCapacityRemaining(existing, maxFollowups) > 0 && isDistinctFollowupQuestion(candidate, existing)
 
 internal fun canAdvanceAiTurn(
-    turnCompleted: Boolean,
-    mainAnswerBlank: Boolean,
     aiLoading: Boolean,
     mainSubmissionPending: Boolean,
     speechRecording: Boolean,
     speechTranscribing: Boolean,
-    hasUnansweredFollowup: Boolean,
 ): Boolean =
-    (turnCompleted || mainAnswerBlank) &&
-            !aiLoading &&
+    !aiLoading &&
             !mainSubmissionPending &&
             !speechRecording &&
-            !speechTranscribing &&
-            !hasUnansweredFollowup
+            !speechTranscribing
 
 /**
  * Simple abstraction for a speech-to-text controller (e.g., Whisper.cpp).
@@ -382,11 +377,8 @@ fun AiScreen(
     val loading by vmAI.loading.collectAsState()
     val stream by vmAI.stream.collectAsState()
     val error by vmAI.error.collectAsState()
-    val persistedFollowups by vmSurvey.followups.collectAsState()
     val aiReasons by vmSurvey.aiReasons.collectAsState()
     val aiReason = aiReasons[nid]
-    val hasUnansweredFollowup = aiReason != com.negi.survey.vm.SurveyAiReason.UNABLE_REFUSED &&
-            persistedFollowups[nid].orEmpty().any { it.answer == null }
     var submissionPending by remember(contextKey) { mutableStateOf(false) }
 
     // ---------------------------------------------------------------------
@@ -1079,21 +1071,15 @@ fun AiScreen(
                         }
 
                         if (isTwoStepNode) {
-                            aiReason?.let { Text("Status: ${it.wireValue.replace('_', ' ')}", modifier = Modifier.padding(horizontal = 12.dp)) }
+                            if (BuildConfig.DEBUG) {
+                                aiReason?.let { Text("Status: ${it.wireValue.replace('_', ' ')}", modifier = Modifier.padding(horizontal = 12.dp)) }
+                            }
                             if (conv.validationFailed) {
                                 OutlinedButton(
                                     enabled = !loading && !submissionPending && !speechRecording && !speechTranscribing,
                                     onClick = { runTwoStep(retry = true) }
                                 ) { Text("Retry saved answers") }
                             }
-                            TextButton(
-                                enabled = !loading && !submissionPending && !conv.turnCompleted &&
-                                        !speechRecording && !speechTranscribing,
-                                onClick = {
-                                    vmSurvey.setAiReason(nid, com.negi.survey.vm.SurveyAiReason.UNABLE_REFUSED)
-                                    vmAI.completeValidationTurn(contextKey, rootQuestion)
-                                }
-                            ) { Text("Unable to answer / prefer not to answer") }
                         }
 
                         ChatComposer(
@@ -1140,23 +1126,17 @@ fun AiScreen(
 
                             OutlinedButton(
                                 enabled = canAdvanceAiTurn(
-                                    turnCompleted = conv.turnCompleted,
-                                    mainAnswerBlank = vmSurvey.getAnswer(nid).isBlank(),
                                     aiLoading = loading,
                                     mainSubmissionPending = submissionPending,
                                     speechRecording = speechRecording,
                                     speechTranscribing = speechTranscribing,
-                                    hasUnansweredFollowup = hasUnansweredFollowup,
                                 ),
                                 onClick = {
                                     if (!canAdvanceAiTurn(
-                                            turnCompleted = conv.turnCompleted,
-                                            mainAnswerBlank = vmSurvey.getAnswer(nid).isBlank(),
                                             aiLoading = loading,
                                             mainSubmissionPending = submissionPending,
                                             speechRecording = speechRecording,
                                             speechTranscribing = speechTranscribing,
-                                            hasUnansweredFollowup = hasUnansweredFollowup,
                                         )
                                     ) {
                                         return@OutlinedButton

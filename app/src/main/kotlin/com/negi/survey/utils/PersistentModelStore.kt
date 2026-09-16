@@ -56,7 +56,8 @@ object PersistentModelStore {
     private data class PersistedEntry(
         val uri: Uri,
         val displayName: String,
-        val size: Long
+        val size: Long,
+        val isPending: Boolean
     )
 
     /** True when this API level supports the MediaStore-based persistent store. */
@@ -89,7 +90,13 @@ object PersistentModelStore {
 
         return runCatching {
             val entries = listEntries(context)
-            val match = entries.firstOrNull { it.displayName == targetFileName }
+            val matching = entries.filter { it.displayName == targetFileName }
+            val match = bestOf(matching)
+
+            // Clean up any duplicate rows sharing targetFileName beyond the one
+            // we're about to use (or, if none are usable, all of them) so they
+            // don't keep piling up run after run.
+            matching.filter { it.uri != match?.uri }.forEach { deleteEntry(context, it.uri) }
 
             if (match != null) {
                 val ok = copyToPrivate(context, match.uri, privateDestination)
@@ -99,6 +106,7 @@ object PersistentModelStore {
                     return@runCatching true
                 }
                 Log.w(TAG, "reuseOrReplace: found persisted entry but copy failed, will redownload")
+                deleteEntry(context, match.uri)
                 return@runCatching false
             }
 
@@ -133,14 +141,19 @@ object PersistentModelStore {
         if (!sourceFile.exists() || sourceFile.length() <= 0L) return false
 
         return runCatching {
-            val existing = findEntry(context, fileName)
-            if (existing != null) {
-                if (existing.size == sourceFile.length()) {
-                    Log.d(TAG, "persistFromPrivate: already persisted with matching size, skipping re-upload")
-                    return@runCatching true
-                }
-                deleteEntry(context, existing.uri)
+            val existingMatches = listEntries(context).filter { it.displayName == fileName }
+            val best = bestOf(existingMatches)
+
+            if (best != null && best.size == sourceFile.length()) {
+                Log.d(TAG, "persistFromPrivate: already persisted with matching size, skipping re-upload")
+                // Still clean up any other duplicate rows left over from a past run.
+                existingMatches.filter { it.uri != best.uri }.forEach { deleteEntry(context, it.uri) }
+                return@runCatching true
             }
+
+            // Replacing (or no usable candidate found): clear every row under this
+            // name so a stale duplicate can't linger alongside the new one.
+            existingMatches.forEach { deleteEntry(context, it.uri) }
 
             val resolver = context.contentResolver
             val values = ContentValues().apply {
@@ -189,7 +202,8 @@ object PersistentModelStore {
         val projection = arrayOf(
             MediaStore.Downloads._ID,
             MediaStore.Downloads.DISPLAY_NAME,
-            MediaStore.Downloads.SIZE
+            MediaStore.Downloads.SIZE,
+            MediaStore.Downloads.IS_PENDING
         )
         val selection = "${MediaStore.Downloads.RELATIVE_PATH} = ?"
         val selectionArgs = arrayOf("$RELATIVE_PATH${File.separator}")
@@ -205,6 +219,7 @@ object PersistentModelStore {
             val idCol = cursor.getColumnIndexOrThrow(MediaStore.Downloads._ID)
             val nameCol = cursor.getColumnIndexOrThrow(MediaStore.Downloads.DISPLAY_NAME)
             val sizeCol = cursor.getColumnIndexOrThrow(MediaStore.Downloads.SIZE)
+            val pendingCol = cursor.getColumnIndexOrThrow(MediaStore.Downloads.IS_PENDING)
 
             while (cursor.moveToNext()) {
                 val id = cursor.getLong(idCol)
@@ -213,7 +228,8 @@ object PersistentModelStore {
                     PersistedEntry(
                         uri = uri,
                         displayName = cursor.getString(nameCol).orEmpty(),
-                        size = cursor.getLong(sizeCol)
+                        size = cursor.getLong(sizeCol),
+                        isPending = cursor.getInt(pendingCol) != 0
                     )
                 )
             }
@@ -221,9 +237,16 @@ object PersistentModelStore {
         return out
     }
 
-    @RequiresApi(Build.VERSION_CODES.Q)
-    private fun findEntry(context: Context, fileName: String): PersistedEntry? =
-        listEntries(context).firstOrNull { it.displayName == fileName }
+    /**
+     * Picks the best candidate among entries that share the same display name
+     * (there should only ever be one, but a killed-mid-persist run or a racing
+     * write can leave more than one behind): prefer a fully-written entry
+     * (not [PersistedEntry.isPending]) and, among those, the largest — a
+     * truncated leftover copy is reliably smaller than a complete model file.
+     * Returns null if every candidate is still pending (nothing safe to reuse).
+     */
+    private fun bestOf(candidates: List<PersistedEntry>): PersistedEntry? =
+        candidates.filterNot { it.isPending }.maxByOrNull { it.size }
 
     private fun copyToPrivate(context: Context, uri: Uri, destination: File): Boolean {
         return runCatching {

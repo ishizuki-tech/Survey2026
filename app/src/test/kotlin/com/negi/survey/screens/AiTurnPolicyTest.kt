@@ -11,90 +11,16 @@ import org.junit.Test
 class AiTurnPolicyTest {
 
     @Test
-    fun blank_main_answer_can_advance_without_completed_turn() {
-        assertTrue(
-            nextEnabled(
-                turnCompleted = false,
-                mainAnswerBlank = true,
-            )
-        )
-    }
-
-    @Test
-    fun typed_but_unsubmitted_main_turn_cannot_advance() {
-        assertFalse(
-            nextEnabled(
-                turnCompleted = false,
-                mainAnswerBlank = false,
-            )
-        )
+    fun can_advance_regardless_of_answer_completeness() {
+        assertTrue(nextEnabled())
     }
 
     @Test
     fun pending_submission_loading_or_speech_cannot_advance() {
-        assertFalse(
-            nextEnabled(
-                turnCompleted = true,
-                mainAnswerBlank = false,
-                mainSubmissionPending = true,
-            )
-        )
-        assertFalse(
-            nextEnabled(
-                turnCompleted = true,
-                mainAnswerBlank = false,
-                aiLoading = true,
-            )
-        )
-        assertFalse(
-            nextEnabled(
-                turnCompleted = true,
-                mainAnswerBlank = false,
-                speechRecording = true,
-            )
-        )
-        assertFalse(
-            nextEnabled(
-                turnCompleted = true,
-                mainAnswerBlank = false,
-                speechTranscribing = true,
-            )
-        )
-    }
-
-    @Test
-    fun unanswered_followup_cannot_advance_until_completed() {
-        assertFalse(
-            nextEnabled(
-                turnCompleted = false,
-                mainAnswerBlank = false,
-                hasUnansweredFollowup = true,
-            )
-        )
-        assertTrue(
-            nextEnabled(
-                turnCompleted = true,
-                mainAnswerBlank = false,
-                hasUnansweredFollowup = false,
-            )
-        )
-    }
-
-    @Test
-    fun completed_main_turn_without_followup_can_advance() {
-        assertTrue(
-            nextEnabled(
-                turnCompleted = true,
-                mainAnswerBlank = false,
-            )
-        )
-        assertTrue(
-            nextEnabled(
-                turnCompleted = true,
-                mainAnswerBlank = false,
-                hasUnansweredFollowup = false,
-            )
-        )
+        assertFalse(nextEnabled(mainSubmissionPending = true))
+        assertFalse(nextEnabled(aiLoading = true))
+        assertFalse(nextEnabled(speechRecording = true))
+        assertFalse(nextEnabled(speechTranscribing = true))
     }
 
     @Test
@@ -131,22 +57,16 @@ class AiTurnPolicyTest {
     }
 
     private fun nextEnabled(
-        turnCompleted: Boolean = false,
-        mainAnswerBlank: Boolean = false,
         aiLoading: Boolean = false,
         mainSubmissionPending: Boolean = false,
         speechRecording: Boolean = false,
         speechTranscribing: Boolean = false,
-        hasUnansweredFollowup: Boolean = false,
     ): Boolean =
         canAdvanceAiTurn(
-            turnCompleted = turnCompleted,
-            mainAnswerBlank = mainAnswerBlank,
             aiLoading = aiLoading,
             mainSubmissionPending = mainSubmissionPending,
             speechRecording = speechRecording,
             speechTranscribing = speechTranscribing,
-            hasUnansweredFollowup = hasUnansweredFollowup,
         )
 
     private class FakeSpeechController(
