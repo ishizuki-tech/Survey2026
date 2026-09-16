@@ -1,0 +1,269 @@
+name: Branch APK Preview
+
+on:
+  push:
+    branches-ignore:
+      - main
+      - gh-pages
+
+permissions:
+  contents: write
+
+concurrency:
+  # Every run updates the shared gh-pages branch, so serialize those updates.
+  group: branch-apk-preview-pages
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+  ANDROID_HOME: /usr/local/lib/android/sdk
+  COMPILE_SDK: "37"
+  BUILD_TOOLS_VERSION: "36.0.0"
+  NDK_VERSION: "29.0.14206865"
+  CMAKE_VERSION: "3.22.1"
+
+jobs:
+  build-and-publish-preview:
+    name: Build and publish branch APK preview
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          accept-android-sdk-licenses: true
+          log-accepted-android-sdk-licenses: false
+          packages: platform-tools
+
+      - name: Install Android CLI
+        run: |
+          set -euo pipefail
+          curl -fsSL \
+            https://dl.google.com/android/cli/latest/linux_x86_64/install_root.sh \
+            | sudo bash
+
+          command -v android
+          android --version
+
+      - name: Install Android SDK components
+        run: |
+          set -euo pipefail
+          android --sdk="$ANDROID_SDK_ROOT" \
+            sdk install \
+            --canary \
+            platform-tools \
+            "platforms/android-${COMPILE_SDK}.0" \
+            "build-tools/${BUILD_TOOLS_VERSION}" \
+            "ndk/${NDK_VERSION}" \
+            "cmake/${CMAKE_VERSION}"
+
+          test -f "$ANDROID_SDK_ROOT/platforms/android-${COMPILE_SDK}.0/android.jar"
+          test -x "$ANDROID_SDK_ROOT/build-tools/$BUILD_TOOLS_VERSION/apksigner"
+          test -x "$ANDROID_SDK_ROOT/build-tools/$BUILD_TOOLS_VERSION/zipalign"
+          test -d "$ANDROID_SDK_ROOT/ndk/$NDK_VERSION"
+          test -d "$ANDROID_SDK_ROOT/cmake/$CMAKE_VERSION"
+
+      - name: Set up Gradle cache
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Make Gradle wrapper executable
+        run: chmod +x ./gradlew
+
+      - name: Run JVM unit tests
+        run: |
+          ./gradlew :app:testDebugUnitTest --no-daemon \
+            -PskipModelDownload=true \
+            -Pdebug.embedSecrets=false \
+            -Prelease.allowSecrets=false
+
+      - name: Build debug APK
+        run: |
+          ./gradlew :app:assembleDebug --no-daemon \
+            -PskipModelDownload=true \
+            -Pdebug.embedSecrets=false \
+            -Prelease.allowSecrets=false
+
+      - name: Collect branch APK metadata
+        id: apk
+        run: |
+          set -euo pipefail
+
+          APK_DIR="app/build/outputs/apk/debug"
+          mapfile -d '' apks < <(find "$APK_DIR" -maxdepth 1 -type f -name '*.apk' -print0)
+          if (( ${#apks[@]} != 1 )); then
+            echo "::error::Expected exactly one debug APK in $APK_DIR; found ${#apks[@]}."
+            find "$APK_DIR" -maxdepth 1 -type f -name '*.apk' -print || true
+            exit 1
+          fi
+
+          BRANCH="$GITHUB_REF_NAME"
+          BRANCH_SLUG="$(printf '%s' "$BRANCH" | LC_ALL=C tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//')"
+          if [[ -z "$BRANCH_SLUG" ]]; then
+            echo "::error::Branch name cannot be converted into a safe Pages path."
+            exit 1
+          fi
+
+          SHORT_SHA="${GITHUB_SHA::7}"
+          APK_NAME="Survey2026-${BRANCH_SLUG}-${SHORT_SHA}.apk"
+          OUTPUT="$RUNNER_TEMP/$APK_NAME"
+          cp "${apks[0]}" "$OUTPUT"
+          APK_SHA256="$(sha256sum "$OUTPUT" | awk '{print $1}')"
+          PAGE_URL="https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}/branches/${BRANCH_SLUG}/"
+
+          echo "path=$OUTPUT" >> "$GITHUB_OUTPUT"
+          echo "name=$APK_NAME" >> "$GITHUB_OUTPUT"
+          echo "sha256=$APK_SHA256" >> "$GITHUB_OUTPUT"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "branch_slug=$BRANCH_SLUG" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+          echo "page_url=$PAGE_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Upload branch APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.apk.outputs.name }}
+          path: ${{ steps.apk.outputs.path }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Check out existing GitHub Pages content
+        uses: actions/checkout@v5
+        with:
+          ref: gh-pages
+          path: preview-pages
+          fetch-depth: 1
+
+      - name: Update this branch preview only
+        env:
+          APK_PATH: ${{ steps.apk.outputs.path }}
+          APK_NAME: ${{ steps.apk.outputs.name }}
+          APK_SHA256: ${{ steps.apk.outputs.sha256 }}
+          BRANCH: ${{ steps.apk.outputs.branch }}
+          BRANCH_SLUG: ${{ steps.apk.outputs.branch_slug }}
+          SHORT_SHA: ${{ steps.apk.outputs.short_sha }}
+          PAGE_URL: ${{ steps.apk.outputs.page_url }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_NUMBER: ${{ github.run_number }}
+          SERVER_URL: ${{ github.server_url }}
+        run: |
+          set -euo pipefail
+
+          PAGES_DIR="preview-pages"
+          TARGET_DIR="$PAGES_DIR/branches/$BRANCH_SLUG"
+          RUN_URL="$SERVER_URL/$REPOSITORY/actions/runs/$RUN_ID"
+          REPOSITORY_URL="$SERVER_URL/$REPOSITORY"
+          APK_URL="$PAGE_URL$APK_NAME"
+          GENERATED_UTC="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+
+          # Slugging is intentionally readable. Refuse to overwrite if two different
+          # branch names sanitize to the same directory.
+          if [[ -f "$TARGET_DIR/branch.txt" ]] && ! cmp -s "$TARGET_DIR/branch.txt" <(printf '%s\n' "$BRANCH"); then
+            echo "::error::Refusing to overwrite $TARGET_DIR because it belongs to a different branch name."
+            exit 1
+          fi
+
+          html_escape() {
+            printf '%s' "$1" | sed \
+              -e 's/&/\&amp;/g' \
+              -e 's/</\&lt;/g' \
+              -e 's/>/\&gt;/g' \
+              -e 's/"/\&quot;/g' \
+              -e "s/'/\&#39;/g"
+          }
+
+          BRANCH_HTML="$(html_escape "$BRANCH")"
+          mkdir -p "$RUNNER_TEMP/branch-preview"
+          PREVIEW_DIR="$RUNNER_TEMP/branch-preview"
+          cp "$APK_PATH" "$PREVIEW_DIR/$APK_NAME"
+          printf '%s\n' "$BRANCH" > "$PREVIEW_DIR/branch.txt"
+          touch "$PREVIEW_DIR/.nojekyll"
+
+          cat > "$PREVIEW_DIR/index.html" <<HTML
+          <!doctype html>
+          <html lang="en">
+          <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <meta name="robots" content="noindex,nofollow">
+            <title>Survey2026 Branch Build</title>
+            <style>
+              :root { color-scheme: dark; font-family: system-ui, sans-serif; background: #07111d; color: #eef6ff; }
+              body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 24px; }
+              main { width: min(820px, 100%); padding: 32px; border: 1px solid #35506c; border-radius: 20px; background: #102238; }
+              h1 { margin-top: 0; } .download { display: inline-block; margin: 12px 0 24px; padding: 14px 20px; border-radius: 10px; background: #e9f3ff; color: #07111d; font-weight: 800; text-decoration: none; }
+              .qr { display: grid; grid-template-columns: 200px 1fr; gap: 24px; align-items: center; margin: 24px 0; padding: 20px; border-radius: 14px; background: #172f4b; }
+              .qr img { width: 200px; height: 200px; background: white; } dl { display: grid; grid-template-columns: max-content 1fr; gap: 10px 18px; } dt { color: #a8c6e6; font-weight: 700; } dd { margin: 0; overflow-wrap: anywhere; } a { color: #9dccff; } code { overflow-wrap: anywhere; } @media (max-width: 600px) { main { padding: 22px; } .qr { grid-template-columns: 1fr; } }
+            </style>
+          </head>
+          <body>
+            <main>
+              <h1>Survey2026 Branch Build</h1>
+              <p>This installable debug APK was built from the branch shown below. It is separate from the production release.</p>
+              <a class="download" href="$APK_URL">Download APK</a>
+              <section class="qr">
+                <img src="https://api.qrserver.com/v1/create-qr-code/?size=300x300&amp;data=$PAGE_URL" alt="QR code for this branch build page" width="200" height="200">
+                <div><h2>Open on Android</h2><p>Scan this code to open this branch-specific download page.</p><code>$PAGE_URL</code></div>
+              </section>
+              <dl>
+                <dt>Original branch</dt><dd><code>$BRANCH_HTML</code></dd>
+                <dt>Branch slug</dt><dd><code>$BRANCH_SLUG</code></dd>
+                <dt>Short commit SHA</dt><dd><code>$SHORT_SHA</code></dd>
+                <dt>Full commit SHA</dt><dd><code>$GITHUB_SHA</code></dd>
+                <dt>Build timestamp</dt><dd><code>$GENERATED_UTC</code></dd>
+                <dt>APK filename</dt><dd><code>$APK_NAME</code></dd>
+                <dt>APK SHA-256</dt><dd><code>$APK_SHA256</code></dd>
+                <dt>Workflow run</dt><dd><a href="$RUN_URL">#$RUN_NUMBER</a></dd>
+              </dl>
+              <p><a href="$REPOSITORY_URL">GitHub repository</a> · <a href="$RUN_URL">GitHub Actions run</a></p>
+            </main>
+          </body>
+          </html>
+          HTML
+
+          cat > "$PREVIEW_DIR/build.json" <<JSON
+          {
+            "original_branch": "$(printf '%s' "$BRANCH" | sed 's/\\/\\\\/g; s/"/\\"/g')",
+            "branch_slug": "$BRANCH_SLUG",
+            "commit_sha": "$GITHUB_SHA",
+            "short_sha": "$SHORT_SHA",
+            "apk_name": "$APK_NAME",
+            "apk_sha256": "$APK_SHA256",
+            "page_url": "$PAGE_URL",
+            "run_url": "$RUN_URL",
+            "generated_utc": "$GENERATED_UTC"
+          }
+          JSON
+
+          rm -rf "$TARGET_DIR"
+          mkdir -p "$(dirname "$TARGET_DIR")"
+          mv "$PREVIEW_DIR" "$TARGET_DIR"
+
+          git -C "$PAGES_DIR" add -- "branches/$BRANCH_SLUG"
+          if git -C "$PAGES_DIR" diff --cached --quiet; then
+            echo "No branch preview changes to publish."
+            exit 0
+          fi
+
+          git -C "$PAGES_DIR" config user.name "github-actions[bot]"
+          git -C "$PAGES_DIR" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C "$PAGES_DIR" commit -m "Update branch APK preview for $BRANCH_SLUG"
+          git -C "$PAGES_DIR" push origin HEAD:gh-pages
