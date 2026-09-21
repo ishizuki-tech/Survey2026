@@ -152,3 +152,5 @@ app/src/main/assets/models/**
 
 # Allow Swahili Whisper model on LFS branch
 !app/src/main/assets/models/ggml-small-sw-q5_0.bin
+
+!app/src/main/assets/models/ggml-small-sw-kenyan-nonstandard-q5_0.bin
