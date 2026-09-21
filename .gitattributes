@@ -1,1 +1,2 @@
 app/src/main/assets/models/ggml-small-sw-q5_0.bin filter=lfs diff=lfs merge=lfs -text
+app/src/main/assets/models/ggml-small-sw-cv14-q5_0.bin filter=lfs diff=lfs merge=lfs -text
