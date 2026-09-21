@@ -329,7 +329,7 @@ model_defaults:
 
 whisper:
   enabled: true
-  asset_model_path: "models/ggml-small-q5_1.bin"
+  asset_model_path: "models/ggml-small-sw-q5_0.bin"
   language: "sw"
   translate: false
   print_timestamp: false

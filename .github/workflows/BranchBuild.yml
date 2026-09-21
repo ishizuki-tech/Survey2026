@@ -38,6 +38,7 @@ jobs:
         with:
           fetch-depth: 1
           submodules: recursive
+          lfs: true
           persist-credentials: false
 
       - name: Set up JDK 17

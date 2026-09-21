@@ -149,3 +149,6 @@ app/src/main/assets/models/**
 *~
 *.orig
 *.bak
+
+# Allow Swahili Whisper model on LFS branch
+!app/src/main/assets/models/ggml-small-sw-q5_0.bin
