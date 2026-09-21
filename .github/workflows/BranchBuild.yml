@@ -145,6 +145,60 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+      - name: Create or update branch preview release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APK_PATH: ${{ steps.apk.outputs.path }}
+          APK_NAME: ${{ steps.apk.outputs.name }}
+          BRANCH: ${{ steps.apk.outputs.branch }}
+          BRANCH_SLUG: ${{ steps.apk.outputs.branch_slug }}
+          REPOSITORY: ${{ github.repository }}
+          SERVER_URL: ${{ github.server_url }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          RELEASE_TAG="branch-preview-$BRANCH_SLUG"
+          RELEASE_TITLE="Survey2026 branch preview: $BRANCH"
+          RELEASE_NOTES="Latest preview APK for branch $BRANCH. This prerelease is replaced by each successful branch build."
+
+          if gh release view "$RELEASE_TAG" --repo "$REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" \
+              --repo "$REPOSITORY" \
+              --target "$COMMIT_SHA" \
+              --title "$RELEASE_TITLE" \
+              --prerelease \
+              --notes "$RELEASE_NOTES"
+          else
+            gh release create "$RELEASE_TAG" \
+              --repo "$REPOSITORY" \
+              --target "$COMMIT_SHA" \
+              --title "$RELEASE_TITLE" \
+              --prerelease \
+              --notes "$RELEASE_NOTES"
+          fi
+
+          # One preview release is retained per branch. Remove only old APK assets
+          # belonging to this branch before uploading the current build.
+          while IFS= read -r asset_name; do
+            case "$asset_name" in
+              "Survey2026-${BRANCH_SLUG}-"*.apk)
+                gh release delete-asset "$RELEASE_TAG" "$asset_name" \
+                  --repo "$REPOSITORY" \
+                  --yes
+                ;;
+            esac
+          done < <(gh release view "$RELEASE_TAG" --repo "$REPOSITORY" --json assets --jq '.assets[].name')
+
+          gh release upload "$RELEASE_TAG" "$APK_PATH#$APK_NAME" \
+            --repo "$REPOSITORY" \
+            --clobber
+
+          RELEASE_ASSET_URL="$SERVER_URL/$REPOSITORY/releases/download/$RELEASE_TAG/$APK_NAME"
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "asset_url=$RELEASE_ASSET_URL" >> "$GITHUB_OUTPUT"
+
       - name: Check out existing GitHub Pages content
         uses: actions/checkout@v5
         with:
@@ -154,13 +208,13 @@ jobs:
 
       - name: Update this branch preview only
         env:
-          APK_PATH: ${{ steps.apk.outputs.path }}
           APK_NAME: ${{ steps.apk.outputs.name }}
           APK_SHA256: ${{ steps.apk.outputs.sha256 }}
           BRANCH: ${{ steps.apk.outputs.branch }}
           BRANCH_SLUG: ${{ steps.apk.outputs.branch_slug }}
           SHORT_SHA: ${{ steps.apk.outputs.short_sha }}
           PAGE_URL: ${{ steps.apk.outputs.page_url }}
+          RELEASE_ASSET_URL: ${{ steps.release.outputs.asset_url }}
           REPOSITORY: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
           RUN_NUMBER: ${{ github.run_number }}
@@ -172,7 +226,7 @@ jobs:
           TARGET_DIR="$PAGES_DIR/branches/$BRANCH_SLUG"
           RUN_URL="$SERVER_URL/$REPOSITORY/actions/runs/$RUN_ID"
           REPOSITORY_URL="$SERVER_URL/$REPOSITORY"
-          APK_URL="$PAGE_URL$APK_NAME"
+          APK_URL="$RELEASE_ASSET_URL"
           GENERATED_UTC="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 
           # Slugging is intentionally readable. Refuse to overwrite if two different
@@ -194,7 +248,6 @@ jobs:
           BRANCH_HTML="$(html_escape "$BRANCH")"
           mkdir -p "$RUNNER_TEMP/branch-preview"
           PREVIEW_DIR="$RUNNER_TEMP/branch-preview"
-          cp "$APK_PATH" "$PREVIEW_DIR/$APK_NAME"
           printf '%s\n' "$BRANCH" > "$PREVIEW_DIR/branch.txt"
           touch "$PREVIEW_DIR/.nojekyll"
 
@@ -249,6 +302,7 @@ jobs:
             "apk_name": "$APK_NAME",
             "apk_sha256": "$APK_SHA256",
             "page_url": "$PAGE_URL",
+            "release_asset_url": "$RELEASE_ASSET_URL",
             "run_url": "$RUN_URL",
             "generated_utc": "$GENERATED_UTC"
           }
@@ -326,11 +380,23 @@ jobs:
 
                   expected_apk_name = f"Survey2026-{slug}-{short_sha}.apk"
                   expected_page_url = f"{page_base_url}{slug}/"
+                  release_asset_url = metadata.get("release_asset_url")
+                  expected_release_asset_url = (
+                      f"{server_url}/{repository}/releases/download/"
+                      f"branch-preview-{slug}/{expected_apk_name}"
+                  )
                   if (
                       metadata["apk_name"] != expected_apk_name
                       or metadata["page_url"] != expected_page_url
                       or not metadata["run_url"].startswith(run_url_prefix)
                       or not metadata["run_url"][len(run_url_prefix):].isdigit()
+                      or (
+                          release_asset_url is not None
+                          and (
+                              not isinstance(release_asset_url, str)
+                              or release_asset_url != expected_release_asset_url
+                          )
+                      )
                   ):
                       raise ValueError
 
@@ -351,7 +417,12 @@ jobs:
                   return html.escape(metadata[field], quote=True)
 
               page_url = escaped("page_url")
-              apk_url = f"{page_url}{escaped('apk_name')}"
+              release_asset_url = metadata.get("release_asset_url")
+              apk_url = (
+                  html.escape(release_asset_url, quote=True)
+                  if isinstance(release_asset_url, str)
+                  else f"{page_url}{escaped('apk_name')}"
+              )
               cards.append(
                   "<article class=\"card\">"
                   f"<h2>{escaped('original_branch')}</h2>"
