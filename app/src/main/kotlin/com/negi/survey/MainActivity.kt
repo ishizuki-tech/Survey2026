@@ -156,14 +156,21 @@ import com.negi.survey.vm.FlowSingle
 import com.negi.survey.vm.FlowText
 import com.negi.survey.vm.ModelPersistenceDialog
 import com.negi.survey.vm.NoOpQuestionSpeaker
+import com.negi.survey.vm.NodeType
 import com.negi.survey.vm.QuestionSpeaker
 import com.negi.survey.vm.SurveyViewModel
 import com.negi.survey.vm.SurveySessionStore
+import com.negi.survey.vm.SurveyFinalizationState
+import com.negi.survey.vm.SurveyFinalizationViewModel
 import com.negi.survey.vm.TtsController
+import com.negi.survey.vm.UploadStatusViewModel
+import com.negi.survey.vm.UploadStatus
 import com.negi.survey.vm.WhisperSpeechController
 import com.negi.survey.vm.shouldAutoPlayQuestion
 import com.negi.survey.vm.toggleQuestionSpeaker
 import java.util.Locale
+import java.text.SimpleDateFormat
+import java.util.Date
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
@@ -618,6 +625,21 @@ fun AppNav() {
         viewModelStoreOwner = activityVmOwner,
         key = "SurveySessionStore"
     )
+    val uploadStatusViewModel: UploadStatusViewModel = viewModel(
+        viewModelStoreOwner = activityVmOwner,
+        key = "UploadStatusViewModel",
+        factory = UploadStatusViewModel.factory(appContext as android.app.Application)
+    )
+    val uploadStatus by uploadStatusViewModel.status.collectAsStateWithLifecycle()
+    val lifecycleOwner = LocalLifecycleOwner.current
+
+    DisposableEffect(lifecycleOwner, uploadStatusViewModel) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) uploadStatusViewModel.refresh()
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
 
     val options = remember(appContext) {
         val assetManager = appContext.assets
@@ -662,6 +684,8 @@ fun AppNav() {
         IntroScreen(
             options = options,
             defaultOptionId = options.firstOrNull()?.id,
+            uploadStatus = uploadStatus,
+            onUploadStatusActive = uploadStatusViewModel::refresh,
             onStart = { option ->
                 selectionEpoch += 1
                 chosenId = option.id
@@ -979,7 +1003,8 @@ fun AppNav() {
                         whisperMeta = cfg.whisper,
                         ttsMeta = cfg.tts,
                         sessionId = sessionKey,
-                        sessionVmOwner = sessionVmOwner
+                        sessionVmOwner = sessionVmOwner,
+                        uploadStatus = uploadStatus
                     )
                 }
             } else {
@@ -991,7 +1016,8 @@ fun AppNav() {
                     whisperMeta = cfg.whisper,
                     ttsMeta = cfg.tts,
                     sessionId = sessionKey,
-                    sessionVmOwner = sessionVmOwner
+                    sessionVmOwner = sessionVmOwner,
+                    uploadStatus = uploadStatus
                 )
             }
         }
@@ -1042,11 +1068,25 @@ fun SurveyNavHost(
     whisperMeta: SurveyConfig.WhisperMeta = SurveyConfig.WhisperMeta(),
     ttsMeta: SurveyConfig.TtsMeta = SurveyConfig.TtsMeta(),
     sessionId: String = "session",
-    sessionVmOwner: ViewModelStoreOwner? = null
+    sessionVmOwner: ViewModelStoreOwner? = null,
+    uploadStatus: UploadStatus = UploadStatus()
 ) {
     val appContext = LocalContext.current.applicationContext
     val owner = sessionVmOwner ?: LocalViewModelStoreOwner.current
     ?: error("Missing ViewModelStoreOwner")
+    val finalizationVm: SurveyFinalizationViewModel = viewModel(
+        viewModelStoreOwner = owner,
+        key = "SurveyFinalizationViewModel_$sessionId",
+        factory = SurveyFinalizationViewModel.factory(appContext as android.app.Application)
+    )
+    val finalizationState by finalizationVm.state.collectAsStateWithLifecycle()
+    val finishTag = remember(appContext) { com.negi.survey.utils.DeviceUploadTagProvider.from(appContext) }
+
+    LaunchedEffect(finalizationState, vmSurvey.currentNodeId) {
+        if (finalizationState is SurveyFinalizationState.Queued && vmSurvey.currentNode.value.type == NodeType.REVIEW) {
+            vmSurvey.advanceToNext()
+        }
+    }
 
     val canGoBack by vmSurvey.canGoBack.collectAsStateWithLifecycle()
     val voiceEnabled = remember(whisperMeta.enabled) { whisperMeta.enabled ?: true }
@@ -1373,24 +1413,30 @@ fun SurveyNavHost(
                 entry<FlowReview> {
                     ReviewScreen(
                         vm = vmSurvey,
-                        onNext = { vmSurvey.advanceToNext() },
-                        onBack = { vmSurvey.backToPrevious() }
+                        finalizationState = finalizationState,
+                        onFinish = {
+                            val stamp = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.US).format(Date())
+                            finalizationVm.finish(
+                                snapshot = vmSurvey.createFinalizationSnapshot(),
+                                config = buildGitHubConfigOrNull(),
+                                tag = finishTag,
+                                stamp = stamp
+                            )
+                        },
+                        onBack = { if (finalizationState !is SurveyFinalizationState.Finishing) vmSurvey.backToPrevious() }
                     )
                 }
 
                 entry<FlowDone> {
-                    // Normalize GitHub config to avoid "owner/repo" vs "repo" mismatch bugs.
-                    val gh = remember { buildGitHubConfigOrNull() }
-
                     DoneScreen(
                         vm = vmSurvey,
+                        uploadStatus = uploadStatus,
                         onRestart = {
                             Log.d(MainActivity.TAG, "Done -> Restart requested (return to selector)")
                             vmAI.resetStates()
                             vmSurvey.resetToStart()
                             onResetToSelector()
                         },
-                        gitHubConfig = gh
                     )
                 }
             }
