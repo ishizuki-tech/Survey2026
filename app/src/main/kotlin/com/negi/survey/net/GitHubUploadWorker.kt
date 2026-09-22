@@ -467,6 +467,8 @@ class GitHubUploadWorker(
 
         val filePath = inputData.getString(KEY_FILE_PATH).orEmpty()
         val fileName = inputData.getString(KEY_FILE_NAME) ?: File(filePath).name
+        val uploadKind = inputData.getString(KEY_UPLOAD_KIND).orEmpty()
+        val surveyId = inputData.getString(KEY_SURVEY_ID).orEmpty()
 
         if (filePath.isBlank()) return Result.failure(workDataOf(ERROR_MESSAGE to "Missing file path."))
 
@@ -518,6 +520,14 @@ class GitHubUploadWorker(
                     message = "Upload $fileName (deferred)",
                     onProgress = onProgress
                 )
+            }
+
+            if (
+                isText &&
+                uploadKind == UPLOAD_KIND_SURVEY_JSON &&
+                surveyId.isNotBlank()
+            ) {
+                UploadedSurveyStore(applicationContext).markUploaded(surveyId)
             }
 
             runCatching {
@@ -2501,6 +2511,11 @@ class GitHubUploadWorker(
         const val KEY_BRANCH = "branch"
         const val KEY_PATH_PREFIX = "pathPrefix"
         const val KEY_MODE = "mode"
+        const val KEY_UPLOAD_KIND = "uploadKind"
+        const val KEY_SURVEY_ID = "surveyId"
+
+        /** Explicit marker for survey JSON only; generic file uploads are never counted. */
+        const val UPLOAD_KIND_SURVEY_JSON = "survey_json"
 
         /** Stable across WorkManager retries for one logical upload session. */
         const val KEY_SESSION_ID = "sessionId"

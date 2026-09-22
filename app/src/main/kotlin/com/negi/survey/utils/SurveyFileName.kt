@@ -106,6 +106,43 @@ fun buildSurveyFileName(
 )
 
 /**
+ * Build a device-tagged survey JSON filename.
+ *
+ * Format:
+ *   <timestamp>_<prefix>_<deviceTag>_<surveyUuid>.json
+ *
+ * This explicit overload preserves the timestamp-last legacy APIs above.
+ */
+fun buildSurveyFileName(
+    surveyId: String,
+    deviceTag: DeviceUploadTag,
+    prefix: String = "survey",
+    stamp: String? = null,
+    nowMillis: Long = System.currentTimeMillis()
+): String {
+    val ts = safeSegment(stamp ?: timeStamp(nowMillis, pattern = DEFAULT_JSON_TS_PATTERN))
+    val pfx = safeSegment(prefix)
+    val tag = safeSegment(deviceTag.value)
+    val sid = safeSegment(surveyId)
+    return "${ts}_${pfx}_${tag}_${sid}.json"
+}
+
+/** Typed overload for device-tagged UUID-first survey exports. */
+fun buildSurveyFileName(
+    surveyId: SurveyUuid,
+    deviceTag: DeviceUploadTag,
+    prefix: String = "survey",
+    stamp: String? = null,
+    nowMillis: Long = System.currentTimeMillis()
+): String = buildSurveyFileName(
+    surveyId = surveyId.value,
+    deviceTag = deviceTag,
+    prefix = prefix,
+    stamp = stamp,
+    nowMillis = nowMillis
+)
+
+/**
  * Legacy-friendly overload for call sites that still name by session id.
  *
  * Legacy format:
@@ -216,6 +253,47 @@ fun buildVoiceFileName(
 ): String = buildVoiceFileName(
     surveyUuid = surveyUuid.value,
     questionId = questionId,
+    prefix = prefix,
+    stamp = stamp,
+    nowMillis = nowMillis
+)
+
+/**
+ * Build a device-tagged voice WAV filename.
+ *
+ * Format:
+ *   <timestamp>_<prefix>_<deviceTag>_<surveyUuid>_<questionId>.wav
+ *
+ * This explicit overload preserves the timestamp-last legacy APIs above.
+ */
+fun buildVoiceFileName(
+    surveyUuid: String,
+    questionId: String?,
+    deviceTag: DeviceUploadTag,
+    prefix: String = "voice",
+    stamp: String? = null,
+    nowMillis: Long = System.currentTimeMillis()
+): String {
+    val ts = safeSegment(stamp ?: timeStamp(nowMillis, pattern = DEFAULT_VOICE_TS_PATTERN))
+    val pfx = safeSegment(prefix)
+    val tag = safeSegment(deviceTag.value)
+    val sid = safeSegment(surveyUuid)
+    val qid = safeSegment(questionId ?: "unknown")
+    return "${ts}_${pfx}_${tag}_${sid}_${qid}.wav"
+}
+
+/** Typed overload for device-tagged UUID-first voice exports. */
+fun buildVoiceFileName(
+    surveyUuid: SurveyUuid,
+    questionId: String?,
+    deviceTag: DeviceUploadTag,
+    prefix: String = "voice",
+    stamp: String? = null,
+    nowMillis: Long = System.currentTimeMillis()
+): String = buildVoiceFileName(
+    surveyUuid = surveyUuid.value,
+    questionId = questionId,
+    deviceTag = deviceTag,
     prefix = prefix,
     stamp = stamp,
     nowMillis = nowMillis

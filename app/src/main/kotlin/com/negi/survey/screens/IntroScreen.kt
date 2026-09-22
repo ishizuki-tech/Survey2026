@@ -126,6 +126,7 @@ import androidx.compose.ui.unit.max
 import androidx.compose.ui.unit.min
 import androidx.compose.ui.unit.sp
 import com.negi.survey.BuildConfig
+import com.negi.survey.vm.UploadStatus
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -170,6 +171,8 @@ data class ConfigDetails(
 fun IntroScreen(
     options: List<ConfigOptionUi>,
     defaultOptionId: String? = null,
+    uploadStatus: UploadStatus,
+    onUploadStatusActive: () -> Unit,
     onStart: (ConfigOptionUi) -> Unit,
     restartEpoch: Long = 0L,
     showRestart: Boolean = false,
@@ -180,6 +183,7 @@ fun IntroScreen(
     require(options.isNotEmpty()) { "IntroScreen requires at least one ConfigOptionUi." }
 
     val bgBrush = animatedMonotoneBackground()
+    LaunchedEffect(Unit) { onUploadStatusActive() }
 
     Box(
         modifier = Modifier
@@ -197,6 +201,7 @@ fun IntroScreen(
                 subtitle = "A focused, privacy-friendly evaluation flow",
                 options = options,
                 defaultOptionId = defaultOptionId,
+                uploadStatus = uploadStatus,
                 onStart = onStart,
                 restartEpoch = restartEpoch,
                 showRestart = showRestart,
@@ -229,6 +234,7 @@ private fun IntroCardMono(
     subtitle: String,
     options: List<ConfigOptionUi>,
     defaultOptionId: String?,
+    uploadStatus: UploadStatus,
     onStart: (ConfigOptionUi) -> Unit,
     restartEpoch: Long,
     showRestart: Boolean,
@@ -360,6 +366,33 @@ private fun IntroCardMono(
                 textAlign = TextAlign.Center,
                 maxLines = 2,
                 overflow = TextOverflow.Ellipsis
+            )
+
+            Spacer(Modifier.padding(top = 14.dp))
+
+            Text(
+                text = "Upload Status",
+                style = MaterialTheme.typography.labelMedium.copy(letterSpacing = 0.2.sp),
+                color = textMuted,
+                modifier = Modifier.align(Alignment.Start)
+            )
+            Text(
+                text = "Device ID: ${uploadStatus.deviceTag}",
+                style = MaterialTheme.typography.bodyMedium,
+                color = textSecondary,
+                modifier = Modifier.align(Alignment.Start)
+            )
+            Text(
+                text = "Uploaded Surveys on This Device: ${uploadStatus.uploadedCount}",
+                style = MaterialTheme.typography.bodyMedium,
+                color = textSecondary,
+                modifier = Modifier.align(Alignment.Start)
+            )
+            Text(
+                text = "Pending Survey Uploads: ${uploadStatus.pendingCount}",
+                style = MaterialTheme.typography.bodyMedium,
+                color = textSecondary,
+                modifier = Modifier.align(Alignment.Start)
             )
 
             Spacer(Modifier.padding(top = 16.dp))
