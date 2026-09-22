@@ -68,10 +68,12 @@ import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -82,16 +84,19 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.work.BackoffPolicy
 import androidx.work.Constraints
+import androidx.work.Data
 import androidx.work.ExistingWorkPolicy
 import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequest
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.OutOfQuotaPolicy
 import androidx.work.WorkManager
-import androidx.work.workDataOf
+import androidx.work.WorkInfo
+import androidx.lifecycle.Observer
 import com.negi.survey.BuildConfig
 import com.negi.survey.net.GitHubUploadWorker
 import com.negi.survey.net.GitHubUploader
+import com.negi.survey.net.UploadedSurveyStore
 import com.negi.survey.net.VoiceUploadCompletionStore
 import com.negi.survey.utils.ExportUtils
 import com.negi.survey.utils.buildSurveyFileName
@@ -171,6 +176,22 @@ fun DoneScreen(
     val bgScope = remember { CoroutineScope(SupervisorJob() + Dispatchers.IO) }
     var uploading by remember { mutableStateOf(false) }
     val context = LocalContext.current
+    val uploadedSurveyStore = remember(context) { UploadedSurveyStore(context) }
+    var uploadedSurveyCount by remember(uploadedSurveyStore) {
+        mutableIntStateOf(uploadedSurveyStore.uploadedCount())
+    }
+
+    // WorkManager is a refresh trigger only. The persisted UUID ledger remains
+    // the sole source of truth for the displayed total.
+    DisposableEffect(context, uploadedSurveyStore) {
+        val workInfos = WorkManager.getInstance(context)
+            .getWorkInfosByTagLiveData(GitHubUploadWorker.TAG)
+        val observer = Observer<List<WorkInfo>> {
+            uploadedSurveyCount = uploadedSurveyStore.uploadedCount()
+        }
+        workInfos.observeForever(observer)
+        onDispose { workInfos.removeObserver(observer) }
+    }
 
     val audioRefsForRun = remember(recordedAudioRefs, surveyUuid) {
         vm.getAudioRefsForRun(surveyUuid)
@@ -377,6 +398,29 @@ fun DoneScreen(
         }
     }
 
+    val scheduleDeferredGitHubUpload = {
+        val cfg = gitHubConfig
+        if (!uploading && cfg != null) {
+            uploading = true
+            bgScope.launch {
+                try {
+                    stageAndScheduleGitHubUploads(
+                        context = context,
+                        cfg = cfg,
+                        surveyUuid = surveyUuid,
+                        exportedAtStamp = exportedAtStamp,
+                        jsonText = jsonText,
+                        expectedVoiceFileNames = expectedVoiceFileNames,
+                        snackbar = snackbar,
+                        voiceFilesState = voiceFilesState
+                    )
+                } finally {
+                    uploading = false
+                }
+            }
+        }
+    }
+
     Scaffold(
         containerColor = Color.Transparent,
         topBar = { TopAppBar(title = { Text("Done") }) }
@@ -399,6 +443,11 @@ fun DoneScreen(
                 Spacer(Modifier.height(8.dp))
                 Text(
                     text = "Survey ID: $surveyUuid",
+                    style = MaterialTheme.typography.labelLarge
+                )
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    text = "Total Surveys Uploaded: $uploadedSurveyCount",
                     style = MaterialTheme.typography.labelLarge
                 )
 
@@ -532,26 +581,7 @@ fun DoneScreen(
                     // -------------------- GitHub upload (staged, runs in background) --------------------
                     if (gitHubConfig != null) {
                         Button(
-                            onClick = {
-                                if (uploading) return@Button
-                                uploading = true
-                                bgScope.launch {
-                                    try {
-                                        stageAndScheduleGitHubUploads(
-                                            context = context,
-                                            cfg = gitHubConfig,
-                                            surveyUuid = surveyUuid,
-                                            exportedAtStamp = exportedAtStamp,
-                                            jsonText = jsonText,
-                                            expectedVoiceFileNames = expectedVoiceFileNames,
-                                            snackbar = snackbar,
-                                            voiceFilesState = voiceFilesState
-                                        )
-                                    } finally {
-                                        uploading = false
-                                    }
-                                }
-                            },
+                            onClick = scheduleDeferredGitHubUpload,
                             enabled = !uploading
                         ) {
                             Text(if (uploading) "Uploading..." else "Upload Survey Results")
@@ -559,6 +589,17 @@ fun DoneScreen(
                     }
 
                     Spacer(Modifier.weight(1f))
+                }
+
+                Spacer(Modifier.height(12.dp))
+
+                if (gitHubConfig != null) {
+                    Button(
+                        onClick = scheduleDeferredGitHubUpload,
+                        enabled = !uploading
+                    ) {
+                        Text(if (uploading) "Uploading..." else "Upload Later")
+                    }
                 }
 
                 Spacer(Modifier.height(12.dp))
@@ -572,25 +613,7 @@ fun DoneScreen(
                             // Kick off the background upload if one hasn't already been
                             // started; if one is already running (on bgScope, which
                             // outlives this screen), it just keeps going regardless.
-                            if (!uploading && gitHubConfig != null) {
-                                uploading = true
-                                bgScope.launch {
-                                    try {
-                                        stageAndScheduleGitHubUploads(
-                                            context = context,
-                                            cfg = gitHubConfig,
-                                            surveyUuid = surveyUuid,
-                                            exportedAtStamp = exportedAtStamp,
-                                            jsonText = jsonText,
-                                            expectedVoiceFileNames = expectedVoiceFileNames,
-                                            snackbar = snackbar,
-                                            voiceFilesState = voiceFilesState
-                                        )
-                                    } finally {
-                                        uploading = false
-                                    }
-                                }
-                            }
+                            scheduleDeferredGitHubUpload()
                             onRestart()
                         }
                     ) {
@@ -648,7 +671,8 @@ private suspend fun stageAndScheduleGitHubUploads(
             context = context,
             cfg = cfg,
             localFile = pendingJson,
-            remoteRelativePath = jsonRemote
+            remoteRelativePath = jsonRemote,
+            surveyIdForCompletion = surveyUuid
         )
     }.onSuccess {
         snackbar.showOnce("GitHub: Upload scheduled (JSON, will run when online).")
@@ -757,7 +781,8 @@ private fun enqueueGitHubWorkerFileUpload(
     context: Context,
     cfg: GitHubUploader.GitHubConfig,
     localFile: File,
-    remoteRelativePath: String
+    remoteRelativePath: String,
+    surveyIdForCompletion: String? = null
 ) {
     val safeUnique = sanitizeWorkName(remoteRelativePath)
     val uniqueName = "gh_upload_$safeUnique"
@@ -765,22 +790,34 @@ private fun enqueueGitHubWorkerFileUpload(
     /** Normalize repo in case it is provided as "owner/repo". */
     val repoName = normalizeRepoNameForWork(cfg.repo)
 
+    val input = Data.Builder()
+        .putString(GitHubUploadWorker.KEY_MODE, "file")
+        .putString(GitHubUploadWorker.KEY_OWNER, cfg.owner)
+        .putString(GitHubUploadWorker.KEY_REPO, repoName)
+        .putString(GitHubUploadWorker.KEY_TOKEN, cfg.token)
+        .putString(GitHubUploadWorker.KEY_BRANCH, cfg.branch)
+        .putString(GitHubUploadWorker.KEY_PATH_PREFIX, cfg.pathPrefix)
+        .putString(GitHubUploadWorker.KEY_FILE_PATH, localFile.absolutePath)
+        .putString(GitHubUploadWorker.KEY_FILE_NAME, remoteRelativePath)
+        .putLong(GitHubUploadWorker.KEY_FILE_MAX_BYTES_HINT, cfg.maxRawBytesHint.toLong())
+        .putInt(GitHubUploadWorker.KEY_FILE_MAX_REQUEST_BYTES_HINT, cfg.maxRequestBytesHint)
+        .apply {
+            surveyIdForCompletion
+                ?.trim()
+                ?.takeIf { it.isNotBlank() }
+                ?.let { surveyId ->
+                    putString(
+                        GitHubUploadWorker.KEY_UPLOAD_KIND,
+                        GitHubUploadWorker.UPLOAD_KIND_SURVEY_JSON
+                    )
+                    putString(GitHubUploadWorker.KEY_SURVEY_ID, surveyId)
+                }
+        }
+        .build()
+
     val req: OneTimeWorkRequest =
         OneTimeWorkRequestBuilder<GitHubUploadWorker>()
-            .setInputData(
-                workDataOf(
-                    GitHubUploadWorker.KEY_MODE to "file",
-                    GitHubUploadWorker.KEY_OWNER to cfg.owner,
-                    GitHubUploadWorker.KEY_REPO to repoName,
-                    GitHubUploadWorker.KEY_TOKEN to cfg.token,
-                    GitHubUploadWorker.KEY_BRANCH to cfg.branch,
-                    GitHubUploadWorker.KEY_PATH_PREFIX to cfg.pathPrefix,
-                    GitHubUploadWorker.KEY_FILE_PATH to localFile.absolutePath,
-                    GitHubUploadWorker.KEY_FILE_NAME to remoteRelativePath,
-                    GitHubUploadWorker.KEY_FILE_MAX_BYTES_HINT to cfg.maxRawBytesHint.toLong(),
-                    GitHubUploadWorker.KEY_FILE_MAX_REQUEST_BYTES_HINT to cfg.maxRequestBytesHint
-                )
-            )
+            .setInputData(input)
             .setConstraints(
                 Constraints.Builder()
                     .setRequiredNetworkType(NetworkType.CONNECTED)
@@ -1217,4 +1254,3 @@ private fun normalizeRepoNameForWork(repo: String): String {
     val t = repo.trim()
     return if (t.contains('/')) t.substringAfterLast('/').trim() else t
 }
-
