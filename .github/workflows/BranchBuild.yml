@@ -1,6 +1,7 @@
 name: Branch APK Preview
 
 on:
+  workflow_dispatch:
   push:
     branches-ignore:
       - main
@@ -33,6 +34,22 @@ jobs:
     timeout-minutes: 75
 
     steps:
+      - name: Reject main and non-preview refs
+        run: |
+          set -euo pipefail
+          case "$GITHUB_REF" in
+            refs/heads/main|refs/heads/gh-pages)
+              echo "::error::Branch APK Preview does not run for $GITHUB_REF."
+              exit 1
+              ;;
+            refs/heads/*)
+              ;;
+            *)
+              echo "::error::Branch APK Preview requires a non-main branch ref; received $GITHUB_REF."
+              exit 1
+              ;;
+          esac
+
       - name: Checkout repository
         uses: actions/checkout@v5
         with:
