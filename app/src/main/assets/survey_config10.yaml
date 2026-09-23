@@ -36,9 +36,9 @@ graph:
       title: Respondent Age
       question: What is your age?
       options:
-        - Under 35/Chini ya 35
+        - Under 35
         - 35-50
-        - Over 50/Zaidi ya 50
+        - Over 50
       nextId: Q5
 
     - id: Q5

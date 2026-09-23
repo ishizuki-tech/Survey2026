@@ -36,9 +36,9 @@ graph:
       title: Umri wa Mhojiwa
       question: Una umri gani?
       options:
-        - Under 35/Chini ya 35
+        - Chini ya 35
         - 35-50
-        - Over 50/Zaidi ya 50
+        - Zaidi ya 50
       nextId: Q5
 
     - id: Q5
