@@ -133,6 +133,15 @@ jobs:
             exit 1
           fi
 
+          INSPECT_DIR="$(mktemp -d)"
+          trap 'rm -rf "$INSPECT_DIR"' EXIT
+          unzip -qq "${apks[0]}" 'classes*.dex' -d "$INSPECT_DIR"
+          find "$INSPECT_DIR" -type f -name 'classes*.dex' -exec strings {} + > "$INSPECT_DIR/dex-strings.txt"
+          if grep -Fq 'hf_' "$INSPECT_DIR/dex-strings.txt"; then
+            echo "::error::Plaintext Hugging Face token marker detected in debug APK."
+            exit 1
+          fi
+
           BRANCH="$GITHUB_REF_NAME"
           BRANCH_SLUG="$(printf '%s' "$BRANCH" | LC_ALL=C tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//')"
           if [[ -z "$BRANCH_SLUG" ]]; then
