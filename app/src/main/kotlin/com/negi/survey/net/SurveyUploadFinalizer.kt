@@ -9,20 +9,12 @@
 package com.negi.survey.net
 
 import android.content.Context
-import androidx.work.BackoffPolicy
-import androidx.work.Constraints
-import androidx.work.Data
-import androidx.work.ExistingWorkPolicy
-import androidx.work.NetworkType
-import androidx.work.OneTimeWorkRequestBuilder
-import androidx.work.OutOfQuotaPolicy
-import androidx.work.WorkManager
 import com.negi.survey.utils.DeviceUploadTag
 import com.negi.survey.utils.buildSurveyFileName
 import com.negi.survey.vm.SurveyFinalizationSnapshot
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
@@ -37,7 +29,12 @@ internal interface SurveyFinalizationOperations {
     fun isUploaded(surveyId: String): Boolean
     fun findPendingSurveyFile(surveyId: String): File?
     fun stageSurveyJson(snapshot: SurveyFinalizationSnapshot, tag: DeviceUploadTag, stamp: String): File
-    fun enqueueSurveyJson(config: GitHubUploader.GitHubConfig, file: File, surveyId: String)
+    fun reconcileSurveyJson(
+        config: GitHubUploader.GitHubConfig,
+        file: File,
+        surveyId: String
+    ): SurveyUploadWork.SurveyWorkReconcileResult
+    fun deletePendingSurveyFile(file: File): Boolean
     suspend fun scheduleVoiceArtifacts(
         config: GitHubUploader.GitHubConfig,
         surveyId: String,
@@ -67,22 +64,56 @@ class SurveyUploadFinalizer private constructor(
         val surveyId = snapshot.surveyId.trim()
         if (surveyId.isBlank()) return SurveyFinalizationResult.Failure("Survey ID is missing.")
         return locks.getOrPut(surveyId) { Mutex() }.withLock {
-            if (operations.isUploaded(surveyId)) {
-                return@withLock SurveyFinalizationResult.AlreadyUploaded
-            }
             try {
+                if (operations.isUploaded(surveyId)) {
+                    return@withLock SurveyFinalizationResult.AlreadyUploaded
+                }
                 val existing = operations.findPendingSurveyFile(surveyId)
                 val pending = existing ?: operations.stageSurveyJson(snapshot, deviceTag, exportedAtStamp)
-                operations.enqueueSurveyJson(config, pending, surveyId)
-                runCatching {
-                    operations.scheduleVoiceArtifacts(config, surveyId, expectedVoiceFileNames(snapshot))
+                val reconciliation = operations.reconcileSurveyJson(config, pending, surveyId)
+                when (reconciliation.decision.action) {
+                    SurveyUploadWork.SurveyWorkAction.SKIP_UPLOADED,
+                    SurveyUploadWork.SurveyWorkAction.SKIP_UPLOADED_TRACKER_CLEANUP_FAILED -> {
+                        try {
+                            operations.deletePendingSurveyFile(pending)
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (_: Exception) {
+                        }
+                        return@withLock SurveyFinalizationResult.AlreadyUploaded
+                    }
+
+                    SurveyUploadWork.SurveyWorkAction.ENQUEUE_NEW,
+                    SurveyUploadWork.SurveyWorkAction.RECOVER_NEW,
+                    SurveyUploadWork.SurveyWorkAction.ENQUEUED_TRACKER_UNCONFIRMED -> {
+                        if (!reconciliation.enqueued) {
+                            return@withLock SurveyFinalizationResult.Failure(reconciliation.decision.reason)
+                        }
+                    }
+
+                    SurveyUploadWork.SurveyWorkAction.KEEP_TRACKED,
+                    SurveyUploadWork.SurveyWorkAction.KEEP_LEGACY,
+                    SurveyUploadWork.SurveyWorkAction.ADOPT_LEGACY -> Unit
+
+                    else -> return@withLock SurveyFinalizationResult.Failure(reconciliation.decision.reason)
                 }
-                runCatching {
+                try {
+                    operations.scheduleVoiceArtifacts(config, surveyId, expectedVoiceFileNames(snapshot))
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                }
+                try {
                     operations.scheduleLogArtifact(config, surveyId, exportedAtStamp)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
                 }
                 SurveyFinalizationResult.Queued(pending, reused = existing != null)
-            } catch (t: Throwable) {
-                SurveyFinalizationResult.Failure(t.message ?: "Could not queue survey upload.")
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (exception: Exception) {
+                SurveyFinalizationResult.Failure(exception.message ?: "Could not queue survey upload.")
             }
         }
     }
@@ -123,32 +154,18 @@ private class AndroidSurveyFinalizationOperations(context: Context) : SurveyFina
         return target
     }
 
-    override fun enqueueSurveyJson(config: GitHubUploader.GitHubConfig, file: File, surveyId: String) {
-        val remotePath = SurveyUploadWork.remoteRelativePath(file.name)
-        val data = Data.Builder()
-            .putString(GitHubUploadWorker.KEY_MODE, "file")
-            .putString(GitHubUploadWorker.KEY_OWNER, config.owner)
-            .putString(GitHubUploadWorker.KEY_REPO, config.repo.substringAfterLast('/'))
-            .putString(GitHubUploadWorker.KEY_TOKEN, config.token)
-            .putString(GitHubUploadWorker.KEY_BRANCH, config.branch)
-            .putString(GitHubUploadWorker.KEY_PATH_PREFIX, config.pathPrefix)
-            .putString(GitHubUploadWorker.KEY_FILE_PATH, file.absolutePath)
-            .putString(GitHubUploadWorker.KEY_FILE_NAME, remotePath)
-            .putLong(GitHubUploadWorker.KEY_FILE_MAX_BYTES_HINT, config.maxRawBytesHint.toLong())
-            .putInt(GitHubUploadWorker.KEY_FILE_MAX_REQUEST_BYTES_HINT, config.maxRequestBytesHint)
-        SurveyUploadWork.addSurveyJsonMetadata(data, surveyId)
-        val request = OneTimeWorkRequestBuilder<GitHubUploadWorker>()
-            .setInputData(data.build())
-            .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
-            .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
-            .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
-            .addTag(GitHubUploadWorker.TAG)
-            .addTag(GitHubUploadWorker.TAG + ":file:" + SurveyUploadWork.safeWorkNameSegment(remotePath))
-            .build()
-        WorkManager.getInstance(appContext).enqueueUniqueWork(
-            SurveyUploadWork.uniqueWorkName(remotePath), ExistingWorkPolicy.REPLACE, request
-        )
-    }
+    override fun reconcileSurveyJson(
+        config: GitHubUploader.GitHubConfig,
+        file: File,
+        surveyId: String
+    ): SurveyUploadWork.SurveyWorkReconcileResult = SurveyUploadWork.reconcile(
+        context = appContext,
+        config = config,
+        expectedSurveyId = surveyId,
+        canonicalFile = file
+    )
+
+    override fun deletePendingSurveyFile(file: File): Boolean = file.delete()
 
     override suspend fun scheduleVoiceArtifacts(
         config: GitHubUploader.GitHubConfig,
