@@ -1,11 +1,11 @@
 {
   "original_branch": "SLM-Download",
   "branch_slug": "slm-download",
-  "commit_sha": "49fd2ef9929f4714a96700a4d0e85bf82b85ad07",
-  "short_sha": "49fd2ef",
-  "apk_name": "Survey2026-slm-download-49fd2ef.apk",
-  "apk_sha256": "669ead707ad9f2db17b855599752db38b37a131e6d652379ee4710b68a34e64d",
+  "commit_sha": "1252487d1108d99e0dd242eae6506aba0ed743f0",
+  "short_sha": "1252487",
+  "apk_name": "Survey2026-slm-download-1252487.apk",
+  "apk_sha256": "0cd60f9dc2bb40a2f03751a4d8d9599faca0071e14af24e2f60525922481b3ac",
   "page_url": "https://ishizuki-tech.github.io/Survey2026/slm-download/",
-  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/35934301029",
-  "generated_utc": "2026-09-23T23:40:12Z"
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/35934722765",
+  "generated_utc": "2026-09-23T23:46:13Z"
 }
