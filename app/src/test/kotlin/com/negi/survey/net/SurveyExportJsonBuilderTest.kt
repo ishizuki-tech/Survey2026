@@ -8,6 +8,7 @@
  */
 package com.negi.survey.net
 
+import com.negi.survey.BuildConfig
 import com.negi.survey.vm.SurveyFinalizationSnapshot
 import com.negi.survey.vm.SurveyViewModel
 import kotlinx.serialization.json.Json
@@ -57,6 +58,10 @@ class SurveyExportJsonBuilderTest {
 
         val root = Json.parseToJsonElement(output).jsonObject
         assertEquals(surveyId, root.getValue("survey_id").jsonPrimitive.content)
+        assertEquals(
+            BuildConfig.GIT_COMMIT_SHA,
+            root.getValue("build").jsonPrimitive.content
+        )
         assertEquals("2026-09-22_11-37-48", root.getValue("exported_at").jsonPrimitive.content)
         assertEquals(
             "Farmer grows maize.",

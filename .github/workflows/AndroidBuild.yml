@@ -8,6 +8,11 @@ on:
         type: boolean
         default: false
         required: true
+      stable_tag:
+        description: "Stable checkpoint tag that must point to the published source commit"
+        type: string
+        default: "upload-flow-stable-2026-09-22"
+        required: true
   push:
     branches:
       - main
@@ -49,6 +54,9 @@ jobs:
       apk_name: ${{ steps.apk.outputs.apk_name }}
       apk_sha256: ${{ steps.apk.outputs.apk_sha256 }}
       signing_cert_sha256: ${{ steps.apk.outputs.signing_cert_sha256 }}
+      english_config_sha256: ${{ steps.apk.outputs.english_config_sha256 }}
+      swahili_config_sha256: ${{ steps.apk.outputs.swahili_config_sha256 }}
+      stable_tag: ${{ steps.apk.outputs.stable_tag }}
       short_sha: ${{ steps.apk.outputs.short_sha }}
       branch: ${{ steps.apk.outputs.branch }}
 
@@ -297,8 +305,26 @@ jobs:
         id: apk
         env:
           PUBLISH_RELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release == true }}
+          STABLE_TAG_INPUT: ${{ github.event_name == 'workflow_dispatch' && inputs.stable_tag || '' }}
         run: |
           set -euo pipefail
+
+          STABLE_TAG=""
+          if [[ "$PUBLISH_RELEASE" == "true" ]]; then
+            STABLE_TAG="${STABLE_TAG_INPUT}"
+            if [[ -z "$STABLE_TAG" ]]; then
+              echo "::error::stable_tag is required when publish_release=true."
+              exit 1
+            fi
+
+            git fetch --force --tags origin "refs/tags/${STABLE_TAG}:refs/tags/${STABLE_TAG}"
+            TAG_COMMIT="$(git rev-list -n 1 "$STABLE_TAG")"
+            if [[ "$TAG_COMMIT" != "$GITHUB_SHA" ]]; then
+              echo "::error::Stable tag $STABLE_TAG points to $TAG_COMMIT, but this workflow is building $GITHUB_SHA."
+              exit 1
+            fi
+            echo "Stable tag verified: $STABLE_TAG -> $GITHUB_SHA"
+          fi
           APK_DIR="app/build/outputs/apk/release"
           if [[ ! -d "$APK_DIR" ]]; then
             echo "::error::Release APK directory does not exist: $APK_DIR"
@@ -379,6 +405,8 @@ jobs:
 
           ENGLISH_CONFIG="$RUNNER_TEMP/survey_config10.yaml"
           SWAHILI_CONFIG="$RUNNER_TEMP/survey_config_sw_10.yaml"
+          ENGLISH_CONFIG_SHA256=""
+          SWAHILI_CONFIG_SHA256=""
           if [[ "$PUBLISH_RELEASE" == "true" ]]; then
             if ! unzip -p "$OUTPUT" assets/survey_config10.yaml > "$ENGLISH_CONFIG"; then
               echo "::error::Release APK is missing assets/survey_config10.yaml."
@@ -397,6 +425,9 @@ jobs:
               echo "::error::Release APK config assets differ from source assets."
               exit 1
             fi
+
+            ENGLISH_CONFIG_SHA256="$(sha256sum "$ENGLISH_CONFIG" | awk '{print $1}')"
+            SWAHILI_CONFIG_SHA256="$(sha256sum "$SWAHILI_CONFIG" | awk '{print $1}')"
           fi
 
           echo "path=$OUTPUT" >> "$GITHUB_OUTPUT"
@@ -406,6 +437,9 @@ jobs:
           echo "apk_name=$APK_NAME" >> "$GITHUB_OUTPUT"
           echo "apk_sha256=$APK_SHA256" >> "$GITHUB_OUTPUT"
           echo "signing_cert_sha256=$SIGNING_CERT_SHA256" >> "$GITHUB_OUTPUT"
+          echo "english_config_sha256=$ENGLISH_CONFIG_SHA256" >> "$GITHUB_OUTPUT"
+          echo "swahili_config_sha256=$SWAHILI_CONFIG_SHA256" >> "$GITHUB_OUTPUT"
+          echo "stable_tag=$STABLE_TAG" >> "$GITHUB_OUTPUT"
           echo "english_config_path=$ENGLISH_CONFIG" >> "$GITHUB_OUTPUT"
           echo "swahili_config_path=$SWAHILI_CONFIG" >> "$GITHUB_OUTPUT"
           echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
@@ -437,6 +471,9 @@ jobs:
           SWAHILI_CONFIG: ${{ steps.apk.outputs.swahili_config_path }}
           APK_SHA256: ${{ steps.apk.outputs.apk_sha256 }}
           SIGNING_CERT_SHA256: ${{ steps.apk.outputs.signing_cert_sha256 }}
+          ENGLISH_CONFIG_SHA256: ${{ steps.apk.outputs.english_config_sha256 }}
+          SWAHILI_CONFIG_SHA256: ${{ steps.apk.outputs.swahili_config_sha256 }}
+          STABLE_TAG: ${{ steps.apk.outputs.stable_tag }}
           RELEASE_TAG: ${{ steps.apk.outputs.release_tag }}
         run: |
           set -euo pipefail
@@ -444,6 +481,9 @@ jobs:
           test -s "$ENGLISH_CONFIG"
           test -s "$SWAHILI_CONFIG"
           test -n "$SIGNING_CERT_SHA256"
+          test -n "$ENGLISH_CONFIG_SHA256"
+          test -n "$SWAHILI_CONFIG_SHA256"
+          test -n "$STABLE_TAG"
 
           NOTES="$RUNNER_TEMP/survey2026-release-notes.md"
           {
@@ -451,11 +491,24 @@ jobs:
             echo
             echo "Verified Android release APK."
             echo
+            echo "- Stable checkpoint: ${STABLE_TAG}"
             echo "- Source commit SHA: ${GITHUB_SHA}"
             echo "- Workflow run number: ${GITHUB_RUN_NUMBER}"
             echo "- APK filename: ${APK_NAME}"
             echo "- APK SHA-256: ${APK_SHA256}"
+            echo "- English config SHA-256: ${ENGLISH_CONFIG_SHA256}"
+            echo "- Swahili config SHA-256: ${SWAHILI_CONFIG_SHA256}"
             echo "- Signing certificate SHA-256: ${SIGNING_CERT_SHA256}"
+            echo
+            echo "## What's New"
+            echo
+            echo "- Review -> Finish -> automatic queue -> Done"
+            echo "- Offline queue with automatic upload after reconnect"
+            echo "- Uploaded/Pending survey counts and Device ID"
+            echo "- Duplicate upload protection and recovery improvements"
+            echo "- English/Swahili age options are now language-specific"
+            echo
+            echo "- Verified device: Pixel 9a (manual E2E)"
           } > "$NOTES"
 
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
@@ -494,6 +547,9 @@ jobs:
           APK_NAME: ${{ needs.build-release-apk.outputs.apk_name }}
           APK_SHA256: ${{ needs.build-release-apk.outputs.apk_sha256 }}
           SIGNING_CERT_SHA256: ${{ needs.build-release-apk.outputs.signing_cert_sha256 }}
+          ENGLISH_CONFIG_SHA256: ${{ needs.build-release-apk.outputs.english_config_sha256 }}
+          SWAHILI_CONFIG_SHA256: ${{ needs.build-release-apk.outputs.swahili_config_sha256 }}
+          STABLE_TAG: ${{ needs.build-release-apk.outputs.stable_tag }}
           SHORT_SHA: ${{ needs.build-release-apk.outputs.short_sha }}
           BRANCH: ${{ needs.build-release-apk.outputs.branch }}
           REPOSITORY: ${{ github.repository }}
@@ -502,7 +558,7 @@ jobs:
           SERVER_URL: ${{ github.server_url }}
         run: |
           set -euo pipefail
-          for name in RELEASE_TAG RELEASE_URL DOWNLOAD_URL APK_NAME APK_SHA256 SIGNING_CERT_SHA256 SHORT_SHA BRANCH; do
+          for name in RELEASE_TAG RELEASE_URL DOWNLOAD_URL APK_NAME APK_SHA256 SIGNING_CERT_SHA256 ENGLISH_CONFIG_SHA256 SWAHILI_CONFIG_SHA256 STABLE_TAG SHORT_SHA BRANCH; do
             if [[ -z "${!name:-}" ]]; then
               echo "::error::Missing download-page value: $name"
               exit 1
@@ -564,21 +620,36 @@ jobs:
             <main>
               <section class="card">
                 <p class="eyebrow">Survey2026</p>
-                <h1>Latest Android APK</h1>
+                <h1>Latest Stable Android Build</h1>
                 <p class="subtitle">Open this page on an Android phone and download the latest verified Survey2026 release APK directly.</p>
+                <section class="config-files">
+                  <h2>Stable checkpoint</h2>
+                  <p><strong>Tag:</strong> <code>${STABLE_TAG}</code><br>
+                  <strong>Source:</strong> <code>${GITHUB_SHA}</code><br>
+                  <strong>Verified device:</strong> Pixel 9a (manual E2E)</p>
+                </section>
                 <a class="download" href="${DOWNLOAD_URL}">Download APK</a>
                 <p class="note">Direct GitHub Release asset. No ZIP extraction is required.</p>
                 <section class="config-files">
+                  <h2>What's New</h2>
+                  <p>Review → Finish → automatic queue → Done<br>
+                  Offline queue with automatic upload after reconnect<br>
+                  Uploaded/Pending survey counts and Device ID<br>
+                  Duplicate upload protection and recovery improvements<br>
+                  English/Swahili age options are now language-specific</p>
+                </section>
+                <section class="config-files">
                   <h2>Config files included in this APK</h2>
                   <p class="note">These config files were extracted from the exact APK build shown on this page.</p>
-                  <p><strong>English — survey_config10.yaml</strong><br><a href="${ENGLISH_CONFIG_VIEW_URL}">View in browser</a> · <a href="${ENGLISH_CONFIG_URL}">Download</a></p>
-                  <p><strong>Swahili — survey_config_sw_10.yaml</strong><br><a href="${SWAHILI_CONFIG_VIEW_URL}">View in browser</a> · <a href="${SWAHILI_CONFIG_URL}">Download</a></p>
+                  <p><strong>English — survey_config10.yaml</strong><br><a href="${ENGLISH_CONFIG_VIEW_URL}">View in browser</a> · <a href="${ENGLISH_CONFIG_URL}">Download</a><br><code>SHA-256: ${ENGLISH_CONFIG_SHA256}</code></p>
+                  <p><strong>Swahili — survey_config_sw_10.yaml</strong><br><a href="${SWAHILI_CONFIG_VIEW_URL}">View in browser</a> · <a href="${SWAHILI_CONFIG_URL}">Download</a><br><code>SHA-256: ${SWAHILI_CONFIG_SHA256}</code></p>
                 </section>
                 <div class="qr-panel">
                   <div class="qr-box"><img src="${QR_URL}" alt="QR code for the permanent Survey2026 download page" width="300" height="300"></div>
                   <div><h2>Scan with Android</h2><p class="subtitle">This QR code opens the permanent download page.</p><code>${PAGE_URL}</code></div>
                 </div>
                 <div class="grid">
+                  <div class="item"><span class="label">Stable checkpoint</span><code>${STABLE_TAG}</code></div>
                   <div class="item"><span class="label">Release tag</span><code>${RELEASE_TAG}</code></div>
                   <div class="item"><span class="label">Branch</span><code>${BRANCH}</code></div>
                   <div class="item"><span class="label">Commit SHA</span><code>${SHORT_SHA}</code></div>
@@ -603,6 +674,9 @@ jobs:
           cat > download-page/latest.json <<JSON
           {
             "repository": "${REPOSITORY}",
+            "stable_tag": "${STABLE_TAG}",
+            "source_commit_sha": "${GITHUB_SHA}",
+            "verified_device": "Pixel 9a",
             "release_tag": "${RELEASE_TAG}",
             "branch": "${BRANCH}",
             "release_url": "${RELEASE_URL}",
@@ -610,11 +684,13 @@ jobs:
             "config_files": {
               "english": {
                 "view_url": "${ENGLISH_CONFIG_VIEW_URL}",
-                "download_url": "${ENGLISH_CONFIG_URL}"
+                "download_url": "${ENGLISH_CONFIG_URL}",
+                "sha256": "${ENGLISH_CONFIG_SHA256}"
               },
               "swahili": {
                 "view_url": "${SWAHILI_CONFIG_VIEW_URL}",
-                "download_url": "${SWAHILI_CONFIG_URL}"
+                "download_url": "${SWAHILI_CONFIG_URL}",
+                "sha256": "${SWAHILI_CONFIG_SHA256}"
               }
             },
             "apk_name": "${APK_NAME}",
