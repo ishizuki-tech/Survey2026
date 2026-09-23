@@ -1,11 +1,11 @@
 {
   "original_branch": "feature/swahili-whisper-cv20",
   "branch_slug": "feature-swahili-whisper-cv20",
-  "commit_sha": "15404ce69a2a3960def30b781bee72c83661fef5",
-  "short_sha": "15404ce",
-  "apk_name": "Survey2026-feature-swahili-whisper-cv20-15404ce.apk",
-  "apk_sha256": "3471edab6fe41472f509c0db3ec172ce27953f5f238394f39e750b29d0e31027",
+  "commit_sha": "41d28086e97f0a0cc2cdddc12c4778297d7aa743",
+  "short_sha": "41d2808",
+  "apk_name": "Survey2026-feature-swahili-whisper-cv20-41d2808.apk",
+  "apk_sha256": "36f1b1176c5a60317fb02e54633f484208f9d81aeb78e7f1a624671349dc200f",
   "page_url": "https://ishizuki-tech.github.io/Survey2026/feature-swahili-whisper-cv20/",
-  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/35913729728",
-  "generated_utc": "2026-09-23T20:11:33Z"
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/35918946307",
+  "generated_utc": "2026-09-23T20:58:45Z"
 }
