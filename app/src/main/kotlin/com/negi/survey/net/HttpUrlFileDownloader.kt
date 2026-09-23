@@ -69,12 +69,12 @@ import kotlinx.coroutines.withContext
  * server supports byte ranges. Existing single-stream logic remains as a
  * fallback for servers that do not support parallel Range transfers.
  *
- * @property hfToken Optional Hugging Face token ("hf_xxx"), applied only to
- * Hugging Face hosts.
+ * @property hfTokenProvider Supplies a short-lived token only for Hugging Face
+ * requests.
  * @property debugLogs Enables diagnostic logging.
  */
 class HttpUrlFileDownloader(
-    private val hfToken: String? = null,
+    private val hfTokenProvider: () -> String? = HfTokenProvider::token,
     private val debugLogs: Boolean = true,
 ) {
     private val tag = "HttpUrlFileDl"
@@ -2945,13 +2945,10 @@ class HttpUrlFileDownloader(
             "identity",
         )
 
-        if (
-            isHfHost(url) &&
-            !hfToken.isNullOrBlank()
-        ) {
+        hfAuthorizationHeader(url, hfTokenProvider)?.let { authorization ->
             conn.setRequestProperty(
                 "Authorization",
-                "Bearer $hfToken",
+                authorization,
             )
         }
     }
@@ -3208,28 +3205,6 @@ class HttpUrlFileDownloader(
                 )
             }
         }
-    }
-
-    /* ========================================================================
-     * Hugging Face
-     * ====================================================================== */
-
-    private fun isHfHost(
-        url: String
-    ): Boolean {
-
-        val host =
-            runCatching {
-                URL(url).host ?: ""
-            }.getOrElse {
-                ""
-            }
-
-        return host ==
-                "huggingface.co" ||
-                host.endsWith(
-                    ".huggingface.co"
-                )
     }
 
     /* ========================================================================
