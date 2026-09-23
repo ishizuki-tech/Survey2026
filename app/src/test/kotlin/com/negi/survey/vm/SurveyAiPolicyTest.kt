@@ -31,6 +31,13 @@ class SurveyAiPolicyTest {
         assertEquals(SurveyAiDecision.FAILURE, eval("""{"score":100}""", error = "failure"))
     }
 
+    @Test fun stale_q11_yield_missing_point_cannot_complete_after_answered_followup() {
+        val staleMissingPoint =
+            """{"score":95,"missing_points":["Specific yield target"],"followup_needed":false}"""
+
+        assertEquals(SurveyAiDecision.FAILURE, eval(staleMissingPoint))
+    }
+
     @Test fun unknown_evaluation_fields_are_accepted() {
         assertEquals(
             SurveyAiDecision.ACHIEVED,

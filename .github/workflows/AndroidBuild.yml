@@ -8,6 +8,11 @@ on:
         type: boolean
         default: false
         required: true
+      stable_tag:
+        description: "Stable checkpoint tag that must point to the published source commit"
+        type: string
+        default: "upload-flow-stable-2026-09-22"
+        required: true
   push:
     branches:
       - main
@@ -49,6 +54,9 @@ jobs:
       apk_name: ${{ steps.apk.outputs.apk_name }}
       apk_sha256: ${{ steps.apk.outputs.apk_sha256 }}
       signing_cert_sha256: ${{ steps.apk.outputs.signing_cert_sha256 }}
+      english_config_sha256: ${{ steps.apk.outputs.english_config_sha256 }}
+      swahili_config_sha256: ${{ steps.apk.outputs.swahili_config_sha256 }}
+      stable_tag: ${{ steps.apk.outputs.stable_tag }}
       short_sha: ${{ steps.apk.outputs.short_sha }}
       branch: ${{ steps.apk.outputs.branch }}
 
@@ -135,7 +143,7 @@ jobs:
           if [[ -z "$SUPABASE_LOG_BUCKET" ]]; then SUPABASE_LOG_BUCKET="logs"; fi
           if [[ -z "$SUPABASE_LOG_PREFIX" ]]; then SUPABASE_LOG_PREFIX="surveyapp"; fi
 
-          PUBLISH_RELEASE="${{ github.event_name == 'workflow_dispatch' && inputs.publish_release == true }}"
+          PUBLISH_RELEASE="${{ github.ref == 'refs/heads/main' || (github.event_name == 'workflow_dispatch' && inputs.publish_release == true) }}"
           HF_TOKEN="${{ secrets.HF_TOKEN }}"
 
           if [[ "$PUBLISH_RELEASE" == "true" ]]; then
@@ -192,7 +200,7 @@ jobs:
       - name: Validate Android signing configuration
         id: signing
         env:
-          PUBLISH_RELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release == true }}
+          PUBLISH_RELEASE: ${{ github.ref == 'refs/heads/main' || (github.event_name == 'workflow_dispatch' && inputs.publish_release == true) }}
         run: |
           set -euo pipefail
           signing_values=(
@@ -296,9 +304,28 @@ jobs:
       - name: Verify and collect release APK
         id: apk
         env:
-          PUBLISH_RELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release == true }}
+          PUBLISH_RELEASE: ${{ github.ref == 'refs/heads/main' || (github.event_name == 'workflow_dispatch' && inputs.publish_release == true) }}
+          STABLE_TAG_INPUT: ${{ github.event_name == 'workflow_dispatch' && inputs.stable_tag || '' }}
         run: |
           set -euo pipefail
+
+          STABLE_TAG=""
+          SHORT_SHA="${GITHUB_SHA::7}"
+          if [[ "$PUBLISH_RELEASE" == "true" && -n "$STABLE_TAG_INPUT" ]]; then
+            STABLE_TAG="${STABLE_TAG_INPUT}"
+            git fetch --force --tags origin "refs/tags/${STABLE_TAG}:refs/tags/${STABLE_TAG}"
+            TAG_COMMIT="$(git rev-list -n 1 "$STABLE_TAG")"
+            if [[ "$TAG_COMMIT" != "$GITHUB_SHA" ]]; then
+              echo "::error::Stable tag $STABLE_TAG points to $TAG_COMMIT, but this workflow is building $GITHUB_SHA."
+              exit 1
+            fi
+            echo "Stable tag verified: $STABLE_TAG -> $GITHUB_SHA"
+          elif [[ "$PUBLISH_RELEASE" == "true" && "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "::error::stable_tag is required for a manually published non-main release."
+            exit 1
+          elif [[ "$PUBLISH_RELEASE" == "true" ]]; then
+            echo "::notice::Publishing the current main build without a stable checkpoint tag."
+          fi
           APK_DIR="app/build/outputs/apk/release"
           if [[ ! -d "$APK_DIR" ]]; then
             echo "::error::Release APK directory does not exist: $APK_DIR"
@@ -367,7 +394,6 @@ jobs:
             exit 1
           fi
 
-          SHORT_SHA="${GITHUB_SHA::7}"
           BRANCH="${GITHUB_REF_NAME}"
           APK_NAME="Survey2026-${SHORT_SHA}-release.apk"
           OUTPUT="$RUNNER_TEMP/$APK_NAME"
@@ -379,6 +405,8 @@ jobs:
 
           ENGLISH_CONFIG="$RUNNER_TEMP/survey_config10.yaml"
           SWAHILI_CONFIG="$RUNNER_TEMP/survey_config_sw_10.yaml"
+          ENGLISH_CONFIG_SHA256=""
+          SWAHILI_CONFIG_SHA256=""
           if [[ "$PUBLISH_RELEASE" == "true" ]]; then
             if ! unzip -p "$OUTPUT" assets/survey_config10.yaml > "$ENGLISH_CONFIG"; then
               echo "::error::Release APK is missing assets/survey_config10.yaml."
@@ -397,6 +425,9 @@ jobs:
               echo "::error::Release APK config assets differ from source assets."
               exit 1
             fi
+
+            ENGLISH_CONFIG_SHA256="$(sha256sum "$ENGLISH_CONFIG" | awk '{print $1}')"
+            SWAHILI_CONFIG_SHA256="$(sha256sum "$SWAHILI_CONFIG" | awk '{print $1}')"
           fi
 
           echo "path=$OUTPUT" >> "$GITHUB_OUTPUT"
@@ -406,6 +437,9 @@ jobs:
           echo "apk_name=$APK_NAME" >> "$GITHUB_OUTPUT"
           echo "apk_sha256=$APK_SHA256" >> "$GITHUB_OUTPUT"
           echo "signing_cert_sha256=$SIGNING_CERT_SHA256" >> "$GITHUB_OUTPUT"
+          echo "english_config_sha256=$ENGLISH_CONFIG_SHA256" >> "$GITHUB_OUTPUT"
+          echo "swahili_config_sha256=$SWAHILI_CONFIG_SHA256" >> "$GITHUB_OUTPUT"
+          echo "stable_tag=$STABLE_TAG" >> "$GITHUB_OUTPUT"
           echo "english_config_path=$ENGLISH_CONFIG" >> "$GITHUB_OUTPUT"
           echo "swahili_config_path=$SWAHILI_CONFIG" >> "$GITHUB_OUTPUT"
           echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
@@ -428,7 +462,7 @@ jobs:
           retention-days: 30
 
       - name: Publish GitHub Release
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release == true }}
+        if: ${{ github.ref == 'refs/heads/main' || (github.event_name == 'workflow_dispatch' && inputs.publish_release == true) }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           APK: ${{ steps.apk.outputs.path }}
@@ -437,6 +471,9 @@ jobs:
           SWAHILI_CONFIG: ${{ steps.apk.outputs.swahili_config_path }}
           APK_SHA256: ${{ steps.apk.outputs.apk_sha256 }}
           SIGNING_CERT_SHA256: ${{ steps.apk.outputs.signing_cert_sha256 }}
+          ENGLISH_CONFIG_SHA256: ${{ steps.apk.outputs.english_config_sha256 }}
+          SWAHILI_CONFIG_SHA256: ${{ steps.apk.outputs.swahili_config_sha256 }}
+          STABLE_TAG: ${{ steps.apk.outputs.stable_tag }}
           RELEASE_TAG: ${{ steps.apk.outputs.release_tag }}
         run: |
           set -euo pipefail
@@ -444,6 +481,8 @@ jobs:
           test -s "$ENGLISH_CONFIG"
           test -s "$SWAHILI_CONFIG"
           test -n "$SIGNING_CERT_SHA256"
+          test -n "$ENGLISH_CONFIG_SHA256"
+          test -n "$SWAHILI_CONFIG_SHA256"
 
           NOTES="$RUNNER_TEMP/survey2026-release-notes.md"
           {
@@ -451,11 +490,28 @@ jobs:
             echo
             echo "Verified Android release APK."
             echo
+            if [[ -n "$STABLE_TAG" ]]; then
+              echo "- Stable checkpoint: ${STABLE_TAG}"
+            else
+              echo "- Source branch: ${GITHUB_REF_NAME}"
+            fi
             echo "- Source commit SHA: ${GITHUB_SHA}"
             echo "- Workflow run number: ${GITHUB_RUN_NUMBER}"
             echo "- APK filename: ${APK_NAME}"
             echo "- APK SHA-256: ${APK_SHA256}"
+            echo "- English config SHA-256: ${ENGLISH_CONFIG_SHA256}"
+            echo "- Swahili config SHA-256: ${SWAHILI_CONFIG_SHA256}"
             echo "- Signing certificate SHA-256: ${SIGNING_CERT_SHA256}"
+            echo
+            echo "## What's New"
+            echo
+            echo "- Review -> Finish -> automatic queue -> Done"
+            echo "- Offline queue with automatic upload after reconnect"
+            echo "- Uploaded/Pending survey counts and Device ID"
+            echo "- Duplicate upload protection and recovery improvements"
+            echo "- English/Swahili age options are now language-specific"
+            echo
+            echo "- Verified device: Pixel 9a (manual E2E)"
           } > "$NOTES"
 
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
@@ -483,7 +539,11 @@ jobs:
     name: Publish mobile download page
     runs-on: ubuntu-latest
     needs: build-release-apk
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release == true }}
+    if: ${{ github.ref == 'refs/heads/main' }}
+    concurrency:
+      # This job and BranchBuild both push to gh-pages.
+      group: branch-apk-preview-pages
+      cancel-in-progress: false
 
     steps:
       - name: Generate download page
@@ -494,6 +554,9 @@ jobs:
           APK_NAME: ${{ needs.build-release-apk.outputs.apk_name }}
           APK_SHA256: ${{ needs.build-release-apk.outputs.apk_sha256 }}
           SIGNING_CERT_SHA256: ${{ needs.build-release-apk.outputs.signing_cert_sha256 }}
+          ENGLISH_CONFIG_SHA256: ${{ needs.build-release-apk.outputs.english_config_sha256 }}
+          SWAHILI_CONFIG_SHA256: ${{ needs.build-release-apk.outputs.swahili_config_sha256 }}
+          STABLE_TAG: ${{ needs.build-release-apk.outputs.stable_tag }}
           SHORT_SHA: ${{ needs.build-release-apk.outputs.short_sha }}
           BRANCH: ${{ needs.build-release-apk.outputs.branch }}
           REPOSITORY: ${{ github.repository }}
@@ -502,7 +565,7 @@ jobs:
           SERVER_URL: ${{ github.server_url }}
         run: |
           set -euo pipefail
-          for name in RELEASE_TAG RELEASE_URL DOWNLOAD_URL APK_NAME APK_SHA256 SIGNING_CERT_SHA256 SHORT_SHA BRANCH; do
+          for name in RELEASE_TAG RELEASE_URL DOWNLOAD_URL APK_NAME APK_SHA256 SIGNING_CERT_SHA256 ENGLISH_CONFIG_SHA256 SWAHILI_CONFIG_SHA256 SHORT_SHA BRANCH; do
             if [[ -z "${!name:-}" ]]; then
               echo "::error::Missing download-page value: $name"
               exit 1
@@ -516,11 +579,24 @@ jobs:
           PAGE_URL="https://${OWNER}.github.io/${REPO_NAME}/"
           RUN_URL="${SERVER_URL}/${REPOSITORY}/actions/runs/${RUN_ID}"
           REPO_URL="${SERVER_URL}/${REPOSITORY}"
-          QR_URL="https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${PAGE_URL}"
+          QR_URL="qr.png"
           ENGLISH_CONFIG_URL="${SERVER_URL}/${REPOSITORY}/releases/download/${RELEASE_TAG}/survey_config10.yaml"
           SWAHILI_CONFIG_URL="${SERVER_URL}/${REPOSITORY}/releases/download/${RELEASE_TAG}/survey_config_sw_10.yaml"
           ENGLISH_CONFIG_VIEW_URL="${SERVER_URL}/${REPOSITORY}/blob/${GITHUB_SHA}/app/src/main/assets/survey_config10.yaml"
           SWAHILI_CONFIG_VIEW_URL="${SERVER_URL}/${REPOSITORY}/blob/${GITHUB_SHA}/app/src/main/assets/survey_config_sw_10.yaml"
+
+          curl --fail --silent --show-error --location \
+            --retry 3 \
+            --retry-all-errors \
+            --get \
+            --data-urlencode "size=300x300" \
+            --data-urlencode "data=$PAGE_URL" \
+            "https://api.qrserver.com/v1/create-qr-code/" \
+            --output download-page/qr.png
+          if [[ ! -s download-page/qr.png ]] || [[ "$(file -b --mime-type download-page/qr.png)" != "image/png" ]]; then
+            echo "::error::Failed to generate a PNG QR code for the main download page."
+            exit 1
+          fi
 
           cat > download-page/index.html <<HTML
           <!doctype html>
@@ -564,15 +640,30 @@ jobs:
             <main>
               <section class="card">
                 <p class="eyebrow">Survey2026</p>
-                <h1>Latest Android APK</h1>
+                <h1>Latest Android Build</h1>
                 <p class="subtitle">Open this page on an Android phone and download the latest verified Survey2026 release APK directly.</p>
+                <section class="config-files">
+                  <h2>Build provenance</h2>
+                  ${STABLE_TAG:+<p><strong>Stable checkpoint:</strong> <code>${STABLE_TAG}</code></p>}
+                  <p>
+                  <strong>Source:</strong> <code>${GITHUB_SHA}</code><br>
+                  <strong>Verified device:</strong> Pixel 9a (manual E2E)</p>
+                </section>
                 <a class="download" href="${DOWNLOAD_URL}">Download APK</a>
                 <p class="note">Direct GitHub Release asset. No ZIP extraction is required.</p>
                 <section class="config-files">
+                  <h2>What's New</h2>
+                  <p>Review → Finish → automatic queue → Done<br>
+                  Offline queue with automatic upload after reconnect<br>
+                  Uploaded/Pending survey counts and Device ID<br>
+                  Duplicate upload protection and recovery improvements<br>
+                  English/Swahili age options are now language-specific</p>
+                </section>
+                <section class="config-files">
                   <h2>Config files included in this APK</h2>
                   <p class="note">These config files were extracted from the exact APK build shown on this page.</p>
-                  <p><strong>English — survey_config10.yaml</strong><br><a href="${ENGLISH_CONFIG_VIEW_URL}">View in browser</a> · <a href="${ENGLISH_CONFIG_URL}">Download</a></p>
-                  <p><strong>Swahili — survey_config_sw_10.yaml</strong><br><a href="${SWAHILI_CONFIG_VIEW_URL}">View in browser</a> · <a href="${SWAHILI_CONFIG_URL}">Download</a></p>
+                  <p><strong>English — survey_config10.yaml</strong><br><a href="${ENGLISH_CONFIG_VIEW_URL}">View in browser</a> · <a href="${ENGLISH_CONFIG_URL}">Download</a><br><code>SHA-256: ${ENGLISH_CONFIG_SHA256}</code></p>
+                  <p><strong>Swahili — survey_config_sw_10.yaml</strong><br><a href="${SWAHILI_CONFIG_VIEW_URL}">View in browser</a> · <a href="${SWAHILI_CONFIG_URL}">Download</a><br><code>SHA-256: ${SWAHILI_CONFIG_SHA256}</code></p>
                 </section>
                 <div class="qr-panel">
                   <div class="qr-box"><img src="${QR_URL}" alt="QR code for the permanent Survey2026 download page" width="300" height="300"></div>
@@ -603,6 +694,9 @@ jobs:
           cat > download-page/latest.json <<JSON
           {
             "repository": "${REPOSITORY}",
+            "stable_tag": "${STABLE_TAG}",
+            "source_commit_sha": "${GITHUB_SHA}",
+            "verified_device": "Pixel 9a",
             "release_tag": "${RELEASE_TAG}",
             "branch": "${BRANCH}",
             "release_url": "${RELEASE_URL}",
@@ -610,11 +704,13 @@ jobs:
             "config_files": {
               "english": {
                 "view_url": "${ENGLISH_CONFIG_VIEW_URL}",
-                "download_url": "${ENGLISH_CONFIG_URL}"
+                "download_url": "${ENGLISH_CONFIG_URL}",
+                "sha256": "${ENGLISH_CONFIG_SHA256}"
               },
               "swahili": {
                 "view_url": "${SWAHILI_CONFIG_VIEW_URL}",
-                "download_url": "${SWAHILI_CONFIG_URL}"
+                "download_url": "${SWAHILI_CONFIG_URL}",
+                "sha256": "${SWAHILI_CONFIG_SHA256}"
               }
             },
             "apk_name": "${APK_NAME}",
@@ -629,11 +725,38 @@ jobs:
 
           touch download-page/.nojekyll
 
-      - name: Publish download page
-        uses: peaceiris/actions-gh-pages@v4
+      - name: Check out existing GitHub Pages content
+        uses: actions/checkout@v5
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./download-page
-          publish_branch: gh-pages
-          force_orphan: true
-          commit_message: "Update Survey2026 download page for ${{ needs.build-release-apk.outputs.release_tag }}"
+          ref: gh-pages
+          path: main-pages
+          fetch-depth: 1
+
+      - name: Publish root main download page
+        run: |
+          set -euo pipefail
+
+          PAGES_DIR="main-pages"
+          for file in index.html latest.json qr.png; do
+            test -s "download-page/$file" || {
+              echo "::error::Missing generated main Pages file: $file"
+              exit 1
+            }
+            cp "download-page/$file" "$PAGES_DIR/$file"
+          done
+          test -f download-page/.nojekyll || {
+            echo "::error::Missing generated main Pages file: .nojekyll"
+            exit 1
+          }
+          cp download-page/.nojekyll "$PAGES_DIR/.nojekyll"
+
+          git -C "$PAGES_DIR" add -- index.html latest.json .nojekyll qr.png
+          if git -C "$PAGES_DIR" diff --cached --quiet; then
+            echo "::error::Main Pages publication produced no changes; refusing to skip the required commit and push."
+            exit 1
+          fi
+
+          git -C "$PAGES_DIR" config user.name "github-actions[bot]"
+          git -C "$PAGES_DIR" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C "$PAGES_DIR" commit -m "Update Survey2026 download page for ${{ needs.build-release-apk.outputs.release_tag }}"
+          git -C "$PAGES_DIR" push origin HEAD:gh-pages
