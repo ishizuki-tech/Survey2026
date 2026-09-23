@@ -118,7 +118,7 @@ fun ReviewScreen(
         (allQuestions.keys + allAnswers.keys)
             .toSet()
             .toList()
-            .sorted()
+            .sortedWith(::naturalNodeIdCompare)
     }
 
     /**
@@ -140,7 +140,7 @@ fun ReviewScreen(
      * The per-node list order is preserved as-is to respect insertion/creation order.
      */
     val sortedFollowups = remember(allFollowups) {
-        allFollowups.toSortedMap()
+        allFollowups.toSortedMap(Comparator(::naturalNodeIdCompare))
     }
 
     Scaffold(containerColor = Color.Transparent) { pad ->
@@ -285,6 +285,31 @@ fun ReviewScreen(
                 }
             }
         }
+    }
+}
+
+/**
+ * Orders node IDs like "Q1", "Q2", ..., "Q10" numerically instead of the
+ * lexicographic "Q1", "Q10", "Q11", "Q2" order plain string sorting gives.
+ * Compares the non-digit prefix first, then the trailing digit run as a
+ * number; IDs without a trailing digit run (or with a differing prefix)
+ * fall back to plain string comparison so this stays safe for any node ID.
+ */
+private fun naturalNodeIdCompare(a: String, b: String): Int {
+    val digitsA = a.takeLastWhile { it.isDigit() }
+    val digitsB = b.takeLastWhile { it.isDigit() }
+    val prefixA = a.substring(0, a.length - digitsA.length)
+    val prefixB = b.substring(0, b.length - digitsB.length)
+
+    val prefixCompare = prefixA.compareTo(prefixB)
+    if (prefixCompare != 0) return prefixCompare
+
+    val numA = digitsA.toLongOrNull()
+    val numB = digitsB.toLongOrNull()
+    return if (numA != null && numB != null) {
+        numA.compareTo(numB)
+    } else {
+        digitsA.compareTo(digitsB)
     }
 }
 
