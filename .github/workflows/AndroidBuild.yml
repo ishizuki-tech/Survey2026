@@ -144,14 +144,9 @@ jobs:
           if [[ -z "$SUPABASE_LOG_PREFIX" ]]; then SUPABASE_LOG_PREFIX="surveyapp"; fi
 
           PUBLISH_RELEASE="${{ github.ref == 'refs/heads/main' || (github.event_name == 'workflow_dispatch' && inputs.publish_release == true) }}"
-          HF_TOKEN="${{ secrets.HF_TOKEN }}"
 
           if [[ "$PUBLISH_RELEASE" == "true" ]]; then
             RELEASE_ALLOW_SECRETS=true
-            if [[ -z "$HF_TOKEN" ]]; then
-              echo "::error::HF_TOKEN is required for an internal release."
-              exit 1
-            fi
             if [[ -z "$GH_TOKEN" ]]; then
               echo "::error::GH_TOKEN is required for an internal release."
               exit 1
@@ -182,8 +177,6 @@ jobs:
 
           # ---- Hugging Face token ----
           release.allowSecrets=$RELEASE_ALLOW_SECRETS
-          hf.token=$HF_TOKEN
-          HF_TOKEN=$HF_TOKEN
           PROPS
 
           echo "::group::gradle.properties (redacted view)"
@@ -192,8 +185,6 @@ jobs:
             -e 's/(gh\.token=).*/\1***REDACTED***/g' \
             -e 's/(supabase\.url=).*/\1***REDACTED***/g' \
             -e 's/(supabase\.anonKey=).*/\1***REDACTED***/g' \
-            -e 's/(HF_TOKEN=).*/\1***REDACTED***/g' \
-            -e 's/(hf\.token=).*/\1***REDACTED***/g' \
             "$HOME/.gradle/gradle.properties"
           echo "::endgroup::"
 
@@ -293,8 +284,15 @@ jobs:
         run: ./gradlew :app:testDebugUnitTest --no-daemon -PskipModelDownload=true
 
       - name: Build release APK
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          PUBLISH_RELEASE: ${{ github.ref == 'refs/heads/main' || (github.event_name == 'workflow_dispatch' && inputs.publish_release == true) }}
         run: |
           set -euo pipefail
+          if [[ "$PUBLISH_RELEASE" == "true" && -z "$HF_TOKEN" ]]; then
+            echo "::error::HF_TOKEN is required for an internal release."
+            exit 1
+          fi
           args=(":app:assembleRelease" "--stacktrace" "--no-daemon")
           if [[ "$RAN_DOWNLOAD_MODEL" == "true" ]]; then
             args+=("-x" ":app:downloadModel")
@@ -369,6 +367,15 @@ jobs:
               --ks-key-alias "$ANDROID_KEY_ALIAS" \
               --key-pass env:ANDROID_KEY_PASSWORD \
               "$FINAL_APK"
+          fi
+
+          INSPECT_DIR="$(mktemp -d)"
+          trap 'rm -rf "$INSPECT_DIR"' EXIT
+          unzip -qq "$FINAL_APK" 'classes*.dex' -d "$INSPECT_DIR"
+          find "$INSPECT_DIR" -type f -name 'classes*.dex' -exec strings {} + > "$INSPECT_DIR/dex-strings.txt"
+          if grep -Fq 'hf_' "$INSPECT_DIR/dex-strings.txt"; then
+            echo "::error::Plaintext Hugging Face token marker detected in release APK."
+            exit 1
           fi
 
           SIGNING_CERT_SHA256=""

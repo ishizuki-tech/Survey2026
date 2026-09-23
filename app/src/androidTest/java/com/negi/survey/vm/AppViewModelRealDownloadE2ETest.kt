@@ -16,7 +16,7 @@ import android.util.Log
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.filters.LargeTest
 import androidx.test.platform.app.InstrumentationRegistry
-import com.negi.survey.BuildConfig
+import com.negi.survey.net.HfTokenProvider
 import java.io.File
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.flow.first
@@ -59,7 +59,7 @@ class EnsureModelDownloadedRealE2E {
 
     /**
      * Real network E2E:
-     * - Requires a valid HF_TOKEN in BuildConfig.
+     * - Requires valid encrypted HF token material in the APK.
      * - Forces a fresh download from the default Gemma LiteRT-LM URL.
      * - Verifies that the file exists and has non-zero length.
      * - Calls ensureModelDownloaded() again without forceFresh and checks that
@@ -70,8 +70,8 @@ class EnsureModelDownloadedRealE2E {
         // English comment:
         // Skip this test entirely when no Hugging Face token is configured.
         assumeTrue(
-            "HF_TOKEN is blank. Set a valid token to run this E2E test.",
-            BuildConfig.HF_TOKEN.isNotBlank()
+            "Encrypted Hugging Face token material is unavailable.",
+            HfTokenProvider.token() != null
         )
 
         val url = AppViewModel.DEFAULT_MODEL_URL
@@ -166,7 +166,7 @@ class EnsureModelDownloadedRealE2E {
      * - Returns false on any exception.
      */
     private fun canReach(url: String): Boolean = try {
-        val token = BuildConfig.HF_TOKEN.takeIf { it.isNotBlank() }
+        val token = HfTokenProvider.token()
 
         val headReq = Request.Builder()
             .url(url)
@@ -188,7 +188,7 @@ class EnsureModelDownloadedRealE2E {
             .url(url)
             .get()
             .apply {
-                val token2 = BuildConfig.HF_TOKEN.takeIf { it.isNotBlank() }
+                val token2 = HfTokenProvider.token()
                 if (token2 != null) {
                     header("Authorization", "Bearer $token2")
                 }
