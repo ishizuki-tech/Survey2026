@@ -228,6 +228,31 @@ open class SurveyViewModel(
         return linkedMapOf(EXPORT_META_SESSION_FREE_TEXT to t.take(SESSION_FREE_TEXT_MAX_CHARS))
     }
 
+    /** Captures immutable export data for a completed run without mutating survey state. */
+    @Synchronized
+    fun createFinalizationSnapshot(): SurveyFinalizationSnapshot {
+        val surveyId = _surveyUuid.value
+        val runAudioRefs = getAudioRefsForRunFlat(surveyId).toList()
+        val snapshotQuestions = questions.value
+        val snapshotAnswers = answers.value
+        val exportQuestionIds = linkedSetOf<String>().apply {
+            addAll(snapshotQuestions.keys)
+            addAll(snapshotAnswers.keys)
+            addAll(runAudioRefs.map { it.questionId })
+        }
+        return SurveyFinalizationSnapshot(
+            surveyId = surveyId,
+            questions = exportQuestionIds.associateWith { id ->
+                snapshotQuestions[id] ?: graph[id]?.question.orEmpty()
+            },
+            answers = snapshotAnswers.toMap(),
+            followups = followups.value.mapValues { (_, entries) -> entries.toList() },
+            audioRefs = runAudioRefs,
+            aiOutcomesJson = aiReasonsJson(),
+            extraMeta = exportExtraMeta().toMap()
+        )
+    }
+
     private fun regenerateSurveyUuid() {
         _surveyUuid.value = UUID.randomUUID().toString()
     }

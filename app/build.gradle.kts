@@ -148,6 +148,39 @@ fun buildTimestampNow(): String =
     OffsetDateTime.now()
         .format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm xxx"))
 
+/** Resolve a short (7-char) git commit SHA from CI env, or `git rev-parse` as a fallback. */
+fun resolveGitCommitSha(): String {
+    val fromEnv =
+        System.getenv("GITHUB_SHA")?.trim()
+
+    if (!fromEnv.isNullOrBlank()) {
+        return fromEnv.take(7)
+    }
+
+    return runCatching {
+        val process =
+            ProcessBuilder(
+                "git",
+                "rev-parse",
+                "--short=7",
+                "HEAD",
+            )
+                .directory(rootProject.projectDir)
+                .redirectErrorStream(true)
+                .start()
+
+        val output =
+            process.inputStream
+                .bufferedReader()
+                .readText()
+                .trim()
+
+        process.waitFor()
+
+        output.takeIf { it.isNotBlank() }
+    }.getOrNull() ?: "unknown"
+}
+
 /* ============================================================================
  * Setup tasks
  * ========================================================================== */
@@ -558,6 +591,12 @@ extensions.configure<ApplicationExtension> {
             "String",
             "BUILD_TIMESTAMP",
             quote(buildTimestampNow()),
+        )
+
+        buildConfigField(
+            "String",
+            "GIT_COMMIT_SHA",
+            quote(resolveGitCommitSha()),
         )
 
         testInstrumentationRunner =

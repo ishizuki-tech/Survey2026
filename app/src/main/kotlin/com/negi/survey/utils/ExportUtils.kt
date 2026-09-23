@@ -28,8 +28,8 @@ import java.util.TimeZone
  * Layout:
  *   <external-or-internal>/exports/
  *     └─ voice/
- *          ├─ voice_<surveyUuid>_<questionId>_<stamp>.wav
- *          └─ voice_<surveyUuid>_<questionId>_<stamp>.meta.json
+ *          ├─ <stamp>_voice_<deviceTag>_<surveyUuid>_<questionId>.wav
+ *          └─ <stamp>_voice_<deviceTag>_<surveyUuid>_<questionId>.meta.json
  *
  * Design goals:
  * - Prefer app-scoped external storage when available (no runtime permission).
@@ -55,7 +55,7 @@ object ExportUtils {
     /**
      * We use UTC to make exported names stable across devices and locales.
      */
-    private val FILE_TS_FORMAT = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).apply {
+    private val FILE_TS_FORMAT = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.US).apply {
         timeZone = TimeZone.getTimeZone("UTC")
     }
 
@@ -149,6 +149,7 @@ object ExportUtils {
         val fileName = buildVoiceFileName(
             surveyUuid = sid,
             questionId = qid,
+            deviceTag = DeviceUploadTagProvider.from(context),
             prefix = "voice",
             stamp = stampUtc
         )

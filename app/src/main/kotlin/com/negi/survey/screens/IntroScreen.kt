@@ -126,6 +126,7 @@ import androidx.compose.ui.unit.max
 import androidx.compose.ui.unit.min
 import androidx.compose.ui.unit.sp
 import com.negi.survey.BuildConfig
+import com.negi.survey.vm.UploadStatus
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -170,6 +171,8 @@ data class ConfigDetails(
 fun IntroScreen(
     options: List<ConfigOptionUi>,
     defaultOptionId: String? = null,
+    uploadStatus: UploadStatus,
+    onUploadStatusActive: () -> Unit,
     onStart: (ConfigOptionUi) -> Unit,
     restartEpoch: Long = 0L,
     showRestart: Boolean = false,
@@ -180,6 +183,7 @@ fun IntroScreen(
     require(options.isNotEmpty()) { "IntroScreen requires at least one ConfigOptionUi." }
 
     val bgBrush = animatedMonotoneBackground()
+    LaunchedEffect(Unit) { onUploadStatusActive() }
 
     Box(
         modifier = Modifier
@@ -194,9 +198,9 @@ fun IntroScreen(
         ) {
             IntroCardMono(
                 title = "Survey Test App",
-                subtitle = "A focused, privacy-friendly evaluation flow",
                 options = options,
                 defaultOptionId = defaultOptionId,
+                uploadStatus = uploadStatus,
                 onStart = onStart,
                 restartEpoch = restartEpoch,
                 showRestart = showRestart,
@@ -226,9 +230,9 @@ fun IntroScreen(
 @Composable
 private fun IntroCardMono(
     title: String,
-    subtitle: String,
     options: List<ConfigOptionUi>,
     defaultOptionId: String?,
+    uploadStatus: UploadStatus,
     onStart: (ConfigOptionUi) -> Unit,
     restartEpoch: Long,
     showRestart: Boolean,
@@ -351,15 +355,31 @@ private fun IntroCardMono(
                 colorBottom = Color(0xFFCFCFCF)
             )
 
-            Spacer(Modifier.padding(top = 8.dp))
+            Spacer(Modifier.padding(top = 14.dp))
 
             Text(
-                text = subtitle,
-                style = MaterialTheme.typography.bodyLarge.copy(lineHeight = 22.sp),
+                text = "Upload Status",
+                style = MaterialTheme.typography.labelMedium.copy(letterSpacing = 0.2.sp),
+                color = textMuted,
+                modifier = Modifier.align(Alignment.Start)
+            )
+            Text(
+                text = "Device ID: ${uploadStatus.deviceTag}",
+                style = MaterialTheme.typography.bodyMedium,
                 color = textSecondary,
-                textAlign = TextAlign.Center,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis
+                modifier = Modifier.align(Alignment.Start)
+            )
+            Text(
+                text = "Uploaded Surveys on This Device: ${uploadStatus.uploadedCount}",
+                style = MaterialTheme.typography.bodyMedium,
+                color = textSecondary,
+                modifier = Modifier.align(Alignment.Start)
+            )
+            Text(
+                text = "Pending Survey Uploads: ${uploadStatus.pendingCount}",
+                style = MaterialTheme.typography.bodyMedium,
+                color = textSecondary,
+                modifier = Modifier.align(Alignment.Start)
             )
 
             Spacer(Modifier.padding(top = 16.dp))
@@ -503,7 +523,7 @@ private fun SelectedConfigDetailsMono(
     ) {
         /** Always-visible build stamp, shown first regardless of load state. */
         Text(
-            text = "Build: ${BuildConfig.BUILD_TIMESTAMP}",
+            text = "Build: ${BuildConfig.GIT_COMMIT_SHA} ${BuildConfig.BUILD_TIMESTAMP}",
             style = MaterialTheme.typography.labelSmall.copy(letterSpacing = 0.2.sp),
             color = textMuted,
             modifier = Modifier.testTag("BuildTimestamp")
@@ -564,7 +584,7 @@ private fun SelectedConfigDetailsMono(
                     text = d.summary,
                     style = MaterialTheme.typography.bodySmall.copy(lineHeight = 18.sp),
                     color = Color(0xFFCFCFCF),
-                    maxLines = if (expanded) Int.MAX_VALUE else 3,
+                    maxLines = if (expanded) Int.MAX_VALUE else 2,
                     overflow = TextOverflow.Ellipsis,
                     onTextLayout = { r ->
                         if (!expanded) {
@@ -581,7 +601,7 @@ private fun SelectedConfigDetailsMono(
                     text = d.longText,
                     style = MaterialTheme.typography.bodySmall.copy(lineHeight = 18.sp),
                     color = Color(0xFFBDBDBD),
-                    maxLines = if (expanded) Int.MAX_VALUE else 6,
+                    maxLines = if (expanded) Int.MAX_VALUE else 3,
                     overflow = TextOverflow.Ellipsis,
                     onTextLayout = { r ->
                         if (!expanded) {
@@ -783,9 +803,9 @@ private fun GradientHeadlineMono(
     }
     Text(
         text = label,
-        style = MaterialTheme.typography.headlineMedium.copy(
+        style = MaterialTheme.typography.headlineSmall.copy(
             fontWeight = FontWeight.SemiBold,
-            lineHeight = 30.sp,
+            lineHeight = 26.sp,
             letterSpacing = 0.2.sp
         ),
         textAlign = TextAlign.Center,
