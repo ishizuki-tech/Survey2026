@@ -95,10 +95,12 @@ jobs:
             -Prelease.allowSecrets=false
 
       - name: Build debug APK
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           ./gradlew :app:assembleDebug --no-daemon \
             -PskipModelDownload=true \
-            -Pdebug.embedSecrets=false \
+            -Pdebug.embedSecrets=true \
             -Prelease.allowSecrets=false
 
       - name: Collect branch APK metadata
@@ -126,7 +128,7 @@ jobs:
           OUTPUT="$RUNNER_TEMP/$APK_NAME"
           cp "${apks[0]}" "$OUTPUT"
           APK_SHA256="$(sha256sum "$OUTPUT" | awk '{print $1}')"
-          PAGE_URL="https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}/branches/${BRANCH_SLUG}/"
+          PAGE_URL="https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}/${BRANCH_SLUG}/"
 
           echo "path=$OUTPUT" >> "$GITHUB_OUTPUT"
           echo "name=$APK_NAME" >> "$GITHUB_OUTPUT"
@@ -168,14 +170,18 @@ jobs:
           set -euo pipefail
 
           PAGES_DIR="preview-pages"
-          TARGET_DIR="$PAGES_DIR/branches/$BRANCH_SLUG"
+          TARGET_DIR="$PAGES_DIR/$BRANCH_SLUG"
           RUN_URL="$SERVER_URL/$REPOSITORY/actions/runs/$RUN_ID"
           REPOSITORY_URL="$SERVER_URL/$REPOSITORY"
           APK_URL="$PAGE_URL$APK_NAME"
           GENERATED_UTC="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 
-          # Slugging is intentionally readable. Refuse to overwrite if two different
-          # branch names sanitize to the same directory.
+          # A branch preview may replace only a directory it already owns. This
+          # prevents a branch slug from deleting main-owned or other Pages content.
+          if [[ -e "$TARGET_DIR" && ! -f "$TARGET_DIR/branch.txt" ]]; then
+            echo "::error::Refusing to overwrite unowned Pages directory $TARGET_DIR."
+            exit 1
+          fi
           if [[ -f "$TARGET_DIR/branch.txt" ]] && ! cmp -s "$TARGET_DIR/branch.txt" <(printf '%s\n' "$BRANCH"); then
             echo "::error::Refusing to overwrite $TARGET_DIR because it belongs to a different branch name."
             exit 1
@@ -194,6 +200,21 @@ jobs:
           mkdir -p "$RUNNER_TEMP/branch-preview"
           PREVIEW_DIR="$RUNNER_TEMP/branch-preview"
           cp "$APK_PATH" "$PREVIEW_DIR/$APK_NAME"
+
+          QR_PATH="$PREVIEW_DIR/qr.png"
+          curl --fail --silent --show-error --location \
+            --retry 3 \
+            --retry-all-errors \
+            --get \
+            --data-urlencode "size=300x300" \
+            --data-urlencode "data=$PAGE_URL" \
+            "https://api.qrserver.com/v1/create-qr-code/" \
+            --output "$QR_PATH"
+          if [[ ! -s "$QR_PATH" ]] || [[ "$(file -b --mime-type "$QR_PATH")" != "image/png" ]]; then
+            echo "::error::Failed to generate a PNG QR code for the branch download page."
+            exit 1
+          fi
+
           printf '%s\n' "$BRANCH" > "$PREVIEW_DIR/branch.txt"
           touch "$PREVIEW_DIR/.nojekyll"
 
@@ -220,7 +241,7 @@ jobs:
               <p>This installable debug APK was built from the branch shown below. It is separate from the production release.</p>
               <a class="download" href="$APK_URL">Download APK</a>
               <section class="qr">
-                <img src="https://api.qrserver.com/v1/create-qr-code/?size=300x300&amp;data=$PAGE_URL" alt="QR code for this branch build page" width="200" height="200">
+                <img src="qr.png" alt="QR code for this branch build page" width="200" height="200">
                 <div><h2>Open on Android</h2><p>Scan this code to open this branch-specific download page.</p><code>$PAGE_URL</code></div>
               </section>
               <dl>
@@ -271,9 +292,9 @@ jobs:
           repository = sys.argv[2]
           server_url = sys.argv[3].rstrip("/")
           owner, repository_name = repository.split("/", 1)
-          branches_dir = pages_dir / "branches"
+          dashboard_dir = pages_dir / "branches"
           page_base_url = (
-              f"https://{owner}.github.io/{repository_name}/branches/"
+              f"https://{owner}.github.io/{repository_name}/"
           )
           run_url_prefix = f"{server_url}/{repository}/actions/runs/"
           slug_pattern = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
@@ -288,7 +309,7 @@ jobs:
               )
 
           entries = []
-          for metadata_path in sorted(branches_dir.glob("*/build.json")):
+          for metadata_path in sorted(pages_dir.glob("*/build.json")):
               try:
                   metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
                   if not isinstance(metadata, dict):
@@ -314,8 +335,11 @@ jobs:
 
                   slug = metadata["branch_slug"]
                   short_sha = metadata["short_sha"]
+                  branch_marker = metadata_path.parent / "branch.txt"
                   if (
                       metadata_path.parent.name != slug
+                      or branch_marker.read_text(encoding="utf-8").strip()
+                      != metadata["original_branch"]
                       or not slug_pattern.fullmatch(slug)
                       or not short_sha_pattern.fullmatch(short_sha)
                       or not commit_sha_pattern.fullmatch(metadata["commit_sha"])
@@ -407,14 +431,15 @@ jobs:
           </body>
           </html>
           """
-          (branches_dir / "index.html").write_text(dashboard, encoding="utf-8")
+          dashboard_dir.mkdir(parents=True, exist_ok=True)
+          (dashboard_dir / "index.html").write_text(dashboard, encoding="utf-8")
           PY
 
-          git -C "$PAGES_DIR" add -- "branches/$BRANCH_SLUG"
+          git -C "$PAGES_DIR" add -- "$BRANCH_SLUG"
           git -C "$PAGES_DIR" add -- branches/index.html
           if git -C "$PAGES_DIR" diff --cached --quiet; then
-            echo "No branch preview changes to publish."
-            exit 0
+            echo "::error::Branch preview publication produced no changes; refusing to skip the required commit and push."
+            exit 1
           fi
 
           git -C "$PAGES_DIR" config user.name "github-actions[bot]"
