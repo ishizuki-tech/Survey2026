@@ -56,6 +56,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
 import com.negi.survey.vm.SurveyViewModel
+import com.negi.survey.vm.SurveyFinalizationState
 
 /**
  * Review screen that renders a compact, read-only summary of the session.
@@ -80,7 +81,8 @@ import com.negi.survey.vm.SurveyViewModel
 @Composable
 fun ReviewScreen(
     vm: SurveyViewModel,
-    onNext: () -> Unit,
+    finalizationState: SurveyFinalizationState,
+    onFinish: () -> Unit,
     onBack: () -> Unit
 ) {
     val cs = MaterialTheme.colorScheme
@@ -254,6 +256,8 @@ fun ReviewScreen(
 
             // Bottom buttons.
             item {
+                val finishing = finalizationState is SurveyFinalizationState.Finishing
+                val error = (finalizationState as? SurveyFinalizationState.Error)?.message
                 Row(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                     modifier = Modifier
@@ -262,16 +266,22 @@ fun ReviewScreen(
                 ) {
                     Button(
                         onClick = onBack,
+                        enabled = !finishing,
                         modifier = Modifier.weight(1f)
                     ) {
                         Text("Back")
                     }
                     Button(
-                        onClick = onNext,
+                        onClick = onFinish,
+                        enabled = !finishing,
                         modifier = Modifier.weight(1f)
                     ) {
-                        Text("Next")
+                        Text(if (finishing) "Finishing..." else "Finish")
                     }
+                }
+                if (!error.isNullOrBlank()) {
+                    Spacer(Modifier.height(8.dp))
+                    Text(text = error, style = bodyTight, color = cs.error)
                 }
             }
         }

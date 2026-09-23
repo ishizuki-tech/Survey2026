@@ -1,69 +1,115 @@
 # Survey2026 TODO
 
-This file tracks unfinished implementation, verification, and documentation work. Items remain unchecked until their implementation and evidence are independently verified.
+This file tracks concrete unfinished implementation, verification, and documentation work.
+Completed baseline capabilities belong in `ROADMAP.md` and should not remain as perpetual unchecked TODOs.
 
-## Build Toolchain
+## P0 — Field Deployment Readiness
 
-- [ ] Pin and document the Android NDK version in both Android modules and CI.
-- [ ] Document the actual CMake version and production ABI configuration.
+### Release provenance / Download Page
+- [ ] Assert intended stable checkpoint/source SHA during manual publish.
+- [ ] Publish and display the stable tag/checkpoint on the download page.
+- [ ] Publish APK SHA-256, English config SHA-256, Swahili config SHA-256, and signing certificate SHA-256.
+- [ ] Add a concise "What's New" section to the download page.
+- [ ] Add verified-device / deployment-status information.
+- [ ] Keep `latest.json` metadata consistent with the rendered download page and GitHub Release.
 
-## LiteRT-LM / SLM
+### Field verification evidence
+- [ ] Record Pixel 9a manual E2E evidence for online Finish/upload.
+- [ ] Record offline Finish -> pending -> reconnect auto-upload evidence.
+- [ ] Record restart/reboot/app-update recovery evidence.
+- [ ] Record duplicate-Finish / one-JSON-per-UUID evidence.
+- [ ] Record Uploaded/Pending count and remote artifact/path checks.
 
-- [ ] Document prompt resolver APIs, including the active ONE_STEP and TWO_STEP paths and enforced output schemas.
-- [ ] Document model-run isolation, cancellation, terminal-result invariants, and context/token capacity behavior.
+### Microphone permission behavior
+- [ ] Decide and document whether microphone denial permits text-only completion.
+- [ ] Implement and test the selected behavior.
+
+### Data handling
+- [ ] Document destinations, retention, deletion, recovery identity, and operator access for survey JSON, WAV, logs, models, and hashed device tags.
+
+## P1 — AI Follow-up Quality
+
+- [ ] Create English Q8-Q17 prompt/config review fixtures.
+- [ ] Create Swahili Q8-Q17 prompt/config review fixtures.
+- [ ] Define expected missing-information targets and prohibited duplicate follow-ups.
+- [ ] Build a controlled real-model semantic acceptance matrix.
+- [ ] Measure unexpected no-follow-up, unnecessary follow-up, relevance, duplicate rate, timeout/recovery, and language parity.
+
+## P1 — Speech Recognition Quality
+
+- [ ] Build a reproducible CER harness.
+- [ ] Build a reproducible WER harness.
+- [ ] Create immutable reference transcripts.
+- [ ] Define speaker/device/noise/distance/speech-rate test matrix.
+- [ ] Run English target-device benchmark.
+- [ ] Run Swahili target-device benchmark.
+- [ ] Select a production Swahili model only from target-device evidence on current main.
+
+## P1 — Voice / Microphone UX
+
+- [ ] Document microphone capture -> WAV -> Whisper -> answer text -> SLM -> TTS ownership.
+- [ ] Verify user-visible recording/transcribing/failure/retry states.
+- [ ] Verify transcription results remain owned by the correct survey/node across lifecycle changes.
+
+## P2 — Reliability / Device Compatibility
+
+- [ ] Soak-test cancellation.
+- [ ] Soak-test rotation and background/foreground transitions.
+- [ ] Soak-test process restart and app update.
+- [ ] Soak-test network flapping.
+- [ ] Soak-test low-storage behavior.
+- [ ] Define supported device/ABI policy.
+- [ ] Validate Samsung target only after the supported-device matrix is defined.
+
+## P3 — Documentation / Toolchain / Maintenance
+
+### Native / build
+- [ ] Document the actual CMake path and current `WHISPER_DIR` wiring.
+- [ ] Document current ABI configuration.
+- [ ] Document the pinned NDK/CMake versions and CI/local ownership.
+
+### SLM
+- [ ] Document prompt resolver APIs and current ONE_STEP / TWO_STEP behavior.
+- [ ] Document model-run isolation, cancellation, terminal-result invariants, and context/token behavior.
 - [ ] Document LiteRT-LM model loading, storage, discovery, and integrity behavior.
 
-## Whisper / Native Audio
-
-- [ ] Document the exact CMake integration with `whisper.cpp`.
-- [ ] Document audio format, WAV/raw behavior, and JNI transcription ownership/threading.
+### Whisper / native audio
+- [ ] Document exact whisper.cpp integration.
+- [ ] Document audio format, WAV/raw behavior, JNI ownership, and threading.
 - [ ] Document Whisper model location, naming, discovery, and integrity behavior.
 
-## Android Permissions and Storage
+### Android storage / permissions
+- [ ] Document exact manifest/runtime permissions.
+- [ ] Document application storage for survey state, recordings, models, logs, and crash diagnostics.
 
-- [ ] Document manifest and runtime permissions, especially microphone denial behavior.
-- [ ] Document application storage for survey state, recordings, models, runtime logs, and crash diagnostics.
-
-## Diagnostics and Logging
-
+### Diagnostics
 - [ ] Document log locations, retention, crash capture, and diagnostic upload behavior.
 - [ ] Document diagnostic configuration handling without exposing secrets.
 
-## Survey Configuration
+### Survey configuration
+- [ ] Document SurveyConfig schema, validation rules, selection flow, and new-language/config process.
 
-- [ ] Document the SurveyConfig schema, validation rules, selection flow, and new-language/config process.
-- [ ] Verify and document ONE_STEP versus TWO_STEP configuration semantics against the active runtime and shipped assets.
+### Testing / CI
+- [ ] Document JVM, instrumentation, real-model, and real-device test tiers.
+- [ ] Define policy for which real-model tests, if any, run automatically in CI.
+- [ ] Document build-only versus published-release workflow behavior.
 
-## AI Follow-up Validation
-
-- [ ] Document the iterative MAIN/FU1/FU2/terminal state machine and accumulated prompt construction.
-- [ ] Document duplicate-follow-up normalization and bounded consistency repair.
-- [ ] Document real-device model-output edge cases, including low-score empty follow-ups and duplicate candidates.
-
-## Testing
-
-- [ ] Document JVM and instrumentation test coverage and requirements.
-- [ ] Document real LiteRT/Gemma safety and soak test execution, including `ITERATIONS` and expected runtime.
-- [ ] Decide which real-model tests, if any, run automatically in CI.
-
-## CI and Release
-
-- [ ] Document workflow responsibilities and build-only versus published-release behavior.
-- [ ] Document signing, release versioning, APK naming, config integrity, and `latest.json` behavior.
-
-## Release Download Page
-
-- [ ] Document the production download-page URL, APK behavior, and YAML browser/download link provenance.
-- [ ] Consider release-note and independently published config-hash presentation.
-
-## Repository Maintenance and Security
-
-- [ ] Keep `whisper.cpp` pinned to a known submodule commit.
-- [ ] Periodically verify that README architecture descriptions match the repository.
+### Repository maintenance
+- [ ] Periodically verify README architecture descriptions match the repository.
 - [ ] Keep generated outputs and model binaries out of Git unless intentionally distributed.
 - [ ] Verify release keystores, API tokens, and other credentials are never committed.
 
-## Documentation Policy
+## Completed / Removed From TODO
 
-- [ ] Keep README limited to current, verified behavior.
-- [ ] Keep unfinished work in this file and mark an item complete only after implementation, validation, and documentation agree.
+The following are baseline capabilities and are tracked as complete in `ROADMAP.md`:
+- Review -> Finish -> queue -> Done
+- Offline upload queueing
+- Duplicate logical-survey protection
+- Pending JSON reuse
+- Reboot/app-update recovery implementation
+- Uploaded/Pending/Device status UI
+- Timestamp/device-tagged exports
+- Single survey JSON serializer
+- Voice/log scheduling separation
+- Active shipped Q8-Q17 TWO_STEP semantics
+- whisper.cpp pinned at v1.9.3

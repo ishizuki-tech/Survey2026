@@ -42,6 +42,7 @@ import android.os.UserManager
 import android.util.Log
 import androidx.work.BackoffPolicy
 import androidx.work.Constraints
+import androidx.work.Data
 import androidx.work.ExistingWorkPolicy
 import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequest
@@ -49,7 +50,6 @@ import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.OutOfQuotaPolicy
 import androidx.work.WorkInfo
 import androidx.work.WorkManager
-import androidx.work.workDataOf
 import com.negi.survey.BuildConfig
 import java.io.File
 import java.util.Locale
@@ -60,6 +60,46 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeout
+
+/**
+ * Recovery classification for files staged before a reboot or app update.
+ * Survey identity is accepted only from the staged JSON's top-level survey_id.
+ */
+internal data class PendingGitHubUploadRecovery(
+    val remoteRelativePath: String,
+    val surveyId: String?
+) {
+    fun uniqueWorkName(file: File): String =
+        if (surveyId != null) {
+            SurveyUploadWork.uniqueWorkName(remoteRelativePath)
+        } else {
+            // Preserve legacy generic-file behavior without classifying the payload.
+            "upload_gh_${file.name}_${file.length().coerceAtLeast(0L)}_${file.lastModified()}"
+        }
+
+    fun workTagSegment(file: File): String =
+        if (surveyId != null) {
+            SurveyUploadWork.safeWorkNameSegment(remoteRelativePath)
+        } else {
+            file.name
+        }
+
+    companion object {
+        fun from(file: File): PendingGitHubUploadRecovery {
+            val surveyId = PendingSurveyUploads.surveyIdFromFile(file)
+            val remoteRelativePath = if (surveyId != null) {
+                SurveyUploadWork.remoteRelativePath(file.name)
+            } else {
+                file.name
+            }
+            return PendingGitHubUploadRecovery(
+                remoteRelativePath = remoteRelativePath,
+                surveyId = surveyId
+            )
+        }
+
+    }
+}
 
 class UploadRescheduleReceiver : BroadcastReceiver() {
 
@@ -177,29 +217,33 @@ class UploadRescheduleReceiver : BroadcastReceiver() {
         cfg: GitHubUploader.GitHubConfig,
         file: File
     ) {
-        val name = file.name
+        val recovery = PendingGitHubUploadRecovery.from(file)
+        val remoteRelativePath = recovery.remoteRelativePath
         val bytes = file.length().coerceAtLeast(0L)
         val mtime = file.lastModified()
+        val uniqueName = recovery.uniqueWorkName(file)
 
-        // Include size+mtime to avoid suppressing uploads for "same name but different content".
-        val uniqueName = "upload_gh_${name}_${bytes}_${mtime}"
+        val input = Data.Builder()
+            .putString(GitHubUploadWorker.KEY_MODE, "file")
+            .putString(GitHubUploadWorker.KEY_OWNER, cfg.owner)
+            .putString(GitHubUploadWorker.KEY_REPO, cfg.repo)
+            .putString(GitHubUploadWorker.KEY_TOKEN, cfg.token)
+            .putString(GitHubUploadWorker.KEY_BRANCH, cfg.branch)
+            .putString(GitHubUploadWorker.KEY_PATH_PREFIX, cfg.pathPrefix)
+            .putString(GitHubUploadWorker.KEY_FILE_PATH, file.absolutePath)
+            .putString(GitHubUploadWorker.KEY_FILE_NAME, remoteRelativePath)
+            .putLong(GitHubUploadWorker.KEY_FILE_MAX_BYTES_HINT, cfg.maxRawBytesHint.toLong())
+            .putInt(GitHubUploadWorker.KEY_FILE_MAX_REQUEST_BYTES_HINT, cfg.maxRequestBytesHint)
+            .apply {
+                recovery.surveyId?.let { surveyId ->
+                    SurveyUploadWork.addSurveyJsonMetadata(this, surveyId)
+                }
+            }
+            .build()
 
         val req: OneTimeWorkRequest =
             OneTimeWorkRequestBuilder<GitHubUploadWorker>()
-                .setInputData(
-                    workDataOf(
-                        GitHubUploadWorker.KEY_MODE to "file",
-                        GitHubUploadWorker.KEY_OWNER to cfg.owner,
-                        GitHubUploadWorker.KEY_REPO to cfg.repo,
-                        GitHubUploadWorker.KEY_TOKEN to cfg.token,
-                        GitHubUploadWorker.KEY_BRANCH to cfg.branch,
-                        GitHubUploadWorker.KEY_PATH_PREFIX to cfg.pathPrefix,
-                        GitHubUploadWorker.KEY_FILE_PATH to file.absolutePath,
-                        GitHubUploadWorker.KEY_FILE_NAME to name,
-                        GitHubUploadWorker.KEY_FILE_MAX_BYTES_HINT to cfg.maxRawBytesHint.toLong(),
-                        GitHubUploadWorker.KEY_FILE_MAX_REQUEST_BYTES_HINT to cfg.maxRequestBytesHint
-                    )
-                )
+                .setInputData(input)
                 .setConstraints(
                     Constraints.Builder()
                         .setRequiredNetworkType(NetworkType.CONNECTED)
@@ -208,12 +252,12 @@ class UploadRescheduleReceiver : BroadcastReceiver() {
                 .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
                 .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
                 .addTag(GitHubUploadWorker.TAG)
-                .addTag("${GitHubUploadWorker.TAG}:file:$name")
+                .addTag("${GitHubUploadWorker.TAG}:file:${recovery.workTagSegment(file)}")
                 .build()
 
         val policy = choosePolicyForUniqueName(context, uniqueName)
 
-        Log.d(TAG, "enqueueGitHubFileUpload: uniqueName=$uniqueName policy=$policy file=${file.absolutePath} bytes=$bytes mtime=$mtime")
+        Log.d(TAG, "enqueueGitHubFileUpload: uniqueName=$uniqueName policy=$policy file=${file.absolutePath} bytes=$bytes mtime=$mtime survey=${recovery.surveyId != null}")
 
         WorkManager.getInstance(context)
             .enqueueUniqueWork(uniqueName, policy, req)
