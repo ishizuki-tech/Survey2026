@@ -8,6 +8,7 @@
  */
 package com.negi.survey.net
 
+import com.negi.survey.BuildConfig
 import com.negi.survey.vm.SurveyFinalizationSnapshot
 
 /**
@@ -27,6 +28,7 @@ object SurveyExportJsonBuilder {
 
         append("{\n")
         append("  \"survey_id\": \"").append(escape(snapshot.surveyId)).append("\",\n")
+        append("  \"build\": \"").append(escape("${BuildConfig.GIT_COMMIT_SHA}")).append("\",\n")
         append("  \"exported_at\": \"").append(escape(exportedAt)).append("\",\n")
 
         append("  \"meta\": ")

@@ -198,7 +198,6 @@ fun IntroScreen(
         ) {
             IntroCardMono(
                 title = "Survey Test App",
-                subtitle = "A focused, privacy-friendly evaluation flow",
                 options = options,
                 defaultOptionId = defaultOptionId,
                 uploadStatus = uploadStatus,
@@ -231,7 +230,6 @@ fun IntroScreen(
 @Composable
 private fun IntroCardMono(
     title: String,
-    subtitle: String,
     options: List<ConfigOptionUi>,
     defaultOptionId: String?,
     uploadStatus: UploadStatus,
@@ -355,17 +353,6 @@ private fun IntroCardMono(
                 text = title,
                 colorTop = Color(0xFFF5F5F5),
                 colorBottom = Color(0xFFCFCFCF)
-            )
-
-            Spacer(Modifier.padding(top = 8.dp))
-
-            Text(
-                text = subtitle,
-                style = MaterialTheme.typography.bodyLarge.copy(lineHeight = 22.sp),
-                color = textSecondary,
-                textAlign = TextAlign.Center,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis
             )
 
             Spacer(Modifier.padding(top = 14.dp))
@@ -536,7 +523,7 @@ private fun SelectedConfigDetailsMono(
     ) {
         /** Always-visible build stamp, shown first regardless of load state. */
         Text(
-            text = "Build: ${BuildConfig.BUILD_TIMESTAMP}",
+            text = "Build: ${BuildConfig.GIT_COMMIT_SHA} ${BuildConfig.BUILD_TIMESTAMP}",
             style = MaterialTheme.typography.labelSmall.copy(letterSpacing = 0.2.sp),
             color = textMuted,
             modifier = Modifier.testTag("BuildTimestamp")
@@ -597,7 +584,7 @@ private fun SelectedConfigDetailsMono(
                     text = d.summary,
                     style = MaterialTheme.typography.bodySmall.copy(lineHeight = 18.sp),
                     color = Color(0xFFCFCFCF),
-                    maxLines = if (expanded) Int.MAX_VALUE else 3,
+                    maxLines = if (expanded) Int.MAX_VALUE else 2,
                     overflow = TextOverflow.Ellipsis,
                     onTextLayout = { r ->
                         if (!expanded) {
@@ -614,7 +601,7 @@ private fun SelectedConfigDetailsMono(
                     text = d.longText,
                     style = MaterialTheme.typography.bodySmall.copy(lineHeight = 18.sp),
                     color = Color(0xFFBDBDBD),
-                    maxLines = if (expanded) Int.MAX_VALUE else 6,
+                    maxLines = if (expanded) Int.MAX_VALUE else 3,
                     overflow = TextOverflow.Ellipsis,
                     onTextLayout = { r ->
                         if (!expanded) {
@@ -816,9 +803,9 @@ private fun GradientHeadlineMono(
     }
     Text(
         text = label,
-        style = MaterialTheme.typography.headlineMedium.copy(
+        style = MaterialTheme.typography.headlineSmall.copy(
             fontWeight = FontWeight.SemiBold,
-            lineHeight = 30.sp,
+            lineHeight = 26.sp,
             letterSpacing = 0.2.sp
         ),
         textAlign = TextAlign.Center,

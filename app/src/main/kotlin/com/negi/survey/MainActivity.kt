@@ -14,7 +14,9 @@
 package com.negi.survey
 
 import android.Manifest
+import android.app.Activity
 import android.content.Context
+import android.content.ContextWrapper
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.AssetManager
@@ -1071,7 +1073,8 @@ fun SurveyNavHost(
     sessionVmOwner: ViewModelStoreOwner? = null,
     uploadStatus: UploadStatus = UploadStatus()
 ) {
-    val appContext = LocalContext.current.applicationContext
+    val localContext = LocalContext.current
+    val appContext = localContext.applicationContext
     val owner = sessionVmOwner ?: LocalViewModelStoreOwner.current
     ?: error("Missing ViewModelStoreOwner")
     val finalizationVm: SurveyFinalizationViewModel = viewModel(
@@ -1415,10 +1418,16 @@ fun SurveyNavHost(
                         vm = vmSurvey,
                         finalizationState = finalizationState,
                         onFinish = {
+                            val config = buildGitHubConfigOrNull()
+                            if (config == null) {
+                                Log.d(MainActivity.TAG, "Finish -> survey upload not configured, exiting app")
+                                localContext.findActivity()?.finish()
+                                return@ReviewScreen
+                            }
                             val stamp = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.US).format(Date())
                             finalizationVm.finish(
                                 snapshot = vmSurvey.createFinalizationSnapshot(),
-                                config = buildGitHubConfigOrNull(),
+                                config = config,
                                 tag = finishTag,
                                 stamp = stamp
                             )
@@ -1449,6 +1458,13 @@ fun SurveyNavHost(
         vmAI.resetStates()
         vmSurvey.backToPrevious()
     }
+}
+
+/** Unwrap Compose's [LocalContext] (possibly a ContextWrapper) to the hosting Activity. */
+private tailrec fun Context.findActivity(): Activity? = when (this) {
+    is Activity -> this
+    is ContextWrapper -> baseContext.findActivity()
+    else -> null
 }
 
 /**
