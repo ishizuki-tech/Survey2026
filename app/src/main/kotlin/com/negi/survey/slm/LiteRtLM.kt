@@ -128,6 +128,40 @@ private const val DEFAULT_TOPK = 40
 private const val DEFAULT_TOPP = 0.9f
 private const val DEFAULT_TEMPERATURE = 0.7f
 
+/** Content-free terminal categories owned by the app wrapper, not by LiteRT. */
+internal enum class InferenceTerminalCategory(val wireValue: String) {
+    NORMAL_ON_DONE("normal_onDone"),
+    ERROR("error"),
+    CANCELLED("cancelled"),
+    WATCHDOG_TIMEOUT("watchdog_timeout"),
+}
+
+/**
+ * Formats completion telemetry without prompt, response, or survey content.
+ * A negative token count means the best-effort LiteRT query was unavailable.
+ */
+internal fun formatCompletionDiagnostics(
+    runId: Long,
+    engineTokenCapacity: Int,
+    prefillTokens: Int,
+    decodeTokens: Int,
+    kvTokens: Int,
+    outputChars: Long,
+    callbackCount: Int,
+    terminal: InferenceTerminalCategory,
+): String =
+    "LiteRT completion: runId=$runId " +
+            "terminal=${terminal.wireValue} phase=unavailable " +
+            "engineTokenCapacity=$engineTokenCapacity " +
+            "prefillTokens=$prefillTokens decodeTokens=$decodeTokens kvTokens=$kvTokens " +
+            "outputChars=$outputChars callbacks=$callbackCount"
+
+private data class CompletionTokenCounts(
+    val prefillTokens: Int,
+    val decodeTokens: Int,
+    val kvTokens: Int,
+)
+
 /**
  * Warm-engine retention window.
  *
@@ -989,6 +1023,16 @@ object LiteRtLM {
                 "decodeTokPerSec=${info.lastDecodeTokensPerSecond} " +
                 "kvTokens=$kvTokenCount " +
                 "effectiveTextLen=$effectiveTextLength"
+    }
+
+    @OptIn(ExperimentalApi::class)
+    private fun readCompletionTokenCounts(conversation: Conversation): CompletionTokenCounts {
+        val info = conversation.getBenchmarkInfo()
+        return CompletionTokenCounts(
+            prefillTokens = info.lastPrefillTokenCount,
+            decodeTokens = info.lastDecodeTokenCount,
+            kvTokens = runCatching { conversation.getTokenCount() }.getOrDefault(-1),
+        )
     }
 
     /**
@@ -4520,6 +4564,7 @@ object LiteRtLM {
             var rsLocal: RunState? = null
             var myRunId = 0L
             var conversation: Conversation? = null
+            var engineTokenCapacity = -1
             var rejectMsg: String? = null
             var notAliveRecoveryInstance: LiteRtLmInstance? = null
 
@@ -4581,6 +4626,7 @@ object LiteRtLM {
 
                     rsLocal = rs
                     conversation = i.conversation
+                    engineTokenCapacity = i.engineConfigSnapshot.maxNumTokens ?: -1
                 }
 
                 val rs = rsLocal
@@ -4696,6 +4742,7 @@ object LiteRtLM {
                 }
 
                 var watchdog: Job? = null
+                val watchdogTimeoutTriggered = AtomicBoolean(false)
 
                 fun captureLogicalDoneOnce(
                     errorMessage: String? = null,
@@ -4796,6 +4843,59 @@ object LiteRtLM {
                                     emittedChars
                         }
 
+                    val terminalCategory = when {
+                        watchdogTimeoutTriggered.get() ->
+                            InferenceTerminalCategory.WATCHDOG_TIMEOUT
+                        isCancel -> InferenceTerminalCategory.CANCELLED
+                        !errorMessage.isNullOrBlank() -> InferenceTerminalCategory.ERROR
+                        else -> InferenceTerminalCategory.NORMAL_ON_DONE
+                    }
+
+                    /*
+                     * LiteRT's callback API exposes onDone() but no finish reason.
+                     * Query its counters only after a normal onDone completion, while
+                     * the current Conversation is still live. This is best-effort and
+                     * deliberately contains no prompt or generated-text logging.
+                     */
+                    val completionDiagnostics =
+                        if (terminalCategory == InferenceTerminalCategory.NORMAL_ON_DONE) {
+                            runCatching {
+                                val tokenCounts = readCompletionTokenCounts(checkNotNull(conv))
+                                formatCompletionDiagnostics(
+                                    runId = myRunId,
+                                    engineTokenCapacity = engineTokenCapacity,
+                                    prefillTokens = tokenCounts.prefillTokens,
+                                    decodeTokens = tokenCounts.decodeTokens,
+                                    kvTokens = tokenCounts.kvTokens,
+                                    outputChars = emittedCharsSnapshot,
+                                    callbackCount = messageCountSnapshot,
+                                    terminal = terminalCategory,
+                                )
+                            }.getOrElse {
+                                formatCompletionDiagnostics(
+                                    runId = myRunId,
+                                    engineTokenCapacity = engineTokenCapacity,
+                                    prefillTokens = -1,
+                                    decodeTokens = -1,
+                                    kvTokens = -1,
+                                    outputChars = emittedCharsSnapshot,
+                                    callbackCount = messageCountSnapshot,
+                                    terminal = terminalCategory,
+                                )
+                            }
+                        } else {
+                            formatCompletionDiagnostics(
+                                runId = myRunId,
+                                engineTokenCapacity = engineTokenCapacity,
+                                prefillTokens = -1,
+                                decodeTokens = -1,
+                                kvTokens = -1,
+                                outputChars = emittedCharsSnapshot,
+                                callbackCount = messageCountSnapshot,
+                                terminal = terminalCategory,
+                            )
+                        }
+
                     val inferenceTimingMessage =
                         "Inference timing: key='$key' " +
                                 "runId=$myRunId " +
@@ -4883,6 +4983,8 @@ object LiteRtLM {
 
                     RuntimeLogStore.w(TAG, inferenceTimingMessage)
                     Log.w(TAG, inferenceTimingMessage)
+                    RuntimeLogStore.i(TAG, completionDiagnostics)
+                    Log.i(TAG, completionDiagnostics)
                     logicalCompletion?.invoke()
                     invokeNativeDoneHook(key, nativeDoneHook)
                 }
@@ -4970,6 +5072,8 @@ object LiteRtLM {
 
                     RuntimeLogStore.e(TAG, "Stream watchdog fired: key='$key' runId=$myRunId timeout=${STREAM_WATCHDOG_MS}ms")
                     debugState(key, rs, "watchdog:fired")
+
+                    watchdogTimeoutTriggered.set(true)
 
                     requestLogicalCancel(
                         expectedRunId = myRunId,

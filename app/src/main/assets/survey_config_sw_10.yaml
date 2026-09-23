@@ -36,9 +36,9 @@ graph:
       title: Umri wa Mhojiwa
       question: Una umri gani?
       options:
-        - Under 35/Chini ya 35
+        - Chini ya 35
         - 35-50
-        - Over 50/Zaidi ya 50
+        - Zaidi ya 50
       nextId: Q5
 
     - id: Q5
@@ -164,6 +164,7 @@ slm:
     Return only compact JSON {"score":N,"missing_points":[],"followup_needed":false}.
     N must be an integer 1-100 for relevance, completeness and accuracy against the original target.
     Evaluate the original answer and all answered followup pairs together.
+    Kabla ya kutoa JSON, linganisha kila taarifa inayodhaniwa kukosekana na jibu la awali na kila jozi ya swali la ufuatiliaji na jibu lake iliyojibiwa. Ikiwa jibu la ufuatiliaji lililojibiwa linatoa moja kwa moja taarifa hiyo, usiiweke katika missing_points. Hesabu upya score, missing_points, na followup_needed pamoja kama uamuzi mmoja wa mwisho unaolingana.
     Tofautisha uhusiano na ukamilifu. Jibu linaweza kuwa kuhusu mada husika lakini bado lisikamilike.
     Toa alama 90-100 tu wakati mhojiwa ametoa kwa wazi kila kipengele muhimu kinachohitajika katika Lengo la jibu na Swali.
     Usikisie maelezo yanayokosekana kutokana na maarifa ya jumla, uwezekano, au kauli tupu kwamba tukio lilitokea.

@@ -46,6 +46,52 @@ class SurveyTwoStepFlowTest {
         assertEquals(SurveyAiReason.ACHIEVED, survey.aiReasons.value["Q8"])
     }
 
+    @Test fun q11_answered_yield_and_pests_history_reaches_achieved_only_with_consistent_final_json() = runBlocking {
+        val yieldMissing = """{"score":75,"missing_points":["Specific yield target"],"followup_needed":true}"""
+        val pestsMissing = """{"score":85,"missing_points":["Specific pest resistances"],"followup_needed":true}"""
+        val consistentFinal = """{"score":95,"missing_points":[],"followup_needed":false}"""
+        val staleYieldFinal =
+            """{"score":95,"missing_points":["Specific yield target"],"followup_needed":false}"""
+
+        for ((finalJson, expectedReason) in listOf(
+            consistentFinal to SurveyAiReason.ACHIEVED,
+            staleYieldFinal to SurveyAiReason.FAILURE,
+        )) {
+            val (survey, ai, repo) = fixture(
+                cap = 2,
+                script = listOf(
+                    yieldMissing,
+                    Q11_YIELD_QUESTION,
+                    pestsMissing,
+                    Q11_PEST_QUESTION,
+                    finalJson,
+                ),
+                nodeId = Q11_NODE_ID,
+                question = Q11_QUESTION,
+                mainAnswer = Q11_MAIN_ANSWER,
+                target = Q11_TARGET,
+            )
+
+            run(survey, ai, Q11_NODE_ID, Q11_QUESTION)
+            survey.answerLastFollowup(Q11_NODE_ID, Q11_YIELD_ANSWER)
+            run(survey, ai, Q11_NODE_ID, Q11_QUESTION)
+            survey.answerLastFollowup(Q11_NODE_ID, Q11_PEST_ANSWER)
+            run(survey, ai, Q11_NODE_ID, Q11_QUESTION)
+
+            val finalPrompt = repo.prompts.last()
+            assertTrue(finalPrompt.contains(Q11_MAIN_ANSWER))
+            assertTrue(finalPrompt.contains("Follow-up 1: $Q11_YIELD_QUESTION"))
+            assertTrue(finalPrompt.contains("Answer 1: $Q11_YIELD_ANSWER"))
+            assertTrue(finalPrompt.contains("Follow-up 2: $Q11_PEST_QUESTION"))
+            assertTrue(finalPrompt.contains("Answer 2: $Q11_PEST_ANSWER"))
+            assertEquals(expectedReason, survey.aiReasons.value[Q11_NODE_ID])
+            assertEquals(
+                expectedReason == SurveyAiReason.ACHIEVED,
+                ai.conversationStateFlow("context").value.turnCompleted,
+            )
+        }
+    }
+
     @Test fun caps_one_and_three_always_evaluate_the_last_answer_before_limit() = runBlocking {
         for (cap in listOf(1, 3)) {
             val script = buildList {
@@ -182,29 +228,58 @@ class SurveyTwoStepFlowTest {
         assertEquals("{}", survey.aiReasonsJson())
     }
 
-    private suspend fun run(survey: SurveyViewModel, ai: AiViewModel) {
-        withTimeout(5_000) { ai.evaluateSurveyTwoStepAsync(survey, "Q8", "context", "Original question").join() }
+    private suspend fun run(
+        survey: SurveyViewModel,
+        ai: AiViewModel,
+        nodeId: String = "Q8",
+        question: String = "Original question",
+    ) {
+        withTimeout(5_000) { ai.evaluateSurveyTwoStepAsync(survey, nodeId, "context", question).join() }
     }
 
-    private fun fixture(cap: Int, script: List<String>): Triple<SurveyViewModel, AiViewModel, ScriptedRepository> {
-        val survey = survey(cap)
+    private fun fixture(
+        cap: Int,
+        script: List<String>,
+        nodeId: String = "Q8",
+        question: String = "Original question",
+        mainAnswer: String = "FAW affected my crop",
+        target: String = "original target",
+    ): Triple<SurveyViewModel, AiViewModel, ScriptedRepository> {
+        val survey = survey(cap, nodeId, question, mainAnswer, target)
         val repo = ScriptedRepository(script)
         val ai = AiViewModel(repo, defaultTimeoutMs = 50, ioDispatcher = Dispatchers.IO)
-        ai.ensureConversationContext("context", "Original question", survey.getAnswer("Q8"))
+        ai.ensureConversationContext("context", question, survey.getAnswer(nodeId))
         return Triple(survey, ai, repo)
     }
 
-    private fun survey(cap: Int) = SurveyViewModel(NavBackStack<NavKey>(FlowHome), SurveyConfig(
+    private fun survey(
+        cap: Int,
+        nodeId: String = "Q8",
+        question: String = "Original question",
+        mainAnswer: String = "FAW affected my crop",
+        target: String = "original target",
+    ) = SurveyViewModel(NavBackStack<NavKey>(FlowHome), SurveyConfig(
         aiInteraction = SurveyConfig.AiInteraction(cap),
         graph = SurveyConfig.Graph("Start", listOf(
-            NodeDTO("Start", "START", nextId = "Q8"),
-            NodeDTO("Q8", "AI", question = "Original question", nextId = "Done"),
+            NodeDTO("Start", "START", nextId = nodeId),
+            NodeDTO(nodeId, "AI", question = question, nextId = "Done"),
             NodeDTO("Done", "DONE")
         )),
-        prompts = listOf(SurveyConfig.Prompt("Q8",
-            evalPrompt = "Target: original target\nQuestion: {{QUESTION}}\nOriginal answer: {{ANSWER}}\n{{HISTORY}}",
-            followupPrompt = "Target: original target\nQuestion: {{QUESTION}}\nOriginal answer: {{ANSWER}}\n{{HISTORY}}\nEVAL_JSON: {{EVAL_JSON}}"))
-    )).also { it.setAnswer("FAW affected my crop", "Q8") }
+        prompts = listOf(SurveyConfig.Prompt(nodeId,
+            evalPrompt = "Target: $target\nQuestion: {{QUESTION}}\nOriginal answer: {{ANSWER}}\n{{HISTORY}}",
+            followupPrompt = "Target: $target\nQuestion: {{QUESTION}}\nOriginal answer: {{ANSWER}}\n{{HISTORY}}\nEVAL_JSON: {{EVAL_JSON}}"))
+    )).also { it.setAnswer(mainAnswer, nodeId) }
+
+    private companion object {
+        const val Q11_NODE_ID = "Q11"
+        const val Q11_QUESTION = "What traits would a new maize variety need to have for you to plant it instead of your current one?"
+        const val Q11_MAIN_ANSWER = "It should resist pests and give high yields."
+        const val Q11_YIELD_QUESTION = "What specific yield target would make a new maize variety preferable to your current one?"
+        const val Q11_YIELD_ANSWER = "At least twenty percent higher yield."
+        const val Q11_PEST_QUESTION = "What specific pests should the new maize variety resist?"
+        const val Q11_PEST_ANSWER = "Fall armyworm and maize stalk borer."
+        const val Q11_TARGET = "Priority traits a new maize variety must have to replace the current one, ideally with a measurable target."
+    }
 
     private class ScriptedRepository(private val script: List<String>) : Repository {
         val phases = mutableListOf<PromptPhase>()
