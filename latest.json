@@ -1,0 +1,24 @@
+{
+  "repository": "ishizuki-tech/Survey2026",
+  "release_tag": "build-81-8fe49c1",
+  "branch": "SLM-Download",
+  "release_url": "https://github.com/ishizuki-tech/Survey2026/releases/tag/build-81-8fe49c1",
+  "download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/build-81-8fe49c1/Survey2026-8fe49c1-release.apk",
+  "config_files": {
+    "english": {
+      "view_url": "https://github.com/ishizuki-tech/Survey2026/blob/8fe49c10fc9be765819faf093ba82c7a22673636/app/src/main/assets/survey_config10.yaml",
+      "download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/build-81-8fe49c1/survey_config10.yaml"
+    },
+    "swahili": {
+      "view_url": "https://github.com/ishizuki-tech/Survey2026/blob/8fe49c10fc9be765819faf093ba82c7a22673636/app/src/main/assets/survey_config_sw_10.yaml",
+      "download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/build-81-8fe49c1/survey_config_sw_10.yaml"
+    }
+  },
+  "apk_name": "Survey2026-8fe49c1-release.apk",
+  "apk_sha256": "89fcbf7b8b4e5e7223f849deb646829d7efa8e97fad192a8e463f9f7cb92e32a",
+  "signing_cert_sha256": "d6edef47ec6734a46122ab7fddb5e4f17d19d4d51ae3eaddfb32f309ee5036ea",
+  "short_sha": "8fe49c1",
+  "run_id": "35882235700",
+  "run_number": "81",
+  "generated_utc": "2026-09-23T15:39:59Z"
+}
