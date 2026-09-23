@@ -143,7 +143,7 @@ jobs:
           if [[ -z "$SUPABASE_LOG_BUCKET" ]]; then SUPABASE_LOG_BUCKET="logs"; fi
           if [[ -z "$SUPABASE_LOG_PREFIX" ]]; then SUPABASE_LOG_PREFIX="surveyapp"; fi
 
-          PUBLISH_RELEASE="${{ github.event_name == 'workflow_dispatch' && inputs.publish_release == true }}"
+          PUBLISH_RELEASE="${{ github.ref == 'refs/heads/main' || (github.event_name == 'workflow_dispatch' && inputs.publish_release == true) }}"
           HF_TOKEN="${{ secrets.HF_TOKEN }}"
 
           if [[ "$PUBLISH_RELEASE" == "true" ]]; then
@@ -200,7 +200,7 @@ jobs:
       - name: Validate Android signing configuration
         id: signing
         env:
-          PUBLISH_RELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release == true }}
+          PUBLISH_RELEASE: ${{ github.ref == 'refs/heads/main' || (github.event_name == 'workflow_dispatch' && inputs.publish_release == true) }}
         run: |
           set -euo pipefail
           signing_values=(
@@ -304,19 +304,15 @@ jobs:
       - name: Verify and collect release APK
         id: apk
         env:
-          PUBLISH_RELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release == true }}
+          PUBLISH_RELEASE: ${{ github.ref == 'refs/heads/main' || (github.event_name == 'workflow_dispatch' && inputs.publish_release == true) }}
           STABLE_TAG_INPUT: ${{ github.event_name == 'workflow_dispatch' && inputs.stable_tag || '' }}
         run: |
           set -euo pipefail
 
           STABLE_TAG=""
-          if [[ "$PUBLISH_RELEASE" == "true" ]]; then
+          SHORT_SHA="${GITHUB_SHA::7}"
+          if [[ "$PUBLISH_RELEASE" == "true" && -n "$STABLE_TAG_INPUT" ]]; then
             STABLE_TAG="${STABLE_TAG_INPUT}"
-            if [[ -z "$STABLE_TAG" ]]; then
-              echo "::error::stable_tag is required when publish_release=true."
-              exit 1
-            fi
-
             git fetch --force --tags origin "refs/tags/${STABLE_TAG}:refs/tags/${STABLE_TAG}"
             TAG_COMMIT="$(git rev-list -n 1 "$STABLE_TAG")"
             if [[ "$TAG_COMMIT" != "$GITHUB_SHA" ]]; then
@@ -324,6 +320,11 @@ jobs:
               exit 1
             fi
             echo "Stable tag verified: $STABLE_TAG -> $GITHUB_SHA"
+          elif [[ "$PUBLISH_RELEASE" == "true" && "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "::error::stable_tag is required for a manually published non-main release."
+            exit 1
+          elif [[ "$PUBLISH_RELEASE" == "true" ]]; then
+            echo "::notice::Publishing the current main build without a stable checkpoint tag."
           fi
           APK_DIR="app/build/outputs/apk/release"
           if [[ ! -d "$APK_DIR" ]]; then
@@ -393,7 +394,6 @@ jobs:
             exit 1
           fi
 
-          SHORT_SHA="${GITHUB_SHA::7}"
           BRANCH="${GITHUB_REF_NAME}"
           APK_NAME="Survey2026-${SHORT_SHA}-release.apk"
           OUTPUT="$RUNNER_TEMP/$APK_NAME"
@@ -462,7 +462,7 @@ jobs:
           retention-days: 30
 
       - name: Publish GitHub Release
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release == true }}
+        if: ${{ github.ref == 'refs/heads/main' || (github.event_name == 'workflow_dispatch' && inputs.publish_release == true) }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           APK: ${{ steps.apk.outputs.path }}
@@ -483,7 +483,6 @@ jobs:
           test -n "$SIGNING_CERT_SHA256"
           test -n "$ENGLISH_CONFIG_SHA256"
           test -n "$SWAHILI_CONFIG_SHA256"
-          test -n "$STABLE_TAG"
 
           NOTES="$RUNNER_TEMP/survey2026-release-notes.md"
           {
@@ -491,7 +490,11 @@ jobs:
             echo
             echo "Verified Android release APK."
             echo
-            echo "- Stable checkpoint: ${STABLE_TAG}"
+            if [[ -n "$STABLE_TAG" ]]; then
+              echo "- Stable checkpoint: ${STABLE_TAG}"
+            else
+              echo "- Source branch: ${GITHUB_REF_NAME}"
+            fi
             echo "- Source commit SHA: ${GITHUB_SHA}"
             echo "- Workflow run number: ${GITHUB_RUN_NUMBER}"
             echo "- APK filename: ${APK_NAME}"
@@ -536,7 +539,11 @@ jobs:
     name: Publish mobile download page
     runs-on: ubuntu-latest
     needs: build-release-apk
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release == true }}
+    if: ${{ github.ref == 'refs/heads/main' }}
+    concurrency:
+      # This job and BranchBuild both push to gh-pages.
+      group: branch-apk-preview-pages
+      cancel-in-progress: false
 
     steps:
       - name: Generate download page
@@ -558,7 +565,7 @@ jobs:
           SERVER_URL: ${{ github.server_url }}
         run: |
           set -euo pipefail
-          for name in RELEASE_TAG RELEASE_URL DOWNLOAD_URL APK_NAME APK_SHA256 SIGNING_CERT_SHA256 ENGLISH_CONFIG_SHA256 SWAHILI_CONFIG_SHA256 STABLE_TAG SHORT_SHA BRANCH; do
+          for name in RELEASE_TAG RELEASE_URL DOWNLOAD_URL APK_NAME APK_SHA256 SIGNING_CERT_SHA256 ENGLISH_CONFIG_SHA256 SWAHILI_CONFIG_SHA256 SHORT_SHA BRANCH; do
             if [[ -z "${!name:-}" ]]; then
               echo "::error::Missing download-page value: $name"
               exit 1
@@ -572,11 +579,24 @@ jobs:
           PAGE_URL="https://${OWNER}.github.io/${REPO_NAME}/"
           RUN_URL="${SERVER_URL}/${REPOSITORY}/actions/runs/${RUN_ID}"
           REPO_URL="${SERVER_URL}/${REPOSITORY}"
-          QR_URL="https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${PAGE_URL}"
+          QR_URL="qr.png"
           ENGLISH_CONFIG_URL="${SERVER_URL}/${REPOSITORY}/releases/download/${RELEASE_TAG}/survey_config10.yaml"
           SWAHILI_CONFIG_URL="${SERVER_URL}/${REPOSITORY}/releases/download/${RELEASE_TAG}/survey_config_sw_10.yaml"
           ENGLISH_CONFIG_VIEW_URL="${SERVER_URL}/${REPOSITORY}/blob/${GITHUB_SHA}/app/src/main/assets/survey_config10.yaml"
           SWAHILI_CONFIG_VIEW_URL="${SERVER_URL}/${REPOSITORY}/blob/${GITHUB_SHA}/app/src/main/assets/survey_config_sw_10.yaml"
+
+          curl --fail --silent --show-error --location \
+            --retry 3 \
+            --retry-all-errors \
+            --get \
+            --data-urlencode "size=300x300" \
+            --data-urlencode "data=$PAGE_URL" \
+            "https://api.qrserver.com/v1/create-qr-code/" \
+            --output download-page/qr.png
+          if [[ ! -s download-page/qr.png ]] || [[ "$(file -b --mime-type download-page/qr.png)" != "image/png" ]]; then
+            echo "::error::Failed to generate a PNG QR code for the main download page."
+            exit 1
+          fi
 
           cat > download-page/index.html <<HTML
           <!doctype html>
@@ -620,11 +640,12 @@ jobs:
             <main>
               <section class="card">
                 <p class="eyebrow">Survey2026</p>
-                <h1>Latest Stable Android Build</h1>
+                <h1>Latest Android Build</h1>
                 <p class="subtitle">Open this page on an Android phone and download the latest verified Survey2026 release APK directly.</p>
                 <section class="config-files">
-                  <h2>Stable checkpoint</h2>
-                  <p><strong>Tag:</strong> <code>${STABLE_TAG}</code><br>
+                  <h2>Build provenance</h2>
+                  ${STABLE_TAG:+<p><strong>Stable checkpoint:</strong> <code>${STABLE_TAG}</code></p>}
+                  <p>
                   <strong>Source:</strong> <code>${GITHUB_SHA}</code><br>
                   <strong>Verified device:</strong> Pixel 9a (manual E2E)</p>
                 </section>
@@ -649,7 +670,6 @@ jobs:
                   <div><h2>Scan with Android</h2><p class="subtitle">This QR code opens the permanent download page.</p><code>${PAGE_URL}</code></div>
                 </div>
                 <div class="grid">
-                  <div class="item"><span class="label">Stable checkpoint</span><code>${STABLE_TAG}</code></div>
                   <div class="item"><span class="label">Release tag</span><code>${RELEASE_TAG}</code></div>
                   <div class="item"><span class="label">Branch</span><code>${BRANCH}</code></div>
                   <div class="item"><span class="label">Commit SHA</span><code>${SHORT_SHA}</code></div>
@@ -705,11 +725,38 @@ jobs:
 
           touch download-page/.nojekyll
 
-      - name: Publish download page
-        uses: peaceiris/actions-gh-pages@v4
+      - name: Check out existing GitHub Pages content
+        uses: actions/checkout@v5
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./download-page
-          publish_branch: gh-pages
-          force_orphan: true
-          commit_message: "Update Survey2026 download page for ${{ needs.build-release-apk.outputs.release_tag }}"
+          ref: gh-pages
+          path: main-pages
+          fetch-depth: 1
+
+      - name: Publish root main download page
+        run: |
+          set -euo pipefail
+
+          PAGES_DIR="main-pages"
+          for file in index.html latest.json qr.png; do
+            test -s "download-page/$file" || {
+              echo "::error::Missing generated main Pages file: $file"
+              exit 1
+            }
+            cp "download-page/$file" "$PAGES_DIR/$file"
+          done
+          test -f download-page/.nojekyll || {
+            echo "::error::Missing generated main Pages file: .nojekyll"
+            exit 1
+          }
+          cp download-page/.nojekyll "$PAGES_DIR/.nojekyll"
+
+          git -C "$PAGES_DIR" add -- index.html latest.json .nojekyll qr.png
+          if git -C "$PAGES_DIR" diff --cached --quiet; then
+            echo "::error::Main Pages publication produced no changes; refusing to skip the required commit and push."
+            exit 1
+          fi
+
+          git -C "$PAGES_DIR" config user.name "github-actions[bot]"
+          git -C "$PAGES_DIR" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C "$PAGES_DIR" commit -m "Update Survey2026 download page for ${{ needs.build-release-apk.outputs.release_tag }}"
+          git -C "$PAGES_DIR" push origin HEAD:gh-pages
