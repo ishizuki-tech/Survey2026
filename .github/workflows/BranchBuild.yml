@@ -38,7 +38,6 @@ jobs:
         with:
           fetch-depth: 1
           submodules: recursive
-          lfs: true
           persist-credentials: false
 
       - name: Set up JDK 17
@@ -96,10 +95,12 @@ jobs:
             -Prelease.allowSecrets=false
 
       - name: Build debug APK
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           ./gradlew :app:assembleDebug --no-daemon \
             -PskipModelDownload=true \
-            -Pdebug.embedSecrets=false \
+            -Pdebug.embedSecrets=true \
             -Prelease.allowSecrets=false
 
       - name: Collect branch APK metadata
@@ -127,7 +128,7 @@ jobs:
           OUTPUT="$RUNNER_TEMP/$APK_NAME"
           cp "${apks[0]}" "$OUTPUT"
           APK_SHA256="$(sha256sum "$OUTPUT" | awk '{print $1}')"
-          PAGE_URL="https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}/branches/${BRANCH_SLUG}/"
+          PAGE_URL="https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}/${BRANCH_SLUG}/"
 
           echo "path=$OUTPUT" >> "$GITHUB_OUTPUT"
           echo "name=$APK_NAME" >> "$GITHUB_OUTPUT"
@@ -145,60 +146,6 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Create or update branch preview release
-        id: release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          APK_PATH: ${{ steps.apk.outputs.path }}
-          APK_NAME: ${{ steps.apk.outputs.name }}
-          BRANCH: ${{ steps.apk.outputs.branch }}
-          BRANCH_SLUG: ${{ steps.apk.outputs.branch_slug }}
-          REPOSITORY: ${{ github.repository }}
-          SERVER_URL: ${{ github.server_url }}
-          COMMIT_SHA: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-
-          RELEASE_TAG="branch-preview-$BRANCH_SLUG"
-          RELEASE_TITLE="Survey2026 branch preview: $BRANCH"
-          RELEASE_NOTES="Latest preview APK for branch $BRANCH. This prerelease is replaced by each successful branch build."
-
-          if gh release view "$RELEASE_TAG" --repo "$REPOSITORY" >/dev/null 2>&1; then
-            gh release edit "$RELEASE_TAG" \
-              --repo "$REPOSITORY" \
-              --target "$COMMIT_SHA" \
-              --title "$RELEASE_TITLE" \
-              --prerelease \
-              --notes "$RELEASE_NOTES"
-          else
-            gh release create "$RELEASE_TAG" \
-              --repo "$REPOSITORY" \
-              --target "$COMMIT_SHA" \
-              --title "$RELEASE_TITLE" \
-              --prerelease \
-              --notes "$RELEASE_NOTES"
-          fi
-
-          # One preview release is retained per branch. Remove only old APK assets
-          # belonging to this branch before uploading the current build.
-          while IFS= read -r asset_name; do
-            case "$asset_name" in
-              "Survey2026-${BRANCH_SLUG}-"*.apk)
-                gh release delete-asset "$RELEASE_TAG" "$asset_name" \
-                  --repo "$REPOSITORY" \
-                  --yes
-                ;;
-            esac
-          done < <(gh release view "$RELEASE_TAG" --repo "$REPOSITORY" --json assets --jq '.assets[].name')
-
-          gh release upload "$RELEASE_TAG" "$APK_PATH#$APK_NAME" \
-            --repo "$REPOSITORY" \
-            --clobber
-
-          RELEASE_ASSET_URL="$SERVER_URL/$REPOSITORY/releases/download/$RELEASE_TAG/$APK_NAME"
-          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
-          echo "asset_url=$RELEASE_ASSET_URL" >> "$GITHUB_OUTPUT"
-
       - name: Check out existing GitHub Pages content
         uses: actions/checkout@v5
         with:
@@ -208,13 +155,13 @@ jobs:
 
       - name: Update this branch preview only
         env:
+          APK_PATH: ${{ steps.apk.outputs.path }}
           APK_NAME: ${{ steps.apk.outputs.name }}
           APK_SHA256: ${{ steps.apk.outputs.sha256 }}
           BRANCH: ${{ steps.apk.outputs.branch }}
           BRANCH_SLUG: ${{ steps.apk.outputs.branch_slug }}
           SHORT_SHA: ${{ steps.apk.outputs.short_sha }}
           PAGE_URL: ${{ steps.apk.outputs.page_url }}
-          RELEASE_ASSET_URL: ${{ steps.release.outputs.asset_url }}
           REPOSITORY: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
           RUN_NUMBER: ${{ github.run_number }}
@@ -223,14 +170,18 @@ jobs:
           set -euo pipefail
 
           PAGES_DIR="preview-pages"
-          TARGET_DIR="$PAGES_DIR/branches/$BRANCH_SLUG"
+          TARGET_DIR="$PAGES_DIR/$BRANCH_SLUG"
           RUN_URL="$SERVER_URL/$REPOSITORY/actions/runs/$RUN_ID"
           REPOSITORY_URL="$SERVER_URL/$REPOSITORY"
-          APK_URL="$RELEASE_ASSET_URL"
+          APK_URL="$PAGE_URL$APK_NAME"
           GENERATED_UTC="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 
-          # Slugging is intentionally readable. Refuse to overwrite if two different
-          # branch names sanitize to the same directory.
+          # A branch preview may replace only a directory it already owns. This
+          # prevents a branch slug from deleting main-owned or other Pages content.
+          if [[ -e "$TARGET_DIR" && ! -f "$TARGET_DIR/branch.txt" ]]; then
+            echo "::error::Refusing to overwrite unowned Pages directory $TARGET_DIR."
+            exit 1
+          fi
           if [[ -f "$TARGET_DIR/branch.txt" ]] && ! cmp -s "$TARGET_DIR/branch.txt" <(printf '%s\n' "$BRANCH"); then
             echo "::error::Refusing to overwrite $TARGET_DIR because it belongs to a different branch name."
             exit 1
@@ -248,6 +199,22 @@ jobs:
           BRANCH_HTML="$(html_escape "$BRANCH")"
           mkdir -p "$RUNNER_TEMP/branch-preview"
           PREVIEW_DIR="$RUNNER_TEMP/branch-preview"
+          cp "$APK_PATH" "$PREVIEW_DIR/$APK_NAME"
+
+          QR_PATH="$PREVIEW_DIR/qr.png"
+          curl --fail --silent --show-error --location \
+            --retry 3 \
+            --retry-all-errors \
+            --get \
+            --data-urlencode "size=300x300" \
+            --data-urlencode "data=$PAGE_URL" \
+            "https://api.qrserver.com/v1/create-qr-code/" \
+            --output "$QR_PATH"
+          if [[ ! -s "$QR_PATH" ]] || [[ "$(file -b --mime-type "$QR_PATH")" != "image/png" ]]; then
+            echo "::error::Failed to generate a PNG QR code for the branch download page."
+            exit 1
+          fi
+
           printf '%s\n' "$BRANCH" > "$PREVIEW_DIR/branch.txt"
           touch "$PREVIEW_DIR/.nojekyll"
 
@@ -274,7 +241,7 @@ jobs:
               <p>This installable debug APK was built from the branch shown below. It is separate from the production release.</p>
               <a class="download" href="$APK_URL">Download APK</a>
               <section class="qr">
-                <img src="https://api.qrserver.com/v1/create-qr-code/?size=300x300&amp;data=$PAGE_URL" alt="QR code for this branch build page" width="200" height="200">
+                <img src="qr.png" alt="QR code for this branch build page" width="200" height="200">
                 <div><h2>Open on Android</h2><p>Scan this code to open this branch-specific download page.</p><code>$PAGE_URL</code></div>
               </section>
               <dl>
@@ -302,7 +269,6 @@ jobs:
             "apk_name": "$APK_NAME",
             "apk_sha256": "$APK_SHA256",
             "page_url": "$PAGE_URL",
-            "release_asset_url": "$RELEASE_ASSET_URL",
             "run_url": "$RUN_URL",
             "generated_utc": "$GENERATED_UTC"
           }
@@ -326,9 +292,9 @@ jobs:
           repository = sys.argv[2]
           server_url = sys.argv[3].rstrip("/")
           owner, repository_name = repository.split("/", 1)
-          branches_dir = pages_dir / "branches"
+          dashboard_dir = pages_dir / "branches"
           page_base_url = (
-              f"https://{owner}.github.io/{repository_name}/branches/"
+              f"https://{owner}.github.io/{repository_name}/"
           )
           run_url_prefix = f"{server_url}/{repository}/actions/runs/"
           slug_pattern = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
@@ -343,7 +309,7 @@ jobs:
               )
 
           entries = []
-          for metadata_path in sorted(branches_dir.glob("*/build.json")):
+          for metadata_path in sorted(pages_dir.glob("*/build.json")):
               try:
                   metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
                   if not isinstance(metadata, dict):
@@ -369,8 +335,11 @@ jobs:
 
                   slug = metadata["branch_slug"]
                   short_sha = metadata["short_sha"]
+                  branch_marker = metadata_path.parent / "branch.txt"
                   if (
                       metadata_path.parent.name != slug
+                      or branch_marker.read_text(encoding="utf-8").strip()
+                      != metadata["original_branch"]
                       or not slug_pattern.fullmatch(slug)
                       or not short_sha_pattern.fullmatch(short_sha)
                       or not commit_sha_pattern.fullmatch(metadata["commit_sha"])
@@ -380,23 +349,11 @@ jobs:
 
                   expected_apk_name = f"Survey2026-{slug}-{short_sha}.apk"
                   expected_page_url = f"{page_base_url}{slug}/"
-                  release_asset_url = metadata.get("release_asset_url")
-                  expected_release_asset_url = (
-                      f"{server_url}/{repository}/releases/download/"
-                      f"branch-preview-{slug}/{expected_apk_name}"
-                  )
                   if (
                       metadata["apk_name"] != expected_apk_name
                       or metadata["page_url"] != expected_page_url
                       or not metadata["run_url"].startswith(run_url_prefix)
                       or not metadata["run_url"][len(run_url_prefix):].isdigit()
-                      or (
-                          release_asset_url is not None
-                          and (
-                              not isinstance(release_asset_url, str)
-                              or release_asset_url != expected_release_asset_url
-                          )
-                      )
                   ):
                       raise ValueError
 
@@ -417,12 +374,7 @@ jobs:
                   return html.escape(metadata[field], quote=True)
 
               page_url = escaped("page_url")
-              release_asset_url = metadata.get("release_asset_url")
-              apk_url = (
-                  html.escape(release_asset_url, quote=True)
-                  if isinstance(release_asset_url, str)
-                  else f"{page_url}{escaped('apk_name')}"
-              )
+              apk_url = f"{page_url}{escaped('apk_name')}"
               cards.append(
                   "<article class=\"card\">"
                   f"<h2>{escaped('original_branch')}</h2>"
@@ -479,14 +431,15 @@ jobs:
           </body>
           </html>
           """
-          (branches_dir / "index.html").write_text(dashboard, encoding="utf-8")
+          dashboard_dir.mkdir(parents=True, exist_ok=True)
+          (dashboard_dir / "index.html").write_text(dashboard, encoding="utf-8")
           PY
 
-          git -C "$PAGES_DIR" add -- "branches/$BRANCH_SLUG"
+          git -C "$PAGES_DIR" add -- "$BRANCH_SLUG"
           git -C "$PAGES_DIR" add -- branches/index.html
           if git -C "$PAGES_DIR" diff --cached --quiet; then
-            echo "No branch preview changes to publish."
-            exit 0
+            echo "::error::Branch preview publication produced no changes; refusing to skip the required commit and push."
+            exit 1
           fi
 
           git -C "$PAGES_DIR" config user.name "github-actions[bot]"
