@@ -27,6 +27,7 @@ import com.negi.survey.net.DiagnosticUploadInstrumentationGate
 import com.negi.survey.net.GitHubUploadWorker
 import com.negi.survey.net.GitHubUploader
 import com.negi.survey.net.RuntimeLogStore
+import com.negi.survey.net.SurveyUploadRescheduler
 import com.negi.survey.slm.LiteRtLM
 import java.io.File
 import java.lang.reflect.Modifier
@@ -252,6 +253,9 @@ class SurveyApp : Application(), Configuration.Provider {
 
                 // Enqueue pending crash uploads from previous run (best-effort).
                 safeEnqueuePendingUploadsWithRetryOnce(appCtx)
+
+                // Resume any queued-but-not-yet-uploaded survey from a previous run (best-effort).
+                safeEnqueuePendingSurveyUploadsOnce(appCtx)
 
                 RuntimeLogStore.w(TAG, "Deferred startup enqueues done: took=${SystemClock.elapsedRealtime() - t0}ms")
             },
@@ -708,6 +712,57 @@ class SurveyApp : Application(), Configuration.Provider {
         }
     }
 
+    /**
+     * On app start, resume any staged-but-not-yet-uploaded survey JSON. This covers a queued
+     * upload from a previous run that was closed via Exit (or otherwise never completed):
+     * WorkManager itself resumes network-blocked work automatically, but a job that reached a
+     * terminal FAILED state (e.g. it was queued before GitHub was configured) needs a fresh
+     * enqueue, which is what this provides.
+     */
+    private fun safeEnqueuePendingSurveyUploadsOnce(context: Context) {
+        if (!startupSurveyUploadsOnce.compareAndSet(false, true)) {
+            RuntimeLogStore.d(TAG, "Startup survey uploads enqueue already executed; skipping.")
+            return
+        }
+
+        val appCtx = context.applicationContext ?: context
+
+        if (!ensureWorkManagerAvailable(where = "startupSurveyUploads(immediate)", ctx = appCtx)) {
+            RuntimeLogStore.w(TAG, "Startup survey uploads: WorkManager unavailable (immediate).")
+            if (startupSurveyUploadsRetryScheduled.compareAndSet(false, true)) {
+                mainHandler.postDelayed(
+                    { enqueueStartupSurveyUploadsInternal(appCtx, attempt = "delayed") },
+                    STARTUP_ENQUEUE_RETRY_DELAY_MS
+                )
+            }
+            return
+        }
+
+        enqueueStartupSurveyUploadsInternal(appCtx, attempt = "immediate")
+    }
+
+    private fun enqueueStartupSurveyUploadsInternal(context: Context, attempt: String) {
+        val appCtx = context.applicationContext ?: context
+
+        val cfg = runCatching { resolveGitHubConfigNormalizedBestEffort(appCtx) }
+            .onFailure { t ->
+                RuntimeLogStore.w(TAG, "Startup survey uploads: config lookup failed: ${t.message}", t)
+            }
+            .getOrNull()
+
+        if (cfg == null || cfg.owner.isBlank() || cfg.repo.isBlank() || cfg.token.isBlank()) {
+            RuntimeLogStore.d(TAG, "Startup survey uploads: GitHub config not available ($attempt).")
+            return
+        }
+
+        runCatching {
+            val count = SurveyUploadRescheduler.reenqueuePendingSurveyUploads(appCtx, cfg)
+            RuntimeLogStore.d(TAG, "Startup survey uploads: re-enqueued=$count ($attempt).")
+        }.onFailure { t ->
+            RuntimeLogStore.w(TAG, "Startup survey uploads: re-enqueue failed ($attempt): ${t.message}", t)
+        }
+    }
+
     private fun logBoot(stage: String, pid: Int, processName: String?, isMain: Boolean) {
         val pn = processName?.takeIf { it.isNotBlank() } ?: "<unknown>"
         val msg = "$stage: pid=$pid process=$pn isMain=$isMain sdk=${Build.VERSION.SDK_INT}"
@@ -743,6 +798,9 @@ class SurveyApp : Application(), Configuration.Provider {
 
         private val startupRingLogsOnce = AtomicBoolean(false)
         private val startupRingLogsRetryScheduled = AtomicBoolean(false)
+
+        private val startupSurveyUploadsOnce = AtomicBoolean(false)
+        private val startupSurveyUploadsRetryScheduled = AtomicBoolean(false)
 
         private val mainHandler: Handler by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
             Handler(Looper.getMainLooper())

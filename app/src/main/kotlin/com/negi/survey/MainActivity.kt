@@ -132,6 +132,7 @@ import androidx.navigation3.ui.NavDisplay
 import com.negi.survey.config.SurveyConfig
 import com.negi.survey.config.SurveyConfigLoader
 import com.negi.survey.net.GitHubUploader
+import com.negi.survey.net.SurveyUploadRescheduler
 import com.negi.survey.screens.AiScreen
 import com.negi.survey.screens.ConfigOptionUi
 import com.negi.survey.screens.DoneScreen
@@ -1075,6 +1076,7 @@ fun SurveyNavHost(
 ) {
     val localContext = LocalContext.current
     val appContext = localContext.applicationContext
+    val navScope = rememberCoroutineScope()
     val owner = sessionVmOwner ?: LocalViewModelStoreOwner.current
     ?: error("Missing ViewModelStoreOwner")
     val finalizationVm: SurveyFinalizationViewModel = viewModel(
@@ -1445,6 +1447,25 @@ fun SurveyNavHost(
                             vmAI.resetStates()
                             vmSurvey.resetToStart()
                             onResetToSelector()
+                        },
+                        onExit = {
+                            Log.d(MainActivity.TAG, "Done -> Exit requested")
+                            val activity = localContext.findActivity()
+                            val config = buildGitHubConfigOrNull()
+                            if (config == null) {
+                                activity?.finish()
+                            } else {
+                                navScope.launch {
+                                    withContext(Dispatchers.IO) {
+                                        runCatching {
+                                            SurveyUploadRescheduler.reenqueuePendingSurveyUploads(appContext, config)
+                                        }.onFailure { t ->
+                                            Log.w(MainActivity.TAG, "Exit: re-enqueue pending uploads failed: ${t.message}", t)
+                                        }
+                                    }
+                                    activity?.finish()
+                                }
+                            }
                         },
                     )
                 }

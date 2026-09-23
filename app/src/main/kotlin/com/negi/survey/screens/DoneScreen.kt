@@ -76,6 +76,7 @@ fun DoneScreen(
     vm: SurveyViewModel,
     uploadStatus: UploadStatus,
     onRestart: () -> Unit,
+    onExit: () -> Unit,
     autoSaveToDevice: Boolean = false
 ) {
     val questions by vm.questions.collectAsState(initial = emptyMap())
@@ -194,6 +195,13 @@ fun DoneScreen(
                         }
                     ) {
                         Text("Start New Survey")
+                    }
+                    Button(
+                        onClick = {
+                            onExit()
+                        }
+                    ) {
+                        Text("Exit")
                     }
                 }
             }
