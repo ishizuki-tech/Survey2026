@@ -16,6 +16,7 @@ import android.provider.MediaStore
 import android.util.Log
 import androidx.core.content.ContextCompat
 import androidx.test.platform.app.InstrumentationRegistry
+import com.negi.survey.net.HfTokenProvider
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.junit.Assume
@@ -49,7 +50,7 @@ class ModelAssetRule(
     private val modelName: String = DEFAULT_MODEL_NAME,
     private val relativeDir: String = DEFAULT_REL_DIR,
     private val modelUrl: String = DEFAULT_MODEL_URL,
-    private val bearerToken: String? = BuildConfig.HF_TOKEN.takeIf { it.isNotBlank() },
+    private val tokenProvider: () -> String? = HfTokenProvider::token,
 ) : ExternalResource() {
 
     /** Target context used for all MediaStore and file operations. */
@@ -185,7 +186,7 @@ class ModelAssetRule(
             Log.i(TAG, "No existing MediaStore entry found; inserting and downloading…")
             val created = insertDownloadOwned(modelName, relativeDir)
             try {
-                downloadToUriOwned(created, modelUrl, bearerToken)
+                downloadToUriOwned(created, modelUrl, tokenProvider)
                 val size = getSize(created)
                 require(size > 0) { "Zero bytes after download via MediaStore (uri=$created)" }
                 Log.i(TAG, "Download complete into MediaStore: uri=$created size=$size")
@@ -603,9 +604,17 @@ class ModelAssetRule(
     }
 
     /** Download the model via OkHttp into the given (pending) Uri; publish by clearing IS_PENDING. */
-    private fun downloadToUriOwned(dstUri: Uri, url: String, token: String?) = withAppIdentity {
+    private fun downloadToUriOwned(
+        dstUri: Uri,
+        url: String,
+        tokenProvider: () -> String?,
+    ) = withAppIdentity {
         val req = Request.Builder().url(url).apply {
-            if (!token.isNullOrBlank()) header("Authorization", "Bearer $token")
+            if (url.startsWith("https://huggingface.co/")) {
+                tokenProvider()?.trim()?.takeIf { it.isNotEmpty() }?.let { token ->
+                    header("Authorization", "Bearer $token")
+                }
+            }
         }.build()
 
         http.newCall(req).execute().use { resp ->
