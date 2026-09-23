@@ -122,14 +122,14 @@ object HeavyInitializer {
      * intentionally replaced under the same URL.
      *
      * [modelUrl] and [hfToken] remain in the signature for source compatibility
-     * with existing callers.
+     * with existing callers. Runtime authorization is owned by HfTokenProvider.
      */
     fun isAlreadyComplete(
         context: Context,
         @Suppress("UNUSED_PARAMETER")
         modelUrl: String,
         @Suppress("UNUSED_PARAMETER")
-        hfToken: String?,
+        hfToken: String? = null,
         fileName: String,
     ): Boolean {
 
@@ -174,8 +174,8 @@ object HeavyInitializer {
      * @param context Android context; application context is retained only for
      * file resolution.
      * @param modelUrl Remote model URL.
-     * @param hfToken Optional Hugging Face bearer token. The token value is
-     * never logged.
+     * @param hfToken Retained only for source compatibility. Authorization is
+     * resolved by HfTokenProvider immediately before Hugging Face requests.
      * @param fileName Relative destination path under application filesDir.
      * @param timeoutMs Overall transfer timeout. Must be positive.
      * @param forceFresh When true, remove the completed file and all known
@@ -186,7 +186,8 @@ object HeavyInitializer {
     suspend fun ensureInitialized(
         context: Context,
         modelUrl: String,
-        hfToken: String?,
+        @Suppress("UNUSED_PARAMETER")
+        hfToken: String? = null,
         fileName: String,
         timeoutMs: Long,
         forceFresh: Boolean,
@@ -246,13 +247,6 @@ object HeavyInitializer {
 
         val startedAtMs =
             SystemClock.elapsedRealtime()
-
-        val token =
-            hfToken
-                ?.trim()
-                ?.takeIf {
-                    it.isNotEmpty()
-                }
 
         val progressCallbackFailed =
             AtomicBoolean(false)
@@ -366,7 +360,6 @@ object HeavyInitializer {
 
             val downloader =
                 HttpUrlFileDownloader(
-                    hfToken = token,
                     debugLogs =
                         BuildConfig.DEBUG,
                 )
@@ -378,7 +371,6 @@ object HeavyInitializer {
                 TAG,
                 "phase=download-start " +
                         "file=${finalFile.name} " +
-                        "tokenConfigured=${token != null} " +
                         "forceFresh=$forceFresh",
             )
 

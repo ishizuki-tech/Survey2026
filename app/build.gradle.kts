@@ -2,9 +2,15 @@
 import com.android.build.api.dsl.ApplicationExtension
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.security.SecureRandom
 import java.time.OffsetDateTime
 import java.time.format.DateTimeFormatter
+import java.util.Base64
 import java.util.Properties
+import javax.crypto.Cipher
+import javax.crypto.KeyGenerator
+import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.SecretKeySpec
 import org.gradle.api.GradleException
 import org.gradle.api.tasks.Exec
 import org.gradle.kotlin.dsl.configure
@@ -105,6 +111,41 @@ fun propOrEnv(
 /** Escape a Java string literal used by BuildConfig. */
 fun quote(value: String): String =
     "\"" + value.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+
+private data class EncryptedHfTokenMaterial(
+    val ciphertextB64: String,
+    val nonceB64: String,
+    val keyPartAB64: String,
+    val keyPartBB64: String,
+)
+
+/** Encrypt a token for APK transport without retaining plaintext in BuildConfig. */
+private fun encryptHfToken(plaintext: String): EncryptedHfTokenMaterial {
+    val key = KeyGenerator.getInstance("AES").apply { init(256) }.generateKey().encoded
+    val keyPartA = ByteArray(key.size).also(SecureRandom()::nextBytes)
+    val keyPartB = ByteArray(key.size) { index -> (key[index].toInt() xor keyPartA[index].toInt()).toByte() }
+    val nonce = ByteArray(12).also(SecureRandom()::nextBytes)
+    val plaintextBytes = plaintext.toByteArray(Charsets.UTF_8)
+
+    return try {
+        val ciphertext = Cipher.getInstance("AES/GCM/NoPadding").run {
+            init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, nonce))
+            doFinal(plaintextBytes)
+        }
+        EncryptedHfTokenMaterial(
+            ciphertextB64 = Base64.getEncoder().encodeToString(ciphertext),
+            nonceB64 = Base64.getEncoder().encodeToString(nonce),
+            keyPartAB64 = Base64.getEncoder().encodeToString(keyPartA),
+            keyPartBB64 = Base64.getEncoder().encodeToString(keyPartB),
+        )
+    } finally {
+        plaintextBytes.fill(0)
+        key.fill(0)
+        keyPartA.fill(0)
+        keyPartB.fill(0)
+        nonce.fill(0)
+    }
+}
 
 /** Keep versionName predictable and Android-safe. */
 fun sanitizeVersionName(raw: String): String =
@@ -562,6 +603,13 @@ extensions.configure<ApplicationExtension> {
             ignoreCase = true,
         )
 
+    val encryptedHfToken =
+        if ((embedDebugSecrets || allowReleaseSecrets) && hfToken.isNotBlank()) {
+            encryptHfToken(hfToken)
+        } else {
+            null
+        }
+
     namespace = appId
     compileSdk = 37
 
@@ -677,17 +725,10 @@ extensions.configure<ApplicationExtension> {
                 ),
             )
 
-            buildConfigField(
-                "String",
-                "HF_TOKEN",
-                quote(
-                    if (embedDebugSecrets) {
-                        hfToken
-                    } else {
-                        ""
-                    }
-                ),
-            )
+            buildConfigField("String", "HF_TOKEN_CIPHERTEXT_B64", quote(if (embedDebugSecrets) encryptedHfToken?.ciphertextB64.orEmpty() else ""))
+            buildConfigField("String", "HF_TOKEN_NONCE_B64", quote(if (embedDebugSecrets) encryptedHfToken?.nonceB64.orEmpty() else ""))
+            buildConfigField("String", "HF_TOKEN_KEY_PART_A_B64", quote(if (embedDebugSecrets) encryptedHfToken?.keyPartAB64.orEmpty() else ""))
+            buildConfigField("String", "HF_TOKEN_KEY_PART_B_B64", quote(if (embedDebugSecrets) encryptedHfToken?.keyPartBB64.orEmpty() else ""))
 
             buildConfigField(
                 "String",
@@ -761,18 +802,10 @@ extensions.configure<ApplicationExtension> {
                 ),
             )
 
-            // Allow the HF token only for explicitly enabled internal releases.
-            buildConfigField(
-                "String",
-                "HF_TOKEN",
-                quote(
-                    if (allowReleaseSecrets) {
-                        hfToken
-                    } else {
-                        ""
-                    }
-                ),
-            )
+            buildConfigField("String", "HF_TOKEN_CIPHERTEXT_B64", quote(if (allowReleaseSecrets) encryptedHfToken?.ciphertextB64.orEmpty() else ""))
+            buildConfigField("String", "HF_TOKEN_NONCE_B64", quote(if (allowReleaseSecrets) encryptedHfToken?.nonceB64.orEmpty() else ""))
+            buildConfigField("String", "HF_TOKEN_KEY_PART_A_B64", quote(if (allowReleaseSecrets) encryptedHfToken?.keyPartAB64.orEmpty() else ""))
+            buildConfigField("String", "HF_TOKEN_KEY_PART_B_B64", quote(if (allowReleaseSecrets) encryptedHfToken?.keyPartBB64.orEmpty() else ""))
 
             buildConfigField(
                 "String",

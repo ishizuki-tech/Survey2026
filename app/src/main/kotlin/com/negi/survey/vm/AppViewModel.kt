@@ -34,7 +34,6 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
-import com.negi.survey.BuildConfig
 import com.negi.survey.utils.HeavyInitializer
 import com.negi.survey.utils.PersistentModelStore
 import java.io.File
@@ -194,8 +193,6 @@ class AppViewModel(
                     }
                 }
 
-                val token = BuildConfig.HF_TOKEN.takeIf { it.isNotBlank() }
-
                 _state.value = DlState.Downloading(downloaded = 0L, total = null)
 
                 var lastEmitNs = System.nanoTime()
@@ -223,7 +220,6 @@ class AppViewModel(
                 val result = HeavyInitializer.ensureInitialized(
                     context = app,
                     modelUrl = modelUrl,
-                    hfToken = token,
                     fileName = safeName,
                     timeoutMs = timeoutMs,
                     forceFresh = forceFresh,
