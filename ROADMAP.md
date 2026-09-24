@@ -1,10 +1,25 @@
-# Survey2026 Roadmap — Main Branch Baseline
+# Survey2026 Roadmap — Current Baseline and Next Work
 
-Baseline:
-- Main commit: `2762c91b3339ddfd5a9aa21e784b031b805a635b`
-- Stable tag: `upload-flow-stable-2026-09-22`
-- Manual Pixel 9a E2E: PASS
-- Core upload/finalization flow is frozen as the stable baseline unless new evidence shows a regression.
+## Current Baseline
+
+Stable release baseline:
+- Main commit: `92de06de2dec83c78aa41f240d6c224a95d84af1` (`92de06d`)
+- Published release: `build-87-92de06d`
+- APK: `Survey2026-92de06d-release.apk`
+- APK SHA-256: `fc0b16068940cc3e4e93081b4c07c2609ef221402b6afe3cba30d8d41163ac8b`
+- Signing certificate SHA-256: `d6edef47ec6734a46122ab7fddb5e4f17d19d4d51ae3eaddfb32f309ee5036ea`
+- Pixel 9a manual E2E: PASS
+- Download Page / `latest.json`: release #87 metadata confirmed
+- Core upload/finalization flow is the stable baseline unless new evidence shows a regression.
+
+Validated merge candidate:
+- Branch: `codex/pending-survey-discovery`
+- Head: `2ea62b26d46fba0aba88cb670c7b7ebf5ee3ec42`
+- Relative to current `main`: ahead 11, behind 0
+- Local JVM unit tests: PASS
+- Local release assembly: PASS
+- Release Gradle signing config: `none` (no forced debug signing)
+- Branch CI #44: pending at time of this roadmap update
 
 ## Stable Baseline — Complete
 
@@ -22,6 +37,33 @@ Baseline:
 - Done screen contains no survey upload actions
 - Start New Survey is reset/navigation only
 
+### Pending-survey discovery / recovery
+Validated on the current merge candidate:
+- Grouped pending-survey discovery with canonical artifact selection
+- Shared recovery through `SurveyUploadRescheduler.recoverPendingSurveyUploads(...)`
+- Reconciliation through `SurveyUploadWork.reconcile(...)`
+- Work tracking through `SurveyUploadWorkTracker`
+- Duplicate-file accounting and canonical logical-survey identity
+- Startup recovery
+- `BOOT_COMPLETED` recovery
+- `MY_PACKAGE_REPLACED` recovery
+- Network reconnect -> automatic upload
+- Post-success startup with `discovered=0` / no resubmit
+- Receiver recovery uses the same shared survey recovery path
+- Old direct `reenqueuePendingSurveyUploads()` path is not part of the current design
+
+Real-device validation:
+- Pixel 9a / Android 16
+- Offline pending survey recovery: PASS
+- Network restore and remote upload: PASS
+- Reboot recovery: PASS
+- App-update recovery: PASS
+- Duplicate suppression: PASS
+- Post-success cleanup / no duplicate submit: PASS
+
+Known validation limitation:
+- App-side `LOCKED_BOOT_COMPLETED` handling has not been directly evidenced in logs. This does not block the current recovery merge, but remains a device-validation observation point.
+
 ### AI / follow-up deterministic baseline
 - TWO_STEP path active for shipped Q8-Q17 English and Swahili configs
 - Strict evaluation JSON parsing
@@ -37,24 +79,35 @@ Baseline:
 
 ### Release / CI baseline
 - Pushes to `main` run build/lint/JVM/release-APK artifact generation
-- Manual `workflow_dispatch` with `publish_release=true` performs signed release publication and Pages update
+- Manual `workflow_dispatch` with release publication performs signed release publication and Pages update
+- Branch pushes run JVM tests, build a branch preview APK, and publish branch preview metadata
+- Release signing key is separate from Android debug signing
+- Local release builds are no longer forcibly signed with the Android debug key
+- The production release keystore certificate matches the published release signer
+- Local release-signed APK update over the published release was verified on Pixel 9a with `versionCode=88`
 
 ## P0 — Field Deployment Readiness
 
 ### 1. Stable release provenance and distribution
+
 Goal:
 Make the field APK identity explicit and independently verifiable.
 
-Required:
-- Stable checkpoint/tag shown on the download page
-- Source commit SHA shown on the download page and release
-- APK SHA-256
+Completed / verified:
+- Source commit SHA is published in release metadata
+- Release tag is published
+- APK SHA-256 is published
+- Signing certificate SHA-256 is published
+- `latest.json` was verified against release #87 after the Pages job was re-run
+- Pixel 9a install/update path using the production signing certificate was verified
+
+Remaining:
 - English config SHA-256
 - Swahili config SHA-256
-- Signing certificate SHA-256
-- "What's New" summary
-- Verified-device note
-- Publish-time consistency check between intended stable checkpoint and source SHA
+- "What's New" section
+- Verified-device / deployment-status section
+- Publish-time assertion that the requested stable checkpoint matches the source SHA
+- Automated consistency check between rendered Download Page, GitHub Release, and `latest.json`
 
 Done criteria:
 - A freshly published signed release is generated from the intended stable main checkpoint.
@@ -63,27 +116,33 @@ Done criteria:
 - APK/config provenance is traceable without guessing.
 
 ### 2. Field verification evidence
+
 Goal:
-Turn manual verification into a repeatable, recorded acceptance artifact.
+Turn successful manual verification into a repeatable, recorded acceptance artifact.
 
-Current state:
-- Pixel 9a manual E2E passed for the completed upload/finalization flow.
-
-Required evidence:
-- Online Finish -> upload
-- Offline Finish -> pending
+Already observed on Pixel 9a:
+- Online/remote survey upload success
+- Offline pending recovery
 - Network reconnect -> automatic upload
-- Restart/recovery
-- Reboot/app-update recovery
-- Duplicate Finish protection
-- Uploaded/Pending count behavior
-- One JSON per survey UUID
-- Remote path/artifact confirmation
+- Restart/startup recovery
+- Reboot recovery
+- App-update / `MY_PACKAGE_REPLACED` recovery
+- Duplicate suppression
+- Post-success `discovered=0` / no re-submit
+- Release-signed local APK installed over the published release
+
+Still to formalize as repository evidence:
+- A single acceptance document containing command/log evidence
+- Uploaded/Pending count screenshots or log evidence
+- One JSON per survey UUID evidence
+- Remote artifact/path confirmation
+- Explicit device/OS/build identity per acceptance run
 
 Done criteria:
 - Results are recorded in repository documentation or release evidence.
 
 ### 3. Microphone-denial product behavior
+
 Goal:
 Define and implement field-safe behavior when microphone permission is denied.
 
@@ -98,6 +157,7 @@ Done criteria:
 - Behavior is explicit, tested, and documented.
 
 ### 4. Data-handling contract
+
 Goal:
 Document what is collected, where it goes, and how it is retained.
 
@@ -117,6 +177,7 @@ Done criteria:
 ## P1 — AI Quality / Follow-up Reliability
 
 ### Deterministic app logic
+
 Status:
 Mostly complete. Avoid speculative runtime redesign.
 
@@ -130,6 +191,7 @@ Preserve:
 - retry-safe respondent input
 
 ### Prompt/config behavior
+
 Required:
 - Review fixtures for Q8-Q17 English and Swahili
 - Expected missing-information target per question
@@ -140,6 +202,7 @@ Done criteria:
 - Each shipped two-step prompt pair has an auditable fixture.
 
 ### Real-model semantic behavior
+
 Measure:
 - Valid evaluation rate
 - Unexpected no-follow-up rate
@@ -218,17 +281,17 @@ Done criteria:
 ## P2 — Release / CI / Download Page
 
 Keep:
-- Main push = build-only
-- Manual publish = signed release + GitHub Release + Pages
+- Main push = build/release pipeline
+- Signed production APKs use the dedicated release certificate
+- Branch preview builds remain separate from production releases
 
 Improve:
 - Stable checkpoint assertion
-- Source/tag/hash provenance
 - Config hashes
 - "What's New"
 - Deployment status
 - Verified-device information
-- `latest.json` parity with rendered page
+- Automated `latest.json` parity with rendered page and GitHub Release
 
 ## P3 — Documentation / Toolchain / Maintenance
 
@@ -239,6 +302,7 @@ Required:
 - Document SurveyConfig schema/validation
 - Document diagnostics/log retention and upload behavior
 - Document test tiers and release workflow
+- Document local release-signing procedure without committing secrets
 - Keep toolchain versions pinned and current
 - Keep whisper.cpp pinned
 - Keep generated outputs/models/secrets out of Git unless intentionally distributed
@@ -247,16 +311,20 @@ Required:
 
 | Area | JVM | Instrumentation | Real Device | Release/CI |
 | --- | --- | --- | --- | --- |
-| Finalization/upload logic | Yes | Partial | Pixel 9a manual PASS | Build pipeline |
-| Reboot/update recovery | Yes | Partial | Manual evidence to document | N/A |
+| Finalization/upload logic | Yes | Partial | Pixel 9a PASS | Branch/main build coverage |
+| Pending discovery/reconciliation | Yes | Partial | Pixel 9a PASS | Branch CI |
+| Reboot/update recovery | Yes | Partial | Pixel 9a PASS | N/A |
+| Duplicate suppression | Yes | Partial | Pixel 9a PASS | N/A |
+| Release signing/update path | N/A | N/A | Pixel 9a PASS | Signed release + local signer verification |
 | Follow-up deterministic policy | Yes | Scripted coverage exists | Semantic validation pending | N/A |
 | Whisper integration | Build coverage | Limited | Benchmark pending | Release assembly |
 | Microphone denial | Pending | Pending | Pending | N/A |
-| Release provenance | N/A | N/A | Install smoke pending | P0 pending |
+| Release provenance | N/A | N/A | Install/update smoke PASS | Partial; config hashes/checks pending |
 
 ## Deferred Work / Non-goals
 
 - No redesign of Review -> Finish -> Done without regression evidence.
+- No Exit-button upload path; Done screen remains free of survey-upload actions.
 - No interviewer-ID system while the product assumption remains one interviewer per device.
 - No speculative SLM runtime redesign before semantic evaluation identifies a concrete failure.
 - No Swahili production-model switch based only on branch-preview or Mac timing.
