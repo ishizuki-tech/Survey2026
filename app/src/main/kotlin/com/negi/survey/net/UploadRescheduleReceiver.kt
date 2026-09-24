@@ -5,7 +5,7 @@
  *  File: UploadRescheduleReceiver.kt
  *  Author: Shu Ishizuki (石附 支)
  *  License: MIT License
- *  © 2025 IshizukiTech LLC. All rights reserved.
+ *  © 2026 IshizukiTech LLC. All rights reserved.
  * =====================================================================
  *
  *  Summary:
@@ -55,51 +55,12 @@ import java.io.File
 import java.util.Locale
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeout
-
-/**
- * Recovery classification for files staged before a reboot or app update.
- * Survey identity is accepted only from the staged JSON's top-level survey_id.
- */
-internal data class PendingGitHubUploadRecovery(
-    val remoteRelativePath: String,
-    val surveyId: String?
-) {
-    fun uniqueWorkName(file: File): String =
-        if (surveyId != null) {
-            SurveyUploadWork.uniqueWorkName(remoteRelativePath)
-        } else {
-            // Preserve legacy generic-file behavior without classifying the payload.
-            "upload_gh_${file.name}_${file.length().coerceAtLeast(0L)}_${file.lastModified()}"
-        }
-
-    fun workTagSegment(file: File): String =
-        if (surveyId != null) {
-            SurveyUploadWork.safeWorkNameSegment(remoteRelativePath)
-        } else {
-            file.name
-        }
-
-    companion object {
-        fun from(file: File): PendingGitHubUploadRecovery {
-            val surveyId = PendingSurveyUploads.surveyIdFromFile(file)
-            val remoteRelativePath = if (surveyId != null) {
-                SurveyUploadWork.remoteRelativePath(file.name)
-            } else {
-                file.name
-            }
-            return PendingGitHubUploadRecovery(
-                remoteRelativePath = remoteRelativePath,
-                surveyId = surveyId
-            )
-        }
-
-    }
-}
 
 class UploadRescheduleReceiver : BroadcastReceiver() {
 
@@ -155,8 +116,10 @@ class UploadRescheduleReceiver : BroadcastReceiver() {
                     // Also enqueue runtime logs bundle upload (best-effort).
                     rescheduleRuntimeLogsUpload(contextsForScan, action)
                 }
-            } catch (t: Throwable) {
-                Log.w(TAG, "Reschedule failed action=$action: ${t.message}", t)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (exception: Exception) {
+                Log.w(TAG, "Reschedule failed action=$action: ${exception.message}", exception)
             } finally {
                 IS_RUNNING.set(false)
                 pending.finish()
@@ -178,50 +141,69 @@ class UploadRescheduleReceiver : BroadcastReceiver() {
             return
         }
 
-        val allFiles = contexts
+        val appCtx = contexts.first().applicationContext ?: contexts.first()
+        try {
+            val summary = SurveyUploadRescheduler.recoverPendingSurveyUploads(appCtx, cfg)
+            Log.i(
+                TAG,
+                "Survey recovery action=$action " +
+                    "discovered=${summary.discoveredSurveyCount} " +
+                    "reconciled=${summary.reconciledCandidateCount} " +
+                    "duplicates=${summary.duplicateFileCount} " +
+                    "unclassified=${summary.unclassifiedFileCount} " +
+                    "operationalFailures=${summary.operationalFailureCount} " +
+                    "classifications=${summary.classificationCounts}",
+            )
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (exception: Exception) {
+            Log.w(TAG, "Survey recovery failed action=$action: ${exception.message}", exception)
+        }
+
+        val genericFiles = contexts
             .flatMap { ctx -> listPendingFiles(ctx, PENDING_DIR_GH, walk = false) }
             .distinctBy { stableKey(it) }
             .asSequence()
             .filter { it.isFile && it.length() > 0L }
             .filterNot { shouldIgnorePendingFile(it) }
+            .filter { PendingSurveyUploads.surveyIdFromFile(it) == null }
             .take(MAX_SCAN_FILES)
             .toList()
 
-        if (allFiles.isEmpty()) {
-            Log.d(TAG, "No GitHub pending files for action=$action")
+        if (genericFiles.isEmpty()) {
+            Log.d(TAG, "No generic GitHub pending files for action=$action")
             return
         }
 
-        Log.d(TAG, "Rescheduling ${allFiles.size} GitHub pending uploads for action=$action")
+        Log.d(TAG, "Rescheduling ${genericFiles.size} generic GitHub pending uploads for action=$action")
 
-        val appCtx = contexts.first().applicationContext ?: contexts.first()
-
-        allFiles.forEach { file ->
-            runCatching {
-                enqueueGitHubFileUpload(appCtx, cfg, file)
-            }.onFailure { t ->
-                Log.w(TAG, "GitHub enqueue failed file=${file.name}: ${t.message}", t)
+        genericFiles.forEach { file ->
+            try {
+                enqueueGenericGitHubFileUpload(appCtx, cfg, file)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (exception: Exception) {
+                Log.w(TAG, "Generic GitHub enqueue failed file=${file.name}: ${exception.message}", exception)
             }
         }
     }
 
     /**
-     * Enqueue a GitHubUploadWorker in MODE=file without relying on a companion convenience API.
+     * Enqueue an unclassified GitHubUploadWorker in MODE=file without relying on a companion convenience API.
      *
      * Rationale:
      * - GitHubUploadWorker.enqueueExistingPayload(...) may not exist depending on branch/version.
-     * - This receiver must compile against the currently integrated Worker API.
+     * - Survey JSON recovery is owned by SurveyUploadWork.reconcile().
      */
-    private fun enqueueGitHubFileUpload(
+    private fun enqueueGenericGitHubFileUpload(
         context: Context,
         cfg: GitHubUploader.GitHubConfig,
         file: File
     ) {
-        val recovery = PendingGitHubUploadRecovery.from(file)
-        val remoteRelativePath = recovery.remoteRelativePath
+        val remoteRelativePath = file.name
         val bytes = file.length().coerceAtLeast(0L)
         val mtime = file.lastModified()
-        val uniqueName = recovery.uniqueWorkName(file)
+        val uniqueName = "upload_gh_${file.name}_${bytes}_${mtime}"
 
         val input = Data.Builder()
             .putString(GitHubUploadWorker.KEY_MODE, "file")
@@ -234,11 +216,6 @@ class UploadRescheduleReceiver : BroadcastReceiver() {
             .putString(GitHubUploadWorker.KEY_FILE_NAME, remoteRelativePath)
             .putLong(GitHubUploadWorker.KEY_FILE_MAX_BYTES_HINT, cfg.maxRawBytesHint.toLong())
             .putInt(GitHubUploadWorker.KEY_FILE_MAX_REQUEST_BYTES_HINT, cfg.maxRequestBytesHint)
-            .apply {
-                recovery.surveyId?.let { surveyId ->
-                    SurveyUploadWork.addSurveyJsonMetadata(this, surveyId)
-                }
-            }
             .build()
 
         val req: OneTimeWorkRequest =
@@ -252,12 +229,12 @@ class UploadRescheduleReceiver : BroadcastReceiver() {
                 .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
                 .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
                 .addTag(GitHubUploadWorker.TAG)
-                .addTag("${GitHubUploadWorker.TAG}:file:${recovery.workTagSegment(file)}")
+                .addTag("${GitHubUploadWorker.TAG}:file:${file.name}")
                 .build()
 
         val policy = choosePolicyForUniqueName(context, uniqueName)
 
-        Log.d(TAG, "enqueueGitHubFileUpload: uniqueName=$uniqueName policy=$policy file=${file.absolutePath} bytes=$bytes mtime=$mtime survey=${recovery.surveyId != null}")
+        Log.d(TAG, "enqueueGenericGitHubFileUpload: uniqueName=$uniqueName policy=$policy file=${file.absolutePath} bytes=$bytes mtime=$mtime")
 
         WorkManager.getInstance(context)
             .enqueueUniqueWork(uniqueName, policy, req)
@@ -287,8 +264,10 @@ class UploadRescheduleReceiver : BroadcastReceiver() {
             val policy = if (inFlight) ExistingWorkPolicy.KEEP else ExistingWorkPolicy.REPLACE
             Log.d(TAG, "choosePolicy: uniqueName=$uniqueName policy=$policy states=[$states]")
             policy
-        } catch (t: Throwable) {
-            Log.w(TAG, "choosePolicy: fallback KEEP (query failed). uniqueName=$uniqueName err=${t.message}")
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (exception: Exception) {
+            Log.w(TAG, "choosePolicy: fallback KEEP (query failed). uniqueName=$uniqueName err=${exception.message}")
             ExistingWorkPolicy.KEEP
         }
     }
@@ -310,11 +289,15 @@ class UploadRescheduleReceiver : BroadcastReceiver() {
         val appCtx = contexts.first().applicationContext ?: contexts.first()
 
         // Make sure store can start even from restricted contexts (best-effort).
-        runCatching { RuntimeLogStore.start(appCtx) }
+        try {
+            RuntimeLogStore.start(appCtx)
+        } catch (exception: Exception) {
+            Log.w(TAG, "Runtime log store start failed: ${exception.message}", exception)
+        }
 
         val reason = "receiver_" + action.lowercase(Locale.US).substringAfterLast(".").take(24)
 
-        runCatching {
+        try {
             GitHubUploadWorker.enqueueStartupRuntimeLogsUpload(
                 context = appCtx,
                 cfg = cfg,
@@ -324,8 +307,10 @@ class UploadRescheduleReceiver : BroadcastReceiver() {
                 deleteZipAfter = true
             )
             Log.d(TAG, "Enqueued runtime logs upload for action=$action reason=$reason")
-        }.onFailure { t ->
-            Log.w(TAG, "Runtime logs enqueue failed action=$action: ${t.message}", t)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (exception: Exception) {
+            Log.w(TAG, "Runtime logs enqueue failed action=$action: ${exception.message}", exception)
         }
     }
 
@@ -353,8 +338,8 @@ class UploadRescheduleReceiver : BroadcastReceiver() {
                     ?.toList()
                     ?: emptyList()
             }
-        } catch (t: Throwable) {
-            Log.w(TAG, "listPendingFiles failed dir=${dir.absolutePath}: ${t.message}", t)
+        } catch (exception: Exception) {
+            Log.w(TAG, "listPendingFiles failed dir=${dir.absolutePath}: ${exception.message}", exception)
             emptyList()
         }
 
@@ -370,7 +355,7 @@ class UploadRescheduleReceiver : BroadcastReceiver() {
     private fun countPendingFiles(context: Context, dirName: String, walk: Boolean): Int {
         val dir = File(context.filesDir, dirName)
         if (!dir.exists() || !dir.isDirectory) return 0
-        return runCatching {
+        return try {
             if (walk) {
                 dir.walkTopDown()
                     .filter { it.isFile }
@@ -379,7 +364,10 @@ class UploadRescheduleReceiver : BroadcastReceiver() {
             } else {
                 dir.listFiles()?.count { it.isFile } ?: 0
             }
-        }.getOrDefault(0)
+        } catch (exception: Exception) {
+            Log.w(TAG, "countPendingFiles failed dir=${dir.absolutePath}: ${exception.message}", exception)
+            0
+        }
     }
 
     /**
@@ -388,7 +376,11 @@ class UploadRescheduleReceiver : BroadcastReceiver() {
      * Prefer canonicalPath when available; fallback to absolutePath.
      */
     private fun stableKey(file: File): String =
-        runCatching { file.canonicalPath }.getOrElse { file.absolutePath }
+        try {
+            file.canonicalPath
+        } catch (_: Exception) {
+            file.absolutePath
+        }
 
     /**
      * Ignore transient/metadata files to avoid enqueuing junk.
@@ -448,12 +440,20 @@ class UploadRescheduleReceiver : BroadcastReceiver() {
 
     private fun createDeviceProtectedContextOrNull(context: Context): Context? {
         if (Build.VERSION.SDK_INT < 24) return null
-        return runCatching { context.createDeviceProtectedStorageContext() }.getOrNull()
+        return try {
+            context.createDeviceProtectedStorageContext()
+        } catch (_: Exception) {
+            null
+        }
     }
 
     private fun isUserUnlocked(context: Context): Boolean {
         if (Build.VERSION.SDK_INT < 24) return true
-        val um = runCatching { context.getSystemService(UserManager::class.java) }.getOrNull()
+        val um = try {
+            context.getSystemService(UserManager::class.java)
+        } catch (_: Exception) {
+            null
+        }
         return um?.isUserUnlocked == true
     }
 
