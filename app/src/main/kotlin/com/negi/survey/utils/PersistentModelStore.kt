@@ -65,15 +65,39 @@ object PersistentModelStore {
     fun isSupported(): Boolean = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
 
     /**
+     * Returns whether [displayName] is the exact logical model filename or an Android-style
+     * MediaStore collision variant of it.
+     */
+    internal fun isMediaStoreCollisionVariant(
+        displayName: String,
+        targetFileName: String
+    ): Boolean {
+        if (displayName == targetFileName) return true
+
+        val lastDot = targetFileName.lastIndexOf('.')
+        val baseName = if (lastDot > 0) targetFileName.substring(0, lastDot) else targetFileName
+        val extension = if (lastDot > 0) targetFileName.substring(lastDot) else ""
+        val prefix = "$baseName ("
+
+        if (!displayName.startsWith(prefix) || !displayName.endsWith(extension)) return false
+
+        val ordinalEnd = displayName.length - extension.length
+        if (ordinalEnd <= prefix.length || displayName[ordinalEnd - 1] != ')') return false
+
+        val ordinal = displayName.substring(prefix.length, ordinalEnd - 1)
+        return ordinal.isNotEmpty() &&
+            ordinal[0] in '1'..'9' &&
+            ordinal.drop(1).all { it in '0'..'9' }
+    }
+
+    /**
      * Attempts to satisfy [targetFileName] entirely from persisted storage.
      *
-     * - If a persisted file with exactly [targetFileName] exists, it is copied
+     * - If a persisted file with [targetFileName] or a collision variant exists, it is copied
      *   into [privateDestination], [onReused] fires with its byte size, and
      *   this returns true (caller can skip the network entirely).
-     * - If persisted storage instead holds a *different* file (an old model
-     *   version), [onReplacing] fires with that old file's name and the stale
-     *   entry is deleted, then this returns false so the caller proceeds to
-     *   download the new one normally.
+     * - Different logical model names are left untouched; this returns false so
+     *   the caller proceeds to download the configured model normally.
      * - If persisted storage is empty, or unsupported on this API level, this
      *   returns false with neither callback invoked.
      *
@@ -90,35 +114,25 @@ object PersistentModelStore {
 
         return runCatching {
             val entries = listEntries(context)
-            val matching = entries.filter { it.displayName == targetFileName }
+            val matching = entries.filter {
+                isMediaStoreCollisionVariant(it.displayName, targetFileName)
+            }
             val match = bestOf(matching)
-
-            // Clean up any duplicate rows sharing targetFileName beyond the one
-            // we're about to use (or, if none are usable, all of them) so they
-            // don't keep piling up run after run.
-            matching.filter { it.uri != match?.uri }.forEach { deleteEntry(context, it.uri) }
 
             if (match != null) {
                 val ok = copyToPrivate(context, match.uri, privateDestination)
                 if (ok) {
+                    // Copy first so a failed read never destroys a usable fallback candidate.
+                    // Pending rows are protected because they may still belong to an active write.
+                    matching
+                        .filter { !it.isPending && it.uri != match.uri }
+                        .forEach { deleteEntry(context, it.uri) }
                     Log.i(TAG, "reuseOrReplace: reused persisted model file=$targetFileName bytes=${match.size}")
                     onReused(privateDestination.length())
                     return@runCatching true
                 }
                 Log.w(TAG, "reuseOrReplace: found persisted entry but copy failed, will redownload")
-                deleteEntry(context, match.uri)
                 return@runCatching false
-            }
-
-            val stale = entries.filter { it.displayName != targetFileName }
-            if (stale.isNotEmpty()) {
-                Log.i(
-                    TAG,
-                    "reuseOrReplace: persisted model(s) ${stale.map { it.displayName }} do not match " +
-                            "required $targetFileName; removing before download"
-                )
-                onReplacing(stale.first().displayName)
-                stale.forEach { deleteEntry(context, it.uri) }
             }
 
             false
@@ -141,19 +155,21 @@ object PersistentModelStore {
         if (!sourceFile.exists() || sourceFile.length() <= 0L) return false
 
         return runCatching {
-            val existingMatches = listEntries(context).filter { it.displayName == fileName }
+            val existingMatches = listEntries(context).filter {
+                isMediaStoreCollisionVariant(it.displayName, fileName)
+            }
             val best = bestOf(existingMatches)
 
             if (best != null && best.size == sourceFile.length()) {
                 Log.d(TAG, "persistFromPrivate: already persisted with matching size, skipping re-upload")
-                // Still clean up any other duplicate rows left over from a past run.
-                existingMatches.filter { it.uri != best.uri }.forEach { deleteEntry(context, it.uri) }
+                // Still clean up visible completed collision variants left over from a past run.
+                existingMatches.filter { !it.isPending && it.uri != best.uri }.forEach { deleteEntry(context, it.uri) }
                 return@runCatching true
             }
 
-            // Replacing (or no usable candidate found): clear every row under this
-            // name so a stale duplicate can't linger alongside the new one.
-            existingMatches.forEach { deleteEntry(context, it.uri) }
+            // Replace only visible completed variants of this same logical model.
+            // Never delete pending rows or differently named model versions.
+            existingMatches.filterNot { it.isPending }.forEach { deleteEntry(context, it.uri) }
 
             val resolver = context.contentResolver
             val values = ContentValues().apply {

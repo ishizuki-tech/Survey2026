@@ -36,55 +36,44 @@ class UploadRescheduleRecoveryTest {
     }
 
     @Test
-    fun validSurveyJson_restoresMarkerUuidAndOriginalWorkIdentity() {
+    fun validSurveyJson_isClassifiedBySharedPendingSurveyDiscovery() {
         val file = write(
             "survey_export.json",
-            """{"survey_id":"  survey-123  ","answer":"value"}"""
+            """{"survey_id":"  Survey-123  ","answer":"value"}"""
         )
 
-        val recovery = PendingGitHubUploadRecovery.from(file)
-        val data = Data.Builder().also { builder ->
-            recovery.surveyId?.let { SurveyUploadWork.addSurveyJsonMetadata(builder, it) }
-        }.build()
-        val originalRemotePath = SurveyUploadWork.remoteRelativePath(file.name)
+        val discovery = PendingSurveyUploads.discoverPendingSurveys(tempDir)
 
-        assertEquals("survey-123", recovery.surveyId)
-        assertEquals(originalRemotePath, recovery.remoteRelativePath)
-        assertEquals(
-            SurveyUploadWork.uniqueWorkName(originalRemotePath),
-            recovery.uniqueWorkName(file)
-        )
-        assertEquals(
-            GitHubUploadWorker.UPLOAD_KIND_SURVEY_JSON,
-            data.getString(GitHubUploadWorker.KEY_UPLOAD_KIND)
-        )
-        assertEquals("survey-123", data.getString(GitHubUploadWorker.KEY_SURVEY_ID))
+        assertEquals("Survey-123", PendingSurveyUploads.surveyIdFromFile(file))
+        assertEquals(1, discovery.candidates.size)
+        assertEquals("survey-123", discovery.candidates.single().normalizedSurveyId)
+        assertEquals(file, discovery.candidates.single().canonicalFile)
+        assertTrue(discovery.unclassifiedFiles.isEmpty())
     }
 
     @Test
-    fun genericOrMalformedJson_remainsUnmarked() {
-        val generic = PendingGitHubUploadRecovery.from(write("generic.json", """{"answer":"value"}"""))
-        val blankSurveyId = PendingGitHubUploadRecovery.from(write("blank.json", """{"survey_id":"  "}"""))
-        val nestedSurveyId = PendingGitHubUploadRecovery.from(
-            write("nested.json", """{"meta":{"survey_id":"not-top-level"}}""")
-        )
-        val malformed = PendingGitHubUploadRecovery.from(write("broken.json", "{not-json"))
+    fun genericOrMalformedJson_isNotClassifiedAsSurveyJson() {
+        val generic = write("generic.json", """{"answer":"value"}""")
+        val blankSurveyId = write("blank.json", """{"survey_id":"  "}""")
+        val nestedSurveyId = write("nested.json", """{"meta":{"survey_id":"not-top-level"}}""")
+        val malformed = write("broken.json", "{not-json")
+        val discovery = PendingSurveyUploads.discoverPendingSurveys(tempDir)
 
-        assertUnmarked(generic)
-        assertUnmarked(blankSurveyId)
-        assertUnmarked(nestedSurveyId)
-        assertUnmarked(malformed)
-    }
-
-    @Test
-    fun nonSurveyFiles_remainUnmarkedEvenWhenTheirContentLooksLikeSurveyJson() {
-        listOf("voice.wav", "session.log", "crash.txt", "diagnostic.gz").forEach { name ->
-            val recovery = PendingGitHubUploadRecovery.from(
-                write(name, """{"survey_id":"must-not-count"}""")
-            )
-
-            assertUnmarked(recovery)
+        listOf(generic, blankSurveyId, nestedSurveyId, malformed).forEach { file ->
+            assertNull(PendingSurveyUploads.surveyIdFromFile(file))
         }
+        assertTrue(discovery.candidates.isEmpty())
+        assertEquals(4, discovery.unclassifiedFiles.size)
+    }
+
+    @Test
+    fun nonSurveyFiles_areNotClassifiedEvenWhenTheirContentLooksLikeSurveyJson() {
+        listOf("voice.wav", "session.log", "crash.txt", "diagnostic.gz").forEach { name ->
+            val file = write(name, """{"survey_id":"must-not-count"}""")
+            assertNull(PendingSurveyUploads.surveyIdFromFile(file))
+        }
+
+        assertTrue(PendingSurveyUploads.discoverPendingSurveys(tempDir).candidates.isEmpty())
     }
 
     @Test
@@ -101,32 +90,15 @@ class UploadRescheduleRecoveryTest {
     }
 
     @Test
-    fun timestampFirstSurveyFile_usesSameNormalAndRecoveryWorkIdentity() {
-        val file = write(
-            "2026-09-22_11-37-48_survey_Pixel_9a_A13F82C4D9E1_survey-123_1.json",
-            """{"survey_id":"survey-123"}"""
-        )
-
-        val recovery = PendingGitHubUploadRecovery.from(file)
-        val normalRemotePath = SurveyUploadWork.remoteRelativePath(file.name)
-
-        assertEquals("survey-123", recovery.surveyId)
-        assertEquals(normalRemotePath, recovery.remoteRelativePath)
+    fun sharedLogicalWorkIdentity_usesNormalizedSurveyIdInsteadOfFileName() {
         assertEquals(
-            SurveyUploadWork.uniqueWorkName(normalRemotePath),
-            recovery.uniqueWorkName(file)
+            SurveyUploadWork.logicalWorkName("survey-123"),
+            SurveyUploadWork.logicalWorkName(" Survey-123 "),
         )
-    }
-
-    private fun assertUnmarked(recovery: PendingGitHubUploadRecovery) {
-        val data = Data.Builder().also { builder ->
-            recovery.surveyId?.let { SurveyUploadWork.addSurveyJsonMetadata(builder, it) }
-        }.build()
-
-        assertNull(recovery.surveyId)
-        assertNull(data.getString(GitHubUploadWorker.KEY_UPLOAD_KIND))
-        assertNull(data.getString(GitHubUploadWorker.KEY_SURVEY_ID))
-        assertTrue(recovery.remoteRelativePath.isNotBlank())
+        assertTrue(
+            SurveyUploadWork.logicalWorkName("survey-123") !=
+                SurveyUploadWork.logicalWorkName("survey-124"),
+        )
     }
 
     private fun write(name: String, content: String): File =

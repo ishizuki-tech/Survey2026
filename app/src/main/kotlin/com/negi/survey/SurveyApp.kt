@@ -27,10 +27,182 @@ import com.negi.survey.net.DiagnosticUploadInstrumentationGate
 import com.negi.survey.net.GitHubUploadWorker
 import com.negi.survey.net.GitHubUploader
 import com.negi.survey.net.RuntimeLogStore
+import com.negi.survey.net.SurveyUploadRescheduler
 import com.negi.survey.slm.LiteRtLM
 import java.io.File
 import java.lang.reflect.Modifier
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
+
+
+/**
+ * Process-local startup state for survey upload recovery.
+ *
+ * Scheduling, execution, completion, and the single retry are tracked independently so a
+ * temporary prerequisite failure cannot permanently suppress recovery for this process.
+ */
+internal class StartupSurveyRecoveryState {
+    val scheduled = AtomicBoolean(false)
+    val running = AtomicBoolean(false)
+    val completed = AtomicBoolean(false)
+    val retryScheduled = AtomicBoolean(false)
+}
+
+/**
+ * Pure startup coordinator used by [SurveyApp] and focused JVM tests.
+ *
+ * Android lifecycle, WorkManager initialization, config loading, and logging stay behind the
+ * narrow [Operations] boundary. The coordinator owns only startup timing and retry semantics.
+ */
+internal class StartupSurveyRecoveryCoordinator(
+    private val state: StartupSurveyRecoveryState,
+    private val operations: Operations,
+    private val initialDelayMs: Long,
+    private val retryDelayMs: Long,
+) {
+    internal interface Operations {
+        fun postDelayed(delayMs: Long, block: () -> Unit)
+        fun launchIo(block: () -> Unit)
+        fun isWorkManagerAvailable(attempt: String): Boolean
+        fun resolveConfig(): GitHubUploader.GitHubConfig?
+        fun recover(config: GitHubUploader.GitHubConfig): SurveyUploadRescheduler.RecoverySummary
+        fun logDebug(message: String)
+        fun logWarning(message: String, throwable: Throwable? = null)
+    }
+
+    fun scheduleInitial() {
+        if (!state.scheduled.compareAndSet(false, true)) {
+            operations.logDebug("Startup survey recovery already scheduled; skipping.")
+            return
+        }
+
+        operations.logDebug("Startup survey recovery deferred: delay=${initialDelayMs}ms")
+        operations.postDelayed(initialDelayMs) {
+            operations.launchIo {
+                runAttempt(isRetry = false)
+            }
+        }
+    }
+
+    private fun runAttempt(isRetry: Boolean) {
+        if (state.completed.get()) {
+            operations.logDebug("Startup survey recovery already completed; skipping.")
+            return
+        }
+
+        if (!state.running.compareAndSet(false, true)) {
+            operations.logDebug("Startup survey recovery already running; skipping concurrent attempt.")
+            return
+        }
+
+        val attempt = if (isRetry) "delayed" else "initial"
+
+        try {
+            if (!operations.isWorkManagerAvailable(attempt)) {
+                operations.logWarning("Startup survey recovery: WorkManager unavailable ($attempt).")
+                scheduleRetryIfAllowed(isRetry, reason = "workmanager")
+                return
+            }
+
+            val config = try {
+                operations.resolveConfig()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (exception: Exception) {
+                operations.logWarning(
+                    "Startup survey recovery: config lookup failed ($attempt): ${exception.message}",
+                    exception,
+                )
+                scheduleRetryIfAllowed(isRetry, reason = "config_exception")
+                return
+            }
+
+            if (config == null) {
+                operations.logWarning("Startup survey recovery: GitHub config unavailable ($attempt).")
+                scheduleRetryIfAllowed(isRetry, reason = "config")
+                return
+            }
+
+            val summary = try {
+                operations.recover(config)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (exception: Exception) {
+                operations.logWarning(
+                    "Startup survey recovery failed ($attempt): ${exception.message}",
+                    exception,
+                )
+                scheduleRetryIfAllowed(isRetry, reason = "recovery")
+                return
+            }
+
+            state.completed.set(true)
+            logSummary(summary)
+        } finally {
+            state.running.set(false)
+        }
+    }
+
+    private fun scheduleRetryIfAllowed(isRetry: Boolean, reason: String) {
+        if (isRetry) {
+            operations.logWarning("Startup survey recovery: retry exhausted; reason=$reason")
+            return
+        }
+
+        if (!state.retryScheduled.compareAndSet(false, true)) {
+            operations.logDebug("Startup survey recovery: retry already scheduled; reason=$reason")
+            return
+        }
+
+        operations.logWarning(
+            "Startup survey recovery: scheduling one retry; reason=$reason delay=${retryDelayMs}ms"
+        )
+        operations.postDelayed(retryDelayMs) {
+            operations.launchIo {
+                runAttempt(isRetry = true)
+            }
+        }
+    }
+
+    private fun logSummary(summary: SurveyUploadRescheduler.RecoverySummary) {
+        fun count(classification: SurveyUploadRescheduler.RecoveryClassification): Int =
+            summary.classificationCounts[classification] ?: 0
+
+        val submitted = count(SurveyUploadRescheduler.RecoveryClassification.SUBMITTED)
+        val active = count(SurveyUploadRescheduler.RecoveryClassification.ACTIVE)
+        val trackerUnconfirmed =
+            count(SurveyUploadRescheduler.RecoveryClassification.SUBMITTED_TRACKER_UNCONFIRMED)
+        val alreadyUploaded =
+            count(SurveyUploadRescheduler.RecoveryClassification.ALREADY_UPLOADED)
+        val deferred = count(SurveyUploadRescheduler.RecoveryClassification.DEFERRED)
+        val invalid = count(SurveyUploadRescheduler.RecoveryClassification.INVALID)
+
+        val message = buildString {
+            append("Startup survey recovery complete: ")
+            append("discovered=${summary.discoveredSurveyCount} ")
+            append("attempted=${summary.reconciledCandidateCount} ")
+            append("submitted=$submitted ")
+            append("active=$active ")
+            append("trackerUnconfirmed=$trackerUnconfirmed ")
+            append("uploaded=$alreadyUploaded ")
+            append("deferred=$deferred ")
+            append("invalid=$invalid ")
+            append("operationalFailures=${summary.operationalFailureCount} ")
+            append("duplicates=${summary.duplicateFileCount} ")
+            append("unclassified=${summary.unclassifiedFileCount}")
+        }
+
+        if (summary.operationalFailureCount > 0 || invalid > 0) {
+            operations.logWarning(message)
+        } else {
+            operations.logDebug(message)
+        }
+    }
+}
 
 /**
  * Application bootstrap:
@@ -54,6 +226,9 @@ class SurveyApp : Application(), Configuration.Provider {
 
     // Guard JNI load to avoid duplicate loads and allow retry on failure.
     private val litertJniLoadOnce = AtomicBoolean(false)
+
+    // Process-lifetime scope for startup survey recovery work.
+    private val startupSurveyRecoveryScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     override fun attachBaseContext(base: Context) {
         val t0 = SystemClock.elapsedRealtime()
@@ -196,6 +371,10 @@ class SurveyApp : Application(), Configuration.Provider {
             scheduleDeferredStartupEnqueues(appCtx)
         }
 
+        // Survey-result recovery is product behavior and must remain independent from the
+        // diagnostic-upload instrumentation gate above.
+        scheduleStartupSurveyRecoveryOnce(appCtx)
+
         RuntimeLogStore.d(TAG, "bootTiming: onCreate total=${SystemClock.elapsedRealtime() - t0}ms")
     }
 
@@ -257,6 +436,98 @@ class SurveyApp : Application(), Configuration.Provider {
             },
             delayMs
         )
+    }
+
+    /**
+     * Schedules survey-result recovery once per application process.
+     *
+     * The delayed callback stays on the main handler, while discovery/reconciliation runs on the
+     * application-owned IO scope.
+     */
+    private fun scheduleStartupSurveyRecoveryOnce(context: Context) {
+        val appCtx = context.applicationContext ?: context
+        StartupSurveyRecoveryCoordinator(
+            state = startupSurveyRecoveryState,
+            operations = AndroidStartupSurveyRecoveryOperations(appCtx),
+            initialDelayMs = STARTUP_DEFERRED_ENQUEUE_DELAY_MS,
+            retryDelayMs = STARTUP_ENQUEUE_RETRY_DELAY_MS,
+        ).scheduleInitial()
+    }
+
+    /**
+     * Narrow readiness check for survey startup recovery.
+     *
+     * Existing diagnostic callers retain [ensureWorkManagerAvailable] unchanged. This boundary
+     * intentionally does not convert [Error] subclasses into a normal "unavailable" result.
+     */
+    private fun ensureSurveyRecoveryWorkManagerAvailable(where: String, ctx: Context): Boolean {
+        val appCtx = ctx.applicationContext ?: ctx
+        val t0 = SystemClock.elapsedRealtime()
+
+        return try {
+            WorkManager.getInstance(appCtx)
+            RuntimeLogStore.d(
+                TAG,
+                "Survey recovery WorkManager available. where=$where " +
+                        "took=${SystemClock.elapsedRealtime() - t0}ms"
+            )
+            true
+        } catch (interrupted: InterruptedException) {
+            Thread.currentThread().interrupt()
+            RuntimeLogStore.w(
+                TAG,
+                "Survey recovery WorkManager interrupted. where=$where msg=${interrupted.message}",
+                interrupted,
+            )
+            false
+        } catch (exception: Exception) {
+            RuntimeLogStore.w(
+                TAG,
+                "Survey recovery WorkManager unavailable. where=$where msg=${exception.message}",
+                exception,
+            )
+            false
+        }
+    }
+
+    /** Android adapter for the pure startup survey-recovery coordinator. */
+    private inner class AndroidStartupSurveyRecoveryOperations(
+        private val appContext: Context,
+    ) : StartupSurveyRecoveryCoordinator.Operations {
+        override fun postDelayed(delayMs: Long, block: () -> Unit) {
+            mainHandler.postDelayed({ block() }, delayMs)
+        }
+
+        override fun launchIo(block: () -> Unit) {
+            startupSurveyRecoveryScope.launch {
+                block()
+            }
+        }
+
+        override fun isWorkManagerAvailable(attempt: String): Boolean =
+            ensureSurveyRecoveryWorkManagerAvailable(
+                where = "startupSurveyUploads($attempt)",
+                ctx = appContext,
+            )
+
+        override fun resolveConfig(): GitHubUploader.GitHubConfig? =
+            resolveGitHubConfigNormalizedBestEffort(appContext)
+
+        override fun recover(
+            config: GitHubUploader.GitHubConfig
+        ): SurveyUploadRescheduler.RecoverySummary =
+            SurveyUploadRescheduler.recoverPendingSurveyUploads(
+                context = appContext,
+                config = config,
+            )
+
+        override fun logDebug(message: String) {
+            RuntimeLogStore.d(TAG, message)
+        }
+
+        override fun logWarning(message: String, throwable: Throwable?) {
+            RuntimeLogStore.w(TAG, message, throwable)
+        }
     }
 
     /**
@@ -737,6 +1008,8 @@ class SurveyApp : Application(), Configuration.Provider {
         private val enqueueRetryScheduled = AtomicBoolean(false)
 
         private val startupDeferredOnce = AtomicBoolean(false)
+
+        private val startupSurveyRecoveryState = StartupSurveyRecoveryState()
 
         private val startupRtLogsOnce = AtomicBoolean(false)
         private val startupRtLogsRetryScheduled = AtomicBoolean(false)
