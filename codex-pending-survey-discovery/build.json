@@ -1,11 +1,11 @@
 {
   "original_branch": "codex/pending-survey-discovery",
   "branch_slug": "codex-pending-survey-discovery",
-  "commit_sha": "1a3f1d5e4f46386d9ef134bb7c0540b52ed688c9",
-  "short_sha": "1a3f1d5",
-  "apk_name": "Survey2026-codex-pending-survey-discovery-1a3f1d5.apk",
-  "apk_sha256": "74e97b9737f445f1d225e6fe977b3c05316614e141f2c37ad8651660a2b03ed1",
+  "commit_sha": "8c6f5a3d356a2f5a1e2f40b7a1a5c08546a18b5c",
+  "short_sha": "8c6f5a3",
+  "apk_name": "Survey2026-codex-pending-survey-discovery-8c6f5a3.apk",
+  "apk_sha256": "9bf60df3d58c677af9b2d1cc2fa6a1350307dd37673926107ddda882826ea4c0",
   "page_url": "https://ishizuki-tech.github.io/Survey2026/codex-pending-survey-discovery/",
-  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/35936964566",
-  "generated_utc": "2026-09-24T00:12:31Z"
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/35938330536",
+  "generated_utc": "2026-09-24T00:30:49Z"
 }
