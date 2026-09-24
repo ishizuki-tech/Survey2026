@@ -1,531 +1,529 @@
 # Survey2026 (SurveyApp)
 
-**Survey2026** is an Android Studio multi-module project (**Android/Kotlin + NDK/C/CMake**) for an **offline-first survey app** with:
+**Survey2026** is an Android survey runtime designed for field use where connectivity may be unreliable or unavailable. It combines structured survey execution, on-device speech recognition, local SLM-based answer evaluation/follow-up generation, persistent diagnostics, and resilient background upload/recovery.
 
-* **On-device speech-to-text** via **whisper.cpp** (NDK/JNI)
-* **On-device SLM (Small Language Model) inference** via **LiteRT-LM** (and related on-device inference APIs)
+The Android Studio project name is `SurveyNav`; the product/repository name is **Survey2026**.
 
-The repo is structured to keep the Android app layer clean while isolating native inference code (whisper.cpp) in a dedicated module, and keeping SLM orchestration/testability on the Kotlin side.
-
-> Maintainer: [ishizuki.tech@gmail.com](mailto:shu.ishizuki@gmail.com)
+> Maintainer: [ishizuki.tech@gmail.com](mailto:ishizuki.tech@gmail.com)
 
 ---
 
-## Table of contents
+## Current baseline
 
-* [What this project is](#what-this-project-is)
-* [Key capabilities](#key-capabilities)
-* [Repository layout](#repository-layout)
-* [Build prerequisites](#build-prerequisites)
-* [Getting started](#getting-started)
-* [On-device SLM integration](#on-device-slm-integration)
-* [Native build (NDK/CMake) details](#native-build-ndkcmake-details)
-* [Model files](#model-files)
-* [Run-time permissions and I/O](#run-time-permissions-and-io)
-* [Diagnostics & logging (reliability-first)](#diagnostics--logging-reliability-first)
-* [CI / workflows](#ci--workflows)
-* [Security and repo hygiene](#security-and-repo-hygiene)
-* [Troubleshooting](#troubleshooting)
-* [License](#license)
-* [Roadmap](#roadmap)
+Stable published baseline:
+
+- Main source: `92de06de2dec83c78aa41f240d6c224a95d84af1` (`92de06d`)
+- Published release: `build-87-92de06d`
+- Pixel 9a / Android 16 field validation: PASS for the completed upload/recovery scenarios recorded in [ROADMAP.md](ROADMAP.md)
+- APK and signing-certificate provenance are published for release #87
+- `whisper.cpp` baseline: v1.9.3
+- LiteRT-LM: 0.16.1
+
+For current completed work and remaining priorities:
+
+- [ROADMAP.md](ROADMAP.md) — current baseline, validated behavior, and product direction
+- [TODO.md](TODO.md) — concrete unfinished implementation, verification, and documentation work
 
 ---
 
-## What this project is
+## What the app does
 
-This repository is a **multi-module Android Studio project**:
+Survey2026 is not a generic chatbot and not just a digital form. It is a structured Android interview runtime that:
 
-* `app/` — Android application module (UI, navigation, storage, orchestration)
-* `nativelib/` — Android library module that builds native code via **NDK + CMake** and exposes it via **JNI**
-* `whisper.cpp/` — **Git submodule** (pinned to a specific commit)
+1. Loads a validated survey configuration.
+2. Runs a deterministic survey/navigation flow.
+3. Accepts typed and optional voice input.
+4. Uses local Whisper inference for speech-to-text.
+5. Uses a local SLM to evaluate free-text answer quality.
+6. Generates follow-up questions only when the configured evaluation requires one.
+7. Persists survey state and export artifacts.
+8. Queues mandatory survey JSON for resilient background upload.
+9. Recovers pending survey uploads after restart, reboot, app replacement, or network restoration.
 
-Design goals:
-
-* **Offline-first**: core features work without network.
-* **On-device AI** is a first-class requirement:
-
-    * Whisper STT runs locally via NDK/JNI.
-    * SLM inference runs locally (Kotlin orchestration, on-device engine).
-* **Reliability-first**: persistent logs + crash capture + optional diagnostic upload.
+Core survey execution remains usable offline. Network access is used for model/download workflows and configured upload/diagnostic destinations.
 
 ---
 
-## Key capabilities
+## Architecture at a glance
 
-### Offline survey app core
+```text
+Android UI / Navigation
+        |
+        v
+Survey state + configuration
+        |
+        +--------------------+
+        |                    |
+        v                    v
+Voice capture           Typed answer
+        |
+        v
+whisper.cpp JNI
+        |
+        v
+Transcribed answer
+        |
+        +-----------> Local SLM evaluation
+                         |
+                         +--> accepted answer
+                         |
+                         +--> follow-up generation when required
 
-* Offline-first survey flow (navigation + state managed in Kotlin)
-* Local persistence for runs/drafts (implementation owned by `app/`)
+Survey Finish
+    |
+    v
+SurveyUploadFinalizer
+    |
+    v
+SurveyUploadWork.reconcile(...)
+    |
+    +--> WorkManager submission / adoption
+    +--> logical-survey duplicate protection
+    +--> tracker / uploaded-state checks
 
-### On-device speech-to-text (Whisper)
+Recovery entry points
+    |
+    +--> normal app startup
+    +--> BOOT_COMPLETED
+    +--> MY_PACKAGE_REPLACED
+    +--> network recovery
+    |
+    v
+SurveyUploadRescheduler.recoverPendingSurveyUploads(...)
+    |
+    v
+PendingSurveyUploads discovery
+    |
+    v
+SurveyUploadWork.reconcile(...)
+```
 
-* Microphone capture → local persistence → native transcription
-* `whisper.cpp` built into an Android native library via `nativelib/`
-* JNI boundary kept narrow (Kotlin owns orchestration; native owns inference)
-
-### On-device SLM integration (required)
-
-* On-device SLM inference for:
-
-    * Free-text normalization / intent classification / evaluation
-    * Two-step pipelines (e.g., **EVAL → FOLLOWUP** JSON flows)
-    * Streaming generation with cancellation/timeout handling
-
-This repo includes or references SLM components such as:
-
-* `AiRepository.kt` — SLM orchestration (streaming, cancellation, logging, prompt hashing, etc.)
-* `LiteRtLM` — SLM engine wrapper (LiteRT-LM bindings)
-* `SurveyConfig` — prompt/config resolvers (one-step / two-step)
-
-> The SLM path is not optional in this project: it is part of the primary product surface.
-
-### Diagnostics-first (developer reliability)
-
-* Early crash capture during app startup (`CrashCapture`)
-* Persistent runtime logging (e.g., `RuntimeLogStore`, ring logs)
-* Optional background upload pipeline via WorkManager:
-
-    * `GitHubUploadWorker`, `GitHubUploader`, and config store(s)
+The current upload/recovery design deliberately uses one shared reconciliation path. The old direct `reenqueuePendingSurveyUploads()` path is not part of the current design.
 
 ---
 
 ## Repository layout
 
-High-level layout:
+```text
+.
+├── app/                         Android application module
+├── nativelib/                   whisper.cpp JNI Android library
+├── whisper.cpp/                 pinned Git submodule
+├── scripts/                     helper/automation scripts
+├── .github/workflows/           CI, release, and branch-preview workflows
+├── ROADMAP.md                   validated baseline + roadmap
+└── TODO.md                      unfinished concrete work
+```
 
-* `.github/workflows/` — GitHub Actions workflows
-* `app/` — Android application module
-* `nativelib/` — Native/JNI Android library module
-* `scripts/` — helper scripts (model download/build helpers)
-* `whisper.cpp/` — whisper.cpp submodule
-* `images/` — documentation images/screenshots
+Important implementation areas:
 
-Some Details: 
-
-* `MainActivity.kt` — app entry, permissions, UI routing
-* `SurveyApp.kt` — Application bootstrap (WorkManager + crash capture wiring often lives here)
-* `CrashCapture.kt` — crash capture + exit info collection (if present)
-* `GitHubUploadWorker.kt` / `GitHubUploader.kt` — diagnostics upload pipeline
-* `RuntimeLogStore.kt` / `AppRingLogStore.kt` — persistent logs
-* `SurveyViewModel.kt` — survey state + prompt resolution integration
-* `AiRepository.kt` — SLM streaming orchestration + guards
+- `app/src/main/kotlin/com/negi/survey/SurveyApp.kt`
+  - process/application bootstrap
+  - startup upload recovery coordination
+- `app/src/main/kotlin/com/negi/survey/net/PendingSurveyUploads.kt`
+  - grouped pending-survey discovery
+- `app/src/main/kotlin/com/negi/survey/net/SurveyUploadFinalizer.kt`
+  - finalization handoff into the shared upload path
+- `app/src/main/kotlin/com/negi/survey/net/SurveyUploadRescheduler.kt`
+  - recovery orchestration
+- `app/src/main/kotlin/com/negi/survey/net/SurveyUploadWork.kt`
+  - WorkManager reconciliation and logical-survey identity handling
+- `app/src/main/kotlin/com/negi/survey/net/SurveyUploadWorkTracker.kt`
+  - exact work tracking
+- `app/src/main/kotlin/com/negi/survey/net/UploadRescheduleReceiver.kt`
+  - reboot / package-replacement recovery entry point
+- `app/src/main/kotlin/com/negi/survey/slm/AiRepository.kt`
+  - local SLM orchestration
+- `app/src/main/kotlin/com/negi/survey/slm/LiteRtLM.kt`
+  - LiteRT-LM runtime wrapper
+- `nativelib/src/main/jni/whisper/`
+  - JNI bridge and native whisper.cpp build
 
 ---
 
-## Build prerequisites
+## Current toolchain
 
-### Required
+| Component | Current repo value |
+| --- | --- |
+| AGP | 9.3.2 |
+| Kotlin | 2.4.10 |
+| Compose BOM | 2026.08.00 |
+| Java | 17 |
+| compileSdk | 37 |
+| targetSdk | 36 |
+| minSdk | 26 |
+| NDK | 29.0.14206865 |
+| CMake | 3.22.1 |
+| LiteRT-LM | 0.16.1 |
+| Native Android ABI | arm64-v8a |
 
-* Android Studio (latest stable recommended)
-* Android SDK (via Android Studio)
-* NDK (Side by side)
-* CMake
-
-Install NDK/CMake:
-
-1. `Tools` → `SDK Manager`
-2. `SDK Tools`
-3. Install:
-
-    * `NDK (Side by side)`
-    * `CMake`
-
-> If you see `NDK is not installed`, fix this first.
-
-**TODO (pin toolchain):**
-
-* Prefer pinning `ndkVersion` and documenting the CMake version.
-
-    * Owner: `app/build.gradle(.kts)` and `nativelib/build.gradle(.kts)`
+AGP 9 built-in Kotlin is used. Do not add `org.jetbrains.kotlin.android` to the Android modules unless the build design changes.
 
 ---
 
 ## Getting started
 
-### 1) Clone with submodules
-
-This repo depends on a submodule (`whisper.cpp`). Clone with submodules enabled:
+### Clone with submodules
 
 ```bash
 git clone --recurse-submodules https://github.com/ishizuki-tech/Survey2026.git
 cd Survey2026
 ```
 
-If you already cloned without submodules:
+For an existing checkout:
 
 ```bash
 git submodule update --init --recursive
 ```
 
-### 2) Open in Android Studio
+### Open in Android Studio
 
-* Android Studio → **Open** → select the `Survey2026` directory
-* Let Gradle Sync complete
+Open the repository root and allow Gradle Sync to complete.
 
-### 3) Build & run
+A physical Android device is recommended because the project depends on real microphone, JNI, on-device inference, WorkManager, and lifecycle behavior that are not fully represented by emulator-only testing.
 
-* Choose a device (physical device recommended for audio + on-device inference)
-* Run the `app` configuration
-
-CLI build:
+### Safe local build without embedded development secrets
 
 ```bash
-./gradlew :app:testDebugUnitTest --no-daemon -PskipModelDownload=true
-./gradlew :app:assembleDebug --no-daemon -PskipModelDownload=true
+./gradlew :app:testDebugUnitTest --no-daemon \
+  -PskipModelDownload=true \
+  -Pdebug.embedSecrets=false \
+  -Prelease.allowSecrets=false
+
+./gradlew :app:assembleDebug --no-daemon \
+  -PskipModelDownload=true \
+  -Pdebug.embedSecrets=false \
+  -Prelease.allowSecrets=false
 ```
 
----
-
-## On-device SLM integration
-
-### Overview
-
-SLM inference is a core feature in Survey2026.
-
-Common responsibilities of the SLM layer:
-
-* Streaming generation (token/segment streaming)
-* Termination handling (exactly-one terminal outcome per run)
-* Cancellation/teardown safety (no late callbacks updating next run)
-* Two-step JSON pipelines (EVAL → FOLLOWUP)
-* Near-context-limit behavior (truncation, end-of-turn loops)
-* Warmup/readiness (cold start / GPU warmup delays)
-
-The implementation is designed to be **defensive** because on-device engines can have:
-
-* long warmups
-* delayed terminal callbacks
-* late events after cancel/close
-* edge cases when prompts approach context limits
-
-### Where it lives in code
-
-Search for these in `app/`:
-
-* `AiRepository.kt`
-* `LiteRtLM` (engine wrapper)
-* `SurveyConfig` prompt resolvers
-
-### Current survey AI flow
-
-A survey node uses the `TWO_STEP` path when both its evaluation and follow-up prompt templates resolve to non-blank values. In the current shipped English and Swahili configurations, Q8 through Q17 have `eval_prompt`/`followup_prompt` pairs and therefore run through this path.
-
-For a configured two-step node:
-
-1. The app evaluates the original answer using the evaluation prompt.
-2. The model must return one evaluation JSON object with an integer `score`, an array of non-blank `missing_points`, and a boolean `followup_needed`.
-3. Malformed, incomplete, wrongly typed, or contradictory evaluation output fails closed. It does not create a follow-up or consume follow-up capacity.
-4. A valid incomplete evaluation can start a separate follow-up-generation step. The generated question is constrained by the original question, original answer, and evaluation output, including the missing information.
-5. Answered follow-up question/answer pairs are included in later evaluation and follow-up prompts where the configuration references history. Unanswered follow-ups are excluded.
-
-The follow-up step is distinct from evaluation: evaluation JSON is not displayed as a respondent question, and only an accepted, non-duplicate generated question can be persisted. The AI layer serializes inference and guards terminal state with run and survey ownership so a stale or cancelled chain cannot overwrite a replacement chain.
-
-One-step support remains available for configurations that provide only a one-step prompt, but it is not the active Q8–Q17 configuration.
-
-### English and Swahili prompt content
-
-The shipped English and Swahili configurations provide human-facing question and follow-up content for their respective survey languages. Some model-facing labels remain English, including `Question:` and `EVAL_JSON:` in the Swahili templates. Runtime template rendering substitutes placeholders such as `{{QUESTION}}` and `{{EVAL_JSON}}`; evaluation parsing relies on the JSON fields rather than a translation of those labels. The labels are intentionally left unchanged here pending separate prompt-policy and real-model validation.
-
-### Validation scope
-
-JVM and scripted instrumentation tests cover deterministic evaluation-policy, capacity, retry, timeout, history, and stale-chain invariants. They do not by themselves establish that a real model generates a semantically meaningful follow-up in every language. Real-device model acceptance remains a separate validation step.
-
-### Streaming + termination contract (recommended invariants)
-
-Client-side invariants that the app enforces (or should enforce):
-
-* Exactly one terminal callback per run (`done` or `error`)
-* No state updates after cancellation/close
-* No cross-run contamination (previous callbacks must not affect next run)
-
-**TODO (align with implementation):**
-
-* Document the run ID / session ID strategy used for guarding streams.
-
-    * Owner: `AiRepository.kt` + ViewModel(s)
-
----
-
-## Native build (NDK/CMake) details
-
-### Where native build lives
-
-* The native build is owned by `nativelib/`.
-* Find the CMake entry point:
+Release assembly:
 
 ```bash
-# macOS / Linux
-find nativelib -name CMakeLists.txt -print
+./gradlew :app:assembleRelease --no-daemon \
+  -PskipModelDownload=true \
+  -Prelease.allowSecrets=false
 ```
 
-Typical (but not guaranteed) location:
-
-* `nativelib/src/main/cpp/CMakeLists.txt`
-
-### How CMake finds whisper.cpp
-
-`whisper.cpp` is included as a **submodule** at repo root:
-
-* `/whisper.cpp`
-
-Recommended practice:
-
-* Keep one canonical whisper.cpp directory.
-* Pass its path explicitly into CMake via a single variable.
-
-Example pattern:
-
-* `-DWHISPER_CPP_DIR=/absolute/or/repo-relative/path/to/whisper.cpp`
-
-Gradle wiring (example):
-
-* `nativelib/build.gradle(.kts)`:
-
-    * `externalNativeBuild { cmake { arguments += listOf("-DWHISPER_CPP_DIR=...") } }`
-
-**TODO (make this exact):**
-
-* Replace the example variable name with what your CMake actually uses.
-
-    * Owner: `nativelib/**/CMakeLists.txt`
-
-### ABI notes
-
-Common targets:
-
-* `arm64-v8a` (recommended baseline)
-
-To reduce build time, restrict ABIs in Gradle (example):
-
-```gradle
-android {
-  defaultConfig {
-    ndk {
-      abiFilters += listOf("arm64-v8a")
-    }
-  }
-}
-```
-
-**TODO (align with repo):**
-
-* Document the actual `abiFilters` used.
-
-    * Owner: `app/build.gradle(.kts)` and/or `nativelib/build.gradle(.kts)`
-
-### Native build debugging workflow
-
-When native build gets weird:
-
-1. Clean project (`Build → Clean Project`)
-2. If needed, delete CMake cache:
-
-    * `nativelib/.cxx/`
-3. Re-sync Gradle
-4. Rebuild
+The normal Gradle `release` build is **not forcibly debug-signed**. `release.useDebugSigning=true` remains an explicit opt-in only. Production release signing is handled separately.
 
 ---
 
-## Model files
+## Survey configuration
 
-### Why models are not in Git
+Shipped survey configurations:
 
-Models are large and frequently change. This repo intentionally ignores common model extensions:
+- `app/src/main/assets/survey_config10.yaml` — English
+- `app/src/main/assets/survey_config_sw_10.yaml` — Swahili
 
-* Whisper models: `*.bin`, `*.gguf`
-* (SLM model extensions depend on the engine/toolchain)
+The configuration drives the structured survey and the SLM prompt behavior.
 
-### Recommended model placement
+### TWO_STEP answer validation
 
-Pick one consistent location and make Kotlin + native agree.
+The shipped Q8-Q17 English and Swahili nodes use the two-step path where configured:
 
-Common choices:
+1. **EVAL** — evaluate the respondent answer.
+2. Parse strict structured output:
+   - `score`
+   - `missing_points`
+   - `followup_needed`
+3. If needed and valid, run **FOLLOWUP** generation.
+4. Persist only an accepted, non-duplicate follow-up question.
+5. Keep run/survey ownership so cancelled or stale inference cannot update a replacement chain.
 
-1. Bundle into APK: `app/src/main/assets/models/`
+Malformed or contradictory evaluation output fails closed.
 
-* ✅ easy distribution
-* ❌ increases APK size
+ONE_STEP support remains available for configurations that use it, but it is not the active Q8-Q17 baseline.
 
-2. Download into app-internal storage (recommended for production)
+Real-model semantic quality is intentionally tracked separately from deterministic app correctness. See [TODO.md](TODO.md).
 
-* ✅ keeps APK smaller
-* ✅ supports multiple models
+---
 
-3. Developer convenience: external storage
+## On-device SLM
 
-* ✅ easy to swap
-* ❌ permissions / scoped storage complexity
+Survey2026 uses LiteRT-LM for local model inference.
 
-Suggested internal layout:
+Current dependency:
 
 ```text
-<app-internal-files>/models/
-  - whisper/<whisper-model-files>
-  - slm/<slm-model-files>
-  - SHA256SUMS.txt
+com.google.ai.edge.litertlm:litertlm-android:0.16.1
 ```
 
-**TODO (align with implementation):**
+The app-side SLM layer is responsible for:
 
-* Document loader behavior for both Whisper and SLM:
+- streaming generation
+- cancellation
+- run/survey ownership
+- terminal-result isolation
+- evaluation JSON parsing
+- follow-up generation
+- warmup/readiness handling
+- timeout/recovery behavior
 
-    * assets vs internal storage
-    * naming rules and discovery
-    * hash verification behavior (if implemented)
-    * Owner: model loader Kotlin file(s) + `AiRepository.kt` + JNI wrapper contract
-
----
-
-## Run-time permissions and I/O
-
-### Microphone permission
-
-The app must request:
-
-* `android.permission.RECORD_AUDIO`
-
-Other permissions depend on storage strategy.
-
-**TODO (make this exact):**
-
-* List exact manifest permissions and runtime request behavior.
-
-    * Owner: `app/src/main/AndroidManifest.xml` + permission request code
-
-### Audio pipeline (typical)
-
-1. Capture PCM audio
-2. Persist WAV or raw PCM
-3. Feed data/file into native whisper.cpp wrapper
-4. Return text (optionally timestamps)
-
-**TODO (align with code):**
-
-* Document sample rate / channels / format + JNI method signature(s).
-
-    * Owner: Kotlin audio capture + JNI wrapper
+The model engine may behave differently across hardware/backend implementations; deterministic app guards are therefore kept separate from semantic model acceptance testing.
 
 ---
 
-## Diagnostics & logging (reliability-first)
+## Whisper / native speech
 
-This repo aims to be **reliability-first**.
+The native library module is `nativelib`.
 
-### What exists (implementation-driven)
+Current CMake entry point:
 
-The current codebase references components such as:
+```text
+nativelib/src/main/jni/whisper/CMakeLists.txt
+```
 
-* `CrashCapture` — early crash capture and exit info
-* `RuntimeLogStore` / `AppRingLogStore` — persistent logs (ring + file)
-* WorkManager uploader pipeline:
+Current Gradle native configuration:
 
-    * `GitHubUploadWorker`
-    * `GitHubUploader`
-    * configuration store(s) such as `GitHubDiagnosticsConfigStore`
+- NDK `29.0.14206865`
+- CMake `3.22.1`
+- `arm64-v8a` only
+- Java/Kotlin target 17
+- native optimization flags include `-O2`
+- CPU-only JNI build
 
-### Recommended operating model
+The native build explicitly forces these GGML backends off:
 
-* Keep diagnostics collection always-on (low overhead).
-* Keep uploads strictly opt-in (dev builds, debug menu, or explicit user action).
-* Never upload secrets.
+- CUDA
+- Metal
+- OpenCL
+- Vulkan
+- HIP
+- SYCL
+- BLAS
+- RPC
 
-**TODO (align with implementation):**
-
-* Document:
-
-    * where logs are stored (files dir paths)
-    * retention policy
-    * how to trigger an upload (if enabled)
-    * where tokens/config live (never commit them)
-    * Owner: `SurveyApp.kt` + `net/` uploader code
-
----
-
-## CI / workflows
-
-Workflows live in:
-
-* `.github/workflows/`
-
-Typical goals:
-
-* `./gradlew :app:testDebugUnitTest --no-daemon -PskipModelDownload=true`
-* `./gradlew :app:assembleDebug --no-daemon -PskipModelDownload=true`
-
-Some variants of this repo include workflows like **Android CI & Release** (manual dispatch, version/tag handling, artifact publishing).
-
-**TODO (make this exact):**
-
-* List the exact workflow file names and what they do.
-
-    * Owner: `.github/workflows/*.yml`
+`WHISPER_DIR` is supported as an optional CMake cache path. If it is not supplied, the CMake file searches known repository-relative locations, including the root `whisper.cpp` checkout.
 
 ---
 
-## Security and repo hygiene
+## Permissions and platform behavior
 
-This repo avoids common Android accidents:
+The current manifest declares:
 
-* Do not commit keystores (`*.jks`) — ignored
-* Do not commit `google-services.json` — ignored
-* Do not commit model files — ignored
+- `RECORD_AUDIO`
+- `INTERNET`
+- `ACCESS_NETWORK_STATE`
+- `ACCESS_WIFI_STATE`
+- `RECEIVE_BOOT_COMPLETED`
+- `POST_NOTIFICATIONS`
+- `FOREGROUND_SERVICE`
+- `FOREGROUND_SERVICE_DATA_SYNC`
+- legacy `READ_EXTERNAL_STORAGE` through API 32
+- legacy `WRITE_EXTERNAL_STORAGE` through API 28
 
-Reproducible builds:
+The microphone feature is declared optional at the device-capability level.
 
-* Fetch models via scripts from trusted sources
-* Verify hashes before use
-* Pin toolchains + submodule commits
+The final product behavior when microphone permission is denied is still an explicit P0 product decision; see [TODO.md](TODO.md).
+
+---
+
+## Survey upload and recovery
+
+Survey JSON is the mandatory survey artifact.
+
+The current design uses logical survey identity rather than only file-path identity. The recovery layer:
+
+- groups pending artifacts
+- selects a canonical candidate
+- reconciles against WorkManager state
+- checks tracker state
+- checks uploaded state
+- suppresses duplicate logical submissions
+- preserves retry/recovery semantics
+
+Current recovery classifications include:
+
+- `SUBMITTED`
+- `ACTIVE`
+- `SUBMITTED_TRACKER_UNCONFIRMED`
+- `ALREADY_UPLOADED`
+- `DEFERRED`
+- `INVALID`
+- `OPERATIONAL_FAILURE`
+
+Validated on Pixel 9a / Android 16:
+
+- offline pending recovery
+- network restore -> upload
+- reboot recovery
+- app-update / `MY_PACKAGE_REPLACED` recovery
+- duplicate suppression
+- post-success cleanup / no re-submit
+
+Direct app-side `LOCKED_BOOT_COMPLETED` logging remains a validation observation point rather than a claimed completed result.
+
+---
+
+## Diagnostics and logging
+
+The repository contains persistent runtime/crash logging and background diagnostic-upload support, including components such as:
+
+- `CrashCapture`
+- `RuntimeLogStore`
+- `AppRingLogStore`
+- `GitHubUploadWorker`
+- `GitHubUploader`
+- `GitHubDiagnosticsConfigStore`
+
+Survey upload recovery and generic diagnostic upload are separate concerns. A diagnostic upload failure must not be treated as evidence that mandatory survey JSON recovery failed.
+
+Exact retention, operator access, storage layout, and diagnostic-upload policy remain documentation work tracked in [TODO.md](TODO.md).
+
+---
+
+## CI, branch previews, and releases
+
+### `.github/workflows/BranchBuild.yml`
+
+Runs for non-`main`, non-`gh-pages` branch pushes and manual dispatch.
+
+It:
+
+- runs JVM unit tests
+- builds a debug APK
+- checks the APK for a plaintext `hf_` token marker
+- publishes a branch-specific APK artifact
+- publishes branch preview metadata to `gh-pages`
+
+Branch preview APKs are development builds and are separate from production releases.
+
+### `.github/workflows/AndroidBuild.yml`
+
+Workflow name: **Android Release APK**.
+
+Current pinned CI toolchain:
+
+- compile SDK 37
+- Build Tools 36.0.0
+- NDK 29.0.14206865
+- CMake 3.22.1
+- JDK 17
+
+The workflow runs for `main` pushes and manual dispatch. Its current publication logic enables production release publication for `main` and for manual dispatch when `publish_release=true`.
+
+Production signing uses GitHub Actions secrets and the dedicated release certificate. The Gradle project itself does not hard-code the release keystore.
+
+Published release metadata includes APK/signing provenance; config-hash and additional download-page consistency work is tracked in [TODO.md](TODO.md).
+
+---
+
+## Secret handling
+
+Do not commit:
+
+- release keystores
+- keystore passwords
+- GitHub tokens
+- Hugging Face tokens
+- other credentials
+- generated signed APKs unless intentionally published as release artifacts
+
+Debug builds can embed development credentials only when explicitly enabled.
+
+The Hugging Face token transport path uses AES-GCM material rather than storing the plaintext token directly in BuildConfig. Because decryption material is also delivered with the application, this is **APK-obfuscation / plaintext-avoidance**, not a secure secret-storage boundary against a determined APK analyst.
+
+Release builds only allow embedded runtime credentials when `release.allowSecrets=true`.
+
+---
+
+## Release signing
+
+Expected local signing report after the release-signing cleanup:
+
+```text
+Variant: debug
+Config: debug
+
+Variant: release
+Config: none
+```
+
+This is intentional.
+
+- Debug APK -> Android debug key
+- Unsigned local release APK -> external/manual signing when needed
+- Production release -> dedicated release key in the release workflow
+
+The production certificate used for release #87 was also verified with a local release-signed update on Pixel 9a.
+
+---
+
+## Testing strategy
+
+Current layers include:
+
+- JVM unit tests for deterministic logic
+- Android instrumentation coverage for selected flows
+- branch CI build/test
+- real-device validation on Pixel 9a
+- release assembly/signing validation
+- separate real-model semantic evaluation
+
+A passing JVM test suite does not prove model-language quality, and a successful diagnostic upload is not a substitute for survey-upload acceptance.
+
+See [ROADMAP.md](ROADMAP.md) for validated areas and [TODO.md](TODO.md) for pending benchmark/acceptance work.
 
 ---
 
 ## Troubleshooting
 
-### NDK not installed
-
-* Android Studio → `Tools → SDK Manager → SDK Tools`
-* Install `NDK (Side by side)`
-
-### CMake/Ninja fails immediately
-
-Common causes:
-
-* missing CMake
-* stale `.cxx/` cache
-* ABI mismatch
-
-Fix:
-
-* `Build → Clean Project`
-* delete `nativelib/.cxx/` (last resort)
-* re-sync and rebuild
-
-### whisper.cpp not found / headers missing
-
-Submodule is not initialized:
+### Submodule missing
 
 ```bash
 git submodule update --init --recursive
 ```
 
-### SLM streaming feels “stuck”
+### NDK/CMake mismatch
 
-Possible causes:
+Use the repository-pinned versions:
 
-* cold start / GPU warmup delays before first token
-* missing/late terminal callbacks
-* cancellation races (late callbacks after cancel/close)
-* near-context-limit truncation breaking strict JSON
+```text
+NDK 29.0.14206865
+CMake 3.22.1
+```
 
-Recommended actions:
+If native configuration is stale, close active builds, then remove only the generated native cache and rebuild:
 
-* enable persistent logs and review run IDs / prompt hashes
-* use conservative timeouts and explicit warmup strategies
-* enforce strict run isolation in the client (ignore late events)
+```bash
+rm -rf nativelib/.cxx
+```
+
+### Release unexpectedly uses the debug certificate
+
+Check:
+
+```bash
+./gradlew :app:signingReport
+```
+
+Expected:
+
+```text
+Variant: release
+Config: none
+```
+
+Also verify that no global or local Gradle property enables:
+
+```text
+release.useDebugSigning=true
+```
+
+### Survey upload appears stuck
+
+Check the survey-specific recovery/reconciliation logs first. Do not infer survey failure only from generic diagnostic worker errors.
+
+Relevant components:
+
+- `PendingSurveyUploads`
+- `SurveyUploadRescheduler`
+- `SurveyUploadWork`
+- `SurveyUploadWorkTracker`
+- `UploadRescheduleReceiver`
 
 ---
 
 ## License
 
-MIT License — see `LICENSE`.
-
----
+MIT License — see [LICENSE](LICENSE).
