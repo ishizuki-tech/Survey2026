@@ -1118,10 +1118,3 @@ tasks.register("printAssets") {
         }
     }
 }
-android {
-    buildTypes {
-        getByName("release") {
-            signingConfig = signingConfigs.getByName("debug")
-        }
-    }
-}
