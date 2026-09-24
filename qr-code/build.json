@@ -1,11 +1,11 @@
 {
   "original_branch": "QR-code",
   "branch_slug": "qr-code",
-  "commit_sha": "b6fdd705eb9880264b369f22248afe42d2326a1e",
-  "short_sha": "b6fdd70",
-  "apk_name": "Survey2026-qr-code-b6fdd70.apk",
-  "apk_sha256": "3a96ca4c13503b7c5500ff86b48ce40ff8c0e382f1689d16ac5c02ad41ad3834",
+  "commit_sha": "849ca7fb2790ab4f0bf19b1bd57b2ed48829199b",
+  "short_sha": "849ca7f",
+  "apk_name": "Survey2026-qr-code-849ca7f.apk",
+  "apk_sha256": "f5766095798f41028bf72755b9c3e9c38cccaac4eb809a6092186e484e0edd88",
   "page_url": "https://ishizuki-tech.github.io/Survey2026/qr-code/",
-  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/36046231329",
-  "generated_utc": "2026-09-24T19:15:43Z"
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/36050984579",
+  "generated_utc": "2026-09-24T19:57:43Z"
 }
