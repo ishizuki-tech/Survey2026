@@ -108,6 +108,7 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
@@ -153,6 +154,7 @@ import com.negi.survey.vm.FlowAI
 import com.negi.survey.vm.FlowDone
 import com.negi.survey.vm.FlowHome
 import com.negi.survey.vm.FlowMulti
+import com.negi.survey.vm.FlowNumber
 import com.negi.survey.vm.FlowReview
 import com.negi.survey.vm.FlowSingle
 import com.negi.survey.vm.FlowText
@@ -161,6 +163,8 @@ import com.negi.survey.vm.NoOpQuestionSpeaker
 import com.negi.survey.vm.NodeType
 import com.negi.survey.vm.QuestionSpeaker
 import com.negi.survey.vm.SurveyViewModel
+import com.negi.survey.vm.composeSingleChoiceAnswer
+import com.negi.survey.vm.isValidNumberAnswer
 import com.negi.survey.vm.SurveySessionStore
 import com.negi.survey.vm.SurveyFinalizationState
 import com.negi.survey.vm.SurveyFinalizationViewModel
@@ -1302,7 +1306,7 @@ fun SurveyNavHost(
                     val ttsSpeaking by ttsController.isSpeaking.collectAsStateWithLifecycle()
 
                     LaunchedEffect(node.id, node.question, ttsAutoPlay) {
-                        if (ttsAutoPlay && vmSurvey.claimTtsAutoPlay(node.id)) {
+                        if (ttsAutoPlay && node.readAloud && vmSurvey.claimTtsAutoPlay(node.id)) {
                             runCatching { ttsController.speak(node.question, node.id) }
                         }
                     }
@@ -1324,7 +1328,7 @@ fun SurveyNavHost(
                     val ttsSpeaking by ttsController.isSpeaking.collectAsStateWithLifecycle()
 
                     LaunchedEffect(node.id, node.question, ttsAutoPlay) {
-                        if (ttsAutoPlay && vmSurvey.claimTtsAutoPlay(node.id)) {
+                        if (ttsAutoPlay && node.readAloud && vmSurvey.claimTtsAutoPlay(node.id)) {
                             runCatching { ttsController.speak(node.question, node.id) }
                         }
                     }
@@ -1335,18 +1339,43 @@ fun SurveyNavHost(
                         options = node.options,
                         selected = vmSurvey.single.collectAsStateWithLifecycle().value,
                         onSelect = { vmSurvey.setSingleChoice(it) },
-                        onNext = {
-                            val sel = vmSurvey.single.value
-                            if (!sel.isNullOrBlank()) {
-                                vmSurvey.setAnswer(sel, node.id)
-                            } else {
-                                vmSurvey.setAnswer("", node.id)
+                        otherTextOption = node.otherTextOption,
+                        onSubmit = { selection, otherText ->
+                            node.composeSingleChoiceAnswer(selection, otherText)?.let { answer ->
+                                vmSurvey.setAnswer(answer, node.id)
+                                vmSurvey.advanceToNext()
                             }
-                            vmSurvey.advanceToNext()
                         },
                         onBack = { vmSurvey.backToPrevious() },
                         onReplay = { toggleQuestionSpeaker(ttsController, node.question, node.id) },
                         isSpeaking = ttsSpeaking
+                    )
+                }
+
+                entry<FlowNumber> {
+                    val node by vmSurvey.currentNode.collectAsStateWithLifecycle()
+                    val answers by vmSurvey.answers.collectAsStateWithLifecycle()
+                    val ttsSpeaking by ttsController.isSpeaking.collectAsStateWithLifecycle()
+                    val answer = answers[node.id].orEmpty()
+
+                    LaunchedEffect(node.id, node.question, ttsAutoPlay, node.readAloud) {
+                        if (ttsAutoPlay && node.readAloud && vmSurvey.claimTtsAutoPlay(node.id)) {
+                            runCatching { ttsController.speak(node.question, node.id) }
+                        }
+                    }
+
+                    NumberNodeScreen(
+                        title = node.title,
+                        question = node.question,
+                        value = answer,
+                        specialOptions = node.specialOptions,
+                        onValueChange = { vmSurvey.setAnswer(it.filter(Char::isDigit), node.id) },
+                        onSpecialSelect = { vmSurvey.setAnswer(it, node.id) },
+                        canSubmit = node.isValidNumberAnswer(answer),
+                        onNext = { vmSurvey.advanceToNext() },
+                        onBack = { vmSurvey.backToPrevious() },
+                        onReplay = { toggleQuestionSpeaker(ttsController, node.question, node.id) },
+                        isSpeaking = ttsSpeaking,
                     )
                 }
 
@@ -1356,7 +1385,7 @@ fun SurveyNavHost(
                     val ttsSpeaking by ttsController.isSpeaking.collectAsStateWithLifecycle()
 
                     LaunchedEffect(node.id, node.question, ttsAutoPlay) {
-                        if (ttsAutoPlay && vmSurvey.claimTtsAutoPlay(node.id)) {
+                        if (ttsAutoPlay && node.readAloud && vmSurvey.claimTtsAutoPlay(node.id)) {
                             runCatching { ttsController.speak(node.question, node.id) }
                         }
                     }
@@ -1395,7 +1424,7 @@ fun SurveyNavHost(
                                 ttsAutoPlay,
                                 speechRecording,
                                 speechTranscribing
-                            ) &&
+                            ) && node.readAloud &&
                             vmSurvey.claimTtsAutoPlay(node.id)
                         ) {
                             runCatching { ttsController.speak(node.question, node.id) }
@@ -1606,8 +1635,6 @@ internal fun TextNodeScreen(
     }
 }
 
-/* (SingleChoiceNodeScreen / MultiChoiceNodeScreen / RowButtons are unchanged below) */
-
 @Composable
 private fun SingleChoiceNodeScreen(
     title: String,
@@ -1615,13 +1642,15 @@ private fun SingleChoiceNodeScreen(
     options: List<String>,
     selected: String?,
     onSelect: (String?) -> Unit,
-    onNext: () -> Unit,
+    otherTextOption: String? = null,
+    onSubmit: (String?, String?) -> Unit,
     onBack: () -> Unit,
     onReplay: () -> Unit = {},
     isSpeaking: Boolean = false
 ) {
     val backplate = appBackplate()
     val scroll = rememberScrollState()
+    var otherText by rememberSaveable(question, otherTextOption) { mutableStateOf("") }
 
     Box(
         modifier = Modifier
@@ -1688,13 +1717,115 @@ private fun SingleChoiceNodeScreen(
                     }
                 }
 
+                if (selected == otherTextOption) {
+                    OutlinedTextField(
+                        value = otherText,
+                        onValueChange = { otherText = it },
+                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text("Other details") },
+                        singleLine = true,
+                    )
+                }
+
                 Spacer(Modifier.height(10.dp))
 
                 RowButtons(
                     primaryLabel = "Next",
-                    onPrimary = onNext,
+                    onPrimary = { onSubmit(selected, otherText) },
+                    primaryEnabled = selected != null &&
+                            (selected != otherTextOption || otherText.isNotBlank()),
                     secondaryLabel = "Back",
                     onSecondary = onBack
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun NumberNodeScreen(
+    title: String,
+    question: String,
+    value: String,
+    specialOptions: List<String>,
+    onValueChange: (String) -> Unit,
+    onSpecialSelect: (String) -> Unit,
+    canSubmit: Boolean,
+    onNext: () -> Unit,
+    onBack: () -> Unit,
+    onReplay: () -> Unit = {},
+    isSpeaking: Boolean = false,
+) {
+    val backplate = appBackplate()
+    val scroll = rememberScrollState()
+    val isSpecialAnswer = value in specialOptions
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .imePadding()
+            .background(backplate)
+            .padding(24.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Surface(
+            tonalElevation = 6.dp,
+            shadowElevation = 8.dp,
+            shape = MaterialTheme.shapes.large,
+            color = MaterialTheme.colorScheme.surface.copy(alpha = 0.97f),
+            modifier = Modifier
+                .fillMaxWidth()
+                .widthIn(max = 520.dp)
+                .wrapContentWidth()
+                .neonEdgeThin(),
+        ) {
+            Column(
+                modifier = Modifier
+                    .padding(horizontal = 24.dp, vertical = 20.dp)
+                    .verticalScroll(scroll),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                if (title.isNotBlank()) Text(text = title, style = MaterialTheme.typography.titleLarge)
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    Text(
+                        text = question.ifBlank { "(no question text)" },
+                        style = MaterialTheme.typography.bodyLarge,
+                        modifier = Modifier.weight(1f),
+                    )
+                    IconButton(onClick = onReplay) { Text(if (isSpeaking) "\u23F9" else "\uD83D\uDD0A") }
+                }
+
+                OutlinedTextField(
+                    value = if (isSpecialAnswer) "" else value,
+                    onValueChange = onValueChange,
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("Number") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                )
+
+                specialOptions.forEach { option ->
+                    if (value == option) {
+                        Button(onClick = { onValueChange("") }, modifier = Modifier.fillMaxWidth()) {
+                            Text(option)
+                        }
+                    } else {
+                        OutlinedButton(onClick = { onSpecialSelect(option) }, modifier = Modifier.fillMaxWidth()) {
+                            Text(option)
+                        }
+                    }
+                }
+
+                Spacer(Modifier.height(10.dp))
+                RowButtons(
+                    primaryLabel = "Next",
+                    onPrimary = onNext,
+                    primaryEnabled = canSubmit,
+                    secondaryLabel = "Back",
+                    onSecondary = onBack,
                 )
             }
         }
@@ -1798,11 +1929,12 @@ private fun MultiChoiceNodeScreen(
 private fun RowButtons(
     primaryLabel: String,
     onPrimary: () -> Unit,
+    primaryEnabled: Boolean = true,
     secondaryLabel: String,
     onSecondary: () -> Unit
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Button(onClick = onPrimary, modifier = Modifier.fillMaxWidth()) {
+        Button(onClick = onPrimary, enabled = primaryEnabled, modifier = Modifier.fillMaxWidth()) {
             Text(primaryLabel)
         }
         OutlinedButton(onClick = onSecondary, modifier = Modifier.fillMaxWidth()) {
