@@ -4,6 +4,7 @@ import androidx.navigation3.runtime.NavBackStack
 import androidx.navigation3.runtime.NavKey
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.negi.survey.config.NodeDTO
+import com.negi.survey.config.RequiredComponent
 import com.negi.survey.config.SurveyConfig
 import com.negi.survey.slm.PromptPhase
 import com.negi.survey.slm.Repository
@@ -44,6 +45,42 @@ class SurveyTwoStepFlowTest {
         assertTrue(repo.prompts[2].contains("Follow-up 1: How much yield was lost?"))
         assertTrue(repo.prompts[2].contains("Answer 1: Two bags per acre"))
         assertEquals(SurveyAiReason.ACHIEVED, survey.aiReasons.value["Q8"])
+    }
+
+    @Test fun low_evaluation_missing_followup_needed_runs_existing_followup_step() = runBlocking {
+        val incomplete = """{"score":45,"missing_points":["yield loss or crop damage description"]}"""
+        val question = "How much yield was lost?"
+        val (survey, ai, repo) = fixture(3, listOf(incomplete, question))
+
+        run(survey, ai)
+
+        assertEquals(listOf(PromptPhase.EVAL, PromptPhase.FOLLOWUP), repo.phases)
+        assertEquals(incomplete, ai.stepHistory.value.first().raw)
+        assertEquals(listOf(question), survey.followups.value["Q8"]?.map { it.question })
+        assertEquals(AiViewModel.ComposerRole.FOLLOWUP, ai.conversationStateFlow("context").value.role)
+        assertNull(survey.aiReasons.value["Q8"])
+    }
+
+    @Test fun structured_followup_output_uses_extracted_candidate_for_two_step_admission() = runBlocking {
+        val question = "How much yield was lost?"
+        for (rawGeneration in listOf(
+            """{"followup_question":"$question"}""",
+            "```json\n{\"followup_question\":\"$question\"}\n```",
+        )) {
+            val (survey, ai, repo) = fixture(3, listOf(low, rawGeneration))
+
+            run(survey, ai)
+
+            assertEquals(listOf(PromptPhase.EVAL, PromptPhase.FOLLOWUP), repo.phases)
+            val generation = ai.stepHistory.value.last()
+            assertEquals(PromptPhase.FOLLOWUP, generation.phase)
+            assertEquals(rawGeneration, generation.raw)
+            assertEquals(listOf(question), generation.followups)
+            assertEquals(listOf(question), survey.followups.value["Q8"]?.map { it.question })
+            assertEquals(AiViewModel.ComposerRole.FOLLOWUP, ai.conversationStateFlow("context").value.role)
+            assertNull(survey.aiReasons.value["Q8"])
+            assertFalse(ai.conversationStateFlow("context").value.validationFailed)
+        }
     }
 
     @Test fun q11_answered_yield_and_pests_history_reaches_achieved_only_with_consistent_final_json() = runBlocking {
@@ -166,6 +203,33 @@ class SurveyTwoStepFlowTest {
         }
     }
 
+    @Test fun q15_combined_missing_point_fails_before_followup_generation() = runBlocking {
+        val nodeId = "Q15"
+        val animals = RequiredComponent("animals", "If white maize is used for livestock: which animals receive it")
+        val frequency = RequiredComponent("feeding_frequency", "If white maize is used for livestock: how often it is fed")
+        val combined = "Which animals receive white maize"
+        val invalidEvaluation =
+            """{"score":65,"missing_points":["$combined"],"followup_needed":true}"""
+        val (survey, ai, repo) = fixture(
+            cap = 2,
+            script = listOf(invalidEvaluation),
+            nodeId = nodeId,
+            question = "If you use white maize to feed livestock, which animals receive it and how often?",
+            mainAnswer = "Yes, I feed white maize to livestock.",
+            requiredComponentCatalog = listOf(animals, frequency),
+        )
+
+        run(survey, ai, nodeId, "If you use white maize to feed livestock, which animals receive it and how often?")
+
+        assertEquals(listOf(PromptPhase.EVAL), repo.phases)
+        assertEquals(1, repo.prompts.size)
+        assertTrue(survey.followups.value[nodeId].isNullOrEmpty())
+        assertEquals(2, survey.remainingFollowups(nodeId))
+        assertEquals("Yes, I feed white maize to livestock.", survey.getAnswer(nodeId))
+        assertEquals(SurveyAiReason.FAILURE, survey.aiReasons.value[nodeId])
+        assertTrue(ai.conversationStateFlow("context").value.validationFailed)
+    }
+
     @Test fun duplicate_after_followup_answer_does_not_consume_capacity_or_duplicate_answer_on_retry() = runBlocking {
         val (survey, ai, repo) = fixture(3, listOf(low, "How much?", low, " how MUCH？ ", low, "Which unit?"))
         run(survey, ai)
@@ -183,6 +247,91 @@ class SurveyTwoStepFlowTest {
         assertEquals(2, survey.followups.value["Q8"]!!.size)
         assertEquals(6, repo.prompts.size)
         assertTrue(repo.prompts.last().contains("Answer 1: Two"))
+    }
+
+    @Test fun cap_two_duplicate_second_followup_is_rejected_without_retry() = runBlocking {
+        val question = "Can you describe how fall armyworm affected your maize crop?"
+        val (survey, ai, repo) = fixture(2, listOf(low, question, low, question))
+
+        run(survey, ai)
+        survey.answerLastFollowup("Q8", "I don't know.")
+        run(survey, ai)
+
+        assertEquals(
+            listOf(PromptPhase.EVAL, PromptPhase.FOLLOWUP, PromptPhase.EVAL, PromptPhase.FOLLOWUP),
+            repo.phases,
+        )
+        assertEquals(4, repo.prompts.size)
+        val entries = survey.followups.value["Q8"].orEmpty()
+        assertEquals(1, entries.size)
+        assertEquals(question, entries.single().question)
+        assertEquals("I don't know.", entries.single().answer)
+        assertEquals(1, survey.remainingFollowups("Q8"))
+        assertEquals(1, ai.chatHistoryFlow("context").value.count { it.text == question })
+        assertEquals(SurveyAiReason.FAILURE, survey.aiReasons.value["Q8"])
+        assertTrue(ai.conversationStateFlow("context").value.validationFailed)
+    }
+
+    @Test fun compound_target_partial_followup_leaves_only_remaining_component() = runBlocking {
+        val nodeId = "Q15"
+        val question = "If you use white maize to feed livestock, which animals receive it and how often?"
+        val target = "Which animals are fed white maize and how often."
+        val animalsComponent = "If white maize is used for livestock: which animals receive it"
+        val frequencyComponent = "If white maize is used for livestock: how often it is fed"
+        val initialEvaluation =
+            """{"score":20,"missing_points":["animals","feeding_frequency"],"followup_needed":true}"""
+        val frequencyOnlyEvaluation =
+            """{"score":65,"missing_points":["feeding_frequency"],"followup_needed":true}"""
+        val completedEvaluation = """{"score":95,"missing_points":[],"followup_needed":false}"""
+        val firstFollowup = "Which livestock animals receive white maize?"
+        val secondFollowup = "How often do you feed white maize to the cattle?"
+        val (survey, ai, repo) = fixture(
+            cap = 2,
+            script = listOf(initialEvaluation, firstFollowup, frequencyOnlyEvaluation, secondFollowup, completedEvaluation),
+            nodeId = nodeId,
+            question = question,
+            mainAnswer = "Yes, I feed white maize to livestock.",
+            target = target,
+            requiredComponentCatalog = listOf(
+                RequiredComponent("animals", animalsComponent),
+                RequiredComponent("feeding_frequency", frequencyComponent),
+            ),
+        )
+
+        run(survey, ai, nodeId, question)
+        survey.answerLastFollowup(nodeId, "Cattle.")
+        run(survey, ai, nodeId, question)
+
+        assertEquals(
+            listOf(PromptPhase.EVAL, PromptPhase.FOLLOWUP, PromptPhase.EVAL, PromptPhase.FOLLOWUP),
+            repo.phases,
+        )
+        assertEquals(4, repo.prompts.size)
+        assertTrue(repo.prompts[0].contains("Required component catalog:\n- animals: $animalsComponent\n- feeding_frequency: $frequencyComponent"))
+        assertTrue(repo.prompts[2].contains("Follow-up 1: $firstFollowup"))
+        assertTrue(repo.prompts[2].contains("Answer 1: Cattle."))
+        assertTrue(repo.prompts[2].contains("Required component catalog:\n- animals: $animalsComponent\n- feeding_frequency: $frequencyComponent"))
+        assertTrue(repo.prompts[3].contains(frequencyOnlyEvaluation))
+        assertTrue(repo.prompts[3].contains("Resolved missing component:\nID: feeding_frequency\nDescription: $frequencyComponent"))
+
+        val entries = survey.followups.value[nodeId].orEmpty()
+        assertEquals(2, entries.size)
+        assertEquals(firstFollowup, entries[0].question)
+        assertEquals("Cattle.", entries[0].answer)
+        assertEquals(secondFollowup, entries[1].question)
+        assertNull(entries[1].answer)
+        assertNotEquals(firstFollowup, secondFollowup)
+        assertTrue(secondFollowup.contains("How often", ignoreCase = true))
+        assertFalse(secondFollowup.contains("which animal", ignoreCase = true))
+        assertEquals(0, survey.remainingFollowups(nodeId))
+
+        survey.answerLastFollowup(nodeId, "Every day.")
+        run(survey, ai, nodeId, question)
+        assertEquals(
+            listOf(PromptPhase.EVAL, PromptPhase.FOLLOWUP, PromptPhase.EVAL, PromptPhase.FOLLOWUP, PromptPhase.EVAL),
+            repo.phases,
+        )
+        assertEquals(SurveyAiReason.ACHIEVED, survey.aiReasons.value[nodeId])
     }
 
     @Test fun cancelled_old_chain_cannot_commit_over_replacement() = runBlocking {
@@ -244,8 +393,10 @@ class SurveyTwoStepFlowTest {
         question: String = "Original question",
         mainAnswer: String = "FAW affected my crop",
         target: String = "original target",
+        requiredComponents: List<String> = emptyList(),
+        requiredComponentCatalog: List<RequiredComponent> = emptyList(),
     ): Triple<SurveyViewModel, AiViewModel, ScriptedRepository> {
-        val survey = survey(cap, nodeId, question, mainAnswer, target)
+        val survey = survey(cap, nodeId, question, mainAnswer, target, requiredComponents, requiredComponentCatalog)
         val repo = ScriptedRepository(script)
         val ai = AiViewModel(repo, defaultTimeoutMs = 50, ioDispatcher = Dispatchers.IO)
         ai.ensureConversationContext("context", question, survey.getAnswer(nodeId))
@@ -258,11 +409,20 @@ class SurveyTwoStepFlowTest {
         question: String = "Original question",
         mainAnswer: String = "FAW affected my crop",
         target: String = "original target",
+        requiredComponents: List<String> = emptyList(),
+        requiredComponentCatalog: List<RequiredComponent> = emptyList(),
     ) = SurveyViewModel(NavBackStack<NavKey>(FlowHome), SurveyConfig(
         aiInteraction = SurveyConfig.AiInteraction(cap),
         graph = SurveyConfig.Graph("Start", listOf(
             NodeDTO("Start", "START", nextId = nodeId),
-            NodeDTO(nodeId, "AI", question = question, nextId = "Done"),
+            NodeDTO(
+                nodeId,
+                "AI",
+                question = question,
+                nextId = "Done",
+                requiredComponents = requiredComponents,
+                requiredComponentCatalog = requiredComponentCatalog,
+            ),
             NodeDTO("Done", "DONE")
         )),
         prompts = listOf(SurveyConfig.Prompt(nodeId,

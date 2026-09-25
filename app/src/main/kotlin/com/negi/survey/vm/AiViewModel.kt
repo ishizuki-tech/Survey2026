@@ -501,6 +501,9 @@ class AiViewModel(
         val runUuid = survey.surveyUuid.value
         val answer = survey.getAnswer(nodeId)
         val remaining = survey.remainingFollowups(nodeId)
+        val requiredComponents = survey.requiredComponentsFor(nodeId)
+        val requiredComponentIds = survey.requiredComponentCatalogFor(nodeId).map { it.id }
+        var admittedMissingPoints = emptyList<String>()
         beginValidationTurn(contextKey)
         // A navigation cancellation leaves a retryable saved state rather than implying completion.
         survey.setAiReason(nodeId, SurveyAiReason.FAILURE)
@@ -508,25 +511,53 @@ class AiViewModel(
             firstPrompt = survey.getEvalPrompt(nodeId, rootQuestion, answer),
             proceedOnTimeout = false,
             shouldRunSecond = { result ->
-                SurveyAiPolicy.evaluate(result.raw, result.timedOut, result.error, remaining) == SurveyAiDecision.GENERATE
+                val admission = SurveyAiPolicy.evaluateAdmission(
+                    result.raw,
+                    result.timedOut,
+                    result.error,
+                    remaining,
+                    requiredComponents,
+                    requiredComponentIds,
+                )
+                admittedMissingPoints = admission.missingPoints
+                admission.decision == SurveyAiDecision.GENERATE
             },
             buildSecondPrompt = { result ->
-                survey.getFollowupPrompt(nodeId, rootQuestion, answer, result.raw)
+                survey.getFollowupPrompt(
+                    nodeId,
+                    rootQuestion,
+                    answer,
+                    result.raw,
+                    survey.resolvedRequiredComponentsFor(nodeId, admittedMissingPoints),
+                )
             },
             onFinished = { evaluation, generation ->
                 if (survey.surveyUuid.value == runUuid) {
                     upsertChatItem(contextKey, ChatItem(
                         id = "eval-$nodeId-${evaluation.runId}", sender = ChatSender.AI, json = evaluation.raw
                     ))
-                    val decision = SurveyAiPolicy.evaluate(evaluation.raw, evaluation.timedOut, evaluation.error, remaining)
+                    val decision = SurveyAiPolicy.evaluate(
+                        evaluation.raw,
+                        evaluation.timedOut,
+                        evaluation.error,
+                        remaining,
+                        requiredComponents,
+                        requiredComponentIds,
+                    )
                     val reason = when (decision) {
                         SurveyAiDecision.ACHIEVED -> SurveyAiReason.ACHIEVED
                         SurveyAiDecision.LIMIT_REACHED -> SurveyAiReason.LIMIT_REACHED
                         SurveyAiDecision.FAILURE -> SurveyAiReason.FAILURE
                         SurveyAiDecision.GENERATE -> {
-                            val question = generation?.let {
-                                SurveyAiPolicy.acceptQuestion(it.raw, it.timedOut, it.error,
-                                    survey.followups.value[nodeId].orEmpty().map { entry -> entry.question })
+                            val question = generation?.let { generated ->
+                                generated.followups.firstOrNull()?.let { candidate ->
+                                    SurveyAiPolicy.acceptQuestion(
+                                        candidate,
+                                        generated.timedOut,
+                                        generated.error,
+                                        survey.followups.value[nodeId].orEmpty().map { entry -> entry.question }
+                                    )
+                                }
                             }
                             if (question != null && survey.addFollowupQuestion(nodeId, question)) {
                                 upsertChatItem(contextKey, ChatItem(

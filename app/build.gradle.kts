@@ -477,6 +477,12 @@ extensions.configure<ApplicationExtension> {
             "appId",
             "com.negi.survey",
         )
+    val localBuild =
+        providers.gradleProperty("localBuild").orNull.equals("true", ignoreCase = true)
+    val applicationIdForBuild =
+        if (localBuild) "com.negi.survey.local" else appId
+    val appLabelResource =
+        if (localBuild) "@string/app_name_local" else "@string/app_name"
 
     /* ------------------------------------------------------------------------
      * GitHub configuration
@@ -614,7 +620,8 @@ extensions.configure<ApplicationExtension> {
     compileSdk = 37
 
     defaultConfig {
-        applicationId = appId
+        applicationId = applicationIdForBuild
+        manifestPlaceholders["appLabel"] = appLabelResource
         minSdk = 26
         targetSdk = 36
 

@@ -69,6 +69,112 @@ class SurveyConfigConditionalNavigationTest {
     }
 
     @Test
+    fun required_components_are_optional_and_blank_entries_fail_validation() {
+        val configured = SurveyConfigLoader.fromStringStrictValidated(
+            text = componentConfig(
+                """
+                    required_components:
+                      - Which livestock animals receive white maize
+                      - How often white maize is fed
+                """.trimIndent()
+            ),
+            format = ConfigFormat.YAML,
+        )
+        assertEquals(
+            listOf(
+                "Which livestock animals receive white maize",
+                "How often white maize is fed",
+            ),
+            configured.graph.nodes.single { it.id == "Q15" }.requiredComponents,
+        )
+
+        val absent = SurveyConfigLoader.fromStringStrictValidated(
+            text = componentConfig(),
+            format = ConfigFormat.YAML,
+        )
+        assertEquals(emptyList<String>(), absent.graph.nodes.single { it.id == "Q15" }.requiredComponents)
+
+        assertTrue(
+            runCatching {
+                SurveyConfigLoader.fromStringStrictValidated(
+                    text = componentConfig(
+                        """
+                            required_components:
+                              - ""
+                        """.trimIndent()
+                    ),
+                    format = ConfigFormat.YAML,
+                )
+            }.isFailure
+        )
+    }
+
+    @Test
+    fun required_component_catalog_is_optional_ordered_and_strictly_validated() {
+        val configured = SurveyConfigLoader.fromStringStrictValidated(
+            text = componentConfig(
+                """
+                    required_component_catalog:
+                      - id: animals
+                        text: Which livestock animals receive white maize
+                      - id: feeding_frequency
+                        text: How often white maize is fed
+                """.trimIndent(),
+            ),
+            format = ConfigFormat.YAML,
+        )
+        assertEquals(
+            listOf(
+                RequiredComponent("animals", "Which livestock animals receive white maize"),
+                RequiredComponent("feeding_frequency", "How often white maize is fed"),
+            ),
+            configured.graph.nodes.single { it.id == "Q15" }.requiredComponentCatalog,
+        )
+
+        assertEquals(
+            emptyList<RequiredComponent>(),
+            SurveyConfigLoader.fromStringStrictValidated(componentConfig(), ConfigFormat.YAML)
+                .graph.nodes.single { it.id == "Q15" }.requiredComponentCatalog,
+        )
+        for (catalog in listOf(
+            """
+                required_component_catalog:
+                  - id: ""
+                    text: Component
+            """.trimIndent(),
+            """
+                required_component_catalog:
+                  - id: animals
+                    text: ""
+            """.trimIndent(),
+            """
+                required_component_catalog:
+                  - id: animals
+                    text: A
+                  - id: animals
+                    text: B
+            """.trimIndent(),
+        )) {
+            assertTrue(
+                runCatching {
+                    SurveyConfigLoader.fromStringStrictValidated(componentConfig(catalog), ConfigFormat.YAML)
+                }.isFailure,
+            )
+        }
+        val nonAiCatalog = surveyConfig(
+            node("Start", "START", nextId = "Text"),
+            NodeDTO(
+                id = "Text",
+                type = "TEXT",
+                requiredComponentCatalog = listOf(RequiredComponent("animals", "Animals")),
+                nextId = "Done",
+            ),
+            node("Done", "DONE"),
+        )
+        assertTrue(nonAiCatalog.validate().any { it.contains("required_component_catalog") })
+    }
+
+    @Test
     fun valid_next_id_by_answer_config_parses_and_validates() {
         val config = SurveyConfigLoader.fromStringStrictValidated(
             text = """
@@ -202,6 +308,30 @@ class SurveyConfigConditionalNavigationTest {
             ),
             node("Done", "DONE")
         )
+
+    private fun componentConfig(requiredComponents: String = ""): String =
+        buildString {
+            appendLine("graph:")
+            appendLine("  startId: Start")
+            appendLine("  nodes:")
+            appendLine("    - id: Start")
+            appendLine("      type: START")
+            appendLine("      nextId: Q15")
+            appendLine("    - id: Q15")
+            appendLine("      type: AI")
+            appendLine("      question: Question")
+            requiredComponents.lineSequence().forEach { appendLine("      $it") }
+            appendLine("      nextId: Done")
+            appendLine("    - id: Done")
+            appendLine("      type: DONE")
+            appendLine("slm:")
+            appendLine("  key_contract_eval: eval")
+            appendLine("  key_contract_followup: follow")
+            appendLine("prompts:")
+            appendLine("  - nodeId: Q15")
+            appendLine("    eval_prompt: eval")
+            append("    followup_prompt: follow")
+        }
 
     private fun surveyConfig(vararg nodes: NodeDTO): SurveyConfig =
         SurveyConfig(
