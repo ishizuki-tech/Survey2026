@@ -8,7 +8,44 @@ graph:
       type: START
       title: Start
       question: Start
+      nextId: Introduction
+
+    - id: Introduction
+      type: INFO
+      title: Introduction
+      question: |-
+        Hallo. Thank you for making time for us today.
+
+        I work with CIMMYT, an organization that conducts research to improve the production of maize, wheat, and other crops in different countries across Africa, Asia, and Latin America.
+
+        We are carrying out this study to learn about farmers’ experiences, challenges, and preferences when growing white maize. The information you share will help researchers better understand farmers’ needs and support the development of better maize varieties in the future.
+
+        During the interview, we will use a mobile phone to help record and organize your responses. This will help us capture your answers accurately and make sure we do not miss any important information.
+
+        Your participation is voluntary. You may choose not to answer any question or stop the interview at any time. The information you provide will be kept private and used only for research purposes. There are no right or wrong answers—we simply want to hear about your real experiences and views.
+
+        The interview will take about 45 minutes.
+
+        Thank you very much for taking part in this study.
+
+        The study is led by Dr. Mercy Mbugua. If you have any questions or concerns about the study, you can contact her on +254 724 740 197.
+
+        If you have any concerns or questions, you can reach her by mobile: +254 724 740 197.
+      read_aloud: true
+      nextId: Consent
+
+    - id: Consent
+      type: SINGLE_CHOICE
+      title: Consent
+      question: Do you agree to participate?
+      options:
+        - Yes, and proceed
+        - No, and stop the interview
+      read_aloud: true
       nextId: Q1
+      nextIdByAnswer:
+        "Yes, and proceed": Q1
+        "No, and stop the interview": Done
 
     - id: Q1
       type: SINGLE_CHOICE

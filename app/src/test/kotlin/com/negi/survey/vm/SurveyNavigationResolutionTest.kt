@@ -23,6 +23,44 @@ class SurveyNavigationResolutionTest {
     }
 
     @Test
+    fun english_config_routes_start_through_introduction_and_consent() {
+        val config = loadAsset("survey_config10.yaml")
+        val start = config.graph.nodes.single { it.id == "Start" }.toVmNode()
+        val introduction = config.graph.nodes.single { it.id == "Introduction" }.toVmNode()
+        val consent = config.graph.nodes.single { it.id == "Consent" }.toVmNode()
+
+        assertEquals("Introduction", start.resolveNextId(null))
+        assertEquals(NodeType.INFO, introduction.type)
+        assertEquals(true, introduction.readAloud)
+        assertEquals("Consent", introduction.resolveNextId(null))
+        assertEquals(true, introduction.question.startsWith("Hallo. Thank you for making time for us today."))
+
+        assertEquals(NodeType.SINGLE_CHOICE, consent.type)
+        assertEquals(true, consent.readAloud)
+        assertEquals("Q1", consent.resolveNextId("Yes, and proceed"))
+        assertEquals("Done", consent.resolveNextId("No, and stop the interview"))
+    }
+
+    @Test
+    fun swahili_config_routes_start_through_introduction_and_consent() {
+        val config = loadAsset("survey_config_sw_10.yaml")
+        val start = config.graph.nodes.single { it.id == "Start" }.toVmNode()
+        val introduction = config.graph.nodes.single { it.id == "Introduction" }.toVmNode()
+        val consent = config.graph.nodes.single { it.id == "Consent" }.toVmNode()
+
+        assertEquals("Introduction", start.resolveNextId(null))
+        assertEquals(NodeType.INFO, introduction.type)
+        assertEquals(true, introduction.readAloud)
+        assertEquals("Consent", introduction.resolveNextId(null))
+        assertEquals(true, introduction.question.startsWith("Habari yako leo? Asante kwa kutupatia muda wako leo."))
+
+        assertEquals(NodeType.SINGLE_CHOICE, consent.type)
+        assertEquals(true, consent.readAloud)
+        assertEquals("Q1", consent.resolveNextId("Ndiyo, nakubali kushiriki"))
+        assertEquals("Done", consent.resolveNextId("Hapana, sikubali kushiriki"))
+    }
+
+    @Test
     fun mapped_answer_overrides_next_id() {
         val node = choiceNode(mapOf("Stop" to "Done"))
 
