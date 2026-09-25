@@ -4,14 +4,105 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class SurveyAiPolicyTest {
-    private fun eval(raw: String, remaining: Int = 2, timeout: Boolean = false, error: String? = null) =
-        SurveyAiPolicy.evaluate(raw, timeout, error, remaining)
+    private fun eval(
+        raw: String,
+        remaining: Int = 2,
+        timeout: Boolean = false,
+        error: String? = null,
+        requiredComponents: List<String> = emptyList(),
+        requiredComponentIds: List<String> = emptyList(),
+    ) = SurveyAiPolicy.evaluate(raw, timeout, error, remaining, requiredComponents, requiredComponentIds)
+
+    @Test fun required_component_catalog_ids_are_exact_and_take_precedence_over_legacy_text() {
+        fun raw(missing: List<String>) =
+            """{"score":60,"missing_points":${missing.joinToString(prefix = "[", postfix = "]") { "\"$it\"" }},"followup_needed":true}"""
+        val ids = listOf("animals", "feeding_frequency")
+
+        assertEquals(SurveyAiDecision.GENERATE, eval(raw(listOf("animals")), requiredComponentIds = ids))
+        assertEquals(SurveyAiDecision.GENERATE, eval(raw(ids), requiredComponentIds = ids))
+        assertEquals(SurveyAiDecision.FAILURE, eval(raw(listOf("Animals")), requiredComponentIds = ids))
+        assertEquals(SurveyAiDecision.FAILURE, eval(raw(listOf("animals", "animals")), requiredComponentIds = ids))
+        assertEquals(
+            SurveyAiDecision.FAILURE,
+            eval(
+                raw(listOf("If white maize is used for livestock: which animals receive it")),
+                requiredComponents = listOf("If white maize is used for livestock: which animals receive it"),
+                requiredComponentIds = ids,
+            ),
+        )
+    }
+
+    @Test fun required_components_accept_exact_members_and_reject_unknown_or_duplicate_missing_points() {
+        val componentA = "Component A"
+        val componentB = "Component B"
+        val unexpected = "Unexpected component"
+        fun raw(missing: List<String>) =
+            """{"score":60,"missing_points":${missing.joinToString(prefix = "[", postfix = "]") { "\"$it\"" }},"followup_needed":true}"""
+
+        assertEquals(
+            SurveyAiDecision.GENERATE,
+            eval(raw(listOf("Any valid missing point"))),
+        )
+        assertEquals(SurveyAiDecision.GENERATE, eval(raw(listOf(componentA)), requiredComponents = listOf(componentA, componentB)))
+        assertEquals(SurveyAiDecision.GENERATE, eval(raw(listOf(componentB)), requiredComponents = listOf(componentA, componentB)))
+        assertEquals(SurveyAiDecision.GENERATE, eval(raw(listOf(componentA, componentB)), requiredComponents = listOf(componentA, componentB)))
+        assertEquals(
+            SurveyAiDecision.ACHIEVED,
+            eval(
+                """{"score":95,"missing_points":[],"followup_needed":false}""",
+                requiredComponents = listOf(componentA, componentB),
+            ),
+        )
+        assertEquals(SurveyAiDecision.FAILURE, eval(raw(listOf(unexpected)), requiredComponents = listOf(componentA, componentB)))
+        assertEquals(SurveyAiDecision.FAILURE, eval(raw(listOf(componentA, unexpected)), requiredComponents = listOf(componentA, componentB)))
+        assertEquals(SurveyAiDecision.FAILURE, eval(raw(listOf(componentA, componentA)), requiredComponents = listOf(componentA, componentB)))
+        assertEquals(SurveyAiDecision.FAILURE, eval(raw(listOf("component A")), requiredComponents = listOf(componentA)))
+        assertEquals(SurveyAiDecision.FAILURE, eval(raw(listOf("Component A ")), requiredComponents = listOf(componentA)))
+    }
+
+    @Test fun q15_combined_missing_point_is_not_a_required_component() {
+        val animals = "If white maize is used for livestock: which animals receive it"
+        val frequency = "If white maize is used for livestock: how often it is fed"
+        val combined = "Which livestock animals receive white maize and how often do you feed them"
+
+        assertEquals(
+            SurveyAiDecision.FAILURE,
+            eval(
+                """{"score":65,"missing_points":["$combined"],"followup_needed":true}""",
+                requiredComponents = listOf(animals, frequency),
+            ),
+        )
+    }
 
     @Test fun valid_evaluations_respect_score_and_capacity() {
         for (cap in listOf(0, 1, 2, 3)) {
             assertEquals(SurveyAiDecision.ACHIEVED, eval("""{"score":90,"missing_points":[],"followup_needed":false}""", cap))
             assertEquals(if (cap == 0) SurveyAiDecision.LIMIT_REACHED else SurveyAiDecision.GENERATE,
                 eval("""{"score":89,"missing_points":["unit"],"followup_needed":true}""", cap))
+        }
+    }
+
+    @Test fun missing_followup_needed_is_inferred_only_for_valid_low_score_with_missing_points() {
+        val missingFollowupNeeded =
+            """{"score":45,"missing_points":["yield loss or crop damage description"]}"""
+        val explicitTrue = """{"score":45,"missing_points":["yield loss"],"followup_needed":true}"""
+
+        assertEquals(SurveyAiDecision.GENERATE, eval(missingFollowupNeeded))
+        assertEquals(SurveyAiDecision.LIMIT_REACHED, eval(missingFollowupNeeded, remaining = 0))
+        assertEquals(SurveyAiDecision.GENERATE, eval(explicitTrue))
+
+        for (raw in listOf(
+            """{"score":45,"missing_points":["yield loss"],"followup_needed":false}""",
+            """{"score":90,"missing_points":[]}""",
+            """{"missing_points":["yield loss"]}""",
+            """{"score":"45","missing_points":["yield loss"]}""",
+            """{"score":45}""",
+            """{"score":45,"missing_points":[]}""",
+            """{"score":45,"missing_points":[""]}""",
+            """{"score":45,"missing_points":[2]}""",
+            """{"score":45,"missing_points":["yield loss"],"followup_needed":null}""",
+        )) {
+            assertEquals(raw, SurveyAiDecision.FAILURE, eval(raw))
         }
     }
 

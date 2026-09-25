@@ -204,6 +204,25 @@ Release assembly:
   -Prelease.allowSecrets=false
 ```
 
+### Separate local-install identity
+
+To install a locally built APK alongside the normal Survey2026 app, explicitly add
+`-PlocalBuild=true`. This changes the application ID to `com.negi.survey.local` and
+the app label to `Survey2026 Local` for both Debug and Release builds; builds without
+this property retain the normal identity.
+
+```bash
+./gradlew :app:assembleDebug --no-daemon \
+  -PlocalBuild=true \
+  -PskipModelDownload=true \
+  -Pdebug.embedSecrets=false
+
+./gradlew :app:assembleRelease --no-daemon \
+  -PlocalBuild=true \
+  -PskipModelDownload=true \
+  -Prelease.allowSecrets=false
+```
+
 The normal Gradle `release` build is **not forcibly debug-signed**. `release.useDebugSigning=true` remains an explicit opt-in only. Production release signing is handled separately.
 
 ---

@@ -564,6 +564,27 @@ data class SurveyConfig(
             issues += "nodes with unknown type: ${unknownTypes.joinToString(",")}"
         }
 
+        graph.nodes.forEach { node ->
+            if (node.requiredComponents.any { it.trim().isEmpty() }) {
+                issues += "node '${node.id}' has blank required_components entries"
+            }
+            if (node.requiredComponents.isNotEmpty() && node.nodeType() != NodeType.AI) {
+                issues += "node '${node.id}' sets required_components but is not AI"
+            }
+            if (node.requiredComponentCatalog.any { it.id.isBlank() || it.text.isBlank() }) {
+                issues += "node '${node.id}' has blank required_component_catalog id or text"
+            }
+            if (node.requiredComponentCatalog.any { !it.id.matches(Regex("[a-z][a-z0-9_]*")) }) {
+                issues += "node '${node.id}' has invalid required_component_catalog id"
+            }
+            if (node.requiredComponentCatalog.map { it.id }.distinct().size != node.requiredComponentCatalog.size) {
+                issues += "node '${node.id}' has duplicate required_component_catalog ids"
+            }
+            if (node.requiredComponentCatalog.isNotEmpty() && node.nodeType() != NodeType.AI) {
+                issues += "node '${node.id}' sets required_component_catalog but is not AI"
+            }
+        }
+
         val startNode = graph.nodes.firstOrNull { it.id.trim() == startIdNorm }
         if (startNode != null && startNode.nodeType() != NodeType.START) {
             issues += "graph.startId points to a non-START node (id='${startNode.id}', type='${startNode.type}')"
@@ -993,14 +1014,22 @@ typealias GraphConfig = SurveyConfig.Graph
 typealias NodePromptEntry = SurveyConfig.NodePrompt
 
 @Serializable
+data class RequiredComponent(
+    val id: String = "",
+    val text: String = "",
+)
+
+@Serializable
 data class NodeDTO(
     val id: String = "",
     val type: String = "",
     val title: String = "",
     val question: String = "",
     val options: List<String> = emptyList(),
+    @SerialName("required_components") val requiredComponents: List<String> = emptyList(),
     val nextId: String? = null,
-    val nextIdByAnswer: Map<String, String> = emptyMap()
+    val nextIdByAnswer: Map<String, String> = emptyMap(),
+    @SerialName("required_component_catalog") val requiredComponentCatalog: List<RequiredComponent> = emptyList(),
 ) {
     fun nodeType(): NodeType = NodeType.from(type)
 }
