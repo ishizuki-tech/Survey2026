@@ -8,7 +8,44 @@ graph:
       type: START
       title: Start
       question: Start
+      nextId: Introduction
+
+    - id: Introduction
+      type: INFO
+      title: Utangulizi wa mahojiano
+      question: |-
+        Habari yako leo? Asante kwa kutupatia muda wako leo.
+
+        Mimi ninafanya kazi na CIMMYT. Ni shirika linalofanya utafiti wa kuboresha kilimo cha mahindi, ngano na mazao mengine katika nchi mbalimbali.
+
+        Leo tunafanya utafiti kuhusu mahindi meupe. Tungependa kusikia kuhusu uzoefu wako wa kulima mahindi, changamoto unazokutana nazo, na aina ya mahindi unayopendelea.
+
+        Wakati wa mahojiano, tutatumia simu ya mkononi kusaidia kurekodi na kupanga majibu yako. Hii itatusaidia kuhakikisha kwamba tunapata taarifa zako vizuri na hakuna jambo muhimu tunalosahau.
+
+        Kushiriki ni kwa hiari. Unaweza kuamua kutokujibu swali lolote, au kusimamisha mahojiano wakati wowote. Taarifa utakazotupatia zitawekwa kwa siri na zitatumika kwa utafiti pekee.
+
+        Pia, hakuna jibu sahihi au lisilo sahihi. Tunataka tu kusikia maoni yako na uzoefu wako halisi.
+
+        Mahojiano yatachukua takribani dakika 45.
+
+        Asante sana kwa kutenga muda wako na kushiriki nasi leo.
+
+        Utafiti huu unaongozwa na Daktari Mercy Mbugua. Kama una swali lolote kuhusu utafiti huu, unaweza kumpigia simu kwa +254 724 740 197.
+      read_aloud: true
+      nextId: Consent
+
+    - id: Consent
+      type: SINGLE_CHOICE
+      title: Ridhaa
+      question: Je, Kabla tuanze, uko tayari kuendelea na mahojiano?
+      options:
+        - Ndiyo, nakubali kushiriki
+        - Hapana, sikubali kushiriki
+      read_aloud: true
       nextId: Q1
+      nextIdByAnswer:
+        "Ndiyo, nakubali kushiriki": Q1
+        "Hapana, sikubali kushiriki": Done
 
     - id: Q1
       type: SINGLE_CHOICE
