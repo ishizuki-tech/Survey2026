@@ -1,0 +1,11 @@
+{
+  "original_branch": "fix/two-step-followup-admission",
+  "branch_slug": "fix-two-step-followup-admission",
+  "commit_sha": "71f908ac5c75ef40fb17f2b93f85ccc7c6e9a98b",
+  "short_sha": "71f908a",
+  "apk_name": "Survey2026-fix-two-step-followup-admission-71f908a.apk",
+  "apk_sha256": "6b7136f4d3b94cc19cc44f20514aae7fa87158b8e7c49dc8a4f870f88d993232",
+  "page_url": "https://ishizuki-tech.github.io/Survey2026/fix-two-step-followup-admission/",
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/36168639621",
+  "generated_utc": "2026-09-25T17:46:55Z"
+}
