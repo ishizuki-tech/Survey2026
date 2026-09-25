@@ -29,7 +29,7 @@
  *
  *  Notes:
  *  ---------------------------------------------------------------------
- *   • Validation follows nextId and optional SINGLE_CHOICE answer routes.
+ *   • Validation follows nextId and optional choice or numeric answer routes.
  * =====================================================================
  */
 
@@ -513,6 +513,9 @@ data class SurveyConfig(
             nextIdByAnswer.values.forEach { destination ->
                 destination.trim().takeIf { it.isNotBlank() }?.let(::add)
             }
+            numericRoutes.forEach { route ->
+                route.nextId?.trim()?.takeIf { it.isNotBlank() }?.let(::add)
+            }
         }
 
         val blankIds = rawIds.filter { it.isBlank() }.distinct()
@@ -813,8 +816,11 @@ data class SurveyConfig(
                     }
                 }
 
-            if (node.nextIdByAnswer.isNotEmpty() && node.nodeType() != NodeType.SINGLE_CHOICE) {
-                issues += "node '${node.id}' defines nextIdByAnswer but is not SINGLE_CHOICE"
+            if (node.nextIdByAnswer.isNotEmpty() &&
+                node.nodeType() != NodeType.SINGLE_CHOICE &&
+                node.nodeType() != NodeType.NUMBER
+            ) {
+                issues += "node '${node.id}' defines nextIdByAnswer but is not SINGLE_CHOICE or NUMBER"
             }
 
             node.nextIdByAnswer.forEach { (answer, destination) ->
@@ -822,8 +828,8 @@ data class SurveyConfig(
                     answer.isBlank() ->
                         issues += "node '${node.id}' nextIdByAnswer contains a blank answer key"
 
-                    answer !in node.options ->
-                        issues += "node '${node.id}' nextIdByAnswer key '$answer' does not exactly match an option"
+                    answer !in node.options && answer !in node.specialOptions ->
+                        issues += "node '${node.id}' nextIdByAnswer key '$answer' does not exactly match an option or special option"
                 }
 
                 val target = destination.trim()
@@ -833,6 +839,43 @@ data class SurveyConfig(
 
                     target !in idSet ->
                         issues += "node '${node.id}' nextIdByAnswer for '$answer' references unknown destination '$target'"
+                }
+            }
+
+            if (node.otherTextOption != null) {
+                when {
+                    node.nodeType() != NodeType.SINGLE_CHOICE ->
+                        issues += "node '${node.id}' defines other_text_option but is not SINGLE_CHOICE"
+
+                    node.otherTextOption !in node.options ->
+                        issues += "node '${node.id}' other_text_option does not exactly match an option"
+                }
+            }
+
+            if (node.specialOptions.isNotEmpty() && node.nodeType() != NodeType.NUMBER) {
+                issues += "node '${node.id}' defines special_options but is not NUMBER"
+            }
+            if (node.specialOptions.any { it.isBlank() }) {
+                issues += "node '${node.id}' has blank special_options entries"
+            }
+            if (node.specialOptions.map { it.trim() }.distinct().size != node.specialOptions.size) {
+                issues += "node '${node.id}' has duplicate special_options entries"
+            }
+
+            if (node.numericRoutes.isNotEmpty() && node.nodeType() != NodeType.NUMBER) {
+                issues += "node '${node.id}' defines numeric_routes but is not NUMBER"
+            }
+            node.numericRoutes.forEach { route ->
+                if (route.lessThanOrEqual == null) {
+                    issues += "node '${node.id}' numeric_routes entry is missing less_than_or_equal"
+                }
+                val target = route.nextId?.trim().orEmpty()
+                when {
+                    target.isBlank() ->
+                        issues += "node '${node.id}' numeric_routes entry has a blank destination"
+
+                    target !in idSet ->
+                        issues += "node '${node.id}' numeric_routes entry references unknown destination '$target'"
                 }
             }
         }
@@ -1026,6 +1069,10 @@ data class NodeDTO(
     val title: String = "",
     val question: String = "",
     val options: List<String> = emptyList(),
+    @SerialName("read_aloud") val readAloud: Boolean = true,
+    @SerialName("other_text_option") val otherTextOption: String? = null,
+    @SerialName("special_options") val specialOptions: List<String> = emptyList(),
+    @SerialName("numeric_routes") val numericRoutes: List<NumericRoute> = emptyList(),
     @SerialName("required_components") val requiredComponents: List<String> = emptyList(),
     val nextId: String? = null,
     val nextIdByAnswer: Map<String, String> = emptyMap(),
@@ -1034,11 +1081,19 @@ data class NodeDTO(
     fun nodeType(): NodeType = NodeType.from(type)
 }
 
+/** A config-driven whole-number route. The first matching route wins. */
+@Serializable
+data class NumericRoute(
+    @SerialName("less_than_or_equal") val lessThanOrEqual: Int? = null,
+    @SerialName("next_id") val nextId: String? = null,
+)
+
 enum class NodeType {
     START,
     TEXT,
     SINGLE_CHOICE,
     MULTI_CHOICE,
+    NUMBER,
     AI,
     REVIEW,
     DONE,
@@ -1057,6 +1112,7 @@ enum class NodeType {
                 "TEXT" -> TEXT
                 "SINGLE_CHOICE", "SINGLECHOICE", "SINGLE_OPTION", "RADIO" -> SINGLE_CHOICE
                 "MULTI_CHOICE", "MULTICHOICE", "MULTI_OPTION", "CHECKBOX" -> MULTI_CHOICE
+                "NUMBER", "NUMERIC", "INTEGER" -> NUMBER
                 "AI", "LLM", "SLM" -> AI
                 "REVIEW" -> REVIEW
                 "DONE", "FINISH", "FINAL" -> DONE

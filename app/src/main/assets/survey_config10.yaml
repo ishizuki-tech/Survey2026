@@ -11,121 +11,125 @@ graph:
       nextId: Q1
 
     - id: Q1
-      type: TEXT
-      title: Sub-County
-      question: Which sub-county do you live in?
+      type: SINGLE_CHOICE
+      title: Sub-county and Ward
+      question: Which sub-county and ward do you live in?
+      options:
+        - Githunguri – Githunguri
+        - Gatundu South – Ndarugu
+        - Gatundu South – Ngenda
+        - Gatundu North – Githobokoni
+        - Gatundu North – Gituamba
+        - Other / Nyingine
+      read_aloud: false
+      other_text_option: Other / Nyingine
       nextId: Q2
 
     - id: Q2
-      type: TEXT
-      title: Ward
-      question: Which ward do you live in?
-      nextId: Q3
-
-    - id: Q3
       type: SINGLE_CHOICE
       title: Respondent Gender
       question: Respondent Gender
       options:
         - Male
         - Female
+      read_aloud: false
+      nextId: Q3
+
+    - id: Q3
+      type: NUMBER
+      title: Respondent Age
+      question: What is your age?
+      special_options:
+        - Prefer not to say
       nextId: Q4
 
     - id: Q4
-      type: SINGLE_CHOICE
-      title: Respondent Age
-      question: What is your age?
-      options:
-        - Under 35
-        - 35-50
-        - Over 50
+      type: TEXT
+      title: Crops Grown
+      question: Which crops do you grow?
       nextId: Q5
 
     - id: Q5
       type: TEXT
-      title: Crops Grown
-      question: Which crops do you grow?
+      title: Animals Kept
+      question: Which animals do you keep?
       nextId: Q6
 
     - id: Q6
-      type: TEXT
-      title: Animals Kept
-      question: Which animals do you keep?
-      nextId: Q7
-
-    - id: Q7
-      type: SINGLE_CHOICE
+      type: NUMBER
       title: Years Growing White Maize
       question: How many years have you been growing white maize?
-      options:
-        - More than 2 years
-        - Less than 2 years
-      nextId: Q8
+      special_options:
+        - Prefer not to say
+      numeric_routes:
+        - less_than_or_equal: 2
+          next_id: Done
+      nextId: Q7
       nextIdByAnswer:
-        "Less than 2 years": Done
+        "Prefer not to say": Done
 
-    - id: Q8
+    - id: Q7
       type: AI
       title: FAW Impact on Maize
       question: >-
-        Has fall armyworm ever affected your maize? If yes, how did it affect your crop?
+        Has fall armyworm ever affected your maize? If yes, what damage or losses did it cause?
+      nextId: Q8
+
+    - id: Q8
+      type: AI
+      title: Yield Trade-off for 20-Day Earlier Harvest
+      question: >-
+        If you could harvest your maize 20 days earlier but this reduced your yield, how much yield would you be willing to lose to harvest earlier?
       nextId: Q9
 
     - id: Q9
       type: AI
-      title: Yield Trade-off for 20-Day Earlier Harvest
+      title: Damage Threshold to Switch Variety
       question: >-
-        If harvesting your maize 20 days earlier reduced your yield, how much yield would you be willing to lose to harvest 20 days earlier?
+        What level of pest or disease damage would make you switch to a different maize variety?
       nextId: Q10
 
     - id: Q10
       type: AI
-      title: Damage Threshold to Switch Variety
+      title: Traits Needed in Replacement Variety
       question: >-
-        How much pest or disease damage would make you switch to a different maize variety?
+        If there were a new maize variety, what characteristics would it need to have for you to decide to plant it instead of your current variety?
       nextId: Q11
 
     - id: Q11
       type: AI
-      title: Traits Needed in Replacement Variety
+      title: Minimum Acceptable Harvest in Bad Season
       question: >-
-        What traits would a new maize variety need to have for you to plant it instead of your current one?
+        In a bad season, what is the lowest maize yield that would still make you continue planting this variety?
       nextId: Q12
 
     - id: Q12
       type: AI
-      title: Minimum Acceptable Harvest in Bad Season
+      title: Growth Stage Most Vulnerable to Drought
       question: >-
-        In a bad season, what is the lowest maize yield that would still make you continue planting your current maize variety?
+        At what stage of maize growth does drought cause the greatest losses?
       nextId: Q13
 
     - id: Q13
       type: AI
-      title: Growth Stage Most Vulnerable to Drought
+      title: "Maize Allocation: Food, Feed, Sale"
       question: >-
-        During which stage of maize growth does drought cause the greatest losses or damage?
+        How do you decide how much maize to use for household food, livestock feed, sale, or other purposes?
       nextId: Q14
 
     - id: Q14
       type: AI
-      title: "Maize Allocation: Food, Feed, Sale"
-      question: >-
-        How do you decide how much maize to use for household food, livestock feed, sale, or other purposes?
-      nextId: Q15
-
-    - id: Q15
-      type: AI
       title: White Maize for Livestock Feed
       question: >-
-        If you use white maize to feed livestock, which animals receive it and how often?
+        If you use white maize to feed livestock, which animals do you feed it to and how often?
       required_component_catalog:
         - id: animals
           text: "If white maize is used for livestock: which animals receive it"
         - id: feeding_frequency
           text: "If white maize is used for livestock: how often it is fed"
-      nextId: Q16
+      nextId: Q15
 
-    - id: Q16
+    - id: Q15
       type: AI
       title: Maize Seed Sourcing
       question: >-
@@ -135,13 +139,13 @@ graph:
           text: "Usual source of white maize seed"
         - id: source_reason
           text: "Reason for preferring that source"
-      nextId: Q17
+      nextId: Q16
 
-    - id: Q17
+    - id: Q16
       type: AI
       title: Maize Selling Market
       question: >-
-        Where do you usually sell your maize after harvest, and why do you choose that market or buyer?
+        Where do you usually sell your maize after harvest, and why do you prefer selling there or to that buyer?
       required_component_catalog:
         - id: sale_destination
           text: "Usual market or buyer after harvest"
@@ -205,7 +209,7 @@ slm:
   length_budget_followup: "Keep the question short and single-scope."
 
 prompts:
-  - nodeId: Q8
+  - nodeId: Q7
     eval_prompt: |-
       Expected answer target: Whether FAW affected the crop and, if yes, at least one concrete description of its effect, such as yield loss or a type of crop damage.
       Question: {{QUESTION}}
@@ -213,6 +217,19 @@ prompts:
       Answered followup pairs: {{HISTORY}}
     followup_prompt: |-
       Expected answer target: Whether FAW affected the crop and, if yes, at least one concrete description of its effect, such as yield loss or a type of crop damage.
+      Question: {{QUESTION}}
+      Original answer: {{ANSWER}}
+      Answered followup pairs: {{HISTORY}}
+      EVAL_JSON: {{EVAL_JSON}}
+
+  - nodeId: Q8
+    eval_prompt: |-
+      Expected answer target: Maximum yield loss acceptable for harvesting 20 days earlier (% or bags/acre).
+      Question: {{QUESTION}}
+      Original answer: {{ANSWER}}
+      Answered followup pairs: {{HISTORY}}
+    followup_prompt: |-
+      Expected answer target: Maximum yield loss acceptable for harvesting 20 days earlier (% or bags/acre).
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
@@ -220,12 +237,12 @@ prompts:
 
   - nodeId: Q9
     eval_prompt: |-
-      Expected answer target: Maximum yield loss acceptable for harvesting 20 days earlier (% or bags/acre).
+      Expected answer target: A clear pest/disease damage threshold that would trigger switching maize varieties.
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
     followup_prompt: |-
-      Expected answer target: Maximum yield loss acceptable for harvesting 20 days earlier (% or bags/acre).
+      Expected answer target: A clear pest/disease damage threshold that would trigger switching maize varieties.
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
@@ -233,12 +250,12 @@ prompts:
 
   - nodeId: Q10
     eval_prompt: |-
-      Expected answer target: A clear pest/disease damage threshold that would trigger switching maize varieties.
+      Expected answer target: Priority traits a new maize variety must have to replace the current one, ideally with a measurable target.
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
     followup_prompt: |-
-      Expected answer target: A clear pest/disease damage threshold that would trigger switching maize varieties.
+      Expected answer target: Priority traits a new maize variety must have to replace the current one, ideally with a measurable target.
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
@@ -246,12 +263,12 @@ prompts:
 
   - nodeId: Q11
     eval_prompt: |-
-      Expected answer target: Priority traits a new maize variety must have to replace the current one, ideally with a measurable target.
+      Expected answer target: The lowest yield in a bad season that would still lead to continued planting of the current variety (% or bags/acre).
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
     followup_prompt: |-
-      Expected answer target: Priority traits a new maize variety must have to replace the current one, ideally with a measurable target.
+      Expected answer target: The lowest yield in a bad season that would still lead to continued planting of the current variety (% or bags/acre).
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
@@ -259,12 +276,12 @@ prompts:
 
   - nodeId: Q12
     eval_prompt: |-
-      Expected answer target: The lowest yield in a bad season that would still lead to continued planting of the current variety (% or bags/acre).
+      Expected answer target: The maize growth stage where drought causes the greatest loss or damage.
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
     followup_prompt: |-
-      Expected answer target: The lowest yield in a bad season that would still lead to continued planting of the current variety (% or bags/acre).
+      Expected answer target: The maize growth stage where drought causes the greatest loss or damage.
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
@@ -272,12 +289,12 @@ prompts:
 
   - nodeId: Q13
     eval_prompt: |-
-      Expected answer target: The maize growth stage where drought causes the greatest loss or damage.
+      Expected answer target: The factors/criteria used to decide how maize is allocated across food, livestock feed, sale, and other uses.
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
     followup_prompt: |-
-      Expected answer target: The maize growth stage where drought causes the greatest loss or damage.
+      Expected answer target: The factors/criteria used to decide how maize is allocated across food, livestock feed, sale, and other uses.
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
@@ -285,12 +302,12 @@ prompts:
 
   - nodeId: Q14
     eval_prompt: |-
-      Expected answer target: The factors/criteria used to decide how maize is allocated across food, livestock feed, sale, and other uses.
+      Expected answer target: Which animals are fed white maize and how often.
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
     followup_prompt: |-
-      Expected answer target: The factors/criteria used to decide how maize is allocated across food, livestock feed, sale, and other uses.
+      Expected answer target: Which animals are fed white maize and how often.
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
@@ -298,31 +315,18 @@ prompts:
 
   - nodeId: Q15
     eval_prompt: |-
-      Expected answer target: Which animals are fed white maize and how often.
+      Expected answer target: Where seed is usually obtained and the reason for preferring that source.
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
     followup_prompt: |-
-      Expected answer target: Which animals are fed white maize and how often.
+      Expected answer target: Where seed is usually obtained and the reason for preferring that source.
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
       EVAL_JSON: {{EVAL_JSON}}
 
   - nodeId: Q16
-    eval_prompt: |-
-      Expected answer target: Where seed is usually obtained and the reason for preferring that source.
-      Question: {{QUESTION}}
-      Original answer: {{ANSWER}}
-      Answered followup pairs: {{HISTORY}}
-    followup_prompt: |-
-      Expected answer target: Where seed is usually obtained and the reason for preferring that source.
-      Question: {{QUESTION}}
-      Original answer: {{ANSWER}}
-      Answered followup pairs: {{HISTORY}}
-      EVAL_JSON: {{EVAL_JSON}}
-
-  - nodeId: Q17
     eval_prompt: |-
       Expected answer target: Where maize is usually sold after harvest and the reason for choosing that market/buyer.
       Question: {{QUESTION}}

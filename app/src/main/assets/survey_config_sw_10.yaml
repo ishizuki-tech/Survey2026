@@ -11,127 +11,131 @@ graph:
       nextId: Q1
 
     - id: Q1
-      type: TEXT
-      title: Sub-County
-      question: Je unaishi katika sub-county gani?
+      type: SINGLE_CHOICE
+      title: Sub-county na Ward
+      question: Unaishi sub-county na ward gani?
+      options:
+        - Githunguri – Githunguri
+        - Gatundu South – Ndarugu
+        - Gatundu South – Ngenda
+        - Gatundu North – Githobokoni
+        - Gatundu North – Gituamba
+        - Other / Nyingine
+      read_aloud: false
+      other_text_option: Other / Nyingine
       nextId: Q2
 
     - id: Q2
-      type: TEXT
-      title: Kata
-      question: Je, unaishi katika kata gani?
-      nextId: Q3
-
-    - id: Q3
       type: SINGLE_CHOICE
       title: Jinsia ya Mhojiwa
-      question: "Jinsia ya Mhojiwa:"
+      question: Jinsia ya Mhojiwa
       options:
         - Mwanaume
         - Mwanamke
+      read_aloud: false
+      nextId: Q3
+
+    - id: Q3
+      type: NUMBER
+      title: Umri wa Mhojiwa
+      question: Una miaka mingapi?
+      special_options:
+        - Sipendi kusema
       nextId: Q4
 
     - id: Q4
-      type: SINGLE_CHOICE
-      title: Umri wa Mhojiwa
-      question: Una umri gani?
-      options:
-        - Chini ya 35
-        - 35-50
-        - Zaidi ya 50
+      type: TEXT
+      title: Mimea Inayolimwa
+      question: Unalima mazao gani?
       nextId: Q5
 
     - id: Q5
       type: TEXT
-      title: Mimea Inayolimwa
-      question: Ni mimea gani unayolima?
+      title: Wanyama Wanaofugwa
+      question: Unafuga wanyama gani?
       nextId: Q6
 
     - id: Q6
-      type: TEXT
-      title: Wanyama Wanaofugwa
-      question: Ni wanyama gani unaofuga?
+      type: NUMBER
+      title: Miaka ya Kulima Mahindi Meupe
+      question: Umekuwa ukilima mahindi meupe kwa miaka mingapi?
+      special_options:
+        - Sipendi kusema
+      numeric_routes:
+        - less_than_or_equal: 2
+          next_id: Done
       nextId: Q7
+      nextIdByAnswer:
+        "Sipendi kusema": Done
 
     - id: Q7
-      type: SINGLE_CHOICE
-      title: Miaka ya Kulima Mahindi Meupe
-      question: Umekuwa ukilima mahindi meupe kwa muda gani?
-      options:
-        - Zaidi ya miaka 2
-        - Chini ya miaka 2
-      nextId: Q8
-      nextIdByAnswer:
-        "Chini ya miaka 2": Done
-
-    - id: Q8
       type: AI
       title: Athari ya FAW kwa Mahindi
       question: >-
-        Je, minyoo ya majani (Fall Armyworm) imewahi kuathiri mahindi yako? Ikiwa ndiyo, iliathiri vipi mazao yako?
+        Mahindi yako yamewahi kushambuliwa na funza jeshi (Fall Armyworm)? Ikiwa ndiyo, yalipata hasara gani?
+      nextId: Q8
+
+    - id: Q8
+      type: AI
+      title: Kubadilishana Mavuno kwa Kuvuna Siku 20 Mapema
+      question: >-
+        Kama ungeweza kuvuna mahindi yako siku 20 mapema, lakini mavuno yangepungua, ungekubali kupoteza kiasi gani cha mavuno ili uvune mapema?
       nextId: Q9
 
     - id: Q9
       type: AI
-      title: Kubadilishana Mavuno kwa Kuvuna Siku 20 Mapema
+      title: Kizingiti cha Uharibifu cha Kubadilisha Aina ya Mahindi
       question: >-
-        Ikiwa kuvuna mahindi yako siku 20 mapema kungepunguza mavuno, ungekubali kupoteza kiasi gani cha mavuno ili uweze kuvuna siku 20 mapema?
+        Ni kiwango gani cha uharibifu wa mahindi unaosababishwa na wadudu au magonjwa ambacho kingekufanya ubadilishe aina ya mahindi unayopanda?
       nextId: Q10
 
     - id: Q10
       type: AI
-      title: Kizingiti cha Uharibifu cha Kubadilisha Aina ya Mahindi
+      title: Sifa Zinazohitajika kwa Aina Mbadala
       question: >-
-        Ni kiwango gani cha uharibifu wa wadudu au magonjwa ambacho kingekufanya ubadilishe na kujaribu aina nyingine ya mahindi?
+        Kama kungekuwa na aina mpya ya mahindi, ingehitaji kuwa na sifa gani ili uamue kuipanda badala ya aina unayopanda sasa?
       nextId: Q11
 
     - id: Q11
       type: AI
-      title: Sifa Zinazohitajika kwa Aina Mbadala
+      title: Mavuno ya Chini Yanayokubalika Msimu Mbaya
       question: >-
-        Aina mpya ya mahindi ingehitaji kuwa na sifa gani ili ujaribu kuipanda badala ya ile ya sasa?
+        Msimu ukiwa mbaya, ni mavuno ya chini kiasi gani ambayo bado yangekufanya uendelee kupanda aina hii ya mahindi?
       nextId: Q12
 
     - id: Q12
       type: AI
-      title: Mavuno ya Chini Yanayokubalika Msimu Mbaya
+      title: Hatua ya Ukuaji Inayoathiriwa Zaidi na Ukame
       question: >-
-        Ikiwa msimu ni mbaya, ni mavuno ya chini kiasi gani ya mahindi bado yangekufanya uendelee kutumia aina hii ya mbegu?
+        Ukame huwa unasababisha hasara kubwa zaidi wakati gani katika ukuaji wa mahindi?
       nextId: Q13
 
     - id: Q13
       type: AI
-      title: Hatua ya Ukuaji Inayoathiriwa Zaidi na Ukame
+      title: "Ugawaji wa Mahindi: Chakula, Malisho, Kuuza"
       question: >-
-        Ukame huwa tatizo kubwa zaidi katika hatua gani ya ukuaji wa mahindi?
+        Unaamua aje kiasi cha mahindi cha kuweka kwa matumizi ya nyumbani, kulisha mifugo, kuuza, au matumizi mengine?
       nextId: Q14
 
     - id: Q14
       type: AI
-      title: "Ugawaji wa Mahindi: Chakula, Malisho, Kuuza"
+      title: Mahindi Meupe kwa Chakula cha Mifugo
       question: >-
-        Unaamuaje kiasi cha mahindi kitakachotumika kwa chakula cha familia, malisho ya mifugo, kuuza, au matumizi mengine?
+        Kama unatumia mahindi meupe kulisha mifugo, unawalisha mifugo gani na mara ngapi?
       nextId: Q15
 
     - id: Q15
       type: AI
-      title: Mahindi Meupe kwa Chakula cha Mifugo
+      title: Chanzo cha Mbegu za Mahindi
       question: >-
-        Ikiwa unatumia mahindi meupe kulisha mifugo, ni mifugo gani hupatiwa na kwa mara ngapi?
+        Kwa kawaida unapata wapi mbegu za mahindi meupe unazopanda, na kwa nini unapendelea kununua au kupata mbegu huko?
       nextId: Q16
 
     - id: Q16
       type: AI
-      title: Chanzo cha Mbegu za Mahindi
-      question: >-
-        Kwa kawaida unapata wapi mbegu za mahindi meupe unazopanda, na kwa nini unachagua mbinu hiyo?
-      nextId: Q17
-
-    - id: Q17
-      type: AI
       title: Soko la Kuuzia Mahindi
       question: >-
-        Kwa kawaida unauza mahindi yako wapi baada ya kuvuna, na kwa nini unachagua soko au mnunuzi huyo?
+        Kwa kawaida baada ya kuvuna, unauza mahindi yako wapi, na kwa nini unapendelea kuuza huko au kwa mnunuzi huyo?
       nextId: Review
 
     - id: Review
@@ -192,7 +196,7 @@ slm:
   length_budget_followup: "Liwe fupi, la moja kwa moja na lenye jambo moja tu."
 
 prompts:
-  - nodeId: Q8
+  - nodeId: Q7
     eval_prompt: |-
       Lengo la jibu: kama FAW iliathiri zao na, kama ndiyo, angalau maelezo moja mahususi ya athari yake, kama vile upotevu wa mavuno au aina ya uharibifu wa zao.
       Question: {{QUESTION}}
@@ -204,7 +208,7 @@ prompts:
       Answered followup pairs: {{HISTORY}}
       EVAL_JSON: {{EVAL_JSON}}
 
-  - nodeId: Q9
+  - nodeId: Q8
     eval_prompt: |-
       Lengo la jibu: hasara ya juu ya mavuno unayokubali ili kuvuna siku 20 mapema (% au magunia/ekari).
       Question: {{QUESTION}}
@@ -212,6 +216,19 @@ prompts:
       Answered followup pairs: {{HISTORY}}
     followup_prompt: |-
       Lengo la jibu: hasara ya juu ya mavuno unayokubali ili kuvuna siku 20 mapema (% au magunia/ekari).
+      Question: {{QUESTION}}
+      Original answer: {{ANSWER}}
+      Answered followup pairs: {{HISTORY}}
+      EVAL_JSON: {{EVAL_JSON}}
+
+  - nodeId: Q9
+    eval_prompt: |-
+      Lengo la jibu: kizingiti wazi cha kubadilisha aina ya mahindi (kipimo + kiwango).
+      Question: {{QUESTION}}
+      Original answer: {{ANSWER}}
+      Answered followup pairs: {{HISTORY}}
+    followup_prompt: |-
+      Lengo la jibu: kizingiti wazi cha kubadilisha aina ya mahindi (kipimo + kiwango).
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
@@ -219,12 +236,12 @@ prompts:
 
   - nodeId: Q10
     eval_prompt: |-
-      Lengo la jibu: kizingiti wazi cha kubadilisha aina ya mahindi (kipimo + kiwango).
+      Lengo la jibu: sifa za kipaumbele za aina mpya, ikiwezekana na kigezo kimoja kinachopimika.
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
     followup_prompt: |-
-      Lengo la jibu: kizingiti wazi cha kubadilisha aina ya mahindi (kipimo + kiwango).
+      Lengo la jibu: sifa za kipaumbele za aina mpya, ikiwezekana na kigezo kimoja kinachopimika.
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
@@ -232,12 +249,12 @@ prompts:
 
   - nodeId: Q11
     eval_prompt: |-
-      Lengo la jibu: sifa za kipaumbele za aina mpya, ikiwezekana na kigezo kimoja kinachopimika.
+      Lengo la jibu: mavuno ya chini unayokubali katika msimu mbaya (% au magunia/ekari).
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
     followup_prompt: |-
-      Lengo la jibu: sifa za kipaumbele za aina mpya, ikiwezekana na kigezo kimoja kinachopimika.
+      Lengo la jibu: mavuno ya chini unayokubali katika msimu mbaya (% au magunia/ekari).
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
@@ -245,12 +262,12 @@ prompts:
 
   - nodeId: Q12
     eval_prompt: |-
-      Lengo la jibu: mavuno ya chini unayokubali katika msimu mbaya (% au magunia/ekari).
+      Lengo la jibu: hatua ya ukuaji wa mahindi inayoathiriwa zaidi na ukame.
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
     followup_prompt: |-
-      Lengo la jibu: mavuno ya chini unayokubali katika msimu mbaya (% au magunia/ekari).
+      Lengo la jibu: hatua ya ukuaji wa mahindi inayoathiriwa zaidi na ukame.
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
@@ -258,12 +275,12 @@ prompts:
 
   - nodeId: Q13
     eval_prompt: |-
-      Lengo la jibu: hatua ya ukuaji wa mahindi inayoathiriwa zaidi na ukame.
+      Lengo la jibu: vigezo/sababu zinazotumika kuamua ugawaji wa mahindi kati ya chakula, malisho, kuuza, na matumizi mengine.
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
     followup_prompt: |-
-      Lengo la jibu: hatua ya ukuaji wa mahindi inayoathiriwa zaidi na ukame.
+      Lengo la jibu: vigezo/sababu zinazotumika kuamua ugawaji wa mahindi kati ya chakula, malisho, kuuza, na matumizi mengine.
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
@@ -271,12 +288,12 @@ prompts:
 
   - nodeId: Q14
     eval_prompt: |-
-      Lengo la jibu: vigezo/sababu zinazotumika kuamua ugawaji wa mahindi kati ya chakula, malisho, kuuza, na matumizi mengine.
+      Lengo la jibu: mifugo inayolishwa mahindi meupe na mara ngapi.
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
     followup_prompt: |-
-      Lengo la jibu: vigezo/sababu zinazotumika kuamua ugawaji wa mahindi kati ya chakula, malisho, kuuza, na matumizi mengine.
+      Lengo la jibu: mifugo inayolishwa mahindi meupe na mara ngapi.
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
@@ -284,31 +301,18 @@ prompts:
 
   - nodeId: Q15
     eval_prompt: |-
-      Lengo la jibu: mifugo inayolishwa mahindi meupe na mara ngapi.
+      Lengo la jibu: chanzo cha kawaida cha mbegu na sababu ya kuchagua chanzo hicho.
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
     followup_prompt: |-
-      Lengo la jibu: mifugo inayolishwa mahindi meupe na mara ngapi.
+      Lengo la jibu: chanzo cha kawaida cha mbegu na sababu ya kuchagua chanzo hicho.
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
       EVAL_JSON: {{EVAL_JSON}}
 
   - nodeId: Q16
-    eval_prompt: |-
-      Lengo la jibu: chanzo cha kawaida cha mbegu na sababu ya kuchagua chanzo hicho.
-      Question: {{QUESTION}}
-      Original answer: {{ANSWER}}
-      Answered followup pairs: {{HISTORY}}
-    followup_prompt: |-
-      Lengo la jibu: chanzo cha kawaida cha mbegu na sababu ya kuchagua chanzo hicho.
-      Question: {{QUESTION}}
-      Original answer: {{ANSWER}}
-      Answered followup pairs: {{HISTORY}}
-      EVAL_JSON: {{EVAL_JSON}}
-
-  - nodeId: Q17
     eval_prompt: |-
       Lengo la jibu: mahali pa kawaida pa kuuza mahindi baada ya kuvuna na sababu ya kuchagua soko/mnunuzi huyo.
       Question: {{QUESTION}}
