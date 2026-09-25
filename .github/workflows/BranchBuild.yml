@@ -172,21 +172,24 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Create or update branch preview release
+      - name: Create branch preview release
         env:
           GH_TOKEN: ${{ github.token }}
           APK_PATH: ${{ steps.apk.outputs.path }}
           APK_NAME: ${{ steps.apk.outputs.name }}
           BRANCH: ${{ steps.apk.outputs.branch }}
           BRANCH_SLUG: ${{ steps.apk.outputs.branch_slug }}
+          SHORT_SHA: ${{ steps.apk.outputs.short_sha }}
           REPOSITORY: ${{ github.repository }}
           SERVER_URL: ${{ github.server_url }}
           COMMIT_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
 
-          RELEASE_TAG="branch-preview-$BRANCH_SLUG"
-          RELEASE_TITLE="Survey2026 branch preview: $BRANCH"
+          # Keep every successful branch build as its own prerelease.
+          # A rerun of the same workflow run updates only that run's prerelease.
+          RELEASE_TAG="branch-preview-$BRANCH_SLUG-$SHORT_SHA-run-$GITHUB_RUN_NUMBER"
+          RELEASE_TITLE="Survey2026 branch preview: $BRANCH · build #$GITHUB_RUN_NUMBER · $SHORT_SHA"
           APK_DOWNLOAD_URL="$SERVER_URL/$REPOSITORY/releases/download/$RELEASE_TAG/$APK_NAME"
 
           # Generate a standalone QR code that points directly to this preview APK.
@@ -214,7 +217,7 @@ jobs:
 
           NOTES="$RUNNER_TEMP/branch-preview-release-notes.md"
           {
-            echo "Latest preview APK for branch $BRANCH. This prerelease is replaced by each successful branch build."
+            echo "Branch preview APK for $BRANCH. This prerelease is retained so older tester builds remain available."
             echo
             echo "- Source commit SHA: $COMMIT_SHA"
             echo "- Workflow run number: $GITHUB_RUN_NUMBER"
@@ -228,16 +231,6 @@ jobs:
           } > "$NOTES"
 
           if gh release view "$RELEASE_TAG" --repo "$REPOSITORY" >/dev/null 2>&1; then
-            while IFS= read -r asset_name; do
-              case "$asset_name" in
-                "Survey2026-${BRANCH_SLUG}-"*.apk|"Survey2026-${BRANCH_SLUG}-"*"-qr.png")
-                  gh release delete-asset "$RELEASE_TAG" "$asset_name" \
-                    --repo "$REPOSITORY" \
-                    --yes
-                  ;;
-              esac
-            done < <(gh release view "$RELEASE_TAG" --repo "$REPOSITORY" --json assets --jq '.assets[].name')
-
             gh release upload "$RELEASE_TAG" "${RELEASE_ASSETS[@]}" \
               --repo "$REPOSITORY" \
               --clobber
