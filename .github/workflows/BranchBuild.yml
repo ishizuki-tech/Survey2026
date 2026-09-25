@@ -172,6 +172,55 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+      - name: Create or update branch preview release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APK_PATH: ${{ steps.apk.outputs.path }}
+          APK_NAME: ${{ steps.apk.outputs.name }}
+          BRANCH: ${{ steps.apk.outputs.branch }}
+          BRANCH_SLUG: ${{ steps.apk.outputs.branch_slug }}
+          REPOSITORY: ${{ github.repository }}
+          SERVER_URL: ${{ github.server_url }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          RELEASE_TAG="branch-preview-$BRANCH_SLUG"
+          RELEASE_TITLE="Survey2026 branch preview: $BRANCH"
+          RELEASE_NOTES="Latest preview APK for branch $BRANCH. This prerelease is replaced by each successful branch build."
+
+          if gh release view "$RELEASE_TAG" --repo "$REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" \
+              --repo "$REPOSITORY" \
+              --target "$COMMIT_SHA" \
+              --title "$RELEASE_TITLE" \
+              --prerelease \
+              --notes "$RELEASE_NOTES"
+          else
+            gh release create "$RELEASE_TAG" \
+              --repo "$REPOSITORY" \
+              --target "$COMMIT_SHA" \
+              --title "$RELEASE_TITLE" \
+              --prerelease \
+              --notes "$RELEASE_NOTES"
+          fi
+
+          while IFS= read -r asset_name; do
+            case "$asset_name" in
+              "Survey2026-${BRANCH_SLUG}-"*.apk)
+                gh release delete-asset "$RELEASE_TAG" "$asset_name" \
+                  --repo "$REPOSITORY" \
+                  --yes
+                ;;
+            esac
+          done < <(gh release view "$RELEASE_TAG" --repo "$REPOSITORY" --json assets --jq '.assets[].name')
+
+          gh release upload "$RELEASE_TAG" "$APK_PATH#$APK_NAME" \
+            --repo "$REPOSITORY" \
+            --clobber
+
+          echo "Release page: $SERVER_URL/$REPOSITORY/releases/tag/$RELEASE_TAG"
+
       - name: Check out existing GitHub Pages content
         uses: actions/checkout@v5
         with:
