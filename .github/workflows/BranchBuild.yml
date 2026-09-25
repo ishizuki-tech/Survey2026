@@ -189,7 +189,7 @@ jobs:
           # Keep every successful branch build as its own prerelease.
           # A rerun of the same workflow run updates only that run's prerelease.
           RELEASE_TAG="branch-preview-$BRANCH_SLUG-$SHORT_SHA-run-$GITHUB_RUN_NUMBER"
-          RELEASE_TITLE="Survey2026 branch preview: $BRANCH · build #$GITHUB_RUN_NUMBER · $SHORT_SHA"
+          RELEASE_TITLE="Survey2026 PREVIEW #$GITHUB_RUN_NUMBER · $BRANCH · $SHORT_SHA"
           APK_DOWNLOAD_URL="$SERVER_URL/$REPOSITORY/releases/download/$RELEASE_TAG/$APK_NAME"
 
           # Generate a standalone QR code that points directly to this preview APK.

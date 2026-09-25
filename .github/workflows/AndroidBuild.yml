@@ -546,14 +546,14 @@ jobs:
             gh release upload "$RELEASE_TAG" "${RELEASE_ASSETS[@]}" --clobber --repo "$GITHUB_REPOSITORY"
             gh release edit "$RELEASE_TAG" \
               --target "$GITHUB_SHA" \
-              --title "Survey2026 build #${GITHUB_RUN_NUMBER}" \
+              --title "Survey2026 MAIN #${GITHUB_RUN_NUMBER} · ${SHORT_SHA}" \
               --notes-file "$NOTES" \
               --latest \
               --repo "$GITHUB_REPOSITORY"
           else
             gh release create "$RELEASE_TAG" "${RELEASE_ASSETS[@]}" \
               --target "$GITHUB_SHA" \
-              --title "Survey2026 build #${GITHUB_RUN_NUMBER}" \
+              --title "Survey2026 MAIN #${GITHUB_RUN_NUMBER} · ${SHORT_SHA}" \
               --notes-file "$NOTES" \
               --latest \
               --repo "$GITHUB_REPOSITORY"
