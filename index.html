@@ -22,6 +22,7 @@
     .config-files h2 { margin-bottom: 8px; }
     .config-files p { margin: 0 0 12px; }
     .config-files a { color: #9dccff; }
+    .whats-new-body { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; color: #becde0; line-height: 1.55; }
     .qr-panel { display: grid; grid-template-columns: 300px 1fr; gap: 30px; align-items: center; margin-top: 30px; padding: 24px; border-radius: 18px; background: rgba(255,255,255,.055); }
     .qr-box { padding: 10px; border-radius: 18px; background: #fff; }
     .qr-box img { display: block; width: 100%; height: auto; }
@@ -45,36 +46,44 @@
         <h2>Build provenance</h2>
         
         <p>
-        <strong>Source:</strong> <code>aed2bc7baad71bbdb8c089e7cb353d665f0fd1f5</code></p>
+        <strong>Source:</strong> <code>d747c9af97b8ca2ea2bb4bc0a70d01f888572238</code></p>
       </section>
-      <a class="download" href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-91-aed2bc7/Survey2026-aed2bc7-release.apk">Download APK</a>
+      <section class="config-files"><h2>What's New</h2><h3>Generate What&#x27;s New from merged pull request</h3><pre class="whats-new-body">Android releases now generate What&#x27;s New automatically from the pull request merged into main.
+
+Changes:
+- use the merged PR title and body for GitHub Release notes
+- show the same What&#x27;s New content on the Android download page
+- fall back to commit metadata when PR lookup is unavailable
+- safely transport multiline metadata and HTML-escape download-page content
+- preserve existing QR, signing, build, and release behavior</pre></section>
+      <a class="download" href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-92-d747c9a/Survey2026-d747c9a-release.apk">Download APK</a>
       <p class="note">Direct GitHub Release asset. No ZIP extraction is required.</p>
       <section class="config-files">
         <h2>Config files included in this APK</h2>
         <p class="note">These config files were extracted from the exact APK build shown on this page.</p>
-        <p><strong>English — survey_config10.yaml</strong><br><a href="https://github.com/ishizuki-tech/Survey2026/blob/aed2bc7baad71bbdb8c089e7cb353d665f0fd1f5/app/src/main/assets/survey_config10.yaml">View in browser</a> · <a href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-91-aed2bc7/survey_config10.yaml">Download</a><br><code>SHA-256: 03c61877264de51524e8f12107f0eaee3ed1abe16c7874fae0a77c863fa66d26</code></p>
-        <p><strong>Swahili — survey_config_sw_10.yaml</strong><br><a href="https://github.com/ishizuki-tech/Survey2026/blob/aed2bc7baad71bbdb8c089e7cb353d665f0fd1f5/app/src/main/assets/survey_config_sw_10.yaml">View in browser</a> · <a href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-91-aed2bc7/survey_config_sw_10.yaml">Download</a><br><code>SHA-256: 90f00f7ceadbd2bb0d780f65fd12f23c2610b9d94ea502e51462c860e617f017</code></p>
+        <p><strong>English — survey_config10.yaml</strong><br><a href="https://github.com/ishizuki-tech/Survey2026/blob/d747c9af97b8ca2ea2bb4bc0a70d01f888572238/app/src/main/assets/survey_config10.yaml">View in browser</a> · <a href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-92-d747c9a/survey_config10.yaml">Download</a><br><code>SHA-256: 03c61877264de51524e8f12107f0eaee3ed1abe16c7874fae0a77c863fa66d26</code></p>
+        <p><strong>Swahili — survey_config_sw_10.yaml</strong><br><a href="https://github.com/ishizuki-tech/Survey2026/blob/d747c9af97b8ca2ea2bb4bc0a70d01f888572238/app/src/main/assets/survey_config_sw_10.yaml">View in browser</a> · <a href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-92-d747c9a/survey_config_sw_10.yaml">Download</a><br><code>SHA-256: 90f00f7ceadbd2bb0d780f65fd12f23c2610b9d94ea502e51462c860e617f017</code></p>
       </section>
       <div class="qr-panel">
-        <div class="qr-box"><img src="qr.png" alt="QR code that downloads the Survey2026 APK for build-91-aed2bc7" width="300" height="300"></div>
-        <div><h2>Scan with Android</h2><p class="subtitle">This QR code downloads the APK for this build (build-91-aed2bc7).</p><code>https://github.com/ishizuki-tech/Survey2026/releases/download/build-91-aed2bc7/Survey2026-aed2bc7-release.apk</code></div>
+        <div class="qr-box"><img src="qr.png" alt="QR code that downloads the Survey2026 APK for build-92-d747c9a" width="300" height="300"></div>
+        <div><h2>Scan with Android</h2><p class="subtitle">This QR code downloads the APK for this build (build-92-d747c9a).</p><code>https://github.com/ishizuki-tech/Survey2026/releases/download/build-92-d747c9a/Survey2026-d747c9a-release.apk</code></div>
       </div>
       <div class="grid">
-        <div class="item"><span class="label">Release tag</span><code>build-91-aed2bc7</code></div>
+        <div class="item"><span class="label">Release tag</span><code>build-92-d747c9a</code></div>
         <div class="item"><span class="label">Branch</span><code>main</code></div>
-        <div class="item"><span class="label">Commit SHA</span><code>aed2bc7</code></div>
-        <div class="item"><span class="label">APK filename</span><code>Survey2026-aed2bc7-release.apk</code></div>
-        <div class="item"><span class="label">Workflow run number</span><code>91</code></div>
-        <div class="item"><span class="label">APK SHA-256</span><code>e2db18537f21abaad391cd7730bb20658890dcc8e8d1eb55023ff0967012c8f8</code></div>
+        <div class="item"><span class="label">Commit SHA</span><code>d747c9a</code></div>
+        <div class="item"><span class="label">APK filename</span><code>Survey2026-d747c9a-release.apk</code></div>
+        <div class="item"><span class="label">Workflow run number</span><code>92</code></div>
+        <div class="item"><span class="label">APK SHA-256</span><code>fc7fa6b9abf9159913cf70ce14411ea7ac2700512aa803c601c82d73c1490fb8</code></div>
         <div class="item"><span class="label">Signing certificate SHA-256</span><code>d6edef47ec6734a46122ab7fddb5e4f17d19d4d51ae3eaddfb32f309ee5036ea</code></div>
-        <div class="item"><span class="label">Generated timestamp</span><code>2026-09-25T17:51:36Z</code></div>
+        <div class="item"><span class="label">Generated timestamp</span><code>2026-09-25T23:35:01Z</code></div>
       </div>
       <div class="links">
-        <a href="https://github.com/ishizuki-tech/Survey2026/releases/tag/build-91-aed2bc7">GitHub Release</a>
-        <a href="https://github.com/ishizuki-tech/Survey2026/actions/runs/36169018960">GitHub Actions run</a>
+        <a href="https://github.com/ishizuki-tech/Survey2026/releases/tag/build-92-d747c9a">GitHub Release</a>
+        <a href="https://github.com/ishizuki-tech/Survey2026/actions/runs/36200997302">GitHub Actions run</a>
         <a href="https://github.com/ishizuki-tech/Survey2026">Repository</a>
       </div>
-      <footer>Survey2026 release metadata generated 2026-09-25T17:51:36Z.</footer>
+      <footer>Survey2026 release metadata generated 2026-09-25T23:35:01Z.</footer>
     </section>
   </main>
 </body>
