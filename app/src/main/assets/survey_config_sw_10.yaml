@@ -45,7 +45,13 @@ graph:
       nextId: Q1
       nextIdByAnswer:
         "Ndiyo, nakubali kushiriki": Q1
-        "Hapana, sikubali kushiriki": Done
+        "Hapana, sikubali kushiriki": ConsentDeclined
+
+    - id: ConsentDeclined
+      type: STOP
+      title: Hapana, sikubali kushiriki
+      question: Mahojiano yamesitishwa.
+      read_aloud: false
 
     - id: Q1
       type: SINGLE_CHOICE

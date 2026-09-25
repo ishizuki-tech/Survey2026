@@ -158,6 +158,7 @@ import com.negi.survey.vm.FlowMulti
 import com.negi.survey.vm.FlowNumber
 import com.negi.survey.vm.FlowReview
 import com.negi.survey.vm.FlowSingle
+import com.negi.survey.vm.FlowStop
 import com.negi.survey.vm.FlowText
 import com.negi.survey.vm.ModelPersistenceDialog
 import com.negi.survey.vm.NoOpQuestionSpeaker
@@ -1321,6 +1322,21 @@ fun SurveyNavHost(
                     )
                 }
 
+                entry<FlowStop> {
+                    val node by vmSurvey.currentNode.collectAsStateWithLifecycle()
+
+                    StopNodeScreen(
+                        title = node.title,
+                        message = node.question,
+                        onRestart = {
+                            Log.d(MainActivity.TAG, "Stop -> Start New Survey requested")
+                            vmAI.resetStates()
+                            vmSurvey.resetToStart()
+                            onResetToSelector()
+                        },
+                    )
+                }
+
                 entry<FlowText> {
                     val node by vmSurvey.currentNode.collectAsStateWithLifecycle()
                     val answers by vmSurvey.answers.collectAsStateWithLifecycle()
@@ -1643,6 +1659,57 @@ private fun InfoNodeScreen(
                     secondaryLabel = "Back",
                     onSecondary = onBack,
                 )
+            }
+        }
+    }
+}
+
+@Composable
+private fun StopNodeScreen(
+    title: String,
+    message: String,
+    onRestart: () -> Unit,
+) {
+    val backplate = appBackplate()
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .imePadding()
+            .background(backplate)
+            .padding(24.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Surface(
+            tonalElevation = 6.dp,
+            shadowElevation = 8.dp,
+            shape = MaterialTheme.shapes.large,
+            color = MaterialTheme.colorScheme.surface.copy(alpha = 0.97f),
+            modifier = Modifier
+                .fillMaxWidth()
+                .widthIn(max = 520.dp)
+                .wrapContentWidth()
+                .neonEdgeThin(),
+        ) {
+            Column(
+                modifier = Modifier.padding(horizontal = 24.dp, vertical = 20.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                if (title.isNotBlank()) {
+                    Text(text = title, style = MaterialTheme.typography.titleLarge)
+                }
+                if (message.isNotBlank()) {
+                    Text(text = message, style = MaterialTheme.typography.bodyLarge)
+                }
+
+                Spacer(Modifier.height(10.dp))
+
+                Button(
+                    onClick = onRestart,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text("Start New Survey")
+                }
             }
         }
     }

@@ -923,7 +923,18 @@ data class SurveyConfig(
 
         graph.nodes
             .asSequence()
-            .filter { it.nodeType() != NodeType.DONE && it.nodeType() != NodeType.UNKNOWN }
+            .filter { it.nodeType() == NodeType.STOP }
+            .filter { !it.nextId.isNullOrBlank() }
+            .forEach { node ->
+                issues += "STOP node '${node.id}' should not define nextId (got nextId='${node.nextId}')"
+            }
+
+        graph.nodes
+            .asSequence()
+            .filter {
+                val type = it.nodeType()
+                type != NodeType.DONE && type != NodeType.STOP && type != NodeType.UNKNOWN
+            }
             .forEach { node ->
                 val next = node.nextId?.trim().orEmpty()
                 if (next.isBlank()) {
@@ -1091,6 +1102,7 @@ data class NumericRoute(
 enum class NodeType {
     START,
     INFO,
+    STOP,
     TEXT,
     SINGLE_CHOICE,
     MULTI_CHOICE,
@@ -1111,6 +1123,7 @@ enum class NodeType {
             return when (norm) {
                 "START" -> START
                 "INFO", "INFORMATION" -> INFO
+                "STOP" -> STOP
                 "TEXT" -> TEXT
                 "SINGLE_CHOICE", "SINGLECHOICE", "SINGLE_OPTION", "RADIO" -> SINGLE_CHOICE
                 "MULTI_CHOICE", "MULTICHOICE", "MULTI_OPTION", "CHECKBOX" -> MULTI_CHOICE
