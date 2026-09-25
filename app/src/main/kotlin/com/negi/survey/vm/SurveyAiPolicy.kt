@@ -13,34 +13,72 @@ enum class SurveyAiReason(val wireValue: String, val terminal: Boolean) {
 
 internal enum class SurveyAiDecision { ACHIEVED, GENERATE, LIMIT_REACHED, FAILURE }
 
+internal data class SurveyAiEvaluation(
+    val decision: SurveyAiDecision,
+    val missingPoints: List<String> = emptyList(),
+)
+
 internal object SurveyAiPolicy {
-    fun evaluate(raw: String, timedOut: Boolean, error: String?, remaining: Int): SurveyAiDecision {
-        if (timedOut || error != null) return SurveyAiDecision.FAILURE
+    fun evaluate(
+        raw: String,
+        timedOut: Boolean,
+        error: String?,
+        remaining: Int,
+        requiredComponents: List<String> = emptyList(),
+        requiredComponentIds: List<String> = emptyList(),
+    ): SurveyAiDecision = evaluateAdmission(
+        raw, timedOut, error, remaining, requiredComponents, requiredComponentIds,
+    ).decision
+
+    fun evaluateAdmission(
+        raw: String,
+        timedOut: Boolean,
+        error: String?,
+        remaining: Int,
+        requiredComponents: List<String> = emptyList(),
+        requiredComponentIds: List<String> = emptyList(),
+    ): SurveyAiEvaluation {
+        if (timedOut || error != null) return SurveyAiEvaluation(SurveyAiDecision.FAILURE)
         val obj = runCatching { Json.parseToJsonElement(raw.trim()) as? JsonObject }.getOrNull()
-            ?: return SurveyAiDecision.FAILURE
-        val scoreValue = obj["score"] as? JsonPrimitive ?: return SurveyAiDecision.FAILURE
+            ?: return SurveyAiEvaluation(SurveyAiDecision.FAILURE)
+        val scoreValue = obj["score"] as? JsonPrimitive ?: return SurveyAiEvaluation(SurveyAiDecision.FAILURE)
         val score = scoreValue.takeUnless { it.isString }?.intOrNull
-            ?.takeIf { it in 1..100 } ?: return SurveyAiDecision.FAILURE
-        val missing = obj["missing_points"] as? JsonArray ?: return SurveyAiDecision.FAILURE
+            ?.takeIf { it in 1..100 } ?: return SurveyAiEvaluation(SurveyAiDecision.FAILURE)
+        val missing = obj["missing_points"] as? JsonArray ?: return SurveyAiEvaluation(SurveyAiDecision.FAILURE)
         if (missing.any {
                 val point = it as? JsonPrimitive
                 point == null || !point.isString || point.content.isBlank()
-            }) return SurveyAiDecision.FAILURE
-        val followupValue = obj["followup_needed"] as? JsonPrimitive
-            ?: return SurveyAiDecision.FAILURE
-        val followupNeeded = followupValue.takeUnless { it.isString }?.booleanOrNull
-            ?: return SurveyAiDecision.FAILURE
+            }) return SurveyAiEvaluation(SurveyAiDecision.FAILURE)
+        val missingPoints = missing.map { (it as JsonPrimitive).content }
+        val allowed = if (requiredComponentIds.isNotEmpty()) requiredComponentIds else requiredComponents
+        if (allowed.isNotEmpty() &&
+            (missingPoints.any { it !in allowed } ||
+                missingPoints.distinct().size != missingPoints.size)
+        ) return SurveyAiEvaluation(SurveyAiDecision.FAILURE)
+        val followupNeeded =
+            if (!obj.containsKey("followup_needed")) {
+                // A low score with valid unresolved points unambiguously requires the next step.
+                if (score in 1..89 && missing.isNotEmpty()) true else return SurveyAiEvaluation(SurveyAiDecision.FAILURE)
+            } else {
+                val followupValue = obj["followup_needed"] as? JsonPrimitive
+                    ?: return SurveyAiEvaluation(SurveyAiDecision.FAILURE)
+                followupValue.takeUnless { it.isString }?.booleanOrNull
+                    ?: return SurveyAiEvaluation(SurveyAiDecision.FAILURE)
+            }
 
         if (score >= 90) {
             return if (missing.isEmpty() && !followupNeeded) {
-                SurveyAiDecision.ACHIEVED
+                SurveyAiEvaluation(SurveyAiDecision.ACHIEVED, missingPoints)
             } else {
-                SurveyAiDecision.FAILURE
+                SurveyAiEvaluation(SurveyAiDecision.FAILURE)
             }
         }
 
-        if (missing.isEmpty() || !followupNeeded) return SurveyAiDecision.FAILURE
-        return if (remaining > 0) SurveyAiDecision.GENERATE else SurveyAiDecision.LIMIT_REACHED
+        if (missing.isEmpty() || !followupNeeded) return SurveyAiEvaluation(SurveyAiDecision.FAILURE)
+        return SurveyAiEvaluation(
+            if (remaining > 0) SurveyAiDecision.GENERATE else SurveyAiDecision.LIMIT_REACHED,
+            missingPoints,
+        )
     }
 
     fun normalize(question: String): String = question.trim().lowercase(Locale.ROOT)

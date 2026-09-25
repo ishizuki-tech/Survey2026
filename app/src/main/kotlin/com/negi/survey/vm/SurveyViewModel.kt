@@ -29,6 +29,7 @@ import androidx.lifecycle.ViewModel
 import androidx.navigation3.runtime.NavBackStack
 import androidx.navigation3.runtime.NavKey
 import com.negi.survey.config.NodeDTO
+import com.negi.survey.config.RequiredComponent
 import com.negi.survey.config.SurveyConfig
 import com.negi.survey.net.RuntimeLogStore
 import java.util.UUID
@@ -399,6 +400,27 @@ open class SurveyViewModel(
     fun remainingFollowups(nodeId: String): Int =
         (maxFollowups - followups.value[nodeId.trim()].orEmpty().size).coerceAtLeast(0)
 
+    fun requiredComponentsFor(nodeId: String): List<String> {
+        val k = nodeId.trim()
+        return config.graph.nodes
+            .firstOrNull { it.id.trim() == k }
+            ?.requiredComponents
+            .orEmpty()
+    }
+
+    fun requiredComponentCatalogFor(nodeId: String): List<RequiredComponent> {
+        val k = nodeId.trim()
+        return config.graph.nodes
+            .firstOrNull { it.id.trim() == k }
+            ?.requiredComponentCatalog
+            .orEmpty()
+    }
+
+    fun resolvedRequiredComponentsFor(nodeId: String, ids: List<String>): List<RequiredComponent> {
+        val byId = requiredComponentCatalogFor(nodeId).associateBy { it.id }
+        return ids.map { id -> byId[id] ?: return emptyList() }
+    }
+
     private fun answeredHistory(nodeId: String): String =
         followups.value[nodeId.trim()].orEmpty().filter { !it.answer.isNullOrBlank() }
             .mapIndexed { index, entry ->
@@ -716,18 +738,48 @@ open class SurveyViewModel(
             )
         )
 
-        if (DEBUG_PROMPTS) {
-            RuntimeLogStore.d(TAG, "getEvalPrompt[$k] -> len=${rendered.length}")
+        val catalog = requiredComponentCatalogFor(k)
+        val requiredComponents = requiredComponentsFor(k)
+
+        val output = if (catalog.isNotEmpty()) {
+            buildString {
+                append(rendered)
+                append("\nRequired component catalog:")
+                catalog.forEach { component ->
+                    append("\n- ")
+                    append(component.id)
+                    append(": ")
+                    append(component.text)
+                }
+            }
+        } else if (requiredComponents.isEmpty()) {
+            rendered
+        } else {
+            buildString {
+                append(rendered)
+                append("\nRequired components:")
+                requiredComponents.forEachIndexed { index, component ->
+                    append("\n")
+                    append(index + 1)
+                    append(". ")
+                    append(component)
+                }
+            }
         }
 
-        return rendered
+        if (DEBUG_PROMPTS) {
+            RuntimeLogStore.d(TAG, "getEvalPrompt[$k] -> len=${output.length}")
+        }
+
+        return output
     }
 
     fun getFollowupPrompt(
         nodeId: String,
         question: String,
         answer: String,
-        evalJsonRaw: String
+        evalJsonRaw: String,
+        resolvedComponents: List<RequiredComponent> = emptyList(),
     ): String {
         val k = nodeId.trim()
         require(k.isNotBlank()) { "getFollowupPrompt: nodeId is blank" }
@@ -746,11 +798,24 @@ open class SurveyViewModel(
             )
         )
 
-        if (DEBUG_PROMPTS) {
-            RuntimeLogStore.d(TAG, "getFollowupPrompt[$k] -> len=${rendered.length} evalLen=${evalJsonRaw.length}")
+        val output = if (resolvedComponents.isEmpty()) rendered else buildString {
+            append(rendered)
+            if (resolvedComponents.size == 1) {
+                val component = resolvedComponents.single()
+                append("\nResolved missing component:\nID: ${component.id}\nDescription: ${component.text}")
+            } else {
+                append("\nResolved missing components:")
+                resolvedComponents.forEach { component ->
+                    append("\n- ID: ${component.id}\n  Description: ${component.text}")
+                }
+            }
         }
 
-        return rendered
+        if (DEBUG_PROMPTS) {
+            RuntimeLogStore.d(TAG, "getFollowupPrompt[$k] -> len=${output.length} evalLen=${evalJsonRaw.length}")
+        }
+
+        return output
     }
 
     private fun renderTemplate(template: String, vars: LinkedHashMap<String, String>): String {

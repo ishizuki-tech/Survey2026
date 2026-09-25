@@ -4,6 +4,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.test.junit4.v2.createComposeRule
 import androidx.navigation3.runtime.rememberNavBackStack
 import com.negi.survey.config.NodeDTO
+import com.negi.survey.config.RequiredComponent
 import com.negi.survey.config.SurveyConfig
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -122,6 +123,98 @@ class AiFollowupPersistenceTest {
         }
     }
 
+    @Test
+    fun eval_prompt_renders_required_components_once_and_preserves_history() {
+        lateinit var vm: SurveyViewModel
+
+        composeRule.setContent {
+            val backStack = rememberNavBackStack(FlowHome)
+            vm = remember { SurveyViewModel(backStack, q15ComponentsConfig()) }
+        }
+
+        composeRule.runOnIdle {
+            vm.setAnswer(Q15_MAIN_ANSWER, Q15_NODE_ID)
+
+            val initial = vm.getEvalPrompt(Q15_NODE_ID, Q15_QUESTION, Q15_MAIN_ANSWER)
+            assertEquals(
+                """
+                    Expected answer target: Which animals are fed white maize and how often.
+                    Question: $Q15_QUESTION
+                    Original answer: $Q15_MAIN_ANSWER
+                    Answered followup pairs:${' '}
+                    Required components:
+                    1. $Q15_ANIMALS_COMPONENT
+                    2. $Q15_FREQUENCY_COMPONENT
+                """.trimIndent(),
+                initial,
+            )
+
+            vm.addFollowupQuestion(Q15_NODE_ID, Q15_FOLLOWUP)
+            vm.answerLastFollowup(Q15_NODE_ID, "Cattle.")
+            val accumulated = vm.getEvalPrompt(Q15_NODE_ID, Q15_QUESTION, Q15_MAIN_ANSWER)
+
+            assertEquals(1, Regex("Required components:").findAll(accumulated).count())
+            assertTrue(accumulated.contains("Expected answer target: Which animals are fed white maize and how often."))
+            assertTrue(accumulated.contains("Question: $Q15_QUESTION"))
+            assertTrue(accumulated.contains("Original answer: $Q15_MAIN_ANSWER"))
+            assertTrue(accumulated.contains("Answered followup pairs: Follow-up 1: $Q15_FOLLOWUP\nAnswer 1: Cattle."))
+            assertTrue(accumulated.contains("1. $Q15_ANIMALS_COMPONENT"))
+            assertTrue(accumulated.contains("2. $Q15_FREQUENCY_COMPONENT"))
+        }
+    }
+
+    @Test
+    fun eval_prompt_without_required_components_preserves_existing_rendering() {
+        lateinit var vm: SurveyViewModel
+
+        composeRule.setContent {
+            val backStack = rememberNavBackStack(FlowHome)
+            vm = remember { SurveyViewModel(backStack, q15ComponentsConfig(requiredComponents = emptyList())) }
+        }
+
+        composeRule.runOnIdle {
+            vm.setAnswer(Q15_MAIN_ANSWER, Q15_NODE_ID)
+            assertEquals(
+                """
+                    Expected answer target: Which animals are fed white maize and how often.
+                    Question: $Q15_QUESTION
+                    Original answer: $Q15_MAIN_ANSWER
+                    Answered followup pairs:${' '}
+                """.trimIndent(),
+                vm.getEvalPrompt(Q15_NODE_ID, Q15_QUESTION, Q15_MAIN_ANSWER),
+            )
+        }
+    }
+
+    @Test
+    fun catalog_eval_and_followup_prompts_include_resolved_component_once() {
+        lateinit var vm: SurveyViewModel
+        val evaluation = """{"score":65,"missing_points":["feeding_frequency"],"followup_needed":true}"""
+
+        composeRule.setContent {
+            val backStack = rememberNavBackStack(FlowHome)
+            vm = remember { SurveyViewModel(backStack, q15CatalogConfig()) }
+        }
+
+        composeRule.runOnIdle {
+            vm.setAnswer(Q15_MAIN_ANSWER, Q15_NODE_ID)
+            val evalPrompt = vm.getEvalPrompt(Q15_NODE_ID, Q15_QUESTION, Q15_MAIN_ANSWER)
+            assertTrue(evalPrompt.contains("Required component catalog:\n- animals: $Q15_ANIMALS_COMPONENT\n- feeding_frequency: $Q15_FREQUENCY_COMPONENT"))
+
+            val followupPrompt = vm.getFollowupPrompt(
+                Q15_NODE_ID,
+                Q15_QUESTION,
+                Q15_MAIN_ANSWER,
+                evaluation,
+                vm.resolvedRequiredComponentsFor(Q15_NODE_ID, listOf("feeding_frequency")),
+            )
+            assertTrue(followupPrompt.contains(evaluation))
+            assertEquals(1, Regex("Resolved missing component:").findAll(followupPrompt).count())
+            assertTrue(followupPrompt.contains("ID: feeding_frequency"))
+            assertTrue(followupPrompt.contains("Description: $Q15_FREQUENCY_COMPONENT"))
+        }
+    }
+
     private fun aiConfig() = SurveyConfig(
         graph = SurveyConfig.Graph(
             startId = "Start",
@@ -160,6 +253,55 @@ class AiFollowupPersistenceTest {
         ),
     )
 
+    private fun q15ComponentsConfig(requiredComponents: List<String> = listOf(
+        Q15_ANIMALS_COMPONENT,
+        Q15_FREQUENCY_COMPONENT,
+    )) = SurveyConfig(
+        graph = SurveyConfig.Graph(
+            startId = "Start",
+            nodes = listOf(
+                NodeDTO(id = "Start", type = "START", nextId = Q15_NODE_ID),
+                NodeDTO(
+                    id = Q15_NODE_ID,
+                    type = "AI",
+                    question = Q15_QUESTION,
+                    nextId = "Done",
+                    requiredComponents = requiredComponents,
+                ),
+                NodeDTO(id = "Done", type = "DONE"),
+            ),
+        ),
+        prompts = listOf(
+            SurveyConfig.Prompt(
+                nodeId = Q15_NODE_ID,
+                evalPrompt = """
+                    Expected answer target: Which animals are fed white maize and how often.
+                    Question: {{QUESTION}}
+                    Original answer: {{ANSWER}}
+                    Answered followup pairs: {{HISTORY}}
+                """.trimIndent(),
+                followupPrompt = "Follow-up: {{EVAL_JSON}}",
+            ),
+        ),
+    )
+
+    private fun q15CatalogConfig() = q15ComponentsConfig(requiredComponents = emptyList()).let { config ->
+        config.copy(
+            graph = config.graph.copy(
+                nodes = config.graph.nodes.map { node ->
+                    if (node.id == Q15_NODE_ID) {
+                        node.copy(
+                            requiredComponentCatalog = listOf(
+                                RequiredComponent("animals", Q15_ANIMALS_COMPONENT),
+                                RequiredComponent("feeding_frequency", Q15_FREQUENCY_COMPONENT),
+                            ),
+                        )
+                    } else node
+                },
+            ),
+        )
+    }
+
     private companion object {
         const val AI_NODE_ID = "Q8"
         const val Q11_NODE_ID = "Q11"
@@ -169,5 +311,11 @@ class AiFollowupPersistenceTest {
         const val Q11_YIELD_ANSWER = "At least twenty percent higher yield."
         const val Q11_PEST_QUESTION = "What specific pests should the new maize variety resist?"
         const val Q11_PEST_ANSWER = "Fall armyworm and maize stalk borer."
+        const val Q15_NODE_ID = "Q15"
+        const val Q15_QUESTION = "If you use white maize to feed livestock, which animals receive it and how often?"
+        const val Q15_MAIN_ANSWER = "Yes, I feed white maize to livestock."
+        const val Q15_FOLLOWUP = "Which livestock animals receive white maize?"
+        const val Q15_ANIMALS_COMPONENT = "If white maize is used for livestock: which animals receive it"
+        const val Q15_FREQUENCY_COMPONENT = "If white maize is used for livestock: how often it is fed"
     }
 }

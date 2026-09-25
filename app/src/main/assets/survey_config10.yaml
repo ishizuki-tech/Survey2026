@@ -118,6 +118,11 @@ graph:
       title: White Maize for Livestock Feed
       question: >-
         If you use white maize to feed livestock, which animals receive it and how often?
+      required_component_catalog:
+        - id: animals
+          text: "If white maize is used for livestock: which animals receive it"
+        - id: feeding_frequency
+          text: "If white maize is used for livestock: how often it is fed"
       nextId: Q16
 
     - id: Q16
@@ -125,6 +130,11 @@ graph:
       title: Maize Seed Sourcing
       question: >-
         Where do you usually obtain the white maize seed that you plant, and why do you prefer getting it there?
+      required_component_catalog:
+        - id: seed_source
+          text: "Usual source of white maize seed"
+        - id: source_reason
+          text: "Reason for preferring that source"
       nextId: Q17
 
     - id: Q17
@@ -132,6 +142,11 @@ graph:
       title: Maize Selling Market
       question: >-
         Where do you usually sell your maize after harvest, and why do you choose that market or buyer?
+      required_component_catalog:
+        - id: sale_destination
+          text: "Usual market or buyer after harvest"
+        - id: destination_reason
+          text: "Reason for choosing that market or buyer"
       nextId: Review
 
     - id: Review
@@ -147,7 +162,7 @@ graph:
 
 slm:
   accelerator: GPU
-  max_tokens: 512
+  max_tokens: 1024
   top_k: 1
   top_p: 0.0
   temperature: 0.0
@@ -164,6 +179,8 @@ slm:
     N must be an integer 1-100 for relevance, completeness and accuracy against the original target.
     Evaluate the original answer and all answered followup pairs together.
     Before emitting JSON, compare every candidate missing point against the original answer and every answered follow-up pair. If an answered follow-up directly supplies that information, do not include it in missing_points. Recompute score, missing_points, and followup_needed together as one consistent final decision.
+    Treat each independently answerable required component as a separate missing_points item; never combine independently answerable deficiencies. After every answered follow-up, recompute components independently and omit each supplied component even when another component from the same target remains missing.
+    When a Required component catalog is present, evaluate each catalog item independently: missing_points may contain only configured component IDs. Omit IDs whose component is supplied by the original answer or answered follow-up pairs; never return component descriptions or questions as missing_points. When a Required components block is present, missing_points may contain only the exact text of unresolved configured components.
     Separate relevance from completeness. An answer can discuss the right topic but still be incomplete.
     Score 90-100 only when the respondent explicitly provides every material component requested by the Expected answer target and Question.
     Do not infer missing details from general knowledge, plausibility, or a bare statement that an event occurred.
