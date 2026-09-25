@@ -48,6 +48,7 @@ private const val TAG = "SurveyVM"
 
 enum class NodeType {
     START,
+    INFO,
     TEXT,
     SINGLE_CHOICE,
     MULTI_CHOICE,
@@ -103,6 +104,7 @@ internal fun Node.composeSingleChoiceAnswer(selected: String?, otherText: String
 /* ───────────────────────────── Nav Keys ───────────────────────────── */
 
 @Serializable object FlowHome : NavKey
+@Serializable object FlowInfo : NavKey
 @Serializable object FlowText : NavKey
 @Serializable object FlowSingle : NavKey
 @Serializable object FlowMulti : NavKey
@@ -896,6 +898,7 @@ open class SurveyViewModel(
     private fun navKeyFor(node: Node): NavKey =
         when (node.type) {
             NodeType.START -> FlowHome
+            NodeType.INFO -> FlowInfo
             NodeType.TEXT -> FlowText
             NodeType.SINGLE_CHOICE -> FlowSingle
             NodeType.MULTI_CHOICE -> FlowMulti
@@ -1138,6 +1141,7 @@ open class SurveyViewModel(
         val rawType = this.type.trim()
         val t = when (rawType.uppercase()) {
             "START" -> NodeType.START
+            "INFO", "INFORMATION" -> NodeType.INFO
             "TEXT" -> NodeType.TEXT
             "SINGLE_CHOICE", "SINGLECHOICE", "RADIO" -> NodeType.SINGLE_CHOICE
             "MULTI_CHOICE", "MULTICHOICE", "CHECKBOX" -> NodeType.MULTI_CHOICE

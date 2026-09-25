@@ -153,6 +153,7 @@ import com.negi.survey.vm.DownloadGate
 import com.negi.survey.vm.FlowAI
 import com.negi.survey.vm.FlowDone
 import com.negi.survey.vm.FlowHome
+import com.negi.survey.vm.FlowInfo
 import com.negi.survey.vm.FlowMulti
 import com.negi.survey.vm.FlowNumber
 import com.negi.survey.vm.FlowReview
@@ -1300,6 +1301,26 @@ fun SurveyNavHost(
                     )
                 }
 
+                entry<FlowInfo> {
+                    val node by vmSurvey.currentNode.collectAsStateWithLifecycle()
+                    val ttsSpeaking by ttsController.isSpeaking.collectAsStateWithLifecycle()
+
+                    LaunchedEffect(node.id, node.question, ttsAutoPlay, node.readAloud) {
+                        if (ttsAutoPlay && node.readAloud && vmSurvey.claimTtsAutoPlay(node.id)) {
+                            runCatching { ttsController.speak(node.question, node.id) }
+                        }
+                    }
+
+                    InfoNodeScreen(
+                        title = node.title,
+                        text = node.question,
+                        onNext = { vmSurvey.advanceToNext() },
+                        onBack = { vmSurvey.backToPrevious() },
+                        onReplay = { toggleQuestionSpeaker(ttsController, node.question, node.id) },
+                        isSpeaking = ttsSpeaking,
+                    )
+                }
+
                 entry<FlowText> {
                     val node by vmSurvey.currentNode.collectAsStateWithLifecycle()
                     val answers by vmSurvey.answers.collectAsStateWithLifecycle()
@@ -1558,6 +1579,74 @@ private fun buildGitHubConfigOrNull(): GitHubUploader.GitHubConfig? {
 }
 
 /* ───────────────────────────── Minimal Node Screens ───────────────────────────── */
+
+@Composable
+private fun InfoNodeScreen(
+    title: String,
+    text: String,
+    onNext: () -> Unit,
+    onBack: () -> Unit,
+    onReplay: () -> Unit = {},
+    isSpeaking: Boolean = false,
+) {
+    val backplate = appBackplate()
+    val scroll = rememberScrollState()
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .imePadding()
+            .background(backplate)
+            .padding(24.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Surface(
+            tonalElevation = 6.dp,
+            shadowElevation = 8.dp,
+            shape = MaterialTheme.shapes.large,
+            color = MaterialTheme.colorScheme.surface.copy(alpha = 0.97f),
+            modifier = Modifier
+                .fillMaxWidth()
+                .widthIn(max = 520.dp)
+                .wrapContentWidth()
+                .neonEdgeThin(),
+        ) {
+            Column(
+                modifier = Modifier
+                    .padding(horizontal = 24.dp, vertical = 20.dp)
+                    .verticalScroll(scroll),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                if (title.isNotBlank()) {
+                    Text(text = title, style = MaterialTheme.typography.titleLarge)
+                }
+
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    Text(
+                        text = text.ifBlank { "(no information text)" },
+                        style = MaterialTheme.typography.bodyLarge,
+                        modifier = Modifier.weight(1f),
+                    )
+                    IconButton(onClick = onReplay) {
+                        Text(if (isSpeaking) "\u23F9" else "\uD83D\uDD0A")
+                    }
+                }
+
+                Spacer(Modifier.height(10.dp))
+
+                RowButtons(
+                    primaryLabel = "Next",
+                    onPrimary = onNext,
+                    secondaryLabel = "Back",
+                    onSecondary = onBack,
+                )
+            }
+        }
+    }
+}
 
 @Composable
 internal fun TextNodeScreen(
