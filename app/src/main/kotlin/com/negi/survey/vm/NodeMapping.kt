@@ -76,6 +76,7 @@ private fun resolveVmNodeType(rawType: String?): NodeType {
     // Keep backward compatibility with legacy config spellings / aliases.
     return when (normalized) {
         "START" -> NodeType.START
+        "INFO", "INFORMATION" -> NodeType.INFO
         "TEXT" -> NodeType.TEXT
 
         "SINGLE_CHOICE", "SINGLECHOICE", "RADIO" -> NodeType.SINGLE_CHOICE

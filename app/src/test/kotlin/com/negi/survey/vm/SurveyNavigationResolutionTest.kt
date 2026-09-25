@@ -1,11 +1,26 @@
 package com.negi.survey.vm
 
+import com.negi.survey.config.NodeDTO
 import com.negi.survey.config.SurveyConfigLoader
 import java.io.File
 import org.junit.Assert.assertEquals
 import org.junit.Test
 
 class SurveyNavigationResolutionTest {
+
+    @Test
+    fun info_node_maps_to_info_and_uses_default_next_id() {
+        val node = NodeDTO(
+            id = "Introduction",
+            type = "INFO",
+            title = "Introduction",
+            question = "Study information",
+            nextId = "Consent",
+        ).toVmNode()
+
+        assertEquals(NodeType.INFO, node.type)
+        assertEquals("Consent", node.resolveNextId(null))
+    }
 
     @Test
     fun mapped_answer_overrides_next_id() {

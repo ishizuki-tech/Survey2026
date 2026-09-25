@@ -1090,6 +1090,7 @@ data class NumericRoute(
 
 enum class NodeType {
     START,
+    INFO,
     TEXT,
     SINGLE_CHOICE,
     MULTI_CHOICE,
@@ -1109,6 +1110,7 @@ enum class NodeType {
 
             return when (norm) {
                 "START" -> START
+                "INFO", "INFORMATION" -> INFO
                 "TEXT" -> TEXT
                 "SINGLE_CHOICE", "SINGLECHOICE", "SINGLE_OPTION", "RADIO" -> SINGLE_CHOICE
                 "MULTI_CHOICE", "MULTICHOICE", "MULTI_OPTION", "CHECKBOX" -> MULTI_CHOICE
