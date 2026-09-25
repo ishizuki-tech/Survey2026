@@ -474,6 +474,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           APK: ${{ steps.apk.outputs.path }}
           APK_NAME: ${{ steps.apk.outputs.apk_name }}
+          DOWNLOAD_URL: ${{ steps.apk.outputs.download_url }}
           ENGLISH_CONFIG: ${{ steps.apk.outputs.english_config_path }}
           SWAHILI_CONFIG: ${{ steps.apk.outputs.swahili_config_path }}
           APK_SHA256: ${{ steps.apk.outputs.apk_sha256 }}
@@ -490,6 +491,30 @@ jobs:
           test -n "$SIGNING_CERT_SHA256"
           test -n "$ENGLISH_CONFIG_SHA256"
           test -n "$SWAHILI_CONFIG_SHA256"
+
+          # Standalone, print-ready QR code (larger, with a quiet zone) that downloads this release's APK.
+          # It is optional: a failure only warns and never blocks the release.
+          RELEASE_ASSETS=("$APK" "$ENGLISH_CONFIG" "$SWAHILI_CONFIG")
+          QR_NAME="${APK_NAME%.apk}-qr.png"
+          QR="$RUNNER_TEMP/$QR_NAME"
+          QR_IMAGE_URL=""
+          if [[ -n "$DOWNLOAD_URL" ]] \
+            && curl --fail --silent --show-error --location \
+              --retry 3 \
+              --retry-all-errors \
+              --get \
+              --data-urlencode "size=1000x1000" \
+              --data-urlencode "qzone=4" \
+              --data-urlencode "data=$DOWNLOAD_URL" \
+              "https://api.qrserver.com/v1/create-qr-code/" \
+              --output "$QR" \
+            && [[ -s "$QR" ]] \
+            && [[ "$(file -b --mime-type "$QR")" == "image/png" ]]; then
+            RELEASE_ASSETS+=("$QR")
+            QR_IMAGE_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/${QR_NAME}"
+          else
+            echo "::warning::Could not generate a PNG QR code for the release APK download link; publishing the release without it."
+          fi
 
           NOTES="$RUNNER_TEMP/survey2026-release-notes.md"
           {
@@ -509,20 +534,16 @@ jobs:
             echo "- English config SHA-256: ${ENGLISH_CONFIG_SHA256}"
             echo "- Swahili config SHA-256: ${SWAHILI_CONFIG_SHA256}"
             echo "- Signing certificate SHA-256: ${SIGNING_CERT_SHA256}"
-            echo
-            echo "## What's New"
-            echo
-            echo "- Review -> Finish -> automatic queue -> Done"
-            echo "- Offline queue with automatic upload after reconnect"
-            echo "- Uploaded/Pending survey counts and Device ID"
-            echo "- Duplicate upload protection and recovery improvements"
-            echo "- English/Swahili age options are now language-specific"
-            echo
-            echo "- Verified device: Pixel 9a (manual E2E)"
+            if [[ -n "$QR_IMAGE_URL" ]]; then
+              echo
+              echo "## Scan to download"
+              echo
+              printf '<img src="%s" width="240" alt="QR code that downloads %s">\n' "$QR_IMAGE_URL" "$APK_NAME"
+            fi
           } > "$NOTES"
 
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" "$APK" "$ENGLISH_CONFIG" "$SWAHILI_CONFIG" --clobber --repo "$GITHUB_REPOSITORY"
+            gh release upload "$RELEASE_TAG" "${RELEASE_ASSETS[@]}" --clobber --repo "$GITHUB_REPOSITORY"
             gh release edit "$RELEASE_TAG" \
               --target "$GITHUB_SHA" \
               --title "Survey2026 build #${GITHUB_RUN_NUMBER}" \
@@ -530,7 +551,7 @@ jobs:
               --latest \
               --repo "$GITHUB_REPOSITORY"
           else
-            gh release create "$RELEASE_TAG" "$APK" "$ENGLISH_CONFIG" "$SWAHILI_CONFIG" \
+            gh release create "$RELEASE_TAG" "${RELEASE_ASSETS[@]}" \
               --target "$GITHUB_SHA" \
               --title "Survey2026 build #${GITHUB_RUN_NUMBER}" \
               --notes-file "$NOTES" \
@@ -581,9 +602,6 @@ jobs:
 
           mkdir -p download-page
           GENERATED_UTC="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-          OWNER="${REPOSITORY%%/*}"
-          REPO_NAME="${REPOSITORY#*/}"
-          PAGE_URL="https://${OWNER}.github.io/${REPO_NAME}/"
           RUN_URL="${SERVER_URL}/${REPOSITORY}/actions/runs/${RUN_ID}"
           REPO_URL="${SERVER_URL}/${REPOSITORY}"
           QR_URL="qr.png"
@@ -597,7 +615,7 @@ jobs:
             --retry-all-errors \
             --get \
             --data-urlencode "size=300x300" \
-            --data-urlencode "data=$PAGE_URL" \
+            --data-urlencode "data=$DOWNLOAD_URL" \
             "https://api.qrserver.com/v1/create-qr-code/" \
             --output download-page/qr.png
           if [[ ! -s download-page/qr.png ]] || [[ "$(file -b --mime-type download-page/qr.png)" != "image/png" ]]; then
@@ -653,19 +671,10 @@ jobs:
                   <h2>Build provenance</h2>
                   ${STABLE_TAG:+<p><strong>Stable checkpoint:</strong> <code>${STABLE_TAG}</code></p>}
                   <p>
-                  <strong>Source:</strong> <code>${GITHUB_SHA}</code><br>
-                  <strong>Verified device:</strong> Pixel 9a (manual E2E)</p>
+                  <strong>Source:</strong> <code>${GITHUB_SHA}</code></p>
                 </section>
                 <a class="download" href="${DOWNLOAD_URL}">Download APK</a>
                 <p class="note">Direct GitHub Release asset. No ZIP extraction is required.</p>
-                <section class="config-files">
-                  <h2>What's New</h2>
-                  <p>Review → Finish → automatic queue → Done<br>
-                  Offline queue with automatic upload after reconnect<br>
-                  Uploaded/Pending survey counts and Device ID<br>
-                  Duplicate upload protection and recovery improvements<br>
-                  English/Swahili age options are now language-specific</p>
-                </section>
                 <section class="config-files">
                   <h2>Config files included in this APK</h2>
                   <p class="note">These config files were extracted from the exact APK build shown on this page.</p>
@@ -673,8 +682,8 @@ jobs:
                   <p><strong>Swahili — survey_config_sw_10.yaml</strong><br><a href="${SWAHILI_CONFIG_VIEW_URL}">View in browser</a> · <a href="${SWAHILI_CONFIG_URL}">Download</a><br><code>SHA-256: ${SWAHILI_CONFIG_SHA256}</code></p>
                 </section>
                 <div class="qr-panel">
-                  <div class="qr-box"><img src="${QR_URL}" alt="QR code for the permanent Survey2026 download page" width="300" height="300"></div>
-                  <div><h2>Scan with Android</h2><p class="subtitle">This QR code opens the permanent download page.</p><code>${PAGE_URL}</code></div>
+                  <div class="qr-box"><img src="${QR_URL}" alt="QR code that downloads the Survey2026 APK for ${RELEASE_TAG}" width="300" height="300"></div>
+                  <div><h2>Scan with Android</h2><p class="subtitle">This QR code downloads the APK for this build (${RELEASE_TAG}).</p><code>${DOWNLOAD_URL}</code></div>
                 </div>
                 <div class="grid">
                   <div class="item"><span class="label">Release tag</span><code>${RELEASE_TAG}</code></div>
@@ -703,7 +712,6 @@ jobs:
             "repository": "${REPOSITORY}",
             "stable_tag": "${STABLE_TAG}",
             "source_commit_sha": "${GITHUB_SHA}",
-            "verified_device": "Pixel 9a",
             "release_tag": "${RELEASE_TAG}",
             "branch": "${BRANCH}",
             "release_url": "${RELEASE_URL}",
