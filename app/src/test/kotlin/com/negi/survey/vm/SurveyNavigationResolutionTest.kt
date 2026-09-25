@@ -38,7 +38,11 @@ class SurveyNavigationResolutionTest {
         assertEquals(NodeType.SINGLE_CHOICE, consent.type)
         assertEquals(true, consent.readAloud)
         assertEquals("Q1", consent.resolveNextId("Yes, and proceed"))
-        assertEquals("Done", consent.resolveNextId("No, and stop the interview"))
+        assertEquals("ConsentDeclined", consent.resolveNextId("No, and stop the interview"))
+
+        val declined = config.graph.nodes.single { it.id == "ConsentDeclined" }.toVmNode()
+        assertEquals(NodeType.STOP, declined.type)
+        assertEquals(null, declined.resolveNextId(null))
     }
 
     @Test
@@ -57,7 +61,11 @@ class SurveyNavigationResolutionTest {
         assertEquals(NodeType.SINGLE_CHOICE, consent.type)
         assertEquals(true, consent.readAloud)
         assertEquals("Q1", consent.resolveNextId("Ndiyo, nakubali kushiriki"))
-        assertEquals("Done", consent.resolveNextId("Hapana, sikubali kushiriki"))
+        assertEquals("ConsentDeclined", consent.resolveNextId("Hapana, sikubali kushiriki"))
+
+        val declined = config.graph.nodes.single { it.id == "ConsentDeclined" }.toVmNode()
+        assertEquals(NodeType.STOP, declined.type)
+        assertEquals(null, declined.resolveNextId(null))
     }
 
     @Test

@@ -77,6 +77,7 @@ private fun resolveVmNodeType(rawType: String?): NodeType {
     return when (normalized) {
         "START" -> NodeType.START
         "INFO", "INFORMATION" -> NodeType.INFO
+        "STOP" -> NodeType.STOP
         "TEXT" -> NodeType.TEXT
 
         "SINGLE_CHOICE", "SINGLECHOICE", "RADIO" -> NodeType.SINGLE_CHOICE
