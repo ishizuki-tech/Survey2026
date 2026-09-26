@@ -19,6 +19,7 @@ on:
 
 permissions:
   contents: write
+  pull-requests: read
 
 concurrency:
   group: android-release-apk-${{ github.ref }}
@@ -59,6 +60,10 @@ jobs:
       stable_tag: ${{ steps.apk.outputs.stable_tag }}
       short_sha: ${{ steps.apk.outputs.short_sha }}
       branch: ${{ steps.apk.outputs.branch }}
+      whats_new_source: ${{ steps.whats_new.outputs.source }}
+      whats_new_pr_number: ${{ steps.whats_new.outputs.pr_number }}
+      whats_new_title_b64: ${{ steps.whats_new.outputs.title_b64 }}
+      whats_new_body_b64: ${{ steps.whats_new.outputs.body_b64 }}
 
     steps:
       - name: Checkout repository
@@ -67,6 +72,49 @@ jobs:
           fetch-depth: 1
           submodules: recursive
           persist-credentials: false
+
+      - name: Resolve What's New metadata
+        id: whats_new
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # If multiple merged main PRs are associated with a commit, choose the highest PR number.
+          if associated_prs="$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls" 2>/dev/null)"; then
+            :
+          else
+            echo "::warning::Could not resolve associated PR metadata; using commit metadata for What's New."
+            associated_prs='[]'
+          fi
+          selected_pr="$(jq -c --arg repository "$GITHUB_REPOSITORY" '
+            [.[] | select(.merged_at != null and .base.ref == "main" and .base.repo.full_name == $repository)]
+            | sort_by(.number)
+            | last // empty
+          ' <<<"$associated_prs")"
+
+          if [[ -n "$selected_pr" ]]; then
+            source="pr"
+            pr_number="$(jq -r '.number' <<<"$selected_pr")"
+            title="$(jq -r '.title // ""' <<<"$selected_pr")"
+            body="$(jq -r '.body // ""' <<<"$selected_pr")"
+          else
+            source="commit"
+            pr_number=""
+            title="$(git log -1 --pretty=%s "$GITHUB_SHA")"
+            body="$(git log -1 --pretty=%b "$GITHUB_SHA")"
+          fi
+
+          title_b64="$(printf '%s' "$title" | base64 --wrap=0)"
+          body_b64="$(printf '%s' "$body" | base64 --wrap=0)"
+          {
+            echo "source=$source"
+            echo "pr_number=$pr_number"
+            echo "title_b64=$title_b64"
+            echo "body_b64=$body_b64"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Set up JDK 17
         uses: actions/setup-java@v5
@@ -483,6 +531,9 @@ jobs:
           SWAHILI_CONFIG_SHA256: ${{ steps.apk.outputs.swahili_config_sha256 }}
           STABLE_TAG: ${{ steps.apk.outputs.stable_tag }}
           RELEASE_TAG: ${{ steps.apk.outputs.release_tag }}
+          SHORT_SHA: ${{ steps.apk.outputs.short_sha }}
+          WHATS_NEW_TITLE_B64: ${{ steps.whats_new.outputs.title_b64 }}
+          WHATS_NEW_BODY_B64: ${{ steps.whats_new.outputs.body_b64 }}
         run: |
           set -euo pipefail
           test -s "$APK"
@@ -517,10 +568,22 @@ jobs:
           fi
 
           NOTES="$RUNNER_TEMP/survey2026-release-notes.md"
+          WHATS_NEW_TITLE="$RUNNER_TEMP/survey2026-whats-new-title.txt"
+          WHATS_NEW_BODY="$RUNNER_TEMP/survey2026-whats-new-body.txt"
+          printf '%s' "$WHATS_NEW_TITLE_B64" | base64 --decode > "$WHATS_NEW_TITLE"
+          printf '%s' "$WHATS_NEW_BODY_B64" | base64 --decode > "$WHATS_NEW_BODY"
           {
             echo "# Survey2026 ${RELEASE_TAG}"
             echo
             echo "Verified Android release APK."
+            echo
+            echo "## What's New"
+            echo
+            printf '### %s\n' "$(cat "$WHATS_NEW_TITLE")"
+            if [[ -s "$WHATS_NEW_BODY" ]]; then
+              echo
+              cat "$WHATS_NEW_BODY"
+            fi
             echo
             if [[ -n "$STABLE_TAG" ]]; then
               echo "- Stable checkpoint: ${STABLE_TAG}"
@@ -546,14 +609,14 @@ jobs:
             gh release upload "$RELEASE_TAG" "${RELEASE_ASSETS[@]}" --clobber --repo "$GITHUB_REPOSITORY"
             gh release edit "$RELEASE_TAG" \
               --target "$GITHUB_SHA" \
-              --title "Survey2026 build #${GITHUB_RUN_NUMBER}" \
+              --title "MAIN #${GITHUB_RUN_NUMBER} · ${SHORT_SHA}" \
               --notes-file "$NOTES" \
               --latest \
               --repo "$GITHUB_REPOSITORY"
           else
             gh release create "$RELEASE_TAG" "${RELEASE_ASSETS[@]}" \
               --target "$GITHUB_SHA" \
-              --title "Survey2026 build #${GITHUB_RUN_NUMBER}" \
+              --title "MAIN #${GITHUB_RUN_NUMBER} · ${SHORT_SHA}" \
               --notes-file "$NOTES" \
               --latest \
               --repo "$GITHUB_REPOSITORY"
@@ -587,6 +650,8 @@ jobs:
           STABLE_TAG: ${{ needs.build-release-apk.outputs.stable_tag }}
           SHORT_SHA: ${{ needs.build-release-apk.outputs.short_sha }}
           BRANCH: ${{ needs.build-release-apk.outputs.branch }}
+          WHATS_NEW_TITLE_B64: ${{ needs.build-release-apk.outputs.whats_new_title_b64 }}
+          WHATS_NEW_BODY_B64: ${{ needs.build-release-apk.outputs.whats_new_body_b64 }}
           REPOSITORY: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
           RUN_NUMBER: ${{ github.run_number }}
@@ -601,6 +666,21 @@ jobs:
           done
 
           mkdir -p download-page
+          python3 - "$WHATS_NEW_TITLE_B64" "$WHATS_NEW_BODY_B64" <<'PY'
+          import base64
+          import html
+          import sys
+
+          title = html.escape(base64.b64decode(sys.argv[1]).decode("utf-8"))
+          body = html.escape(base64.b64decode(sys.argv[2]).decode("utf-8"))
+          fragment = "<section class=\"config-files\"><h2>What's New</h2><h3>{}</h3>{}</section>".format(
+              title,
+              "<pre class=\"whats-new-body\">{}</pre>".format(body) if body else "",
+          )
+          with open("download-page/whats-new.html", "w", encoding="utf-8") as output:
+              output.write(fragment)
+          PY
+          WHATS_NEW_HTML="$(cat download-page/whats-new.html)"
           GENERATED_UTC="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
           RUN_URL="${SERVER_URL}/${REPOSITORY}/actions/runs/${RUN_ID}"
           REPO_URL="${SERVER_URL}/${REPOSITORY}"
@@ -648,6 +728,7 @@ jobs:
               .config-files h2 { margin-bottom: 8px; }
               .config-files p { margin: 0 0 12px; }
               .config-files a { color: #9dccff; }
+              .whats-new-body { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; color: #becde0; line-height: 1.55; }
               .qr-panel { display: grid; grid-template-columns: 300px 1fr; gap: 30px; align-items: center; margin-top: 30px; padding: 24px; border-radius: 18px; background: rgba(255,255,255,.055); }
               .qr-box { padding: 10px; border-radius: 18px; background: #fff; }
               .qr-box img { display: block; width: 100%; height: auto; }
@@ -673,6 +754,7 @@ jobs:
                   <p>
                   <strong>Source:</strong> <code>${GITHUB_SHA}</code></p>
                 </section>
+                ${WHATS_NEW_HTML}
                 <a class="download" href="${DOWNLOAD_URL}">Download APK</a>
                 <p class="note">Direct GitHub Release asset. No ZIP extraction is required.</p>
                 <section class="config-files">
