@@ -1,11 +1,11 @@
 {
   "original_branch": "fix/main-release-short-sha-env",
   "branch_slug": "fix-main-release-short-sha-env",
-  "commit_sha": "10b85635b05f21582228a1b27fa1a72903589b5e",
-  "short_sha": "10b8563",
-  "apk_name": "Survey2026-fix-main-release-short-sha-env-10b8563.apk",
-  "apk_sha256": "5550a1ef5743e3f496f4e3744c69ae93e0772e161049b16b655ee6da557a758c",
+  "commit_sha": "d42cdc62b36d6e3e4ff989d93056c344658b578e",
+  "short_sha": "d42cdc6",
+  "apk_name": "Survey2026-fix-main-release-short-sha-env-d42cdc6.apk",
+  "apk_sha256": "b8e7c3af61e2ae842080f2b88f6bb8b68b065c601ec546239aa0b71322b52250",
   "page_url": "https://ishizuki-tech.github.io/Survey2026/fix-main-release-short-sha-env/",
-  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/36205817627",
-  "generated_utc": "2026-09-26T00:48:49Z"
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/36205821873",
+  "generated_utc": "2026-09-26T00:55:24Z"
 }
