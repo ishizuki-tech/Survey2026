@@ -1,0 +1,11 @@
+{
+  "original_branch": "fix/main-release-short-sha-env",
+  "branch_slug": "fix-main-release-short-sha-env",
+  "commit_sha": "10b85635b05f21582228a1b27fa1a72903589b5e",
+  "short_sha": "10b8563",
+  "apk_name": "Survey2026-fix-main-release-short-sha-env-10b8563.apk",
+  "apk_sha256": "5550a1ef5743e3f496f4e3744c69ae93e0772e161049b16b655ee6da557a758c",
+  "page_url": "https://ishizuki-tech.github.io/Survey2026/fix-main-release-short-sha-env/",
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/36205817627",
+  "generated_utc": "2026-09-26T00:48:49Z"
+}
