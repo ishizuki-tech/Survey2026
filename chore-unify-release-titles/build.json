@@ -1,11 +1,11 @@
 {
   "original_branch": "chore/unify-release-titles",
   "branch_slug": "chore-unify-release-titles",
-  "commit_sha": "0d525cb250c015f08b3eea57832269d49752b034",
-  "short_sha": "0d525cb",
-  "apk_name": "Survey2026-chore-unify-release-titles-0d525cb.apk",
-  "apk_sha256": "ef0e9e6a2e7d41e622436a8d749a6969f83484ccacb6ceeb72e98b075a18bc50",
+  "commit_sha": "fe3099561609c72d09fbfffda29a9c23fe8d844c",
+  "short_sha": "fe30995",
+  "apk_name": "Survey2026-chore-unify-release-titles-fe30995.apk",
+  "apk_sha256": "9b0b819a7d4822d9715bd9401d06e4d0e0f94e9d3922068c6177cde745bfaa83",
   "page_url": "https://ishizuki-tech.github.io/Survey2026/chore-unify-release-titles/",
-  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/36202954560",
-  "generated_utc": "2026-09-26T00:01:00Z"
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/36203422926",
+  "generated_utc": "2026-09-26T00:14:46Z"
 }
