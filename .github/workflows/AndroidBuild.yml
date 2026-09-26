@@ -531,6 +531,7 @@ jobs:
           SWAHILI_CONFIG_SHA256: ${{ steps.apk.outputs.swahili_config_sha256 }}
           STABLE_TAG: ${{ steps.apk.outputs.stable_tag }}
           RELEASE_TAG: ${{ steps.apk.outputs.release_tag }}
+          SHORT_SHA: ${{ steps.apk.outputs.short_sha }}
           WHATS_NEW_TITLE_B64: ${{ steps.whats_new.outputs.title_b64 }}
           WHATS_NEW_BODY_B64: ${{ steps.whats_new.outputs.body_b64 }}
         run: |
