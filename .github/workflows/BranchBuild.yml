@@ -172,6 +172,86 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+      - name: Create branch preview release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APK_PATH: ${{ steps.apk.outputs.path }}
+          APK_NAME: ${{ steps.apk.outputs.name }}
+          BRANCH: ${{ steps.apk.outputs.branch }}
+          BRANCH_SLUG: ${{ steps.apk.outputs.branch_slug }}
+          SHORT_SHA: ${{ steps.apk.outputs.short_sha }}
+          REPOSITORY: ${{ github.repository }}
+          SERVER_URL: ${{ github.server_url }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          # Keep every successful branch build as its own prerelease.
+          # A rerun of the same workflow run updates only that run's prerelease.
+          RELEASE_TAG="branch-preview-$BRANCH_SLUG-$SHORT_SHA-run-$GITHUB_RUN_NUMBER"
+          RELEASE_TITLE="PREVIEW #$GITHUB_RUN_NUMBER · $BRANCH · $SHORT_SHA"
+          APK_DOWNLOAD_URL="$SERVER_URL/$REPOSITORY/releases/download/$RELEASE_TAG/$APK_NAME"
+
+          # Generate a standalone QR code that points directly to this preview APK.
+          # QR generation is optional so a third-party QR service outage cannot block the APK release.
+          RELEASE_ASSETS=("$APK_PATH#$APK_NAME")
+          QR_NAME="${APK_NAME%.apk}-qr.png"
+          QR_PATH="$RUNNER_TEMP/$QR_NAME"
+          QR_IMAGE_URL=""
+          if curl --fail --silent --show-error --location \
+              --retry 3 \
+              --retry-all-errors \
+              --get \
+              --data-urlencode "size=1000x1000" \
+              --data-urlencode "qzone=4" \
+              --data-urlencode "data=$APK_DOWNLOAD_URL" \
+              "https://api.qrserver.com/v1/create-qr-code/" \
+              --output "$QR_PATH" \
+            && [[ -s "$QR_PATH" ]] \
+            && [[ "$(file -b --mime-type "$QR_PATH")" == "image/png" ]]; then
+            RELEASE_ASSETS+=("$QR_PATH#$QR_NAME")
+            QR_IMAGE_URL="$SERVER_URL/$REPOSITORY/releases/download/$RELEASE_TAG/$QR_NAME"
+          else
+            echo "::warning::Could not generate a PNG QR code for the branch preview APK; publishing without it."
+          fi
+
+          NOTES="$RUNNER_TEMP/branch-preview-release-notes.md"
+          {
+            echo "Branch preview APK for $BRANCH. This prerelease is retained so older tester builds remain available."
+            echo
+            echo "- Source commit SHA: $COMMIT_SHA"
+            echo "- Workflow run number: $GITHUB_RUN_NUMBER"
+            echo "- APK filename: $APK_NAME"
+            if [[ -n "$QR_IMAGE_URL" ]]; then
+              echo
+              echo "## Scan to download"
+              echo
+              printf '<img src="%s" width="240" alt="QR code that downloads %s">\n' "$QR_IMAGE_URL" "$APK_NAME"
+            fi
+          } > "$NOTES"
+
+          if gh release view "$RELEASE_TAG" --repo "$REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "${RELEASE_ASSETS[@]}" \
+              --repo "$REPOSITORY" \
+              --clobber
+
+            gh release edit "$RELEASE_TAG" \
+              --repo "$REPOSITORY" \
+              --target "$COMMIT_SHA" \
+              --title "$RELEASE_TITLE" \
+              --prerelease \
+              --notes-file "$NOTES"
+          else
+            gh release create "$RELEASE_TAG" "${RELEASE_ASSETS[@]}" \
+              --repo "$REPOSITORY" \
+              --target "$COMMIT_SHA" \
+              --title "$RELEASE_TITLE" \
+              --prerelease \
+              --notes-file "$NOTES"
+          fi
+
+          echo "Release page: $SERVER_URL/$REPOSITORY/releases/tag/$RELEASE_TAG"
+
       - name: Check out existing GitHub Pages content
         uses: actions/checkout@v5
         with:
