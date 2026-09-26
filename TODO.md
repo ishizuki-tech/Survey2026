@@ -5,25 +5,45 @@ Completed baseline capabilities belong in `ROADMAP.md` and should not remain as 
 
 ## P0 — Field Deployment Readiness
 
+### Kiambu questionnaire validation before merge
+The active Kiambu work is on `feature/kiambu-introduction-consent` and is not merged into `main`.
+
+Remaining:
+- [ ] Run a full English Introduction -> Consent -> Q1-Q16 target-device acceptance pass.
+- [ ] Run a full Swahili Introduction -> Consent -> Q1-Q16 target-device acceptance pass.
+- [ ] Verify Q6 screen-out behavior on the current Kiambu branch.
+- [ ] Verify Introduction/Consent TTS behavior on both language paths.
+- [ ] Resolve or explicitly accept the remaining source-fidelity differences before merge, including the Swahili consent option parentheticals and the Q1 Other/Nyingine label ordering.
+- [ ] Record final Kiambu acceptance evidence before opening/merging the production PR.
+
+Already observed during current branch validation:
+- English consent Yes -> Q1 works.
+- English consent No -> dedicated STOP / ConsentDeclined flow works.
+- The STOP flow does not use the normal Done/export/upload path.
+
 ### Release provenance / Download Page
 Remaining:
-- [ ] Publish English config SHA-256.
-- [ ] Publish Swahili config SHA-256.
-- [ ] Add a concise "What's New" section to the download page.
 - [ ] Add verified-device / deployment-status information.
-- [ ] Assert the intended stable checkpoint/source SHA during manual publish.
 - [ ] Add an automated consistency check between the rendered Download Page, GitHub Release, and `latest.json`.
 
-Already verified and tracked in `ROADMAP.md`:
-- Release tag/source identity for release #87.
-- APK SHA-256 publication.
-- Signing certificate SHA-256 publication.
-- `latest.json` alignment with release #87 after Pages republish.
-- Pixel 9a install/update using the production signing certificate.
-- Local release build is no longer forcibly signed with the Android debug key.
+Completed on the current release pipeline:
+- [x] Publish source commit SHA and release tag.
+- [x] Publish APK SHA-256.
+- [x] Publish signing certificate SHA-256.
+- [x] Publish English config SHA-256.
+- [x] Publish Swahili config SHA-256.
+- [x] Publish the exact English and Swahili config files as release assets.
+- [x] Generate a dynamic "What's New" section from merged PR/commit metadata.
+- [x] Assert the requested stable checkpoint/source SHA during manual release publication.
+- [x] Publish QR download metadata/image.
+- [x] Standardize main release titles as `MAIN #<run> · <short-sha>`.
+- [x] Standardize branch prerelease titles as `PREVIEW #<run> · <branch> · <short-sha>`.
+- [x] Retain each successful branch preview as its own prerelease.
+- [x] Fix main release publication so `SHORT_SHA` is passed into the release step.
+- [x] Current `gh-pages/latest.json` matches release `build-95-c7d668a`.
 
 ### Field verification evidence
-The runtime behavior has already been manually observed on Pixel 9a. Remaining work is to turn that validation into durable repository evidence.
+The core runtime behavior has already been manually observed on Pixel 9a. Remaining work is to turn that validation into durable repository evidence.
 
 - [ ] Create one acceptance document containing the relevant commands/log evidence.
 - [ ] Record explicit device / Android / build identity for each acceptance run.
@@ -52,10 +72,13 @@ Already observed and tracked in `ROADMAP.md`:
 ## P1 — AI Follow-up Quality
 
 ### Prompt/config review
-- [ ] Create English Q8-Q17 prompt/config review fixtures.
-- [ ] Create Swahili Q8-Q17 prompt/config review fixtures.
+The stable main release still uses the pre-Kiambu Q8-Q17 numbering. The current Kiambu branch renumbers the AI questionnaire section to Q7-Q16.
+
+- [ ] Create English Q7-Q16 prompt/config review fixtures for the Kiambu questionnaire.
+- [ ] Create Swahili Q7-Q16 prompt/config review fixtures for the Kiambu questionnaire.
 - [ ] Define expected missing-information targets per question.
 - [ ] Define prohibited duplicate/rephrase follow-ups per question.
+- [ ] Reconfirm component-ID mappings after the questionnaire renumbering.
 
 ### Real-model semantic acceptance
 - [ ] Build a controlled real-model semantic acceptance matrix.
@@ -66,6 +89,14 @@ Already observed and tracked in `ROADMAP.md`:
 - [ ] Measure duplicate follow-up rate.
 - [ ] Measure timeout/recovery behavior.
 - [ ] Measure English/Swahili parity.
+
+Completed deterministic baseline:
+- [x] Strict EVAL JSON parsing and validation.
+- [x] Low-score normalization when `followup_needed` is omitted but valid unresolved `missing_points` are present.
+- [x] Step-2 follow-up admission uses extracted follow-up candidates rather than raw model text.
+- [x] Duplicate follow-up normalization.
+- [x] Structured component IDs with deterministic ID -> text mapping for livestock, seed-source, and market-destination follow-ups.
+- [x] Run/survey ownership and cancellation isolation.
 
 ## P1 — Speech Recognition Quality
 
@@ -78,7 +109,7 @@ Already observed and tracked in `ROADMAP.md`:
 ### Target-device evaluation
 - [ ] Run English target-device benchmark.
 - [ ] Run Swahili target-device benchmark.
-- [ ] Select a production Swahili model only from target-device evidence on current main.
+- [ ] Select a production Swahili model only from target-device evidence on the current production baseline.
 
 ## P1 — Voice / Microphone UX
 
@@ -102,16 +133,22 @@ Already observed and tracked in `ROADMAP.md`:
 
 ### Supported devices
 - [ ] Define supported device/ABI policy.
-- [ ] Validate Samsung target only after the supported-device matrix is defined.
+- [ ] Validate Samsung Galaxy S25 only after the supported-device matrix is defined.
 
 ## P2 — Release / CI / Download Page
 
-- [ ] Add stable-checkpoint assertion to release publication.
-- [ ] Publish config hashes in release/download metadata.
-- [ ] Add "What's New" to release/download metadata.
+Remaining:
 - [ ] Add deployment-status / verified-device metadata.
 - [ ] Add automated parity validation for GitHub Release, rendered Download Page, and `latest.json`.
 - [ ] Document the local release-signing workflow without committing secrets.
+
+Completed implementation:
+- [x] Stable-checkpoint assertion for manual release publication.
+- [x] Config hashes in release/download metadata.
+- [x] Dynamic "What's New" in release/download metadata.
+- [x] Automatic main release publication and Pages update on `main` pushes.
+- [x] Retained branch prereleases with APK + optional QR assets.
+- [x] Per-run branch preview tags avoid replacing older tester builds.
 
 ## P3 — Documentation / Toolchain / Maintenance
 
@@ -139,13 +176,13 @@ Already observed and tracked in `ROADMAP.md`:
 - [ ] Document diagnostic configuration handling without exposing secrets.
 
 ### Survey configuration
-- [ ] Document SurveyConfig schema, validation rules, selection flow, and new-language/config process.
+- [ ] Document SurveyConfig schema, validation rules, selection flow, INFO/STOP nodes, and new-language/config process.
 
 ### Testing / CI
 - [ ] Document JVM, instrumentation, real-model, and real-device test tiers.
 - [ ] Define policy for which real-model tests, if any, run automatically in CI.
-- [ ] Document main-build versus published-release workflow behavior.
-- [ ] Document branch-preview workflow behavior.
+- [ ] Document main-build / GitHub Release / Pages behavior.
+- [ ] Document retained branch-preview prerelease behavior.
 
 ### Repository maintenance
 - [ ] Periodically verify README architecture descriptions match the repository.
@@ -153,8 +190,6 @@ Already observed and tracked in `ROADMAP.md`:
 - [ ] Verify release keystores, API tokens, and other credentials are never committed.
 
 ## Completed / Removed From TODO
-
-The following are baseline capabilities or completed validation milestones and are tracked in `ROADMAP.md`:
 
 ### Survey finalization / upload
 - Review -> Finish -> queue -> Done.
@@ -183,17 +218,28 @@ The following are baseline capabilities or completed validation milestones and a
 - Old direct `reenqueuePendingSurveyUploads()` path removed from the current design.
 
 ### AI / speech baseline
-- Active shipped Q8-Q17 TWO_STEP semantics.
+- TWO_STEP evaluation + follow-up flow.
 - Strict evaluation JSON handling.
+- Structured component-ID follow-up mapping.
 - Run/survey ownership and cancellation isolation.
 - whisper.cpp pinned at v1.9.3.
 - Bundled baseline Whisper model remains `models/ggml-small-q5_1.bin`.
 
+### Current Kiambu branch implementation — pending merge
+- Q1-Q16 questionnaire graph migration.
+- Config-driven INFO node for questionnaire Introduction.
+- Config-driven Consent node.
+- Dedicated STOP / ConsentDeclined terminal path.
+- Android TTS integration for read-aloud Introduction/Consent.
+- English and Swahili navigation/config tests.
+- Latest `main` merged into `feature/kiambu-introduction-consent`.
+
 ### Release / signing validation
-- Published release #87 provenance verified.
-- APK SHA-256 published.
-- Signing certificate SHA-256 published.
-- `latest.json` republished and verified for release #87.
+- Current production release: `build-95-c7d668a` / `MAIN #95 · c7d668a`.
+- APK/config/signing hashes published.
+- Dynamic "What's New" published.
+- Download Page and `latest.json` generated for release #95.
 - Production signing certificate verified locally.
-- Local release-signed APK update over the published release verified on Pixel 9a.
+- Local release-signed APK update over a published release verified on Pixel 9a.
 - Forced debug signing removed from the local release Gradle configuration.
+- Branch preview releases are retained per successful run.
