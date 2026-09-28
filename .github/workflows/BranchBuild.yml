@@ -220,6 +220,7 @@ jobs:
             echo "::error::Could not access androiddebugkey with key password android."
             exit 1
           fi
+          echo "BRANCH_PREVIEW_KEYSTORE_FILE=$KEYSTORE_PATH" >> "$GITHUB_ENV"
 
       - name: Build debug APK
         env:
@@ -253,6 +254,8 @@ jobs:
           fi
           if [[ "$SIGNING_CERT_SHA256" != "$EXPECTED_CERT_SHA256" ]]; then
             echo "::error::Generated APK signer certificate SHA-256 does not match the required preview certificate."
+            echo "Expected signing certificate SHA-256: $EXPECTED_CERT_SHA256"
+            echo "Actual APK signing certificate SHA-256: $SIGNING_CERT_SHA256"
             exit 1
           fi
 

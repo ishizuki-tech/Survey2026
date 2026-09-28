@@ -34,6 +34,10 @@ plugins {
 val isCi: Boolean =
     System.getenv("CI")?.equals("true", ignoreCase = true) == true
 
+/** Optional CI-only keystore path for persistent branch preview signing. */
+val branchPreviewKeystoreFile: String =
+    System.getenv("BRANCH_PREVIEW_KEYSTORE_FILE")?.trim().orEmpty()
+
 /** Load optional repository-local Gradle properties. */
 val gradleLocalProps: Properties = Properties().apply {
     val file = rootProject.file("gradle.properties.local")
@@ -692,9 +696,22 @@ extensions.configure<ApplicationExtension> {
             JavaVersion.VERSION_17
     }
 
+    if (branchPreviewKeystoreFile.isNotBlank()) {
+        signingConfigs.getByName("debug").apply {
+            storeFile = File(branchPreviewKeystoreFile)
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
+    }
+
     buildTypes {
         debug {
             // Keep the applicationId stable so MediaStore ownership remains stable.
+
+            if (branchPreviewKeystoreFile.isNotBlank()) {
+                signingConfig = signingConfigs.getByName("debug")
+            }
 
             buildConfigField(
                 "String",
