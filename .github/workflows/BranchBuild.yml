@@ -55,6 +55,7 @@ jobs:
         with:
           fetch-depth: 1
           submodules: recursive
+          lfs: true
           persist-credentials: false
 
       - name: Set up JDK 17
@@ -104,6 +105,58 @@ jobs:
       - name: Make Gradle wrapper executable
         run: chmod +x ./gradlew
 
+      - name: Prepare Whisper model
+        run: |
+          set -euo pipefail
+
+          MODEL_DIR="app/src/main/assets/models"
+          mkdir -p "$MODEL_DIR"
+
+          # Branch previews were created to test branch-specific Whisper models.
+          # Prefer any real model supplied by the branch (typically through Git LFS).
+          # Only fall back to the repository baseline when the branch carries no model.
+          mapfile -d '' model_files < <(find "$MODEL_DIR" -maxdepth 1 -type f -name '*.bin' -print0)
+
+          real_model_count=0
+          for model in "${model_files[@]}"; do
+            if head -n 1 "$model" | grep -Fq 'version https://git-lfs.github.com/spec/v1'; then
+              echo "::error::Git LFS pointer was not materialized: $model"
+              exit 1
+            fi
+
+            size="$(stat -c '%s' "$model")"
+            if (( size < 1048576 )); then
+              echo "::error::Whisper model is unexpectedly small ($size bytes): $model"
+              exit 1
+            fi
+
+            echo "Using branch Whisper model: $model ($size bytes)"
+            real_model_count=$((real_model_count + 1))
+          done
+
+          if (( real_model_count == 0 )); then
+            echo "No branch-specific Whisper model found; preparing baseline model."
+            ./gradlew :app:downloadModel --stacktrace --no-daemon
+          fi
+
+          mapfile -d '' prepared_models < <(find "$MODEL_DIR" -maxdepth 1 -type f -name '*.bin' -print0)
+          if (( ${#prepared_models[@]} == 0 )); then
+            echo "::error::No Whisper model is available after model preparation."
+            exit 1
+          fi
+
+          for model in "${prepared_models[@]}"; do
+            if head -n 1 "$model" | grep -Fq 'version https://git-lfs.github.com/spec/v1'; then
+              echo "::error::Git LFS pointer remains after model preparation: $model"
+              exit 1
+            fi
+            size="$(stat -c '%s' "$model")"
+            if (( size < 1048576 )); then
+              echo "::error::Whisper model is unexpectedly small after preparation ($size bytes): $model"
+              exit 1
+            fi
+          done
+
       - name: Run JVM unit tests
         run: |
           ./gradlew :app:testDebugUnitTest --no-daemon \
@@ -116,7 +169,7 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           ./gradlew :app:assembleDebug --no-daemon \
-            -PskipModelDownload=false \
+            -PskipModelDownload=true \
             -Pdebug.embedSecrets=true \
             -Prelease.allowSecrets=false
 
@@ -133,11 +186,39 @@ jobs:
             exit 1
           fi
 
-          WHISPER_MODEL_ASSET="assets/models/ggml-small-q5_1.bin"
-          if ! unzip -Z1 "${apks[0]}" | grep -Fxq "$WHISPER_MODEL_ASSET"; then
-            echo "::error::Required Whisper model is missing from branch APK: $WHISPER_MODEL_ASSET"
-            exit 1
-          fi
+          python3 - "${apks[0]}" <<'PY'
+          import sys
+          import zipfile
+
+          apk = sys.argv[1]
+          with zipfile.ZipFile(apk) as archive:
+              models = [
+                  info for info in archive.infolist()
+                  if info.filename.startswith("assets/models/")
+                  and info.filename.endswith(".bin")
+              ]
+              if not models:
+                  raise SystemExit(
+                      "::error::Branch APK contains no packaged Whisper .bin model."
+                  )
+
+              for info in models:
+                  if info.file_size < 1024 * 1024:
+                      with archive.open(info) as handle:
+                          prefix = handle.read(128)
+                      if prefix.startswith(b"version https://git-lfs.github.com/spec/v1"):
+                          raise SystemExit(
+                              f"::error::Branch APK contains a Git LFS pointer instead of a model: {info.filename}"
+                          )
+                      raise SystemExit(
+                          f"::error::Packaged Whisper model is unexpectedly small "
+                          f"({info.file_size} bytes): {info.filename}"
+                      )
+                  print(
+                      f"Packaged Whisper model: {info.filename} "
+                      f"({info.file_size} bytes uncompressed)"
+                  )
+          PY
 
           INSPECT_DIR="$(mktemp -d)"
           trap 'rm -rf "$INSPECT_DIR"' EXIT
