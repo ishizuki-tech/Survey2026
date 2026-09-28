@@ -1,13 +1,13 @@
 {
   "original_branch": "feature/kiambu-introduction-consent",
   "branch_slug": "feature-kiambu-introduction-consent",
-  "commit_sha": "3b255b989613a111ea22123265ee0de1162abc1c",
-  "short_sha": "3b255b9",
-  "apk_name": "Survey2026-feature-kiambu-introduction-consent-3b255b9.apk",
-  "apk_sha256": "aabc686bbaea2e341709f11cf688ade9ef95aeaa2ddc187ba10f0f96ebe05265",
+  "commit_sha": "ec8ee5c9363cb1fa8b035994419c0117420939e0",
+  "short_sha": "ec8ee5c",
+  "apk_name": "Survey2026-feature-kiambu-introduction-consent-ec8ee5c.apk",
+  "apk_sha256": "13569bf86a52bf86db1d146efa6dc2a863a6a2ddaa44a47c74ecece2d272cb4f",
   "signing_cert_sha256": "73684540bf9ebfadceee724611e5a27e100149731a2ffdea241b6cd99e043c09",
-  "apk_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-feature-kiambu-introduction-consent-3b255b9-run-84/Survey2026-feature-kiambu-introduction-consent-3b255b9.apk",
+  "apk_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-feature-kiambu-introduction-consent-ec8ee5c-run-85/Survey2026-feature-kiambu-introduction-consent-ec8ee5c.apk",
   "page_url": "https://ishizuki-tech.github.io/Survey2026/feature-kiambu-introduction-consent/",
-  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/36488868562",
-  "generated_utc": "2026-09-28T21:58:28Z"
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/36492661968",
+  "generated_utc": "2026-09-28T22:36:22Z"
 }
