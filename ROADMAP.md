@@ -146,6 +146,7 @@ Project #2 is the authoritative live execution board for these workstreams. Prio
 | P1 | #43 | Voice and microphone UX validation |
 | P2 | #44 | Reliability and lifecycle soak testing |
 | P2 | #45 | Supported-device and ABI compatibility |
+| P2 | #50 | S25 Whisper / LiteRT-LM memory pressure |
 | P2 | #46 | Release, CI, and Download Page hardening |
 | P3 | #47 | Documentation, toolchain, and repository maintenance |
 
@@ -212,6 +213,15 @@ Outcome:
 
 Outcome:
 - Supported device/ABI policy exists before Samsung Galaxy S25 validation is treated as production evidence.
+- Galaxy S25 runtime acceptance includes resolution or explicit acceptance of the Whisper / LiteRT-LM memory-pressure risk tracked in #50.
+
+**#50 S25 Whisper / LiteRT-LM memory pressure**
+
+Outcome:
+- The intermittent Galaxy S25 memory-pressure/crash path during cold Whisper initialization is reproducibly characterized.
+- The native-memory peak from overlapping warm LiteRT-LM and Whisper runtime residency is measured and mitigated where needed.
+- Whisper / LiteRT-LM lifecycle coordination is explicit and validated on Galaxy S25 without regressing the Pixel 9a baseline.
+- This issue spans the reliability work in #44 and the supported-device work in #45.
 
 **#46 Release, CI, and Download Page hardening**
 
