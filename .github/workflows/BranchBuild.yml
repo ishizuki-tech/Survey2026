@@ -348,7 +348,6 @@ jobs:
 
       - name: Update this branch preview only
         env:
-          APK_PATH: ${{ steps.apk.outputs.path }}
           APK_NAME: ${{ steps.apk.outputs.name }}
           APK_SHA256: ${{ steps.apk.outputs.sha256 }}
           BRANCH: ${{ steps.apk.outputs.branch }}
@@ -516,7 +515,6 @@ jobs:
                       "short_sha",
                       "apk_name",
                       "apk_sha256",
-                      "apk_url",
                       "page_url",
                       "run_url",
                       "generated_utc",
@@ -544,22 +542,28 @@ jobs:
 
                   expected_apk_name = f"Survey2026-{slug}-{short_sha}.apk"
                   expected_page_url = f"{page_base_url}{slug}/"
-                  release_url_prefix = (
+                  run_id = metadata["run_url"][len(run_url_prefix):]
+                  apk_url_prefix = (
                       f"{server_url}/{repository}/releases/download/"
                       f"branch-preview-{slug}-{short_sha}-run-"
                   )
-                  apk_url = metadata["apk_url"]
+                  apk_url_suffix = f"/{expected_apk_name}"
                   if (
                       metadata["apk_name"] != expected_apk_name
                       or metadata["page_url"] != expected_page_url
                       or not metadata["run_url"].startswith(run_url_prefix)
-                      or not metadata["run_url"][len(run_url_prefix):].isdigit()
-                      or not apk_url.startswith(release_url_prefix)
-                      or not apk_url.endswith(f"/{expected_apk_name}")
-                      or not apk_url[
-                          len(release_url_prefix):
-                          -len(f"/{expected_apk_name}")
-                      ].isdigit()
+                      or not run_id.isdigit()
+                      or (
+                          "apk_url" in metadata
+                          and (
+                              not isinstance(metadata["apk_url"], str)
+                              or not metadata["apk_url"].startswith(apk_url_prefix)
+                              or not metadata["apk_url"].endswith(apk_url_suffix)
+                              or not metadata["apk_url"][
+                                  len(apk_url_prefix):-len(apk_url_suffix)
+                              ].isdigit()
+                          )
+                      )
                   ):
                       raise ValueError
 
@@ -580,7 +584,9 @@ jobs:
                   return html.escape(metadata[field], quote=True)
 
               page_url = escaped("page_url")
-              apk_url = escaped("apk_url")
+              apk_url = escaped("apk_url") if "apk_url" in metadata else (
+                  f"{page_url}{escaped('apk_name')}"
+              )
               cards.append(
                   "<article class=\"card\">"
                   f"<h2>{escaped('original_branch')}</h2>"
