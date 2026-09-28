@@ -120,8 +120,6 @@ Release/Page/`latest.json` parity and verified-device metadata are owned by P0 i
 
 ### #47 — Documentation, toolchain, and repository maintenance
 
-- [ ] Refresh README baseline from the old release #87 / `92de06d` references to the current `main c7d668a` / release #95 baseline.
-- [ ] Refresh README release/CI text to reflect config hashes, dynamic "What's New", automatic main publication, and retained branch prereleases.
 - [ ] Document the actual CMake path and current `WHISPER_DIR` wiring.
 - [ ] Document current ABI configuration.
 - [ ] Document pinned NDK/CMake versions and CI/local ownership.
