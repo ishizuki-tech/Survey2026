@@ -366,7 +366,8 @@ jobs:
           TARGET_DIR="$PAGES_DIR/$BRANCH_SLUG"
           RUN_URL="$SERVER_URL/$REPOSITORY/actions/runs/$RUN_ID"
           REPOSITORY_URL="$SERVER_URL/$REPOSITORY"
-          APK_URL="$PAGE_URL$APK_NAME"
+          RELEASE_TAG="branch-preview-$BRANCH_SLUG-$SHORT_SHA-run-$RUN_NUMBER"
+          APK_URL="$SERVER_URL/$REPOSITORY/releases/download/$RELEASE_TAG/$APK_NAME"
           GENERATED_UTC="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 
           # A branch preview may replace only a directory it already owns. This
@@ -392,7 +393,6 @@ jobs:
           BRANCH_HTML="$(html_escape "$BRANCH")"
           mkdir -p "$RUNNER_TEMP/branch-preview"
           PREVIEW_DIR="$RUNNER_TEMP/branch-preview"
-          cp "$APK_PATH" "$PREVIEW_DIR/$APK_NAME"
 
           QR_PATH="$PREVIEW_DIR/qr.png"
           curl --fail --silent --show-error --location \
@@ -461,6 +461,7 @@ jobs:
             "short_sha": "$SHORT_SHA",
             "apk_name": "$APK_NAME",
             "apk_sha256": "$APK_SHA256",
+            "apk_url": "$APK_URL",
             "page_url": "$PAGE_URL",
             "run_url": "$RUN_URL",
             "generated_utc": "$GENERATED_UTC"
@@ -515,6 +516,7 @@ jobs:
                       "short_sha",
                       "apk_name",
                       "apk_sha256",
+                      "apk_url",
                       "page_url",
                       "run_url",
                       "generated_utc",
@@ -542,11 +544,22 @@ jobs:
 
                   expected_apk_name = f"Survey2026-{slug}-{short_sha}.apk"
                   expected_page_url = f"{page_base_url}{slug}/"
+                  release_url_prefix = (
+                      f"{server_url}/{repository}/releases/download/"
+                      f"branch-preview-{slug}-{short_sha}-run-"
+                  )
+                  apk_url = metadata["apk_url"]
                   if (
                       metadata["apk_name"] != expected_apk_name
                       or metadata["page_url"] != expected_page_url
                       or not metadata["run_url"].startswith(run_url_prefix)
                       or not metadata["run_url"][len(run_url_prefix):].isdigit()
+                      or not apk_url.startswith(release_url_prefix)
+                      or not apk_url.endswith(f"/{expected_apk_name}")
+                      or not apk_url[
+                          len(release_url_prefix):
+                          -len(f"/{expected_apk_name}")
+                      ].isdigit()
                   ):
                       raise ValueError
 
@@ -567,7 +580,7 @@ jobs:
                   return html.escape(metadata[field], quote=True)
 
               page_url = escaped("page_url")
-              apk_url = f"{page_url}{escaped('apk_name')}"
+              apk_url = escaped("apk_url")
               cards.append(
                   "<article class=\"card\">"
                   f"<h2>{escaped('original_branch')}</h2>"
