@@ -146,7 +146,7 @@ Project #2 is the authoritative live execution board for these workstreams. Prio
 | P1 | #43 | Voice and microphone UX validation |
 | P2 | #44 | Reliability and lifecycle soak testing |
 | P2 | #45 | Supported-device and ABI compatibility |
-| P2 | #50 | S25 Whisper / LiteRT-LM memory pressure |
+| P1 | #50 | S25 Whisper / LiteRT-LM memory pressure |
 | P2 | #46 | Release, CI, and Download Page hardening |
 | P3 | #47 | Documentation, toolchain, and repository maintenance |
 
