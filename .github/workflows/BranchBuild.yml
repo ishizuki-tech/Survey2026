@@ -116,7 +116,7 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           ./gradlew :app:assembleDebug --no-daemon \
-            -PskipModelDownload=true \
+            -PskipModelDownload=false \
             -Pdebug.embedSecrets=true \
             -Prelease.allowSecrets=false
 
@@ -130,6 +130,12 @@ jobs:
           if (( ${#apks[@]} != 1 )); then
             echo "::error::Expected exactly one debug APK in $APK_DIR; found ${#apks[@]}."
             find "$APK_DIR" -maxdepth 1 -type f -name '*.apk' -print || true
+            exit 1
+          fi
+
+          WHISPER_MODEL_ASSET="assets/models/ggml-small-q5_1.bin"
+          if ! unzip -Z1 "${apks[0]}" | grep -Fxq "$WHISPER_MODEL_ASSET"; then
+            echo "::error::Required Whisper model is missing from branch APK: $WHISPER_MODEL_ASSET"
             exit 1
           fi
 
