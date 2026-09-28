@@ -164,6 +164,63 @@ jobs:
             -Pdebug.embedSecrets=false \
             -Prelease.allowSecrets=false
 
+      - name: Restore and verify branch preview signing key
+        env:
+          BRANCH_PREVIEW_DEBUG_KEYSTORE_B64: ${{ secrets.BRANCH_PREVIEW_DEBUG_KEYSTORE_B64 }}
+        run: |
+          set -euo pipefail
+
+          EXPECTED_CERT_SHA256="73684540bf9ebfadceee724611e5a27e100149731a2ffdea241b6cd99e043c09"
+          KEYSTORE_PATH="$HOME/.android/debug.keystore"
+          if [[ -z "$BRANCH_PREVIEW_DEBUG_KEYSTORE_B64" ]]; then
+            echo "::error::BRANCH_PREVIEW_DEBUG_KEYSTORE_B64 is not configured."
+            exit 1
+          fi
+
+          mkdir -p "$(dirname "$KEYSTORE_PATH")"
+          umask 077
+          if ! printf '%s' "$BRANCH_PREVIEW_DEBUG_KEYSTORE_B64" | base64 --decode > "$KEYSTORE_PATH"; then
+            echo "::error::Could not Base64-decode BRANCH_PREVIEW_DEBUG_KEYSTORE_B64."
+            exit 1
+          fi
+          if [[ ! -s "$KEYSTORE_PATH" ]]; then
+            echo "::error::Decoded branch preview keystore is empty."
+            exit 1
+          fi
+
+          if ! KEYSTORE_DETAILS="$(keytool -list -v \
+            -keystore "$KEYSTORE_PATH" \
+            -alias androiddebugkey \
+            -storepass android 2>&1)"; then
+            echo "::error::Could not open alias androiddebugkey in the branch preview keystore."
+            exit 1
+          fi
+          CERT_SHA256="$(printf '%s\n' "$KEYSTORE_DETAILS" | awk -F': ' '/^[[:space:]]*SHA256:/{gsub(":", "", $2); print tolower($2); exit}')"
+          if [[ ! "$CERT_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::Could not read the androiddebugkey certificate SHA-256 from the branch preview keystore."
+            exit 1
+          fi
+          if [[ "$CERT_SHA256" != "$EXPECTED_CERT_SHA256" ]]; then
+            echo "::error::Branch preview keystore certificate SHA-256 does not match the required preview certificate."
+            exit 1
+          fi
+
+          KEY_VALIDATION_DIR="$(mktemp -d "$RUNNER_TEMP/branch-preview-key-validation.XXXXXX")"
+          trap 'rm -rf "$KEY_VALIDATION_DIR"' EXIT
+          if ! keytool -importkeystore \
+            -srckeystore "$KEYSTORE_PATH" \
+            -srcstorepass android \
+            -srcalias androiddebugkey \
+            -srckeypass android \
+            -destkeystore "$KEY_VALIDATION_DIR/androiddebugkey.p12" \
+            -deststoretype PKCS12 \
+            -deststorepass android \
+            -destkeypass android \
+            -noprompt >/dev/null 2>&1; then
+            echo "::error::Could not access androiddebugkey with key password android."
+            exit 1
+          fi
+
       - name: Build debug APK
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
@@ -183,6 +240,19 @@ jobs:
           if (( ${#apks[@]} != 1 )); then
             echo "::error::Expected exactly one debug APK in $APK_DIR; found ${#apks[@]}."
             find "$APK_DIR" -maxdepth 1 -type f -name '*.apk' -print || true
+            exit 1
+          fi
+
+          EXPECTED_CERT_SHA256="73684540bf9ebfadceee724611e5a27e100149731a2ffdea241b6cd99e043c09"
+          APK_SIGNER="$ANDROID_SDK_ROOT/build-tools/$BUILD_TOOLS_VERSION/apksigner"
+          APK_SIGNER_OUTPUT="$("$APK_SIGNER" verify --verbose --print-certs "${apks[0]}")"
+          SIGNING_CERT_SHA256="$(printf '%s\n' "$APK_SIGNER_OUTPUT" | awk -F': ' '/^Signer #1 certificate SHA-256 digest:/{print tolower($2); exit}')"
+          if [[ ! "$SIGNING_CERT_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::Could not read the APK signer certificate SHA-256."
+            exit 1
+          fi
+          if [[ "$SIGNING_CERT_SHA256" != "$EXPECTED_CERT_SHA256" ]]; then
+            echo "::error::Generated APK signer certificate SHA-256 does not match the required preview certificate."
             exit 1
           fi
 
@@ -246,6 +316,7 @@ jobs:
           echo "path=$OUTPUT" >> "$GITHUB_OUTPUT"
           echo "name=$APK_NAME" >> "$GITHUB_OUTPUT"
           echo "sha256=$APK_SHA256" >> "$GITHUB_OUTPUT"
+          echo "signing_cert_sha256=$SIGNING_CERT_SHA256" >> "$GITHUB_OUTPUT"
           echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
           echo "branch_slug=$BRANCH_SLUG" >> "$GITHUB_OUTPUT"
           echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
@@ -264,6 +335,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           APK_PATH: ${{ steps.apk.outputs.path }}
           APK_NAME: ${{ steps.apk.outputs.name }}
+          SIGNING_CERT_SHA256: ${{ steps.apk.outputs.signing_cert_sha256 }}
           BRANCH: ${{ steps.apk.outputs.branch }}
           BRANCH_SLUG: ${{ steps.apk.outputs.branch_slug }}
           SHORT_SHA: ${{ steps.apk.outputs.short_sha }}
@@ -309,6 +381,7 @@ jobs:
             echo "- Source commit SHA: $COMMIT_SHA"
             echo "- Workflow run number: $GITHUB_RUN_NUMBER"
             echo "- APK filename: $APK_NAME"
+            echo "- Signing certificate SHA-256: $SIGNING_CERT_SHA256"
             if [[ -n "$QR_IMAGE_URL" ]]; then
               echo
               echo "## Scan to download"
@@ -350,6 +423,7 @@ jobs:
         env:
           APK_NAME: ${{ steps.apk.outputs.name }}
           APK_SHA256: ${{ steps.apk.outputs.sha256 }}
+          SIGNING_CERT_SHA256: ${{ steps.apk.outputs.signing_cert_sha256 }}
           BRANCH: ${{ steps.apk.outputs.branch }}
           BRANCH_SLUG: ${{ steps.apk.outputs.branch_slug }}
           SHORT_SHA: ${{ steps.apk.outputs.short_sha }}
@@ -444,6 +518,7 @@ jobs:
                 <dt>Build timestamp</dt><dd><code>$GENERATED_UTC</code></dd>
                 <dt>APK filename</dt><dd><code>$APK_NAME</code></dd>
                 <dt>APK SHA-256</dt><dd><code>$APK_SHA256</code></dd>
+                <dt>Signing certificate SHA-256</dt><dd><code>$SIGNING_CERT_SHA256</code></dd>
                 <dt>Workflow run</dt><dd><a href="$RUN_URL">#$RUN_NUMBER</a></dd>
               </dl>
               <p><a href="$REPOSITORY_URL">GitHub repository</a> · <a href="$RUN_URL">GitHub Actions run</a></p>
@@ -460,6 +535,7 @@ jobs:
             "short_sha": "$SHORT_SHA",
             "apk_name": "$APK_NAME",
             "apk_sha256": "$APK_SHA256",
+            "signing_cert_sha256": "$SIGNING_CERT_SHA256",
             "apk_url": "$APK_URL",
             "page_url": "$PAGE_URL",
             "run_url": "$RUN_URL",
@@ -494,6 +570,7 @@ jobs:
           short_sha_pattern = re.compile(r"[0-9a-f]{7}")
           commit_sha_pattern = re.compile(r"[0-9a-f]{40}")
           checksum_pattern = re.compile(r"[0-9a-f]{64}")
+          signing_cert_pattern = re.compile(r"[0-9a-f]{64}")
 
           def warning(path: Path) -> None:
               print(
@@ -537,6 +614,15 @@ jobs:
                       or not short_sha_pattern.fullmatch(short_sha)
                       or not commit_sha_pattern.fullmatch(metadata["commit_sha"])
                       or not checksum_pattern.fullmatch(metadata["apk_sha256"])
+                      or (
+                          "signing_cert_sha256" in metadata
+                          and (
+                              not isinstance(metadata["signing_cert_sha256"], str)
+                              or not signing_cert_pattern.fullmatch(
+                                  metadata["signing_cert_sha256"]
+                              )
+                          )
+                      )
                   ):
                       raise ValueError
 
@@ -658,3 +744,7 @@ jobs:
           git -C "$PAGES_DIR" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git -C "$PAGES_DIR" commit -m "Update branch APK preview for $BRANCH_SLUG"
           git -C "$PAGES_DIR" push origin HEAD:gh-pages
+
+      - name: Remove branch preview signing key
+        if: ${{ always() }}
+        run: rm -f "$HOME/.android/debug.keystore"
