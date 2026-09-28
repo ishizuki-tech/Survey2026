@@ -1,11 +1,11 @@
 {
   "original_branch": "docs/normalize-live-baseline",
   "branch_slug": "docs-normalize-live-baseline",
-  "commit_sha": "5e6b1dcbb2a4421df0685b9aade38ce20f4aaf85",
-  "short_sha": "5e6b1dc",
-  "apk_name": "Survey2026-docs-normalize-live-baseline-5e6b1dc.apk",
-  "apk_sha256": "1acee22220fafb65bae39df5ca77803842e229db2c1f8c53a8f3c7a05b78502b",
+  "commit_sha": "bb50c45b96d4fc7b8726ac369a688b72df6c9486",
+  "short_sha": "bb50c45",
+  "apk_name": "Survey2026-docs-normalize-live-baseline-bb50c45.apk",
+  "apk_sha256": "237e0ea3853545f3cea9f5764ea533ca635086b82493f79e09af0b0be6f97332",
   "page_url": "https://ishizuki-tech.github.io/Survey2026/docs-normalize-live-baseline/",
-  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/36458897602",
-  "generated_utc": "2026-09-28T17:37:20Z"
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/36458919827",
+  "generated_utc": "2026-09-28T17:42:21Z"
 }
