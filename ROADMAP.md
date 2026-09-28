@@ -17,28 +17,21 @@ Issues #1-#8 are historical/external LiteRT-LM or earlier app-hardening records 
 
 ## Current Baseline
 
-### Stable main release
+### Stable main / release identity
 
-- Main commit: `c7d668ad26d929c819b340f4722217cef60f7aec` (`c7d668a`)
-- Published release: `build-95-c7d668a`
-- Release title: `MAIN #95 · c7d668a`
-- APK: `Survey2026-c7d668a-release.apk`
-- APK SHA-256: `e3d1bc16b1e2339078fc155867d25b8ae677a44f24a7d068f43a4351d906aae7`
-- English config SHA-256: `03c61877264de51524e8f12107f0eaee3ed1abe16c7874fae0a77c863fa66d26`
-- Swahili config SHA-256: `90f00f7ceadbd2bb0d780f65fd12f23c2610b9d94ea502e51462c860e617f017`
-- Signing certificate SHA-256: `d6edef47ec6734a46122ab7fddb5e4f17d19d4d51ae3eaddfb32f309ee5036ea`
-- Download Page / `latest.json`: aligned to release #95 / run #95
-- Dynamic "What's New": published from merged PR/commit metadata
-- Pixel 9a / Android 16 remains the manually validated baseline for the core survey/upload flow
-- Core upload/finalization/recovery behavior remains the production baseline unless new regression evidence appears
+- Live production release identity is authoritative in the latest GitHub Release and `gh-pages/latest.json`; this file intentionally does not duplicate the moving release run number or source SHA.
+- Pre-Kiambu application behavior checkpoint: `c7d668ad26d929c819b340f4722217cef60f7aec` (`c7d668a`)
+- The production release pipeline publishes source SHA, release tag, APK SHA-256, signing-certificate SHA-256, exact English/Swahili config assets and hashes, and dynamic "What's New".
+- Pixel 9a / Android 16 remains the manually validated baseline for the core survey/upload flow.
+- Core upload/finalization/recovery behavior remains the production baseline unless new regression evidence appears.
 
 ### Active Kiambu validation branch — not merged
 
 - Branch: `feature/kiambu-introduction-consent`
 - Kiambu implementation baseline: `1240cec`
-- Latest production `main` incorporated into that implementation baseline: `c7d668a`
+- Latest production application-code checkpoint incorporated into that implementation baseline: `c7d668a`
 - Implementation preview verified by CI: `PREVIEW #71 · feature/kiambu-introduction-consent · 1240cec`
-- Later commits on the same branch may update documentation without changing the Kiambu implementation baseline
+- Later main/branch documentation-only commits and releases do not change the Kiambu implementation baseline
 - Questionnaire migrated to Kiambu Q1-Q16 in both English and Swahili configs
 - Questionnaire Introduction is a config-driven INFO node with Android TTS read-aloud behavior
 - Consent is config-driven; decline routes to a dedicated STOP / ConsentDeclined terminal screen
@@ -96,7 +89,7 @@ Known validation limitation:
 ### AI / follow-up deterministic baseline
 
 - TWO_STEP path active for the shipped main questionnaire
-- Main release #95 uses the pre-Kiambu Q8-Q17 numbering
+- The current pre-Kiambu main questionnaire uses Q8-Q17 numbering
 - Kiambu implementation preserves the same AI flow after renumbering the AI questionnaire section to Q7-Q16
 - Strict evaluation JSON parsing
 - Score / `missing_points` / `followup_needed` validation
@@ -119,7 +112,7 @@ Known validation limitation:
 - Main release titles use `MAIN #<run> · <short-sha>`
 - Release metadata publishes source SHA, APK SHA-256, signing certificate SHA-256, English/Swahili config files and hashes, and dynamic "What's New"
 - Manual release publication validates the requested stable tag against the source commit
-- `gh-pages/latest.json` is generated from the release pipeline and currently points to release #95
+- `gh-pages/latest.json` is generated from the release pipeline and is the authoritative machine-readable pointer to the current production release
 - Branch pushes run the branch preview pipeline
 - Every successful branch preview is retained as its own GitHub prerelease with a unique branch/SHA/run tag
 - Branch preview titles use `PREVIEW #<run> · <branch> · <short-sha>`
