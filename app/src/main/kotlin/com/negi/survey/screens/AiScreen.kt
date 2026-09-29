@@ -822,7 +822,10 @@ fun AiScreen(
         if (!retry) {
             val input = conv.composerDraft.trim()
             if (input.isBlank()) return
-            if (conv.role == AiViewModel.ComposerRole.MAIN) vmSurvey.setAnswer(input, nid)
+            if (conv.role == AiViewModel.ComposerRole.MAIN) {
+                vmSurvey.beginAnswerTransaction(nid, inputSource = "typed")
+                vmSurvey.setAnswer(input, nid)
+            }
             else vmSurvey.answerLastFollowup(nid, input)
             vmAI.appendUserMessage(contextKey, input)
         }

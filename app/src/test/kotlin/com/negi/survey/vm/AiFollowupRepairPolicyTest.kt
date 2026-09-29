@@ -113,7 +113,7 @@ class AiFollowupRepairPolicyTest {
         var requestCount = 0
             private set
 
-        override suspend fun request(prompt: String): Flow<String> {
+        override suspend fun request(prompt: String, traceContext: com.negi.survey.slm.RepositoryTraceContext?): Flow<String> {
             requestCount++
             return emptyFlow()
         }
