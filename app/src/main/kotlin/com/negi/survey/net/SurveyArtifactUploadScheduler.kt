@@ -28,6 +28,7 @@ import java.io.FileOutputStream
 import java.io.IOException
 import java.util.concurrent.TimeUnit
 import java.util.zip.GZIPOutputStream
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -82,6 +83,47 @@ internal class SurveyArtifactUploadScheduler(context: Context) {
             localFile = pendingLog,
             remoteRelativePath = REMOTE_LOG_DIR + "/" + pendingLog.name
         )
+    }
+
+    /**
+     * Schedules finalized traces already published for this survey. A missing archive is normal:
+     * trace gzip finalization is asynchronous and startup recovery scans again later.
+     */
+    suspend fun scheduleDiagnosticTraces(
+        config: GitHubUploader.GitHubConfig,
+        surveyId: String
+    ) {
+        val candidates = withContext(Dispatchers.IO) {
+            DiagnosticTraceArtifacts.discover(appContext.filesDir, surveyId)
+        }
+        candidates.forEach { candidate ->
+            enqueueDiagnosticTrace(config, candidate)
+        }
+    }
+
+    /** Called by the existing restart/reconnect receiver for archives missed by the initial race. */
+    fun recoverDiagnosticTraces(config: GitHubUploader.GitHubConfig) {
+        DiagnosticTraceArtifacts.discover(appContext.filesDir).forEach { candidate ->
+            enqueueDiagnosticTrace(config, candidate)
+        }
+    }
+
+    private fun enqueueDiagnosticTrace(
+        config: GitHubUploader.GitHubConfig,
+        candidate: DiagnosticTraceArtifacts.Candidate
+    ) {
+        try {
+            enqueueGitHubWorkerFileUpload(
+                context = appContext,
+                config = config,
+                localFile = candidate.file,
+                remoteRelativePath = DiagnosticTraceArtifacts.remoteRelativePath(candidate)
+            )
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (exception: Exception) {
+            Log.w(LOG_TAG, "Failed to schedule diagnostic trace: " + candidate.file.name, exception)
+        }
     }
 
     private fun stageVoiceFilesToSharedPendingForRun(
