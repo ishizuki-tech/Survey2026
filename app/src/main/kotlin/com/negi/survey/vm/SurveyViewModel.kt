@@ -183,7 +183,7 @@ open class SurveyViewModel(
 
     /** Starts one answer transaction; callers reuse its ID through evaluation and UI completion. */
     fun beginAnswerTransaction(questionId: String, inputSource: String): String {
-        val id = answerTraceIds.begin(questionId)
+        val id = answerTraceIds.begin(questionId, inputSource)
         trace?.event("ANSWER_TRANSACTION_STARTED", id, questionId, mapOf("inputSource" to inputSource))
         return id
     }
@@ -387,9 +387,9 @@ open class SurveyViewModel(
     }
 
     fun commitAnswer(questionId: String, inputSource: String): String? {
-        val traceId = answerTraceIds.commit(questionId) ?: return null
-        trace?.event("ANSWER_COMMITTED", traceId, questionId, mapOf("answer" to getAnswer(questionId), "inputSource" to inputSource))
-        return traceId
+        val transaction = answerTraceIds.commit(questionId) ?: return null
+        trace?.event("ANSWER_COMMITTED", transaction.id, questionId, mapOf("answer" to getAnswer(questionId), "inputSource" to transaction.inputSource))
+        return transaction.id
     }
 
     /** Marks the one voice-to-submit handoff that must retain its mic-start transaction. */

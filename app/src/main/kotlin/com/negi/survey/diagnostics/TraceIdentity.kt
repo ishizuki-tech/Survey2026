@@ -30,14 +30,15 @@ data class TraceIdentity(
 
 /** Pure active-transaction holder: explicit starts supersede; commits only observe. */
 internal class AnswerTraceTransactions {
-    private val active = mutableMapOf<String, String>()
+    data class Transaction(val id: String, val inputSource: String)
+    private val active = mutableMapOf<String, Transaction>()
     private val acceptedVoice = mutableSetOf<String>()
-    fun begin(questionId: String): String = TraceIdentity.newAnswerTraceId().also {
-        active[questionId] = it
+    fun begin(questionId: String, inputSource: String): String = TraceIdentity.newAnswerTraceId().also {
+        active[questionId] = Transaction(it, inputSource)
         acceptedVoice.remove(questionId)
     }
-    fun current(questionId: String): String? = active[questionId]
-    fun commit(questionId: String): String? = active[questionId]
+    fun current(questionId: String): String? = active[questionId]?.id
+    fun commit(questionId: String): Transaction? = active[questionId]
     fun markVoiceAccepted(questionId: String) { acceptedVoice += questionId }
     fun consumeVoiceAccepted(questionId: String): Boolean = acceptedVoice.remove(questionId)
     fun clear() { active.clear(); acceptedVoice.clear() }
