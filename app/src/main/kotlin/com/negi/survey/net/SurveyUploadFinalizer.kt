@@ -10,6 +10,8 @@ package com.negi.survey.net
 
 import android.content.Context
 import com.negi.survey.utils.DeviceUploadTag
+import com.negi.survey.diagnostics.SurveyTraceRegistry
+import com.negi.survey.diagnostics.WhisperTraceRegistry
 import com.negi.survey.utils.buildSurveyFileName
 import com.negi.survey.vm.SurveyFinalizationSnapshot
 import java.io.File
@@ -45,6 +47,10 @@ internal interface SurveyFinalizationOperations {
         surveyId: String,
         exportedAtStamp: String
     )
+    suspend fun scheduleDiagnosticTraceArtifacts(
+        config: GitHubUploader.GitHubConfig,
+        surveyId: String
+    )
 }
 
 /** Stages and queues one logical survey JSON upload per survey UUID. */
@@ -63,6 +69,8 @@ class SurveyUploadFinalizer private constructor(
     ): SurveyFinalizationResult {
         val surveyId = snapshot.surveyId.trim()
         if (surveyId.isBlank()) return SurveyFinalizationResult.Failure("Survey ID is missing.")
+        SurveyTraceRegistry.finalizeAsync(surveyId)
+        WhisperTraceRegistry.finalizeAsync(surveyId)
         return locks.getOrPut(surveyId) { Mutex() }.withLock {
             try {
                 if (operations.isUploaded(surveyId)) {
@@ -105,6 +113,12 @@ class SurveyUploadFinalizer private constructor(
                 }
                 try {
                     operations.scheduleLogArtifact(config, surveyId, exportedAtStamp)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                }
+                try {
+                    operations.scheduleDiagnosticTraceArtifacts(config, surveyId)
                 } catch (cancelled: CancellationException) {
                     throw cancelled
                 } catch (_: Exception) {
@@ -181,6 +195,13 @@ private class AndroidSurveyFinalizationOperations(context: Context) : SurveyFina
         exportedAtStamp: String
     ) {
         artifactScheduler.scheduleLog(config, surveyId, exportedAtStamp)
+    }
+
+    override suspend fun scheduleDiagnosticTraceArtifacts(
+        config: GitHubUploader.GitHubConfig,
+        surveyId: String
+    ) {
+        artifactScheduler.scheduleDiagnosticTraces(config, surveyId)
     }
 
     private companion object {

@@ -78,7 +78,7 @@ enum class PromptPhase {
 interface Repository {
 
     /** Execute a single streaming inference for the given [prompt]. */
-    suspend fun request(prompt: String): Flow<String>
+    suspend fun request(prompt: String, traceContext: RepositoryTraceContext? = null): Flow<String>
 
     /** Build the full model-ready prompt string from a user-level [userPrompt]. */
     fun buildPrompt(userPrompt: String): String
@@ -97,6 +97,21 @@ interface Repository {
      * Default: no-op for backends that don't require it.
      */
     suspend fun warmUp() {}
+}
+
+/** Optional diagnostics-only correlation for a repository request. */
+data class RepositoryTraceContext(
+    val answerTraceId: String,
+    val questionId: String,
+    val phase: PromptPhase,
+    val onEvent: (RepositoryTraceEvent) -> Unit,
+) {
+    fun emit(event: RepositoryTraceEvent) = runCatching { onEvent(event) }
+}
+
+sealed interface RepositoryTraceEvent {
+    data class Started(val requestId: Long, val modelIdentity: String, val finalPrompt: String) : RepositoryTraceEvent
+    data class Finished(val requestId: Long, val rawResponse: String, val terminalStatus: String, val error: String?, val liteRtRunId: Long) : RepositoryTraceEvent
 }
 
 /* ====================================================================== */
@@ -1152,7 +1167,7 @@ class LiteRtRepository(
     }
 
     @OptIn(ExperimentalCoroutinesApi::class)
-    override suspend fun request(prompt: String): Flow<String> {
+    override suspend fun request(prompt: String, traceContext: RepositoryTraceContext?): Flow<String> {
         return callbackFlow {
             val out = this
 
@@ -1344,6 +1359,11 @@ class LiteRtRepository(
 
                                 val outText =
                                     synchronized(outLock) { fullOut.toString() }
+                                traceContext?.emit(
+                                    RepositoryTraceEvent.Finished(
+                                        requestId, outText, reason, cause?.message, liteRtRunId.get()
+                                    )
+                                )
 
                                 AiTrace.ringI(
                                     TAG,
@@ -1688,6 +1708,7 @@ class LiteRtRepository(
                             )
 
                         val promptSha = AiTrace.sha256Short(cappedPrompt)
+                        traceContext?.emit(RepositoryTraceEvent.Started(requestId, model.name, cappedPrompt))
                         val gateWaitMs =
                             SystemClock.elapsedRealtime() - gateRequestedAt
 

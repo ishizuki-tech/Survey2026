@@ -61,7 +61,7 @@ class SurveySessionStoreTest {
     }
 
     private class FakeRepository : Repository {
-        override suspend fun request(prompt: String): Flow<String> = error("not used")
+        override suspend fun request(prompt: String, traceContext: com.negi.survey.slm.RepositoryTraceContext?): Flow<String> = error("not used")
 
         override fun buildPrompt(userPrompt: String): String = userPrompt
     }

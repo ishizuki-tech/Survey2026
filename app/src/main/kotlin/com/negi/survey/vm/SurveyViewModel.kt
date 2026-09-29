@@ -31,7 +31,12 @@ import androidx.navigation3.runtime.NavKey
 import com.negi.survey.config.NodeDTO
 import com.negi.survey.config.RequiredComponent
 import com.negi.survey.config.SurveyConfig
+import com.negi.survey.diagnostics.SurveyTrace
+import com.negi.survey.diagnostics.SurveyTraceRegistry
+import com.negi.survey.diagnostics.TraceIdentity
+import com.negi.survey.diagnostics.AnswerTraceTransactions
 import com.negi.survey.net.RuntimeLogStore
+import android.content.Context
 import java.util.UUID
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -133,7 +138,8 @@ enum class PromptMode {
 
 open class SurveyViewModel(
     private var nav: NavBackStack<NavKey>,
-    private val config: SurveyConfig
+    private val config: SurveyConfig,
+    private val traceContext: Context? = null
 ) : ViewModel() {
 
     companion object {
@@ -172,6 +178,21 @@ open class SurveyViewModel(
 
     private val _surveyUuid = MutableStateFlow(UUID.randomUUID().toString())
     val surveyUuid: StateFlow<String> = _surveyUuid.asStateFlow()
+    private var trace: SurveyTrace? = traceContext?.let { SurveyTraceRegistry.start(it, _surveyUuid.value) }
+    private val answerTraceIds = AnswerTraceTransactions()
+
+    /** Starts one answer transaction; callers reuse its ID through evaluation and UI completion. */
+    fun beginAnswerTransaction(questionId: String, inputSource: String): String {
+        val id = answerTraceIds.begin(questionId, inputSource)
+        trace?.event("ANSWER_TRANSACTION_STARTED", id, questionId, mapOf("inputSource" to inputSource))
+        return id
+    }
+
+    fun answerTraceId(questionId: String): String? = answerTraceIds.current(questionId)
+
+    fun traceEvent(name: String, answerTraceId: String? = null, questionId: String? = null, fields: Map<String, Any?> = emptyMap()) {
+        trace?.event(name, answerTraceId, questionId, fields)
+    }
 
     /**
      * Home draft note (editable on Home only).
@@ -364,6 +385,22 @@ open class SurveyViewModel(
             old.mutableLinked().apply { put(key.trim(), text) }
         }
     }
+
+    fun commitAnswer(questionId: String, inputSource: String): String? {
+        val transaction = answerTraceIds.commit(questionId) ?: return null
+        trace?.event("ANSWER_COMMITTED", transaction.id, questionId, mapOf("answer" to getAnswer(questionId), "inputSource" to transaction.inputSource))
+        return transaction.id
+    }
+
+    /** Marks the one voice-to-submit handoff that must retain its mic-start transaction. */
+    fun acceptVoiceTranscript(questionId: String, text: String) {
+        setAnswer(text, questionId)
+        answerTraceIds.markVoiceAccepted(questionId)
+    }
+
+    /** Consumed exactly once by the normal submit path. */
+    fun consumeAcceptedVoiceTransaction(questionId: String): Boolean =
+        answerTraceIds.consumeVoiceAccepted(questionId)
 
     fun getAnswer(key: String): String = answers.value[key.trim()].orEmpty()
 
@@ -949,6 +986,11 @@ open class SurveyViewModel(
         updateCanGoBack()
 
         RuntimeLogStore.d(TAG, "push -> ${node.id}, navSize=${nav.size}, stackSize=${nodeStack.size}")
+        trace?.event("QUESTION_SHOWN", questionId = node.id, fields = mapOf(
+            "nodeType" to node.type.name,
+            "prompt" to node.question,
+            "parentNodeId" to nodeStack.dropLast(1).lastOrNull()
+        ))
     }
 
     private fun ensureQuestion(id: String) {
@@ -1024,6 +1066,8 @@ open class SurveyViewModel(
         }
 
         regenerateSurveyUuid()
+        answerTraceIds.clear()
+        trace = traceContext?.let { SurveyTraceRegistry.start(it, _surveyUuid.value) }
 
         resetQuestions()
         resetAnswers()

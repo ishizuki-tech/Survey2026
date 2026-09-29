@@ -23,6 +23,8 @@ import com.negi.survey.net.RuntimeLogStore
 import com.negi.survey.slm.FollowupExtractor
 import com.negi.survey.slm.PromptPhase
 import com.negi.survey.slm.Repository
+import com.negi.survey.slm.RepositoryTraceContext
+import com.negi.survey.slm.RepositoryTraceEvent
 import java.security.MessageDigest
 import java.util.ArrayDeque
 import java.util.Collections
@@ -53,6 +55,11 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
 
 /**
  * ViewModel dedicated to AI-related operations and chat persistence.
@@ -500,15 +507,23 @@ class AiViewModel(
         evalJobRef.get()?.takeIf { it.isActive }?.let { return@synchronized it }
         val runUuid = survey.surveyUuid.value
         val answer = survey.getAnswer(nodeId)
+        val answerTraceId = survey.commitAnswer(nodeId, inputSource = "typed")
         val remaining = survey.remainingFollowups(nodeId)
         val requiredComponents = survey.requiredComponentsFor(nodeId)
         val requiredComponentIds = survey.requiredComponentCatalogFor(nodeId).map { it.id }
         var admittedMissingPoints = emptyList<String>()
+        var traceMissingPoints = emptyList<String>()
+        var traceFollowupNeeded: Boolean? = null
+        val evalPrompt = survey.getEvalPrompt(nodeId, rootQuestion, answer)
+        survey.traceEvent("AI_EVAL_STARTED", answerTraceId, nodeId, mapOf(
+            "prompt" to evalPrompt, "promptLength" to evalPrompt.length,
+            "modelPhase" to "EVAL"
+        ))
         beginValidationTurn(contextKey)
         // A navigation cancellation leaves a retryable saved state rather than implying completion.
         survey.setAiReason(nodeId, SurveyAiReason.FAILURE)
         evaluateConditionalTwoStepAsync(
-            firstPrompt = survey.getEvalPrompt(nodeId, rootQuestion, answer),
+            firstPrompt = evalPrompt,
             proceedOnTimeout = false,
             shouldRunSecond = { result ->
                 val admission = SurveyAiPolicy.evaluateAdmission(
@@ -519,6 +534,12 @@ class AiViewModel(
                     requiredComponents,
                     requiredComponentIds,
                 )
+                val traceJson = runCatching { Json.parseToJsonElement(result.raw.trim()) as? JsonObject }.getOrNull()
+                traceMissingPoints = (traceJson?.get("missing_points") as? JsonArray)
+                    ?.mapNotNull { (it as? JsonPrimitive)?.takeIf(JsonPrimitive::isString)?.content }
+                    .orEmpty()
+                traceFollowupNeeded = (traceJson?.get("followup_needed") as? JsonPrimitive)
+                    ?.takeUnless(JsonPrimitive::isString)?.booleanOrNull
                 admittedMissingPoints = admission.missingPoints
                 admission.decision == SurveyAiDecision.GENERATE
             },
@@ -529,10 +550,26 @@ class AiViewModel(
                     answer,
                     result.raw,
                     survey.resolvedRequiredComponentsFor(nodeId, admittedMissingPoints),
-                )
+                ).also { prompt ->
+                    survey.traceEvent("AI_FOLLOWUP_STARTED", answerTraceId, nodeId, mapOf(
+                        "prompt" to prompt, "promptLength" to prompt.length,
+                        "followupIndex" to (survey.followups.value[nodeId].orEmpty().size + 1),
+                        "modelPhase" to "FOLLOWUP"
+                    ))
+                }
             },
             onFinished = { evaluation, generation ->
                 if (survey.surveyUuid.value == runUuid) {
+                    survey.traceEvent("AI_EVAL_FINISHED", answerTraceId, nodeId, mapOf(
+                        "rawResponse" to evaluation.raw, "responseLength" to evaluation.raw.length,
+                        "timedOut" to evaluation.timedOut, "error" to evaluation.error, "aiViewModelRunId" to evaluation.runId
+                    ))
+                    survey.traceEvent("AI_EVAL_PARSED", answerTraceId, nodeId, mapOf(
+                        "score" to evaluation.score, "extractedFollowups" to evaluation.followups,
+                        "missing_points" to traceMissingPoints,
+                        "followup_needed" to traceFollowupNeeded,
+                        "parseSuccess" to (traceFollowupNeeded != null), "error" to evaluation.error
+                    ))
                     upsertChatItem(contextKey, ChatItem(
                         id = "eval-$nodeId-${evaluation.runId}", sender = ChatSender.AI, json = evaluation.raw
                     ))
@@ -544,6 +581,12 @@ class AiViewModel(
                         requiredComponents,
                         requiredComponentIds,
                     )
+                    survey.traceEvent("AI_POLICY_DECISION", answerTraceId, nodeId, mapOf(
+                        "decision" to decision.name, "score" to evaluation.score,
+                        "missing_points" to traceMissingPoints,
+                        "followup_needed" to traceFollowupNeeded,
+                        "remainingFollowupCapacity" to remaining, "policyMissingPoints" to admittedMissingPoints
+                    ))
                     val reason = when (decision) {
                         SurveyAiDecision.ACHIEVED -> SurveyAiReason.ACHIEVED
                         SurveyAiDecision.LIMIT_REACHED -> SurveyAiReason.LIMIT_REACHED
@@ -559,19 +602,65 @@ class AiViewModel(
                                     )
                                 }
                             }
+                            if (generation != null) {
+                                survey.traceEvent("AI_FOLLOWUP_FINISHED", answerTraceId, nodeId, mapOf(
+                                    "rawResponse" to generation.raw, "responseLength" to generation.raw.length,
+                                    "timedOut" to generation.timedOut, "error" to generation.error,
+                                    "aiViewModelRunId" to generation.runId
+                                ))
+                                survey.traceEvent("AI_FOLLOWUP_EXTRACTED", answerTraceId, nodeId, mapOf(
+                                    "candidate" to generation.followups.firstOrNull(), "extractionSuccess" to (question != null)
+                                ))
+                            }
                             if (question != null && survey.addFollowupQuestion(nodeId, question)) {
+                                survey.traceEvent("AI_FOLLOWUP_ACCEPTED", answerTraceId, nodeId, mapOf("followup" to question))
                                 upsertChatItem(contextKey, ChatItem(
                                     id = "fu-$nodeId-${generation.runId}", sender = ChatSender.AI, text = question
                                 ))
                                 setFollowupMode(contextKey, question)
                                 null
-                            } else SurveyAiReason.FAILURE
+                            } else {
+                                survey.traceEvent("AI_FOLLOWUP_REJECTED", answerTraceId, nodeId, mapOf("candidate" to generation?.followups?.firstOrNull()))
+                                SurveyAiReason.FAILURE
+                            }
                         }
                     }
                     survey.setAiReason(nodeId, reason)
+                    survey.traceEvent("AI_UI_UPDATED", answerTraceId, nodeId, mapOf(
+                        "terminalOutcome" to (reason?.name ?: "FOLLOWUP_SHOWN"),
+                        "followupDisplayed" to (reason == null)
+                    ))
+                    survey.traceEvent("QUESTION_COMPLETED", answerTraceId, nodeId, mapOf(
+                        "outcome" to (reason?.name ?: "FOLLOWUP_SHOWN"), "advanced" to false
+                    ))
                     if (reason?.terminal == true) completeValidationTurn(contextKey, rootQuestion)
                     else if (reason == SurveyAiReason.FAILURE) failValidationTurn(contextKey)
                     removeTypingMessage(contextKey, nodeId)
+                }
+            },
+            repositoryTraceContextForRun = { _, phase ->
+                answerTraceId?.let { traceId ->
+                    RepositoryTraceContext(traceId, nodeId, phase) { event ->
+                        when (event) {
+                            is RepositoryTraceEvent.Started -> survey.traceEvent(
+                                "AI_REPOSITORY_REQUEST", traceId, nodeId, mapOf(
+                                    "repositoryRequestId" to event.requestId,
+                                    "modelIdentity" to event.modelIdentity,
+                                    "finalPrompt" to event.finalPrompt,
+                                    "requestPhase" to phase.name
+                                )
+                            )
+                            is RepositoryTraceEvent.Finished -> survey.traceEvent(
+                                "AI_REPOSITORY_FINISHED", traceId, nodeId, mapOf(
+                                    "repositoryRequestId" to event.requestId,
+                                    "rawResponse" to event.rawResponse,
+                                    "terminalStatus" to event.terminalStatus,
+                                    "error" to event.error,
+                                    "liteRtRunId" to event.liteRtRunId
+                                )
+                            )
+                        }
+                    }
                 }
             }
         )
@@ -891,7 +980,8 @@ class AiViewModel(
         proceedOnTimeout: Boolean = true,
         shouldRunSecond: (EvalResult) -> Boolean,
         buildSecondPrompt: (EvalResult) -> String,
-        onFinished: (EvalResult, EvalResult?) -> Unit = { _, _ -> }
+        onFinished: (EvalResult, EvalResult?) -> Unit = { _, _ -> },
+        repositoryTraceContextForRun: ((Long, PromptPhase) -> RepositoryTraceContext?)? = null,
     ): Job {
         val p1 = firstPrompt.trim()
         if (p1.isEmpty()) {
@@ -914,7 +1004,8 @@ class AiViewModel(
                     timeoutMs = timeoutMs,
                     mode = EvalMode.EVAL_JSON,
                     phase = firstPhase,
-                    commitToPrimaryState = true
+                    commitToPrimaryState = true,
+                    repositoryTraceContext = repositoryTraceContextForRun?.invoke(runId1, firstPhase)
                 )
 
                 currentCoroutineContext().ensureActive()
@@ -987,7 +1078,8 @@ class AiViewModel(
                     timeoutMs = timeoutMs,
                     mode = EvalMode.FOLLOWUP_JSON_OR_TEXT,
                     phase = PromptPhase.FOLLOWUP,
-                    commitToPrimaryState = false
+                    commitToPrimaryState = false,
+                    repositoryTraceContext = repositoryTraceContextForRun?.invoke(runId2, PromptPhase.FOLLOWUP)
                 )
                 currentCoroutineContext().ensureActive()
                 synchronized(executionLock) {
@@ -1074,7 +1166,8 @@ class AiViewModel(
         timeoutMs: Long,
         mode: EvalMode,
         phase: PromptPhase,
-        commitToPrimaryState: Boolean
+        commitToPrimaryState: Boolean,
+        repositoryTraceContext: RepositoryTraceContext? = null
     ): EvalResult {
         val buf = StringBuilder()
         var chunkCount = 0
@@ -1202,7 +1295,7 @@ class AiViewModel(
                     inferenceMutex.withLock {
                         requireActiveRun()
 
-                        repo.request(fullPrompt).collect { part ->
+                        repo.request(fullPrompt, repositoryTraceContext).collect { part ->
                             requireActiveRun()
 
                             if (part.isNotEmpty()) {

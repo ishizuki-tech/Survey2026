@@ -77,7 +77,7 @@ class SurveyUploadFinalizerTest {
         assertEquals(File(directory, "survey-uuid.json"), operations.reconciledFile)
         assertEquals("survey-uuid", operations.reconciledSurveyId)
         assertEquals(0, operations.deleteCalls.get())
-        assertEquals(listOf("lookup", "stage", "reconcile", "voice", "log"), operations.events)
+        assertEquals(listOf("lookup", "stage", "reconcile", "voice", "log", "trace"), operations.events)
     }
 
     @Test
@@ -131,6 +131,7 @@ class SurveyUploadFinalizerTest {
             assertEquals(1, operations.reconcileCalls.get())
             assertTrue(operations.events.contains("voice"))
             assertTrue(operations.events.contains("log"))
+            assertTrue(operations.events.contains("trace"))
         }
     }
 
@@ -265,17 +266,18 @@ class SurveyUploadFinalizerTest {
     }
 
     @Test
-    fun finalize_voiceAndLogFailuresRemainBestEffortAfterSafeReconciliation() = runBlocking {
+    fun finalize_optionalArtifactFailuresRemainBestEffortAfterSafeReconciliation() = runBlocking {
         val operations = FakeOperations(directory).apply {
             reconciliationResult = reconciliation(SurveyUploadWork.SurveyWorkAction.KEEP_TRACKED)
             voiceFailure = IllegalStateException("voice")
             logFailure = IllegalStateException("log")
+            traceFailure = IllegalStateException("trace")
         }
 
         val result = finalizer(operations).finalize(snapshot(), config(), tag(), STAMP)
 
         assertTrue(result is SurveyFinalizationResult.Queued)
-        assertEquals(listOf("lookup", "stage", "reconcile", "voice", "log"), operations.events)
+        assertEquals(listOf("lookup", "stage", "reconcile", "voice", "log", "trace"), operations.events)
     }
 
     @Test
@@ -328,6 +330,7 @@ class SurveyUploadFinalizerTest {
         var deleteResult = true
         var voiceFailure: Exception? = null
         var logFailure: Exception? = null
+        var traceFailure: Exception? = null
         var blockStage = false
         val stageEntered = CountDownLatch(1)
         val allowStage = CountDownLatch(1)
@@ -405,6 +408,14 @@ class SurveyUploadFinalizerTest {
         ) {
             events += "log"
             logFailure?.let { throw it }
+        }
+
+        override suspend fun scheduleDiagnosticTraceArtifacts(
+            config: GitHubUploader.GitHubConfig,
+            surveyId: String
+        ) {
+            events += "trace"
+            traceFailure?.let { throw it }
         }
     }
 

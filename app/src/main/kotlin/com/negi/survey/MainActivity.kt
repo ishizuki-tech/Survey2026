@@ -974,7 +974,7 @@ fun AppNav() {
                 factory = object : ViewModelProvider.Factory {
                     @Suppress("UNCHECKED_CAST")
                     override fun <T : ViewModel> create(modelClass: Class<T>): T {
-                        return SurveyViewModel(nav = backStack, config = cfg) as T
+                        return SurveyViewModel(nav = backStack, config = cfg, traceContext = appContext) as T
                     }
                 }
             )

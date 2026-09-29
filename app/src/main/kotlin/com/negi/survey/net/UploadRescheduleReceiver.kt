@@ -160,6 +160,14 @@ class UploadRescheduleReceiver : BroadcastReceiver() {
             Log.w(TAG, "Survey recovery failed action=$action: ${exception.message}", exception)
         }
 
+        try {
+            SurveyArtifactUploadScheduler(appCtx).recoverDiagnosticTraces(cfg)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (exception: Exception) {
+            Log.w(TAG, "Diagnostic trace recovery failed action=$action: ${exception.message}", exception)
+        }
+
         val genericFiles = contexts
             .flatMap { ctx -> listPendingFiles(ctx, PENDING_DIR_GH, walk = false) }
             .distinctBy { stableKey(it) }
