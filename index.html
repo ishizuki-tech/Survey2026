@@ -46,78 +46,77 @@
         <h2>Build provenance</h2>
         
         <p>
-        <strong>Source:</strong> <code>05ca79a9a75fef5f42dad1956c91a1a2f7225453</code></p>
+        <strong>Source:</strong> <code>a7696b27b91c28a84c18f193f88d963f83ec14b4</code></p>
       </section>
-      <section class="config-files"><h2>What's New</h2><h3>Fix LiteRT runtime identity across Android path aliases</h3><pre class="whats-new-body">## Summary
+      <section class="config-files"><h2>What's New</h2><h3>Integrate Kiambu introduction, consent, and Q1-Q16 flow</h3><pre class="whats-new-body">## Summary
 
-Fixes the Galaxy S25 duplicate LiteRT-LM runtime failure tracked in #50.
+Integrates the reviewed Kiambu questionnaire flow onto the current main baseline.
 
-The same physical Gemma model could be exposed through different Android path aliases, such as:
+### Included
 
-```text
-/data/data/com.negi.survey/files/...
-/data/user/0/com.negi.survey/files/...
-```
+- English and Swahili Kiambu Q1-Q16 questionnaire structure
+- Introduction screen
+- Consent screen
+- Consent Yes -&gt; Q1
+- Consent No -&gt; dedicated ConsentDeclined STOP path
+- Config-driven INFO nodes
+- read_aloud behavior
+- Q6 numeric and special-answer screen-out
+- Q7-Q16 AI node/prompt/component rebinding
+- Existing TWO_STEP EVAL -&gt; FOLLOWUP behavior preserved
 
-LiteRT previously used the raw model path as the runtime identity, so the aliases were treated as different models and could initialize two GPU runtimes for the same underlying file.
+### Explicitly preserved
 
-## Fix
+- Latest main LiteRT runtime identity fix
+- Same physical model file aliases reuse the same runtime identity
+- ModelIdentityTest coverage
+- Existing upload/recovery behavior
+- Existing CI/release behavior
 
-- Use filesystem identity (`dev + inode + size + mtime`) for existing model files.
-- Fall back deterministically to absolute path if filesystem stat is unavailable.
-- Use the same identity for the stable LiteRT engine cache key.
-- Add regression coverage for:
-  - same physical file through different aliases
-  - different inode =&gt; different identity
-  - deterministic fallback
+### Explicitly excluded
 
-## Validation
+- branch-preview/signing changes
+- S25 debugging changes
+- Whisper experiments
+- unrelated documentation changes
+- unrelated CI changes
 
-- `:app:testDebugUnitTest --tests com.negi.survey.slm.ModelIdentityTest` — passed
-- `:app:assembleDebug` — passed
-- `git diff --check` — passed
-- Physical Galaxy S25 verification:
-  - only one `Initializing LiteRT-LM`
-  - later calls reused the same warm runtime
-  - multiple inference requests completed on that runtime
+### Validation
 
-This PR intentionally contains only the #50 runtime-identity fix.
-
-It does **not** include:
-- Kiambu changes
-- Whisper cold-load mitigation experiment
-
-Closes #50.
-
-Remaining single-runtime S25 memory pressure is tracked separately in #51.</pre></section>
-      <a class="download" href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-98-05ca79a/Survey2026-05ca79a-release.apk">Download APK</a>
+- Focused JVM tests: PASS
+- Full :app:testDebugUnitTest: PASS
+- :app:assembleDebug: PASS
+- git diff --check: PASS
+- No cherry-pick conflicts
+- Clean worktree</pre></section>
+      <a class="download" href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-99-a7696b2/Survey2026-a7696b2-release.apk">Download APK</a>
       <p class="note">Direct GitHub Release asset. No ZIP extraction is required.</p>
       <section class="config-files">
         <h2>Config files included in this APK</h2>
         <p class="note">These config files were extracted from the exact APK build shown on this page.</p>
-        <p><strong>English — survey_config10.yaml</strong><br><a href="https://github.com/ishizuki-tech/Survey2026/blob/05ca79a9a75fef5f42dad1956c91a1a2f7225453/app/src/main/assets/survey_config10.yaml">View in browser</a> · <a href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-98-05ca79a/survey_config10.yaml">Download</a><br><code>SHA-256: 03c61877264de51524e8f12107f0eaee3ed1abe16c7874fae0a77c863fa66d26</code></p>
-        <p><strong>Swahili — survey_config_sw_10.yaml</strong><br><a href="https://github.com/ishizuki-tech/Survey2026/blob/05ca79a9a75fef5f42dad1956c91a1a2f7225453/app/src/main/assets/survey_config_sw_10.yaml">View in browser</a> · <a href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-98-05ca79a/survey_config_sw_10.yaml">Download</a><br><code>SHA-256: 90f00f7ceadbd2bb0d780f65fd12f23c2610b9d94ea502e51462c860e617f017</code></p>
+        <p><strong>English — survey_config10.yaml</strong><br><a href="https://github.com/ishizuki-tech/Survey2026/blob/a7696b27b91c28a84c18f193f88d963f83ec14b4/app/src/main/assets/survey_config10.yaml">View in browser</a> · <a href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-99-a7696b2/survey_config10.yaml">Download</a><br><code>SHA-256: 1b03c87ce94c58b8b31a3ab1f45f312a83566d22205da878bd5112620070bce6</code></p>
+        <p><strong>Swahili — survey_config_sw_10.yaml</strong><br><a href="https://github.com/ishizuki-tech/Survey2026/blob/a7696b27b91c28a84c18f193f88d963f83ec14b4/app/src/main/assets/survey_config_sw_10.yaml">View in browser</a> · <a href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-99-a7696b2/survey_config_sw_10.yaml">Download</a><br><code>SHA-256: f9ff740df94c3ad5830153d3464601cc427eaec47ab1217f03f4165e31d0e9a3</code></p>
       </section>
       <div class="qr-panel">
-        <div class="qr-box"><img src="qr.png" alt="QR code that downloads the Survey2026 APK for build-98-05ca79a" width="300" height="300"></div>
-        <div><h2>Scan with Android</h2><p class="subtitle">This QR code downloads the APK for this build (build-98-05ca79a).</p><code>https://github.com/ishizuki-tech/Survey2026/releases/download/build-98-05ca79a/Survey2026-05ca79a-release.apk</code></div>
+        <div class="qr-box"><img src="qr.png" alt="QR code that downloads the Survey2026 APK for build-99-a7696b2" width="300" height="300"></div>
+        <div><h2>Scan with Android</h2><p class="subtitle">This QR code downloads the APK for this build (build-99-a7696b2).</p><code>https://github.com/ishizuki-tech/Survey2026/releases/download/build-99-a7696b2/Survey2026-a7696b2-release.apk</code></div>
       </div>
       <div class="grid">
-        <div class="item"><span class="label">Release tag</span><code>build-98-05ca79a</code></div>
+        <div class="item"><span class="label">Release tag</span><code>build-99-a7696b2</code></div>
         <div class="item"><span class="label">Branch</span><code>main</code></div>
-        <div class="item"><span class="label">Commit SHA</span><code>05ca79a</code></div>
-        <div class="item"><span class="label">APK filename</span><code>Survey2026-05ca79a-release.apk</code></div>
-        <div class="item"><span class="label">Workflow run number</span><code>98</code></div>
-        <div class="item"><span class="label">APK SHA-256</span><code>7dda6b713a1a45a0de2e85fd30a72039409aba19425a7fda62dd2f0a60d895bb</code></div>
+        <div class="item"><span class="label">Commit SHA</span><code>a7696b2</code></div>
+        <div class="item"><span class="label">APK filename</span><code>Survey2026-a7696b2-release.apk</code></div>
+        <div class="item"><span class="label">Workflow run number</span><code>99</code></div>
+        <div class="item"><span class="label">APK SHA-256</span><code>edbeaf438049fa2cab1f11c94fc36abdcbdd723d16141333f35f959fbccd6a62</code></div>
         <div class="item"><span class="label">Signing certificate SHA-256</span><code>d6edef47ec6734a46122ab7fddb5e4f17d19d4d51ae3eaddfb32f309ee5036ea</code></div>
-        <div class="item"><span class="label">Generated timestamp</span><code>2026-09-29T01:20:59Z</code></div>
+        <div class="item"><span class="label">Generated timestamp</span><code>2026-09-29T17:35:14Z</code></div>
       </div>
       <div class="links">
-        <a href="https://github.com/ishizuki-tech/Survey2026/releases/tag/build-98-05ca79a">GitHub Release</a>
-        <a href="https://github.com/ishizuki-tech/Survey2026/actions/runs/36506711036">GitHub Actions run</a>
+        <a href="https://github.com/ishizuki-tech/Survey2026/releases/tag/build-99-a7696b2">GitHub Release</a>
+        <a href="https://github.com/ishizuki-tech/Survey2026/actions/runs/36604838730">GitHub Actions run</a>
         <a href="https://github.com/ishizuki-tech/Survey2026">Repository</a>
       </div>
-      <footer>Survey2026 release metadata generated 2026-09-29T01:20:59Z.</footer>
+      <footer>Survey2026 release metadata generated 2026-09-29T17:35:14Z.</footer>
     </section>
   </main>
 </body>
