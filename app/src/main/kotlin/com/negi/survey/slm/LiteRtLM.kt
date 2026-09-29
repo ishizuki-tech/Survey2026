@@ -12,6 +12,7 @@
 package com.negi.survey.slm
 
 import android.os.Build
+import android.system.Os
 import android.util.Log
 
 import android.content.Context
@@ -62,6 +63,45 @@ import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.asCoroutineDispatcher
 
 private const val TAG = "LiteRtLM"
+
+internal data class ModelFilesystemIdentity(
+    val device: Long,
+    val inode: Long,
+    val size: Long,
+    val modifiedAtMillis: Long,
+)
+
+/**
+ * Returns a stable model identity that merges Android path aliases for the
+ * same existing file. Filesystem identity is preferred because canonicalPath
+ * does not collapse /data/data and /data/user/0 on all devices.
+ */
+internal fun modelIdentityForPath(
+    path: String,
+    filesystemIdentity: (File) -> ModelFilesystemIdentity? = ::existingFilesystemIdentity,
+): String {
+    val file = File(path)
+    val identity = filesystemIdentity(file)
+    return if (identity != null) {
+        "fs|dev=${identity.device}|ino=${identity.inode}|size=${identity.size}|mtime=${identity.modifiedAtMillis}"
+    } else {
+        "path|${file.absolutePath}"
+    }
+}
+
+private fun existingFilesystemIdentity(file: File): ModelFilesystemIdentity? {
+    if (!file.isFile) return null
+
+    return runCatching {
+        val stat = Os.stat(file.absolutePath)
+        ModelFilesystemIdentity(
+            device = stat.st_dev,
+            inode = stat.st_ino,
+            size = stat.st_size,
+            modifiedAtMillis = file.lastModified(),
+        )
+    }.getOrNull()
+}
 
 /** Upper bound for error strings rendered in UI/log aggregation. */
 private const val ERROR_MAX_CHARS = 280
@@ -412,8 +452,8 @@ object LiteRtLM {
     /** Returns true when a generateText call is currently in progress. */
     fun isBusy(): Boolean = busy.get()
 
-    /** Stable runtime key. */
-    private fun runtimeKey(model: Model): String = "${model.name}|${model.taskPath}"
+    /** Stable runtime key shared by every path alias of the same model file. */
+    private fun runtimeKey(model: Model): String = modelIdentityForPath(model.taskPath)
 
     private fun throwIfPoisoned(key: String) {
         nativeLifecycle.poisonErrorOrNull()?.let { error ->
@@ -497,7 +537,7 @@ object LiteRtLM {
      */
     private fun stableEngineCacheDir(
         context: Context,
-        modelPath: String,
+        modelIdentity: String,
         backend: Backend,
         supportImage: Boolean,
         supportAudio: Boolean,
@@ -506,20 +546,9 @@ object LiteRtLM {
             val base = File(context.noBackupFilesDir, LITERT_CACHE_SUBDIR)
             if (!ensureDirExists(base)) return@runCatching null
 
-            /*
-             * Include a lightweight model-file fingerprint in the cache key.
-             * Replacing a model in-place under the same pathname must not reuse
-             * serialized GPU artifacts produced for different model bytes.
-             */
-            val modelFile = File(modelPath)
-            val modelSize = runCatching { modelFile.length() }.getOrDefault(-1L)
-            val modelMtime = runCatching { modelFile.lastModified() }.getOrDefault(-1L)
-
             val key = buildString {
                 append("v=").append(LITERT_CACHE_VERSION)
-                append("|path=").append(modelPath)
-                append("|size=").append(modelSize)
-                append("|mtime=").append(modelMtime)
+                append("|model=").append(modelIdentity)
                 append("|backend=").append(backend.name)
                 append("|img=").append(supportImage)
                 append("|aud=").append(supportAudio)
@@ -2420,7 +2449,7 @@ object LiteRtLM {
                         val stable =
                             stableEngineCacheDir(
                                 context = appContext,
-                                modelPath = modelPath,
+                                modelIdentity = key,
                                 backend = forBackend,
                                 supportImage = supportImage,
                                 supportAudio = supportAudio,
