@@ -1,0 +1,13 @@
+{
+  "original_branch": "fix/s25-runtime-memory-pressure",
+  "branch_slug": "fix-s25-runtime-memory-pressure",
+  "commit_sha": "de68a24ec0751c963bd4fa3ab62049ead0e46b5b",
+  "short_sha": "de68a24",
+  "apk_name": "Survey2026-fix-s25-runtime-memory-pressure-de68a24.apk",
+  "apk_sha256": "14cbe708c1fa0146a7aedc86bc5f0c0ebd160027ba5480366382148b57245259",
+  "signing_cert_sha256": "73684540bf9ebfadceee724611e5a27e100149731a2ffdea241b6cd99e043c09",
+  "apk_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-fix-s25-runtime-memory-pressure-de68a24-run-87/Survey2026-fix-s25-runtime-memory-pressure-de68a24.apk",
+  "page_url": "https://ishizuki-tech.github.io/Survey2026/fix-s25-runtime-memory-pressure/",
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/36506018445",
+  "generated_utc": "2026-09-29T01:09:49Z"
+}
