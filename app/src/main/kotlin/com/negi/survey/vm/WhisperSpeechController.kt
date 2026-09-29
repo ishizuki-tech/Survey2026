@@ -487,8 +487,8 @@ class WhisperSpeechController(
             }
 
             WhisperTraceRegistry.event(currentSurveyId, currentQuestionId, "MODEL_INIT_STARTED", mapOf("modelKey" to assetModelPath, "language" to normalizedLanguage))
-        var initTiming: InitTiming? = null
-        val result = WhisperEngine.ensureInitializedFromAsset(
+            var initTiming: InitTiming? = null
+            val result = WhisperEngine.ensureInitializedFromAsset(
                 context = appContext,
                 assetPath = assetModelPath,
                 onTiming = { timing -> initTiming = timing }
