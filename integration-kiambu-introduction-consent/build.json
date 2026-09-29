@@ -1,0 +1,11 @@
+{
+  "original_branch": "integration/kiambu-introduction-consent",
+  "branch_slug": "integration-kiambu-introduction-consent",
+  "commit_sha": "ce7d83cd8183b9d283f6f00efb6ab91c766f391f",
+  "short_sha": "ce7d83c",
+  "apk_name": "Survey2026-integration-kiambu-introduction-consent-ce7d83c.apk",
+  "apk_sha256": "7181ff748d33dc90671d44709bb4538049223e051b48e98c225f228576918309",
+  "page_url": "https://ishizuki-tech.github.io/Survey2026/integration-kiambu-introduction-consent/",
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/36602549077",
+  "generated_utc": "2026-09-29T17:12:43Z"
+}
