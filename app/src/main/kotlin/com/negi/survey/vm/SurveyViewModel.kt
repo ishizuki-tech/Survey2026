@@ -48,9 +48,12 @@ private const val TAG = "SurveyVM"
 
 enum class NodeType {
     START,
+    INFO,
+    STOP,
     TEXT,
     SINGLE_CHOICE,
     MULTI_CHOICE,
+    NUMBER,
     AI,
     REVIEW,
     DONE
@@ -62,23 +65,52 @@ data class Node(
     val title: String = "",
     val question: String = "",
     val options: List<String> = emptyList(),
+    val readAloud: Boolean = true,
+    val otherTextOption: String? = null,
+    val specialOptions: List<String> = emptyList(),
+    val numericRoutes: List<NumericRoute> = emptyList(),
     val nextId: String? = null,
     val nextIdByAnswer: Map<String, String> = emptyMap()
 )
 
-internal fun Node.resolveNextId(answer: String?): String? =
-    if (type == NodeType.SINGLE_CHOICE && answer != null) {
-        nextIdByAnswer[answer] ?: nextId
-    } else {
-        nextId
+data class NumericRoute(
+    val lessThanOrEqual: Int,
+    val nextId: String,
+)
+
+internal fun Node.resolveNextId(answer: String?): String? = when (type) {
+    NodeType.SINGLE_CHOICE -> answer?.let { nextIdByAnswer[it] } ?: nextId
+    NodeType.NUMBER -> {
+        answer?.let { nextIdByAnswer[it] }
+            ?: answer?.toIntOrNull()?.let { number ->
+                numericRoutes.firstOrNull { number <= it.lessThanOrEqual }?.nextId
+            }
+            ?: nextId
     }
+    else -> nextId
+}
+
+internal fun Node.isValidNumberAnswer(answer: String): Boolean =
+    answer in specialOptions ||
+            (answer.isNotEmpty() && answer.all(Char::isDigit) && answer.toIntOrNull() != null)
+
+internal fun Node.composeSingleChoiceAnswer(selected: String?, otherText: String?): String? {
+    val choice = selected?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+    if (choice != otherTextOption) return choice
+
+    val detail = otherText?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+    return "$choice: $detail"
+}
 
 /* ───────────────────────────── Nav Keys ───────────────────────────── */
 
 @Serializable object FlowHome : NavKey
+@Serializable object FlowInfo : NavKey
+@Serializable object FlowStop : NavKey
 @Serializable object FlowText : NavKey
 @Serializable object FlowSingle : NavKey
 @Serializable object FlowMulti : NavKey
+@Serializable object FlowNumber : NavKey
 @Serializable object FlowAI : NavKey
 @Serializable object FlowReview : NavKey
 @Serializable object FlowDone : NavKey
@@ -868,9 +900,12 @@ open class SurveyViewModel(
     private fun navKeyFor(node: Node): NavKey =
         when (node.type) {
             NodeType.START -> FlowHome
+            NodeType.INFO -> FlowInfo
+            NodeType.STOP -> FlowStop
             NodeType.TEXT -> FlowText
             NodeType.SINGLE_CHOICE -> FlowSingle
             NodeType.MULTI_CHOICE -> FlowMulti
+            NodeType.NUMBER -> FlowNumber
             NodeType.AI -> FlowAI
             NodeType.REVIEW -> FlowReview
             NodeType.DONE -> FlowDone
@@ -1109,9 +1144,12 @@ open class SurveyViewModel(
         val rawType = this.type.trim()
         val t = when (rawType.uppercase()) {
             "START" -> NodeType.START
+            "INFO", "INFORMATION" -> NodeType.INFO
+            "STOP" -> NodeType.STOP
             "TEXT" -> NodeType.TEXT
             "SINGLE_CHOICE", "SINGLECHOICE", "RADIO" -> NodeType.SINGLE_CHOICE
             "MULTI_CHOICE", "MULTICHOICE", "CHECKBOX" -> NodeType.MULTI_CHOICE
+            "NUMBER", "NUMERIC", "INTEGER" -> NodeType.NUMBER
             "AI", "LLM", "SLM" -> NodeType.AI
             "REVIEW" -> NodeType.REVIEW
             "DONE", "FINISH", "FINAL" -> NodeType.DONE
@@ -1127,6 +1165,14 @@ open class SurveyViewModel(
             title = this.title,
             question = this.question,
             options = this.options,
+            readAloud = this.readAloud,
+            otherTextOption = this.otherTextOption?.trim()?.takeIf { it.isNotEmpty() },
+            specialOptions = this.specialOptions.map { it.trim() }.filter { it.isNotEmpty() },
+            numericRoutes = this.numericRoutes.mapNotNull { route ->
+                val threshold = route.lessThanOrEqual ?: return@mapNotNull null
+                val destination = route.nextId?.trim()?.takeIf { it.isNotEmpty() } ?: return@mapNotNull null
+                NumericRoute(threshold, destination)
+            },
             nextId = this.nextId?.trim(),
             nextIdByAnswer = this.nextIdByAnswer.mapValues { (_, destination) -> destination.trim() }
         )

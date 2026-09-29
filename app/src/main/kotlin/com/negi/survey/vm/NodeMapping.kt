@@ -12,6 +12,7 @@
 package com.negi.survey.vm
 
 import com.negi.survey.config.NodeDTO
+import com.negi.survey.config.NumericRoute as ConfigNumericRoute
 import java.util.Locale
 
 /**
@@ -50,6 +51,10 @@ fun NodeDTO.toVmNode(): Node {
         title = title.orEmpty().trim(),
         question = question.orEmpty().trim(),
         options = safeOptions,
+        readAloud = readAloud,
+        otherTextOption = otherTextOption?.trim()?.takeIf { it.isNotEmpty() },
+        specialOptions = specialOptions.map { it.trim() }.filter { it.isNotEmpty() },
+        numericRoutes = numericRoutes.mapNotNull(ConfigNumericRoute::toVmNumericRoute),
         nextId = safeNextId,
         nextIdByAnswer = safeNextIdByAnswer
     )
@@ -71,10 +76,13 @@ private fun resolveVmNodeType(rawType: String?): NodeType {
     // Keep backward compatibility with legacy config spellings / aliases.
     return when (normalized) {
         "START" -> NodeType.START
+        "INFO", "INFORMATION" -> NodeType.INFO
+        "STOP" -> NodeType.STOP
         "TEXT" -> NodeType.TEXT
 
         "SINGLE_CHOICE", "SINGLECHOICE", "RADIO" -> NodeType.SINGLE_CHOICE
         "MULTI_CHOICE", "MULTICHOICE", "CHECKBOX" -> NodeType.MULTI_CHOICE
+        "NUMBER", "NUMERIC", "INTEGER" -> NodeType.NUMBER
 
         "AI", "LLM", "SLM" -> NodeType.AI
 
@@ -85,4 +93,10 @@ private fun resolveVmNodeType(rawType: String?): NodeType {
         else -> runCatching { NodeType.valueOf(normalized) }
             .getOrElse { NodeType.TEXT }
     }
+}
+
+private fun ConfigNumericRoute.toVmNumericRoute(): NumericRoute? {
+    val threshold = lessThanOrEqual ?: return null
+    val destination = nextId?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+    return NumericRoute(threshold, destination)
 }
