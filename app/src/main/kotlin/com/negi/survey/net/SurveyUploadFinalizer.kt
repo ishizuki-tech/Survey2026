@@ -11,6 +11,7 @@ package com.negi.survey.net
 import android.content.Context
 import com.negi.survey.utils.DeviceUploadTag
 import com.negi.survey.diagnostics.SurveyTraceRegistry
+import com.negi.survey.diagnostics.WhisperTraceRegistry
 import com.negi.survey.utils.buildSurveyFileName
 import com.negi.survey.vm.SurveyFinalizationSnapshot
 import java.io.File
@@ -65,6 +66,7 @@ class SurveyUploadFinalizer private constructor(
         val surveyId = snapshot.surveyId.trim()
         if (surveyId.isBlank()) return SurveyFinalizationResult.Failure("Survey ID is missing.")
         SurveyTraceRegistry.finalizeAsync(surveyId)
+        WhisperTraceRegistry.finalizeAsync(surveyId)
         return locks.getOrPut(surveyId) { Mutex() }.withLock {
             try {
                 if (operations.isUploaded(surveyId)) {

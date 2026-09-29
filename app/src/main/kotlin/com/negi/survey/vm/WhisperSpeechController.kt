@@ -31,6 +31,7 @@ package com.negi.survey.vm
 import android.content.Context
 import android.os.SystemClock
 import android.util.Log
+import com.negi.survey.diagnostics.WhisperTraceRegistry
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
@@ -39,6 +40,7 @@ import com.negi.survey.utils.ExportUtils
 import com.negi.survey.whisper.Recorder
 import com.negi.survey.whisper.RecorderBackend
 import com.negi.survey.whisper.WhisperEngine
+import com.negi.survey.whisper.InitTiming
 import java.io.File
 import java.io.FileInputStream
 import java.io.RandomAccessFile
@@ -186,6 +188,7 @@ class WhisperSpeechController(
         currentSurveyId = surveyId
         currentQuestionId = questionId
         Log.d(TAG, "updateContext: surveyId=$surveyId, questionId=$questionId")
+        WhisperTraceRegistry.event(surveyId, questionId, "WHISPER_CONTEXT_UPDATED")
     }
 
     // ---------------------------------------------------------------------
@@ -216,6 +219,7 @@ class WhisperSpeechController(
         session.recorder = newRecorder(session)
 
         Log.d(TAG, "startRecording: requested")
+        WhisperTraceRegistry.event(session.surveyId, session.questionId, "RECORDING_STARTED", mapOf("whisperRecordingId" to session.id))
         _error.value = null
         _partialText.value = ""
         _isRecording.value = true
@@ -325,6 +329,7 @@ class WhisperSpeechController(
 
                     val stableBytes = awaitFileSizeStabilized(wav)
                     Log.d(TAG, "stopRecording: wav.size(stable)=$stableBytes path=${wav.path}")
+                    WhisperTraceRegistry.event(session.surveyId, session.questionId, "RECORDING_STOPPED", mapOf("whisperRecordingId" to session.id, "byteSize" to stableBytes))
 
                     if (wav.length() <= MIN_WAV_BYTES) {
                         Log.d(TAG, "stopRecording: WAV too short (likely no speech) (${wav.length()} bytes)")
@@ -378,6 +383,7 @@ class WhisperSpeechController(
                                 checksum = checksum
                             )
                         )
+                        WhisperTraceRegistry.event(session.surveyId, session.questionId, "AUDIO_EXPORTED", mapOf("fileName" to exported.name, "byteSize" to exported.length()))
 
                         Log.d(
                             TAG,
@@ -393,6 +399,7 @@ class WhisperSpeechController(
                     if (!owns(session)) return@withLock
                     _isTranscribing.value = true
                     Log.d(TAG, "stopRecording: transcribing -> ${wav.path}")
+                    WhisperTraceRegistry.event(session.surveyId, session.questionId, "TRANSCRIPTION_STARTED", mapOf("language" to normalizedLanguage))
 
                     val result = transcriber?.invoke(wav, normalizedLanguage)
                         ?: WhisperEngine.transcribeWaveFile(
@@ -400,7 +407,14 @@ class WhisperSpeechController(
                             lang = normalizedLanguage,
                             translate = false,
                             printTimestamp = false,
-                            targetSampleRate = 16_000
+                            targetSampleRate = 16_000,
+                            onTiming = { timing ->
+                                WhisperTraceRegistry.event(session.surveyId, session.questionId, "TRANSCRIPTION_FINISHED", mapOf(
+                                    "whisperRequestId" to timing.requestId, "totalMs" to timing.totalMs,
+                                    "decodeMs" to timing.decodeMs, "lockWaitMs" to timing.lockWaitMs,
+                                    "selectedLanguage" to timing.selectedLang, "audioSeconds" to timing.audioSeconds
+                                ))
+                            }
                         )
 
                     result
@@ -412,12 +426,14 @@ class WhisperSpeechController(
                                 _error.value = buildEmptyTranscriptionReason(wav)
                             } else {
                                 Log.d(TAG, "Transcription success: ${trimmed.take(80)}")
+                                WhisperTraceRegistry.event(session.surveyId, session.questionId, "TRANSCRIPTION_FINISHED", mapOf("transcript" to trimmed, "success" to true, "language" to normalizedLanguage))
                             }
                             updatePartialText(trimmed)
                         }
                         .onFailure { e ->
                             if (!owns(session)) return@onFailure
                             Log.e(TAG, "Transcription failed", e)
+                            WhisperTraceRegistry.event(session.surveyId, session.questionId, "TRANSCRIPTION_FAILED", mapOf("error" to e.message))
                             _error.value = e.message ?: "Transcription failed"
                         }
                 } catch (ce: CancellationException) {
@@ -470,17 +486,25 @@ class WhisperSpeechController(
                 return
             }
 
-            val result = WhisperEngine.ensureInitializedFromAsset(
+            WhisperTraceRegistry.event(currentSurveyId, currentQuestionId, "MODEL_INIT_STARTED", mapOf("modelKey" to assetModelPath, "language" to normalizedLanguage))
+        var initTiming: InitTiming? = null
+        val result = WhisperEngine.ensureInitializedFromAsset(
                 context = appContext,
-                assetPath = assetModelPath
+                assetPath = assetModelPath,
+                onTiming = { timing -> initTiming = timing }
             )
 
             result.onFailure { e ->
+                WhisperTraceRegistry.event(currentSurveyId, currentQuestionId, "MODEL_INIT_FINISHED", mapOf("success" to false, "modelKey" to assetModelPath, "error" to e.message))
                 Log.e(TAG, "ensureModelInitializedFromAssetsOnce failed: assets/$assetModelPath", e)
                 throw IllegalStateException(
                     "Failed to initialize Whisper model from assets/$assetModelPath",
                     e
                 )
+            }
+
+            result.onSuccess {
+                initTiming?.let { timing -> WhisperTraceRegistry.event(currentSurveyId, currentQuestionId, "MODEL_INIT_FINISHED", mapOf("success" to true, "modelInitRequestId" to timing.requestId, "modelKey" to timing.key, "totalMs" to timing.totalMs, "lockWaitMs" to timing.lockWaitMs, "modelBytes" to timing.modelBytes)) }
             }
 
             Log.d(TAG, "WhisperEngine initialized: assets/$assetModelPath")

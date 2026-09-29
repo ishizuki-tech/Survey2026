@@ -152,6 +152,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.ClipEntry
 import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.font.FontFamily
@@ -161,6 +162,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.negi.survey.BuildConfig
 import com.negi.survey.net.RuntimeLogStore
+import com.negi.survey.diagnostics.WhisperTraceRegistry
 import com.negi.survey.slm.FollowupExtractor
 import com.negi.survey.slm.PromptPhase
 import com.negi.survey.vm.AiViewModel
@@ -301,6 +303,7 @@ fun AiScreen(
     ttsController: QuestionSpeaker? = null
 ) {
     val nid = remember(nodeId) { nodeId.trim() }
+    val localContext = LocalContext.current.applicationContext
 
     val keyboard = LocalSoftwareKeyboardController.current
     val focusManager = LocalFocusManager.current
@@ -738,6 +741,8 @@ fun AiScreen(
             (!wasRecording && !wasTranscribing) && (speechRecording || speechTranscribing)
 
         if (startedThisUtterance) {
+            val traceId = vmSurvey.answerTraceId(nid)
+            WhisperTraceRegistry.start(localContext, surveyUuid)?.event("RECORDING_STARTED", traceId, nid, mapOf("inputSource" to "voice"))
             vmAI.updateComposerDraft(contextKey, "")
             lastCommitted = null
 
@@ -759,6 +764,7 @@ fun AiScreen(
 
                 if (conv.role == AiViewModel.ComposerRole.MAIN) {
                     vmSurvey.setAnswer(text, nid)
+                    WhisperTraceRegistry.start(localContext, surveyUuid)?.event("TRANSCRIPT_ACCEPTED", vmSurvey.answerTraceId(nid), nid, mapOf("transcript" to text, "inputSource" to "voice"))
                 }
 
                 RuntimeLogStore.d(TAG, "Speech committed (node=$nid role=${conv.role} len=${text.length})")
@@ -1103,7 +1109,13 @@ fun AiScreen(
                             speechStatusText = speechStatusText,
                             speechStatusIsError = speechStatusIsError,
                             onToggleSpeech = speechController?.let { sc ->
-                                { toggleSpeechRecordingWithTtsInterlock(sc, ttsController) }
+                                {
+                                    if (!sc.isRecording.value) {
+                                        val traceId = vmSurvey.beginAnswerTransaction(nid, "voice")
+                                        WhisperTraceRegistry.beginVoiceTransaction(localContext, surveyUuid, nid, traceId)
+                                    }
+                                    toggleSpeechRecordingWithTtsInterlock(sc, ttsController)
+                                }
                             }
                         )
 
