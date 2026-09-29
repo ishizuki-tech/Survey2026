@@ -763,7 +763,7 @@ fun AiScreen(
                 lastCommitted = text
 
                 if (conv.role == AiViewModel.ComposerRole.MAIN) {
-                    vmSurvey.setAnswer(text, nid)
+                    vmSurvey.acceptVoiceTranscript(nid, text)
                     WhisperTraceRegistry.start(localContext, surveyUuid)?.event("TRANSCRIPT_ACCEPTED", vmSurvey.answerTraceId(nid), nid, mapOf("transcript" to text, "inputSource" to "voice"))
                 }
 
@@ -829,7 +829,9 @@ fun AiScreen(
             val input = conv.composerDraft.trim()
             if (input.isBlank()) return
             if (conv.role == AiViewModel.ComposerRole.MAIN) {
-                vmSurvey.beginAnswerTransaction(nid, inputSource = "typed")
+                if (!vmSurvey.consumeAcceptedVoiceTransaction(nid)) {
+                    vmSurvey.beginAnswerTransaction(nid, inputSource = "typed")
+                }
                 vmSurvey.setAnswer(input, nid)
             }
             else vmSurvey.answerLastFollowup(nid, input)

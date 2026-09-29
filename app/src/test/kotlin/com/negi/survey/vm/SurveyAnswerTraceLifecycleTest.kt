@@ -3,6 +3,8 @@ package com.negi.survey.vm
 import com.negi.survey.diagnostics.AnswerTraceTransactions
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class SurveyAnswerTraceLifecycleTest {
@@ -15,5 +17,27 @@ class SurveyAnswerTraceLifecycleTest {
         val second = transactions.begin("Q14")
         assertNotEquals(first, second)
         assertEquals(second, transactions.commit("Q14"))
+    }
+
+    @Test fun accepted_voice_handoff_is_one_shot_and_fresh_voice_supersedes_it() {
+        val transactions = AnswerTraceTransactions()
+        val voiceA = transactions.begin("Q14")
+        transactions.markVoiceAccepted("Q14")
+
+        assertTrue(transactions.consumeVoiceAccepted("Q14"))
+        assertEquals(voiceA, transactions.commit("Q14"))
+        assertFalse(transactions.consumeVoiceAccepted("Q14"))
+
+        val typedB = transactions.begin("Q14")
+        assertNotEquals(voiceA, typedB)
+        assertEquals(typedB, transactions.commit("Q14"))
+
+        transactions.markVoiceAccepted("Q14")
+        val voiceC = transactions.begin("Q14")
+        assertNotEquals(typedB, voiceC)
+        assertFalse(transactions.consumeVoiceAccepted("Q14"))
+        transactions.markVoiceAccepted("Q14")
+        transactions.clear()
+        assertFalse(transactions.consumeVoiceAccepted("Q14"))
     }
 }

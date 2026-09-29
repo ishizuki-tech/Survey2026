@@ -392,6 +392,16 @@ open class SurveyViewModel(
         return traceId
     }
 
+    /** Marks the one voice-to-submit handoff that must retain its mic-start transaction. */
+    fun acceptVoiceTranscript(questionId: String, text: String) {
+        setAnswer(text, questionId)
+        answerTraceIds.markVoiceAccepted(questionId)
+    }
+
+    /** Consumed exactly once by the normal submit path. */
+    fun consumeAcceptedVoiceTransaction(questionId: String): Boolean =
+        answerTraceIds.consumeVoiceAccepted(questionId)
+
     fun getAnswer(key: String): String = answers.value[key.trim()].orEmpty()
 
     fun clearAnswer(key: String) {
