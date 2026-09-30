@@ -1,0 +1,11 @@
+{
+  "original_branch": "fix/issue-59-fenced-eval-json",
+  "branch_slug": "fix-issue-59-fenced-eval-json",
+  "commit_sha": "21afd0577d0292e319fc37ea03b8eb1f5bafcaed",
+  "short_sha": "21afd05",
+  "apk_name": "Survey2026-fix-issue-59-fenced-eval-json-21afd05.apk",
+  "apk_sha256": "12f46188424cbf641dc999e7559699121149c547cc4687cce0f9735cd31ec98c",
+  "page_url": "https://ishizuki-tech.github.io/Survey2026/fix-issue-59-fenced-eval-json/",
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/36765357950",
+  "generated_utc": "2026-09-30T19:29:54Z"
+}
