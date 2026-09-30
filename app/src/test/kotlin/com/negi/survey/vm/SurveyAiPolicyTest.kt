@@ -13,15 +13,21 @@ class SurveyAiPolicyTest {
         requiredComponentIds: List<String> = emptyList(),
     ) = SurveyAiPolicy.evaluate(raw, timeout, error, remaining, requiredComponents, requiredComponentIds)
 
-    @Test fun required_component_catalog_ids_are_exact_and_take_precedence_over_legacy_text() {
+    @Test fun required_component_catalog_ids_canonicalize_formatting_and_take_precedence_over_legacy_text() {
         fun raw(missing: List<String>) =
             """{"score":60,"missing_points":${missing.joinToString(prefix = "[", postfix = "]") { "\"$it\"" }},"followup_needed":true}"""
         val ids = listOf("animals", "feeding_frequency")
 
         assertEquals(SurveyAiDecision.GENERATE, eval(raw(listOf("animals")), requiredComponentIds = ids))
         assertEquals(SurveyAiDecision.GENERATE, eval(raw(ids), requiredComponentIds = ids))
-        assertEquals(SurveyAiDecision.FAILURE, eval(raw(listOf("Animals")), requiredComponentIds = ids))
-        assertEquals(SurveyAiDecision.FAILURE, eval(raw(listOf("animals", "animals")), requiredComponentIds = ids))
+        assertEquals(SurveyAiDecision.GENERATE, eval(raw(listOf("feeding frequency")), requiredComponentIds = ids))
+        assertEquals(SurveyAiDecision.GENERATE, eval(raw(listOf("feeding-frequency")), requiredComponentIds = ids))
+        assertEquals(SurveyAiDecision.GENERATE, eval(raw(listOf("Feeding Frequency")), requiredComponentIds = ids))
+        assertEquals(SurveyAiDecision.GENERATE, eval(raw(listOf(" feeding__frequency ")), requiredComponentIds = ids))
+        assertEquals(SurveyAiDecision.GENERATE, eval(raw(listOf("Animals")), requiredComponentIds = ids))
+        assertEquals(SurveyAiDecision.FAILURE, eval(raw(listOf("frequency")), requiredComponentIds = ids))
+        assertEquals(SurveyAiDecision.FAILURE, eval(raw(listOf("how often it is fed")), requiredComponentIds = ids))
+        assertEquals(SurveyAiDecision.FAILURE, eval(raw(listOf("feeding_frequency", "feeding frequency")), requiredComponentIds = ids))
         assertEquals(
             SurveyAiDecision.FAILURE,
             eval(
@@ -29,6 +35,24 @@ class SurveyAiPolicyTest {
                 requiredComponents = listOf("If white maize is used for livestock: which animals receive it"),
                 requiredComponentIds = ids,
             ),
+        )
+    }
+
+    @Test fun required_component_catalog_ids_return_canonical_ids_and_reject_ambiguous_formats() {
+        val raw = """{"score":60,"missing_points":["feeding frequency"],"followup_needed":true}"""
+        val admission = SurveyAiPolicy.evaluateAdmission(
+            raw = raw,
+            timedOut = false,
+            error = null,
+            remaining = 2,
+            requiredComponentIds = listOf("animals", "feeding_frequency"),
+        )
+
+        assertEquals(SurveyAiDecision.GENERATE, admission.decision)
+        assertEquals(listOf("feeding_frequency"), admission.missingPoints)
+        assertEquals(
+            SurveyAiDecision.FAILURE,
+            eval(raw, requiredComponentIds = listOf("feeding_frequency", "feeding-frequency")),
         )
     }
 
