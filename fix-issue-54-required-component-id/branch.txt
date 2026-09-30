@@ -1,0 +1,1 @@
+fix/issue-54-required-component-id
