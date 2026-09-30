@@ -49,12 +49,20 @@ internal object SurveyAiPolicy {
                 val point = it as? JsonPrimitive
                 point == null || !point.isString || point.content.isBlank()
             }) return SurveyAiEvaluation(SurveyAiDecision.FAILURE)
-        val missingPoints = missing.map { (it as JsonPrimitive).content }
-        val allowed = if (requiredComponentIds.isNotEmpty()) requiredComponentIds else requiredComponents
-        if (allowed.isNotEmpty() &&
-            (missingPoints.any { it !in allowed } ||
-                missingPoints.distinct().size != missingPoints.size)
-        ) return SurveyAiEvaluation(SurveyAiDecision.FAILURE)
+        val modelMissingPoints = missing.map { (it as JsonPrimitive).content }
+        val missingPoints = when {
+            requiredComponentIds.isNotEmpty() -> canonicalizeRequiredComponentIds(
+                modelMissingPoints,
+                requiredComponentIds,
+            ) ?: return SurveyAiEvaluation(SurveyAiDecision.FAILURE)
+            requiredComponents.isNotEmpty() -> {
+                if (modelMissingPoints.any { it !in requiredComponents } ||
+                    modelMissingPoints.distinct().size != modelMissingPoints.size
+                ) return SurveyAiEvaluation(SurveyAiDecision.FAILURE)
+                modelMissingPoints
+            }
+            else -> modelMissingPoints
+        }
         val followupNeeded =
             if (!obj.containsKey("followup_needed")) {
                 // A low score with valid unresolved points unambiguously requires the next step.
@@ -83,6 +91,22 @@ internal object SurveyAiPolicy {
 
     fun normalize(question: String): String = question.trim().lowercase(Locale.ROOT)
         .replace(Regex("\\s+"), " ").trimEnd('?', '？').trim()
+
+    private fun canonicalizeRequiredComponentIds(
+        modelIds: List<String>,
+        configuredIds: List<String>,
+    ): List<String>? {
+        val configuredByFormat = configuredIds.groupBy(::normalizeRequiredComponentId)
+        val canonicalIds = modelIds.map { modelId ->
+            configuredByFormat[normalizeRequiredComponentId(modelId)]?.singleOrNull()
+                ?: return null
+        }
+        return canonicalIds.takeIf { it.distinct().size == it.size }
+    }
+
+    private fun normalizeRequiredComponentId(id: String): String = id.trim()
+        .lowercase(Locale.ROOT)
+        .replace(Regex("[\\s_-]+"), "_")
 
     fun acceptQuestion(raw: String, timedOut: Boolean, error: String?, existing: List<String>): String? {
         if (timedOut || error != null) return null
