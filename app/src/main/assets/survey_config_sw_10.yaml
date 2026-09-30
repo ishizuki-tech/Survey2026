@@ -165,6 +165,11 @@ graph:
       title: Mahindi Meupe kwa Chakula cha Mifugo
       question: >-
         Kama unatumia mahindi meupe kulisha mifugo, unawalisha mifugo gani na mara ngapi?
+      required_component_catalog:
+        - id: animals
+          text: "Mifugo inayolishwa mahindi meupe"
+        - id: feeding_frequency
+          text: "Mara ngapi mahindi meupe hulishwa"
       nextId: Q15
 
     - id: Q15
@@ -172,6 +177,11 @@ graph:
       title: Chanzo cha Mbegu za Mahindi
       question: >-
         Kwa kawaida unapata wapi mbegu za mahindi meupe unazopanda, na kwa nini unapendelea kununua au kupata mbegu huko?
+      required_component_catalog:
+        - id: seed_source
+          text: "Chanzo cha kawaida cha mbegu za mahindi meupe"
+        - id: source_reason
+          text: "Sababu ya kupendelea chanzo hicho"
       nextId: Q16
 
     - id: Q16
@@ -179,6 +189,11 @@ graph:
       title: Soko la Kuuzia Mahindi
       question: >-
         Kwa kawaida baada ya kuvuna, unauza mahindi yako wapi, na kwa nini unapendelea kuuza huko au kwa mnunuzi huyo?
+      required_component_catalog:
+        - id: sale_destination
+          text: "Soko au mnunuzi wa kawaida baada ya mavuno"
+        - id: destination_reason
+          text: "Sababu ya kuchagua soko au mnunuzi huyo"
       nextId: Review
 
     - id: Review
@@ -212,6 +227,7 @@ slm:
     N must be an integer 1-100 for relevance, completeness and accuracy against the original target.
     Evaluate the original answer and all answered followup pairs together.
     Kabla ya kutoa JSON, linganisha kila taarifa inayodhaniwa kukosekana na jibu la awali na kila jozi ya swali la ufuatiliaji na jibu lake iliyojibiwa. Ikiwa jibu la ufuatiliaji lililojibiwa linatoa moja kwa moja taarifa hiyo, usiiweke katika missing_points. Hesabu upya score, missing_points, na followup_needed pamoja kama uamuzi mmoja wa mwisho unaolingana.
+    Wakati Required component catalog ipo, tathmini kila kipengele cha catalog kivyake: missing_points inaweza kuwa na ID za vipengele vilivyosanidiwa pekee. Ondoa ID ambayo kipengele chake kimetolewa katika jibu la awali au jozi za maswali ya ufuatiliaji zilizojibiwa; kamwe usirudishe maelezo ya kipengele au maswali katika missing_points. Wakati Required components block ya zamani ipo, missing_points inaweza kuwa na maandishi halisi ya vipengele vilivyosanidiwa ambavyo bado havijajibiwa. Wakati hakuna catalog wala Required components block, missing_points inaweza kuandikwa kwa Kiswahili.
     Tofautisha uhusiano na ukamilifu. Jibu linaweza kuwa kuhusu mada husika lakini bado lisikamilike.
     Toa alama 90-100 tu wakati mhojiwa ametoa kwa wazi kila kipengele muhimu kinachohitajika katika Lengo la jibu na Swali.
     Usikisie maelezo yanayokosekana kutokana na maarifa ya jumla, uwezekano, au kauli tupu kwamba tukio lilitokea.
@@ -223,7 +239,6 @@ slm:
     For score below 90, missing_points must contain the specific missing or ambiguous target-required information
     and followup_needed must be true. Otherwise missing_points is empty and followup_needed is false.
     Do not generate a question. Do not penalize style or request information outside the target.
-    Write missing_points in Swahili.
   strict_output_eval: "One JSON object only; no markdown or generated question."
   length_budget_eval: "Keep missing_points concise."
   followup_output_mode: TEXT

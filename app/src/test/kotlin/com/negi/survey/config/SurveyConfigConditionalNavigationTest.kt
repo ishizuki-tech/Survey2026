@@ -2,6 +2,7 @@ package com.negi.survey.config
 
 import java.io.File
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -199,6 +200,40 @@ class SurveyConfigConditionalNavigationTest {
             ),
             config.graph.nodes.single { it.id == "Q16" }.requiredComponentCatalog,
         )
+    }
+
+    @Test
+    fun kiambu_swahili_component_catalogs_use_canonical_ids_and_the_catalog_eval_contract() {
+        val config = SurveyConfigLoader.fromFileStrictValidated(assetFile("survey_config_sw_10.yaml").absolutePath)
+
+        assertEquals(
+            listOf(
+                RequiredComponent("animals", "Mifugo inayolishwa mahindi meupe"),
+                RequiredComponent("feeding_frequency", "Mara ngapi mahindi meupe hulishwa"),
+            ),
+            config.graph.nodes.single { it.id == "Q14" }.requiredComponentCatalog,
+        )
+        assertEquals(
+            listOf(
+                RequiredComponent("seed_source", "Chanzo cha kawaida cha mbegu za mahindi meupe"),
+                RequiredComponent("source_reason", "Sababu ya kupendelea chanzo hicho"),
+            ),
+            config.graph.nodes.single { it.id == "Q15" }.requiredComponentCatalog,
+        )
+        assertEquals(
+            listOf(
+                RequiredComponent("sale_destination", "Soko au mnunuzi wa kawaida baada ya mavuno"),
+                RequiredComponent("destination_reason", "Sababu ya kuchagua soko au mnunuzi huyo"),
+            ),
+            config.graph.nodes.single { it.id == "Q16" }.requiredComponentCatalog,
+        )
+
+        val evalSystemPrompt = config.composeSystemPromptEval()
+        assertTrue(evalSystemPrompt.contains("ID za vipengele vilivyosanidiwa pekee"))
+        assertTrue(evalSystemPrompt.contains("maelezo ya kipengele au maswali"))
+        assertTrue(evalSystemPrompt.contains("Wakati Required components block ya zamani ipo"))
+        assertTrue(evalSystemPrompt.contains("Wakati hakuna catalog wala Required components block"))
+        assertFalse(evalSystemPrompt.contains("Write missing_points in Swahili."))
     }
 
     @Test
