@@ -514,6 +514,7 @@ class AiViewModel(
         var admittedMissingPoints = emptyList<String>()
         var traceMissingPoints = emptyList<String>()
         var traceFollowupNeeded: Boolean? = null
+        var traceParseSuccess = false
         val evalPrompt = survey.getEvalPrompt(nodeId, rootQuestion, answer)
         survey.traceEvent("AI_EVAL_STARTED", answerTraceId, nodeId, mapOf(
             "prompt" to evalPrompt, "promptLength" to evalPrompt.length,
@@ -534,7 +535,8 @@ class AiViewModel(
                     requiredComponents,
                     requiredComponentIds,
                 )
-                val traceJson = runCatching { Json.parseToJsonElement(result.raw.trim()) as? JsonObject }.getOrNull()
+                val traceJson = parseStrictModelJsonObject(result.raw)
+                traceParseSuccess = traceJson != null
                 traceMissingPoints = (traceJson?.get("missing_points") as? JsonArray)
                     ?.mapNotNull { (it as? JsonPrimitive)?.takeIf(JsonPrimitive::isString)?.content }
                     .orEmpty()
@@ -568,7 +570,7 @@ class AiViewModel(
                         "score" to evaluation.score, "extractedFollowups" to evaluation.followups,
                         "missing_points" to traceMissingPoints,
                         "followup_needed" to traceFollowupNeeded,
-                        "parseSuccess" to (traceFollowupNeeded != null), "error" to evaluation.error
+                        "parseSuccess" to traceParseSuccess, "error" to evaluation.error
                     ))
                     upsertChatItem(contextKey, ChatItem(
                         id = "eval-$nodeId-${evaluation.runId}", sender = ChatSender.AI, json = evaluation.raw
