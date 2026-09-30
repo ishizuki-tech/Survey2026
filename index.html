@@ -46,53 +46,85 @@
         <h2>Build provenance</h2>
         
         <p>
-        <strong>Source:</strong> <code>04e5de064f8d669e00c30391d2a5dfa314721ad2</code></p>
+        <strong>Source:</strong> <code>d3abedf253467071c35b6228f002ae084a92ed76</code></p>
       </section>
-      <section class="config-files"><h2>What's New</h2><h3>Add Swahili required-component catalogs</h3><pre class="whats-new-body">## Summary
+      <section class="config-files"><h2>What's New</h2><h3>Handle fenced EVAL JSON responses</h3><pre class="whats-new-body">## Summary
 
-- add `required_component_catalog` entries to Swahili Q14, Q15, and Q16
-- keep required-component IDs identical to the English configuration
-- localize component descriptions in Swahili
-- update the Swahili EVAL contract so catalog-backed questions emit configured IDs only
-- preserve legacy exact-text behavior and allow Swahili free-text missing points only when no component configuration exists
-- add regression coverage for shipped Swahili catalogs and the scoped EVAL contract
+Fixes #59.
+
+Handle model EVAL responses that are valid JSON objects wrapped in exactly one `json` Markdown code fence, while preserving the existing strict fail-closed contract.
+
+## What changed
+
+- Added a shared transport parser for:
+  - one complete plain JSON object, or
+  - exactly one full-output triple-backtick `json` fence
+  - case-insensitive `json` tag
+  - LF and CRLF
+- Kept semantic schema validation unchanged.
+- Reused the same parser for `AI_EVAL_PARSED.parseSuccess` trace parsing.
+- Preserved raw model output in diagnostics.
+- Added regression coverage for accepted and rejected transport forms.
+
+Rejected forms still include:
+
+- untagged fences
+- unsupported tags
+- prose before or after JSON
+- multiple fences / multiple JSON values
+- arrays and primitives
+- malformed or incomplete fenced payloads
+- schema-invalid JSON objects
 
 ## Validation
 
-- `./gradlew :app:testDebugUnitTest --tests com.negi.survey.config.SurveyConfigConditionalNavigationTest`
+Local verification passed:
+
 - `./gradlew :app:testDebugUnitTest`
 - `./gradlew :app:assembleDebug`
 - `git diff --check`
 
-Closes #58</pre></section>
-      <a class="download" href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-104-04e5de0/Survey2026-04e5de0-release.apk">Download APK</a>
+Real-device validation on Samsung SM-S731U confirmed the normal plain-JSON path and Swahili Q16 multi-turn follow-up flow continue to work.
+
+A fenced JSON response did not naturally reoccur on-device after the fix; that transport path is covered by JVM regression tests.
+
+## Scope
+
+Changed files only:
+
+- `app/src/main/kotlin/com/negi/survey/vm/AiViewModel.kt`
+- `app/src/main/kotlin/com/negi/survey/vm/SurveyAiPolicy.kt`
+- `app/src/test/kotlin/com/negi/survey/vm/SurveyAiPolicyTest.kt`
+
+No changes to survey routing, prompts, Whisper, LiteRT lifecycle, follow-up capacity, or Issue #62 behavior.</pre></section>
+      <a class="download" href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-105-d3abedf/Survey2026-d3abedf-release.apk">Download APK</a>
       <p class="note">Direct GitHub Release asset. No ZIP extraction is required.</p>
       <section class="config-files">
         <h2>Config files included in this APK</h2>
         <p class="note">These config files were extracted from the exact APK build shown on this page.</p>
-        <p><strong>English — survey_config10.yaml</strong><br><a href="https://github.com/ishizuki-tech/Survey2026/blob/04e5de064f8d669e00c30391d2a5dfa314721ad2/app/src/main/assets/survey_config10.yaml">View in browser</a> · <a href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-104-04e5de0/survey_config10.yaml">Download</a><br><code>SHA-256: 1b03c87ce94c58b8b31a3ab1f45f312a83566d22205da878bd5112620070bce6</code></p>
-        <p><strong>Swahili — survey_config_sw_10.yaml</strong><br><a href="https://github.com/ishizuki-tech/Survey2026/blob/04e5de064f8d669e00c30391d2a5dfa314721ad2/app/src/main/assets/survey_config_sw_10.yaml">View in browser</a> · <a href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-104-04e5de0/survey_config_sw_10.yaml">Download</a><br><code>SHA-256: e9240a22e089c2f9782c78994edc60278f6fa0f05fdf2ea01b99f60603b6b1cb</code></p>
+        <p><strong>English — survey_config10.yaml</strong><br><a href="https://github.com/ishizuki-tech/Survey2026/blob/d3abedf253467071c35b6228f002ae084a92ed76/app/src/main/assets/survey_config10.yaml">View in browser</a> · <a href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-105-d3abedf/survey_config10.yaml">Download</a><br><code>SHA-256: 1b03c87ce94c58b8b31a3ab1f45f312a83566d22205da878bd5112620070bce6</code></p>
+        <p><strong>Swahili — survey_config_sw_10.yaml</strong><br><a href="https://github.com/ishizuki-tech/Survey2026/blob/d3abedf253467071c35b6228f002ae084a92ed76/app/src/main/assets/survey_config_sw_10.yaml">View in browser</a> · <a href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-105-d3abedf/survey_config_sw_10.yaml">Download</a><br><code>SHA-256: e9240a22e089c2f9782c78994edc60278f6fa0f05fdf2ea01b99f60603b6b1cb</code></p>
       </section>
       <div class="qr-panel">
-        <div class="qr-box"><img src="qr.png" alt="QR code that downloads the Survey2026 APK for build-104-04e5de0" width="300" height="300"></div>
-        <div><h2>Scan with Android</h2><p class="subtitle">This QR code downloads the APK for this build (build-104-04e5de0).</p><code>https://github.com/ishizuki-tech/Survey2026/releases/download/build-104-04e5de0/Survey2026-04e5de0-release.apk</code></div>
+        <div class="qr-box"><img src="qr.png" alt="QR code that downloads the Survey2026 APK for build-105-d3abedf" width="300" height="300"></div>
+        <div><h2>Scan with Android</h2><p class="subtitle">This QR code downloads the APK for this build (build-105-d3abedf).</p><code>https://github.com/ishizuki-tech/Survey2026/releases/download/build-105-d3abedf/Survey2026-d3abedf-release.apk</code></div>
       </div>
       <div class="grid">
-        <div class="item"><span class="label">Release tag</span><code>build-104-04e5de0</code></div>
+        <div class="item"><span class="label">Release tag</span><code>build-105-d3abedf</code></div>
         <div class="item"><span class="label">Branch</span><code>main</code></div>
-        <div class="item"><span class="label">Commit SHA</span><code>04e5de0</code></div>
-        <div class="item"><span class="label">APK filename</span><code>Survey2026-04e5de0-release.apk</code></div>
-        <div class="item"><span class="label">Workflow run number</span><code>104</code></div>
-        <div class="item"><span class="label">APK SHA-256</span><code>f6e437fb2eafd24cd37930229dc6e3be653d5d07fc19b3915c8c84ed30d44e53</code></div>
+        <div class="item"><span class="label">Commit SHA</span><code>d3abedf</code></div>
+        <div class="item"><span class="label">APK filename</span><code>Survey2026-d3abedf-release.apk</code></div>
+        <div class="item"><span class="label">Workflow run number</span><code>105</code></div>
+        <div class="item"><span class="label">APK SHA-256</span><code>503d4cba48bd7fb7fe8714b7890903124a345d82fce7c210a60ea61b7c6528a5</code></div>
         <div class="item"><span class="label">Signing certificate SHA-256</span><code>d6edef47ec6734a46122ab7fddb5e4f17d19d4d51ae3eaddfb32f309ee5036ea</code></div>
-        <div class="item"><span class="label">Generated timestamp</span><code>2026-09-30T18:13:36Z</code></div>
+        <div class="item"><span class="label">Generated timestamp</span><code>2026-09-30T19:41:21Z</code></div>
       </div>
       <div class="links">
-        <a href="https://github.com/ishizuki-tech/Survey2026/releases/tag/build-104-04e5de0">GitHub Release</a>
-        <a href="https://github.com/ishizuki-tech/Survey2026/actions/runs/36756086058">GitHub Actions run</a>
+        <a href="https://github.com/ishizuki-tech/Survey2026/releases/tag/build-105-d3abedf">GitHub Release</a>
+        <a href="https://github.com/ishizuki-tech/Survey2026/actions/runs/36766490047">GitHub Actions run</a>
         <a href="https://github.com/ishizuki-tech/Survey2026">Repository</a>
       </div>
-      <footer>Survey2026 release metadata generated 2026-09-30T18:13:36Z.</footer>
+      <footer>Survey2026 release metadata generated 2026-09-30T19:41:21Z.</footer>
     </section>
   </main>
 </body>
