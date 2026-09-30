@@ -13,6 +13,64 @@ class SurveyAiPolicyTest {
         requiredComponentIds: List<String> = emptyList(),
     ) = SurveyAiPolicy.evaluate(raw, timeout, error, remaining, requiredComponents, requiredComponentIds)
 
+    @Test fun eval_json_transport_accepts_only_plain_or_single_json_tagged_fence() {
+        val plain = """{"score":75,"missing_points":["feeding frequency"],"followup_needed":true,"note":"```"}"""
+        val lowercaseFenced = """
+            ```json
+            $plain
+            ```
+        """.trimIndent()
+        val uppercaseFenced = """
+            ```JSON
+            $plain
+            ```
+        """.trimIndent()
+        val expectedMissingPoints = listOf("feeding_frequency")
+
+        listOf(
+            plain,
+            lowercaseFenced,
+            uppercaseFenced,
+            uppercaseFenced.replace("```JSON", "```Json").replace("\n", "\r\n"),
+            "  \n$lowercaseFenced\n  ",
+        ).forEach { raw ->
+            val admission = SurveyAiPolicy.evaluateAdmission(
+                raw = raw,
+                timedOut = false,
+                error = null,
+                remaining = 2,
+                requiredComponentIds = listOf("animals", "feeding_frequency"),
+            )
+            assertEquals(raw, SurveyAiDecision.GENERATE, admission.decision)
+            assertEquals(raw, expectedMissingPoints, admission.missingPoints)
+        }
+    }
+
+    @Test fun eval_json_transport_rejects_noncanonical_fences_and_nonobject_payloads() {
+        val valid = """{"score":75,"missing_points":["feeding_frequency"],"followup_needed":true}"""
+        val rejected = listOf(
+            "```\n$valid\n```",
+            "```yaml\n$valid\n```",
+            "```json extra\n$valid\n```",
+            "Explanation\n```json\n$valid\n```",
+            "```json\n$valid\n```\nExplanation",
+            "Explanation $valid",
+            "$valid Explanation",
+            "```json\n$valid\n```\n```json\n$valid\n```",
+            "$valid$valid",
+            "[1]",
+            "true",
+            "```json\n\n```",
+            "```json\n{bad}\n```",
+            "```json\n$valid",
+            "```json\n{\"score\":\"75\",\"missing_points\":[\"feeding_frequency\"],\"followup_needed\":true}\n```",
+        )
+
+        rejected.forEach { raw ->
+            assertEquals(raw, SurveyAiDecision.FAILURE, eval(raw, requiredComponentIds = listOf("feeding_frequency")))
+        }
+    }
+
     @Test fun required_component_catalog_ids_canonicalize_formatting_and_take_precedence_over_legacy_text() {
         fun raw(missing: List<String>) =
             """{"score":60,"missing_points":${missing.joinToString(prefix = "[", postfix = "]") { "\"$it\"" }},"followup_needed":true}"""

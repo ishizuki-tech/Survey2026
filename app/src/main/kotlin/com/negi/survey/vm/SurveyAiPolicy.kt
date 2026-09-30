@@ -18,6 +18,28 @@ internal data class SurveyAiEvaluation(
     val missingPoints: List<String> = emptyList(),
 )
 
+/** Parses only a complete JSON object or one complete JSON-tagged Markdown code fence. */
+internal fun parseStrictModelJsonObject(raw: String): JsonObject? {
+    val trimmed = raw.trim()
+
+    fun parseObject(text: String): JsonObject? =
+        runCatching { Json.parseToJsonElement(text) as? JsonObject }.getOrNull()
+
+    parseObject(trimmed)?.let { return it }
+
+    val openingLineEnd = trimmed.indexOf('\n')
+    if (openingLineEnd < 0) return null
+    val openingLine = trimmed.substring(0, openingLineEnd).removeSuffix("\r")
+    if (openingLine.length != 7 || !openingLine.startsWith("```") ||
+        openingLine.substring(3).lowercase(Locale.ROOT) != "json"
+    ) return null
+
+    val closingLineStart = trimmed.lastIndexOf('\n') + 1
+    if (closingLineStart <= openingLineEnd || trimmed.substring(closingLineStart) != "```") return null
+
+    return parseObject(trimmed.substring(openingLineEnd + 1, closingLineStart - 1))
+}
+
 internal object SurveyAiPolicy {
     fun evaluate(
         raw: String,
@@ -39,7 +61,7 @@ internal object SurveyAiPolicy {
         requiredComponentIds: List<String> = emptyList(),
     ): SurveyAiEvaluation {
         if (timedOut || error != null) return SurveyAiEvaluation(SurveyAiDecision.FAILURE)
-        val obj = runCatching { Json.parseToJsonElement(raw.trim()) as? JsonObject }.getOrNull()
+        val obj = parseStrictModelJsonObject(raw)
             ?: return SurveyAiEvaluation(SurveyAiDecision.FAILURE)
         val scoreValue = obj["score"] as? JsonPrimitive ?: return SurveyAiEvaluation(SurveyAiDecision.FAILURE)
         val score = scoreValue.takeUnless { it.isString }?.intOrNull
