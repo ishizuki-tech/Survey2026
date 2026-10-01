@@ -99,6 +99,9 @@ internal fun Node.isValidNumberAnswer(answer: String): Boolean =
     answer in specialOptions ||
             (answer.isNotEmpty() && answer.all(Char::isDigit) && answer.toIntOrNull() != null)
 
+internal fun shouldShowOtherDetails(selected: String?, otherTextOption: String?): Boolean =
+    otherTextOption != null && selected == otherTextOption
+
 internal fun Node.composeSingleChoiceAnswer(selected: String?, otherText: String?): String? {
     val choice = selected?.trim()?.takeIf { it.isNotEmpty() } ?: return null
     if (choice != otherTextOption) return choice
