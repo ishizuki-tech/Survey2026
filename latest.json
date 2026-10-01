@@ -1,28 +1,28 @@
 {
   "repository": "ishizuki-tech/Survey2026",
   "stable_tag": "",
-  "source_commit_sha": "e0b940c76a32432f846b8828c39fd0a8d30458e2",
-  "release_tag": "build-107-e0b940c",
+  "source_commit_sha": "86049ce29dd33bd2a7f9d0378398e3725ca3853b",
+  "release_tag": "build-108-86049ce",
   "branch": "main",
-  "release_url": "https://github.com/ishizuki-tech/Survey2026/releases/tag/build-107-e0b940c",
-  "download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/build-107-e0b940c/Survey2026-e0b940c-release.apk",
+  "release_url": "https://github.com/ishizuki-tech/Survey2026/releases/tag/build-108-86049ce",
+  "download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/build-108-86049ce/Survey2026-86049ce-release.apk",
   "config_files": {
     "english": {
-      "view_url": "https://github.com/ishizuki-tech/Survey2026/blob/e0b940c76a32432f846b8828c39fd0a8d30458e2/app/src/main/assets/survey_config10.yaml",
-      "download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/build-107-e0b940c/survey_config10.yaml",
+      "view_url": "https://github.com/ishizuki-tech/Survey2026/blob/86049ce29dd33bd2a7f9d0378398e3725ca3853b/app/src/main/assets/survey_config10.yaml",
+      "download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/build-108-86049ce/survey_config10.yaml",
       "sha256": "1b03c87ce94c58b8b31a3ab1f45f312a83566d22205da878bd5112620070bce6"
     },
     "swahili": {
-      "view_url": "https://github.com/ishizuki-tech/Survey2026/blob/e0b940c76a32432f846b8828c39fd0a8d30458e2/app/src/main/assets/survey_config_sw_10.yaml",
-      "download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/build-107-e0b940c/survey_config_sw_10.yaml",
+      "view_url": "https://github.com/ishizuki-tech/Survey2026/blob/86049ce29dd33bd2a7f9d0378398e3725ca3853b/app/src/main/assets/survey_config_sw_10.yaml",
+      "download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/build-108-86049ce/survey_config_sw_10.yaml",
       "sha256": "e9240a22e089c2f9782c78994edc60278f6fa0f05fdf2ea01b99f60603b6b1cb"
     }
   },
-  "apk_name": "Survey2026-e0b940c-release.apk",
-  "apk_sha256": "42f14bde8e4c53ffe36e3135e4886e2205286842d8b508dca53bcc396eb3258a",
+  "apk_name": "Survey2026-86049ce-release.apk",
+  "apk_sha256": "033208435e126f4ebbeeee0b51554663a0352aeada5b5b0fb9ed25899315a6e0",
   "signing_cert_sha256": "d6edef47ec6734a46122ab7fddb5e4f17d19d4d51ae3eaddfb32f309ee5036ea",
-  "short_sha": "e0b940c",
-  "run_id": "36793096397",
-  "run_number": "107",
-  "generated_utc": "2026-10-01T00:02:07Z"
+  "short_sha": "86049ce",
+  "run_id": "36909606455",
+  "run_number": "108",
+  "generated_utc": "2026-10-01T18:58:33Z"
 }

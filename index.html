@@ -46,60 +46,90 @@
         <h2>Build provenance</h2>
         
         <p>
-        <strong>Source:</strong> <code>e0b940c76a32432f846b8828c39fd0a8d30458e2</code></p>
+        <strong>Source:</strong> <code>86049ce29dd33bd2a7f9d0378398e3725ca3853b</code></p>
       </section>
-      <section class="config-files"><h2>What's New</h2><h3>Disable blank GitHub issues</h3><pre class="whats-new-body">## Summary
+      <section class="config-files"><h2>What's New</h2><h3>Fix Other details visibility for single-choice questions</h3><pre class="whats-new-body">## Summary
 
-Disable GitHub&#x27;s default **Blank issue** option.
+Fixes #67.
 
-After this change, new issues should use one of the configured templates:
+The generic single-choice UI incorrectly displayed the **Other details** field when both the current selection and `other_text_option` were null.
 
-- Bug Report
-- Engineering Issue
+This change requires a configured `other_text_option` and an exact selection match before displaying the field.
 
-## Change
+Source bug report: #64
 
-Add:
+## Behavior
 
-- `.github/ISSUE_TEMPLATE/config.yml`
+- Consent: **Other details** is hidden.
+- Q1 normal option: **Other details** is hidden.
+- Q1 `Other / Nyingine`: **Other details** is shown.
+- Q1 Other detail remains part of the composed answer.
+- Q2 Gender: **Other details** is hidden.
+- Existing single-choice navigation and submission behavior is unchanged.
 
-with:
+## Implementation
 
-```yaml
-blank_issues_enabled: false
-```
+- Added a focused visibility predicate requiring a non-null configured Other option and an exact selection match.
+- Updated the single-choice UI to use that predicate.
+- Added regression tests for all visibility states.
+- Added configuration assertions confirming Consent and Q2 do not define `other_text_option` in both English and Swahili survey configurations.
+
+## Validation
+
+Passed:
+
+- `git diff --check`
+- focused Issue #67 JVM tests
+- `./gradlew :app:testDebugUnitTest`
+- `./gradlew :app:assembleDebug`
+- physical-device testing
+
+Physical-device verification confirmed:
+
+- Consent Other details hidden
+- Q1 normal option -&gt; hidden
+- Q1 `Other / Nyingine` -&gt; visible
+- Q1 detail preserved
+- Q2 Other details hidden
+- normal navigation unchanged
 
 ## Scope
 
-No application code, tests, workflows, survey configuration, or existing Issue Templates are changed.</pre></section>
-      <a class="download" href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-107-e0b940c/Survey2026-e0b940c-release.apk">Download APK</a>
+No changes to:
+
+- survey YAML
+- export schema
+- upload/finalization
+- survey routing
+- AI behavior</pre></section>
+      <a class="download" href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-108-86049ce/Survey2026-86049ce-release.apk">Download APK</a>
       <p class="note">Direct GitHub Release asset. No ZIP extraction is required.</p>
       <section class="config-files">
         <h2>Config files included in this APK</h2>
         <p class="note">These config files were extracted from the exact APK build shown on this page.</p>
-        <p><strong>English — survey_config10.yaml</strong><br><a href="https://github.com/ishizuki-tech/Survey2026/blob/e0b940c76a32432f846b8828c39fd0a8d30458e2/app/src/main/assets/survey_config10.yaml">View in browser</a> · <a href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-107-e0b940c/survey_config10.yaml">Download</a><br><code>SHA-256: 1b03c87ce94c58b8b31a3ab1f45f312a83566d22205da878bd5112620070bce6</code></p>
-        <p><strong>Swahili — survey_config_sw_10.yaml</strong><br><a href="https://github.com/ishizuki-tech/Survey2026/blob/e0b940c76a32432f846b8828c39fd0a8d30458e2/app/src/main/assets/survey_config_sw_10.yaml">View in browser</a> · <a href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-107-e0b940c/survey_config_sw_10.yaml">Download</a><br><code>SHA-256: e9240a22e089c2f9782c78994edc60278f6fa0f05fdf2ea01b99f60603b6b1cb</code></p>
+        <p><strong>English — survey_config10.yaml</strong><br><a href="https://github.com/ishizuki-tech/Survey2026/blob/86049ce29dd33bd2a7f9d0378398e3725ca3853b/app/src/main/assets/survey_config10.yaml">View in browser</a> · <a href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-108-86049ce/survey_config10.yaml">Download</a><br><code>SHA-256: 1b03c87ce94c58b8b31a3ab1f45f312a83566d22205da878bd5112620070bce6</code></p>
+        <p><strong>Swahili — survey_config_sw_10.yaml</strong><br><a href="https://github.com/ishizuki-tech/Survey2026/blob/86049ce29dd33bd2a7f9d0378398e3725ca3853b/app/src/main/assets/survey_config_sw_10.yaml">View in browser</a> · <a href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-108-86049ce/survey_config_sw_10.yaml">Download</a><br><code>SHA-256: e9240a22e089c2f9782c78994edc60278f6fa0f05fdf2ea01b99f60603b6b1cb</code></p>
       </section>
       <div class="qr-panel">
-        <div class="qr-box"><img src="qr.png" alt="QR code that downloads the Survey2026 APK for build-107-e0b940c" width="300" height="300"></div>
-        <div><h2>Scan with Android</h2><p class="subtitle">This QR code downloads the APK for this build (build-107-e0b940c).</p><code>https://github.com/ishizuki-tech/Survey2026/releases/download/build-107-e0b940c/Survey2026-e0b940c-release.apk</code></div>
+        <div class="qr-box"><img src="qr.png" alt="QR code that downloads the Survey2026 APK for build-108-86049ce" width="300" height="300"></div>
+        <div><h2>Scan with Android</h2><p class="subtitle">This QR code downloads the APK for this build (build-108-86049ce).</p><code>https://github.com/ishizuki-tech/Survey2026/releases/download/build-108-86049ce/Survey2026-86049ce-release.apk</code></div>
       </div>
       <div class="grid">
-        <div class="item"><span class="label">Release tag</span><code>build-107-e0b940c</code></div>
+        <div class="item"><span class="label">Release tag</span><code>build-108-86049ce</code></div>
         <div class="item"><span class="label">Branch</span><code>main</code></div>
-        <div class="item"><span class="label">Commit SHA</span><code>e0b940c</code></div>
-        <div class="item"><span class="label">APK filename</span><code>Survey2026-e0b940c-release.apk</code></div>
-        <div class="item"><span class="label">Workflow run number</span><code>107</code></div>
-        <div class="item"><span class="label">APK SHA-256</span><code>42f14bde8e4c53ffe36e3135e4886e2205286842d8b508dca53bcc396eb3258a</code></div>
+        <div class="item"><span class="label">Commit SHA</span><code>86049ce</code></div>
+        <div class="item"><span class="label">APK filename</span><code>Survey2026-86049ce-release.apk</code></div>
+        <div class="item"><span class="label">Workflow run number</span><code>108</code></div>
+        <div class="item"><span class="label">APK SHA-256</span><code>033208435e126f4ebbeeee0b51554663a0352aeada5b5b0fb9ed25899315a6e0</code></div>
         <div class="item"><span class="label">Signing certificate SHA-256</span><code>d6edef47ec6734a46122ab7fddb5e4f17d19d4d51ae3eaddfb32f309ee5036ea</code></div>
-        <div class="item"><span class="label">Generated timestamp</span><code>2026-10-01T00:02:07Z</code></div>
+        <div class="item"><span class="label">Generated timestamp</span><code>2026-10-01T18:58:33Z</code></div>
       </div>
       <div class="links">
-        <a href="https://github.com/ishizuki-tech/Survey2026/releases/tag/build-107-e0b940c">GitHub Release</a>
-        <a href="https://github.com/ishizuki-tech/Survey2026/actions/runs/36793096397">GitHub Actions run</a>
+        <a href="https://github.com/ishizuki-tech/Survey2026/releases/tag/build-108-86049ce">GitHub Release</a>
+        <a href="https://github.com/ishizuki-tech/Survey2026/actions/runs/36909606455">GitHub Actions run</a>
         <a href="https://github.com/ishizuki-tech/Survey2026">Repository</a>
       </div>
-      <footer>Survey2026 release metadata generated 2026-10-01T00:02:07Z.</footer>
+      <footer>Survey2026 release metadata generated 2026-10-01T18:58:33Z.</footer>
     </section>
   </main>
 </body>
