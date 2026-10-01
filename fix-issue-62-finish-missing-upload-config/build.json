@@ -1,0 +1,11 @@
+{
+  "original_branch": "fix/issue-62-finish-missing-upload-config",
+  "branch_slug": "fix-issue-62-finish-missing-upload-config",
+  "commit_sha": "17059202b9a22f1391b71ced3ae0fe1162cb435f",
+  "short_sha": "1705920",
+  "apk_name": "Survey2026-fix-issue-62-finish-missing-upload-config-1705920.apk",
+  "apk_sha256": "2c12826bebffd38851f69ec31f468d5bc9d0ab8a2e9e70d9cd78ff0eec3a91b4",
+  "page_url": "https://ishizuki-tech.github.io/Survey2026/fix-issue-62-finish-missing-upload-config/",
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/36924866879",
+  "generated_utc": "2026-10-01T21:00:46Z"
+}
