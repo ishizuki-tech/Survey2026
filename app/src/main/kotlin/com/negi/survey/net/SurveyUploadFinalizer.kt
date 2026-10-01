@@ -74,13 +74,13 @@ class SurveyUploadFinalizer private constructor(
         WhisperTraceRegistry.finalizeAsync(surveyId)
         return locks.getOrPut(surveyId) { Mutex() }.withLock {
             try {
+                if (operations.isUploaded(surveyId)) {
+                    return@withLock SurveyFinalizationResult.AlreadyUploaded
+                }
                 if (config == null) {
                     val existing = operations.findPendingSurveyFile(surveyId)
                     val pending = existing ?: operations.stageSurveyJson(snapshot, deviceTag, exportedAtStamp)
                     return@withLock SurveyFinalizationResult.StagedPending(pending, reused = existing != null)
-                }
-                if (operations.isUploaded(surveyId)) {
-                    return@withLock SurveyFinalizationResult.AlreadyUploaded
                 }
                 val existing = operations.findPendingSurveyFile(surveyId)
                 val pending = existing ?: operations.stageSurveyJson(snapshot, deviceTag, exportedAtStamp)

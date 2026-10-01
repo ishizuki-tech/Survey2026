@@ -96,6 +96,19 @@ class SurveyUploadFinalizerTest {
     }
 
     @Test
+    fun finalize_withoutConfigAlreadyUploadedSkipsPendingAndUploadOperations() = runBlocking {
+        val operations = FakeOperations(directory).apply { uploaded = true }
+
+        val result = finalizer(operations).finalize(snapshot(), null, tag(), STAMP)
+
+        assertEquals(SurveyFinalizationResult.AlreadyUploaded, result)
+        assertEquals(0, operations.pendingLookupCalls.get())
+        assertEquals(0, operations.stageCalls.get())
+        assertEquals(0, operations.reconcileCalls.get())
+        assertTrue(operations.events.isEmpty())
+    }
+
+    @Test
     fun finalize_withoutConfigReusesPendingFileWithoutReconciliation() = runBlocking {
         val existing = File(directory, "existing.json").apply {
             writeText("{\"survey_id\":\"survey-uuid\"}")
