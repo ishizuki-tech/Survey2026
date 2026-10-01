@@ -1,0 +1,1 @@
+fix/issue-67-other-details-null
