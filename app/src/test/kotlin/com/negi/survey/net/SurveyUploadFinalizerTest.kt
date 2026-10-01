@@ -81,6 +81,48 @@ class SurveyUploadFinalizerTest {
     }
 
     @Test
+    fun finalize_withoutConfigStagesPendingWithoutReconciliationOrArtifacts() = runBlocking {
+        val operations = FakeOperations(directory)
+
+        val result = finalizer(operations).finalize(snapshot(), null, tag(), STAMP)
+
+        assertEquals(
+            SurveyFinalizationResult.StagedPending(File(directory, "survey-uuid.json"), reused = false),
+            result
+        )
+        assertEquals(1, operations.stageCalls.get())
+        assertEquals(0, operations.reconcileCalls.get())
+        assertEquals(listOf("lookup", "stage"), operations.events)
+    }
+
+    @Test
+    fun finalize_withoutConfigReusesPendingFileWithoutReconciliation() = runBlocking {
+        val existing = File(directory, "existing.json").apply {
+            writeText("{\"survey_id\":\"survey-uuid\"}")
+        }
+        val operations = FakeOperations(directory).apply { pendingFile = existing }
+
+        val result = finalizer(operations).finalize(snapshot(), null, tag(), STAMP)
+
+        assertEquals(SurveyFinalizationResult.StagedPending(existing, reused = true), result)
+        assertEquals(0, operations.stageCalls.get())
+        assertEquals(0, operations.reconcileCalls.get())
+        assertEquals(listOf("lookup"), operations.events)
+    }
+
+    @Test
+    fun finalize_withoutConfigStageFailureReturnsFailureWithoutReconciliation() = runBlocking {
+        val operations = FakeOperations(directory).apply { stageFailure = IllegalStateException("disk full") }
+
+        val result = finalizer(operations).finalize(snapshot(), null, tag(), STAMP)
+
+        assertEquals(SurveyFinalizationResult.Failure("disk full"), result)
+        assertEquals(1, operations.stageCalls.get())
+        assertEquals(0, operations.reconcileCalls.get())
+        assertEquals(listOf("lookup", "stage"), operations.events)
+    }
+
+    @Test
     fun finalize_stageFailureReturnsFailureWithoutReconciliationOrArtifacts() = runBlocking {
         val operations = FakeOperations(directory).apply { stageFailure = IllegalStateException("disk full") }
 

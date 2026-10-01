@@ -17,7 +17,7 @@ import org.junit.Test
 
 class SurveyFinalizationStatePolicyTest {
     @Test
-    fun stateTransitions_allowRetryAfterErrorAndNavigateOnlyAfterSuccess() {
+    fun stateTransitions_allowRetryAfterErrorAndNavigateAfterLocalCompletion() {
         assertTrue(SurveyFinalizationStatePolicy.mayStart(SurveyFinalizationState.Idle))
         assertEquals(
             SurveyFinalizationState.Error("disk full"),
@@ -28,12 +28,20 @@ class SurveyFinalizationStatePolicyTest {
             SurveyFinalizationState.Queued,
             SurveyFinalizationStatePolicy.complete(SurveyFinalizationResult.Queued(File("pending.json"), false))
         )
+        assertEquals(
+            SurveyFinalizationState.PendingUpload,
+            SurveyFinalizationStatePolicy.complete(SurveyFinalizationResult.StagedPending(File("pending.json"), false))
+        )
+        assertTrue(SurveyFinalizationStatePolicy.shouldAdvanceToDone(SurveyFinalizationState.Queued))
+        assertTrue(SurveyFinalizationStatePolicy.shouldAdvanceToDone(SurveyFinalizationState.PendingUpload))
+        assertFalse(SurveyFinalizationStatePolicy.shouldAdvanceToDone(SurveyFinalizationState.Error("disk full")))
     }
 
     @Test
     fun stateTransitions_blockDuplicateFinishWhileFinishingOrQueued() {
         assertFalse(SurveyFinalizationStatePolicy.mayStart(SurveyFinalizationState.Finishing))
         assertFalse(SurveyFinalizationStatePolicy.mayStart(SurveyFinalizationState.Queued))
+        assertFalse(SurveyFinalizationStatePolicy.mayStart(SurveyFinalizationState.PendingUpload))
         assertEquals(
             SurveyFinalizationState.Queued,
             SurveyFinalizationStatePolicy.complete(SurveyFinalizationResult.AlreadyUploaded)

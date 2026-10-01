@@ -14,9 +14,7 @@
 package com.negi.survey
 
 import android.Manifest
-import android.app.Activity
 import android.content.Context
-import android.content.ContextWrapper
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.AssetManager
@@ -170,6 +168,7 @@ import com.negi.survey.vm.isValidNumberAnswer
 import com.negi.survey.vm.shouldShowOtherDetails
 import com.negi.survey.vm.SurveySessionStore
 import com.negi.survey.vm.SurveyFinalizationState
+import com.negi.survey.vm.SurveyFinalizationStatePolicy
 import com.negi.survey.vm.SurveyFinalizationViewModel
 import com.negi.survey.vm.TtsController
 import com.negi.survey.vm.UploadStatusViewModel
@@ -1093,7 +1092,10 @@ fun SurveyNavHost(
     val finishTag = remember(appContext) { com.negi.survey.utils.DeviceUploadTagProvider.from(appContext) }
 
     LaunchedEffect(finalizationState, vmSurvey.currentNodeId) {
-        if (finalizationState is SurveyFinalizationState.Queued && vmSurvey.currentNode.value.type == NodeType.REVIEW) {
+        if (
+            SurveyFinalizationStatePolicy.shouldAdvanceToDone(finalizationState) &&
+            vmSurvey.currentNode.value.type == NodeType.REVIEW
+        ) {
             vmSurvey.advanceToNext()
         }
     }
@@ -1486,11 +1488,6 @@ fun SurveyNavHost(
                         finalizationState = finalizationState,
                         onFinish = {
                             val config = buildGitHubConfigOrNull()
-                            if (config == null) {
-                                Log.d(MainActivity.TAG, "Finish -> survey upload not configured, exiting app")
-                                localContext.findActivity()?.finish()
-                                return@ReviewScreen
-                            }
                             val stamp = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.US).format(Date())
                             finalizationVm.finish(
                                 snapshot = vmSurvey.createFinalizationSnapshot(),
@@ -1525,13 +1522,6 @@ fun SurveyNavHost(
         vmAI.resetStates()
         vmSurvey.backToPrevious()
     }
-}
-
-/** Unwrap Compose's [LocalContext] (possibly a ContextWrapper) to the hosting Activity. */
-private tailrec fun Context.findActivity(): Activity? = when (this) {
-    is Activity -> this
-    is ContextWrapper -> baseContext.findActivity()
-    else -> null
 }
 
 /**

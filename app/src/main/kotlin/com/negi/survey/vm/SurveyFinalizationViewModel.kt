@@ -27,6 +27,7 @@ sealed interface SurveyFinalizationState {
     data object Idle : SurveyFinalizationState
     data object Finishing : SurveyFinalizationState
     data object Queued : SurveyFinalizationState
+    data object PendingUpload : SurveyFinalizationState
     data class Error(val message: String) : SurveyFinalizationState
 }
 
@@ -38,10 +39,6 @@ class SurveyFinalizationViewModel(app: Application) : AndroidViewModel(app) {
 
     fun finish(snapshot: SurveyFinalizationSnapshot, config: GitHubUploader.GitHubConfig?, tag: DeviceUploadTag, stamp: String) {
         if (!SurveyFinalizationStatePolicy.mayStart(_state.value)) return
-        if (config == null) {
-            _state.value = SurveyFinalizationState.Error("Survey upload is not configured.")
-            return
-        }
         _state.value = SurveyFinalizationState.Finishing
         viewModelScope.launch(Dispatchers.IO) {
             val result = finalizer.finalize(snapshot, config, tag, stamp)
