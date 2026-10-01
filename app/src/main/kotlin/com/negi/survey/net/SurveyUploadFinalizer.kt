@@ -22,6 +22,7 @@ import kotlinx.coroutines.sync.withLock
 
 sealed interface SurveyFinalizationResult {
     data class Queued(val file: File, val reused: Boolean) : SurveyFinalizationResult
+    data class StagedPending(val file: File, val reused: Boolean) : SurveyFinalizationResult
     data object AlreadyUploaded : SurveyFinalizationResult
     data class Failure(val message: String) : SurveyFinalizationResult
 }
@@ -53,7 +54,7 @@ internal interface SurveyFinalizationOperations {
     )
 }
 
-/** Stages and queues one logical survey JSON upload per survey UUID. */
+/** Stages one logical survey JSON upload per survey UUID and queues it when configured. */
 class SurveyUploadFinalizer private constructor(
     private val operations: SurveyFinalizationOperations
 ) {
@@ -63,7 +64,7 @@ class SurveyUploadFinalizer private constructor(
 
     suspend fun finalize(
         snapshot: SurveyFinalizationSnapshot,
-        config: GitHubUploader.GitHubConfig,
+        config: GitHubUploader.GitHubConfig?,
         deviceTag: DeviceUploadTag,
         exportedAtStamp: String
     ): SurveyFinalizationResult {
@@ -75,6 +76,11 @@ class SurveyUploadFinalizer private constructor(
             try {
                 if (operations.isUploaded(surveyId)) {
                     return@withLock SurveyFinalizationResult.AlreadyUploaded
+                }
+                if (config == null) {
+                    val existing = operations.findPendingSurveyFile(surveyId)
+                    val pending = existing ?: operations.stageSurveyJson(snapshot, deviceTag, exportedAtStamp)
+                    return@withLock SurveyFinalizationResult.StagedPending(pending, reused = existing != null)
                 }
                 val existing = operations.findPendingSurveyFile(surveyId)
                 val pending = existing ?: operations.stageSurveyJson(snapshot, deviceTag, exportedAtStamp)
