@@ -1,11 +1,11 @@
 {
   "original_branch": "chore/disable-blank-issues",
   "branch_slug": "chore-disable-blank-issues",
-  "commit_sha": "1f9699c67d0dba0a608f8ec6cda9218e62117a89",
-  "short_sha": "1f9699c",
-  "apk_name": "Survey2026-chore-disable-blank-issues-1f9699c.apk",
-  "apk_sha256": "2c120ac07435d58e2fa309fbe42c25f167f0c8a8aa7b4a307470c7059f315f9f",
+  "commit_sha": "bae2361b160ba345b56940aaccf52e1af2fdddf1",
+  "short_sha": "bae2361",
+  "apk_name": "Survey2026-chore-disable-blank-issues-bae2361.apk",
+  "apk_sha256": "a8773cde55db5914e9d9937bc792af568ef52200bc2ca0fd7ebcaa1470bd22c4",
   "page_url": "https://ishizuki-tech.github.io/Survey2026/chore-disable-blank-issues/",
-  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/36793019650",
-  "generated_utc": "2026-09-30T23:55:25Z"
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/36793024516",
+  "generated_utc": "2026-10-01T00:01:46Z"
 }
