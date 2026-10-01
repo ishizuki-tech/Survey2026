@@ -46,90 +46,95 @@
         <h2>Build provenance</h2>
         
         <p>
-        <strong>Source:</strong> <code>86049ce29dd33bd2a7f9d0378398e3725ca3853b</code></p>
+        <strong>Source:</strong> <code>ba67468382b417e8d9e34fe93bc426e9e6d54101</code></p>
       </section>
-      <section class="config-files"><h2>What's New</h2><h3>Fix Other details visibility for single-choice questions</h3><pre class="whats-new-body">## Summary
+      <section class="config-files"><h2>What's New</h2><h3>Preserve completed surveys when upload is unavailable</h3><pre class="whats-new-body">## Summary
 
-Fixes #67.
+Closes #62.
 
-The generic single-choice UI incorrectly displayed the **Other details** field when both the current selection and `other_text_option` were null.
+This PR updates the Review -&gt; Finish flow so a completed survey can finish safely even when upload configuration is unavailable.
 
-This change requires a configured `other_text_option` and an exact selection match before displaying the field.
+When upload configuration is missing, the survey is now staged in the existing pending-upload storage, the app proceeds to Done, and the user can start a new survey while the completed survey remains available for later recovery/upload.
 
-Source bug report: #64
+## Changes
 
-## Behavior
-
-- Consent: **Other details** is hidden.
-- Q1 normal option: **Other details** is hidden.
-- Q1 `Other / Nyingine`: **Other details** is shown.
-- Q1 Other detail remains part of the composed answer.
-- Q2 Gender: **Other details** is hidden.
-- Existing single-choice navigation and submission behavior is unchanged.
-
-## Implementation
-
-- Added a focused visibility predicate requiring a non-null configured Other option and an exact selection match.
-- Updated the single-choice UI to use that predicate.
-- Added regression tests for all visibility states.
-- Added configuration assertions confirming Consent and Q2 do not define `other_text_option` in both English and Swahili survey configurations.
+- remove the Review-path Activity exit when upload configuration is unavailable
+- allow finalization with nullable upload configuration
+- add an explicit locally-pending finalization result/state
+- stage or reuse the canonical pending survey JSON when upload config is absent
+- skip GitHub reconciliation, WorkManager enqueueing, and upload-artifact scheduling in the no-config path
+- advance Review -&gt; Done for both queued uploads and locally staged pending surveys
+- preserve existing already-uploaded precedence so an uploaded survey is not recreated as pending
+- preserve duplicate-Finish protection and existing configured-upload behavior
 
 ## Validation
 
-Passed:
+Passed locally:
 
 - `git diff --check`
-- focused Issue #67 JVM tests
-- `./gradlew :app:testDebugUnitTest`
-- `./gradlew :app:assembleDebug`
-- physical-device testing
+- focused `SurveyFinalizationStatePolicyTest`
+- focused `SurveyUploadFinalizerTest`
+- full `:app:testDebugUnitTest`
+- `:app:assembleDebug`
 
-Physical-device verification confirmed:
+Existing unrelated Kotlin warnings remain in `AiRepository.kt` and `LiteRtLM.kt`.
 
-- Consent Other details hidden
-- Q1 normal option -&gt; hidden
-- Q1 `Other / Nyingine` -&gt; visible
-- Q1 detail preserved
-- Q2 Other details hidden
-- normal navigation unchanged
+## Physical-device validation
+
+Validated with upload credentials disabled using:
+
+```bash
+./gradlew :app:installDebug -Pdebug.embedSecrets=false
+```
+
+Confirmed on device:
+
+- Finish no longer closes the app
+- completed survey is staged under `files/pending_uploads`
+- Done is reached after local staging
+- Start New Survey works
+- a second survey creates a separate pending JSON
+- the first pending survey is not overwritten or removed
+- multiple pending surveys remain after force-stop and app restart
 
 ## Scope
 
 No changes to:
 
-- survey YAML
+- upload credential/configuration design
+- WorkManager/recovery architecture
 - export schema
-- upload/finalization
-- survey routing
-- AI behavior</pre></section>
-      <a class="download" href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-108-86049ce/Survey2026-86049ce-release.apk">Download APK</a>
+- questionnaire routing/content
+- AI / SLM
+- ASR / Whisper</pre></section>
+      <a class="download" href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-109-ba67468/Survey2026-ba67468-release.apk">Download APK</a>
       <p class="note">Direct GitHub Release asset. No ZIP extraction is required.</p>
       <section class="config-files">
         <h2>Config files included in this APK</h2>
         <p class="note">These config files were extracted from the exact APK build shown on this page.</p>
-        <p><strong>English — survey_config10.yaml</strong><br><a href="https://github.com/ishizuki-tech/Survey2026/blob/86049ce29dd33bd2a7f9d0378398e3725ca3853b/app/src/main/assets/survey_config10.yaml">View in browser</a> · <a href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-108-86049ce/survey_config10.yaml">Download</a><br><code>SHA-256: 1b03c87ce94c58b8b31a3ab1f45f312a83566d22205da878bd5112620070bce6</code></p>
-        <p><strong>Swahili — survey_config_sw_10.yaml</strong><br><a href="https://github.com/ishizuki-tech/Survey2026/blob/86049ce29dd33bd2a7f9d0378398e3725ca3853b/app/src/main/assets/survey_config_sw_10.yaml">View in browser</a> · <a href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-108-86049ce/survey_config_sw_10.yaml">Download</a><br><code>SHA-256: e9240a22e089c2f9782c78994edc60278f6fa0f05fdf2ea01b99f60603b6b1cb</code></p>
+        <p><strong>English — survey_config10.yaml</strong><br><a href="https://github.com/ishizuki-tech/Survey2026/blob/ba67468382b417e8d9e34fe93bc426e9e6d54101/app/src/main/assets/survey_config10.yaml">View in browser</a> · <a href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-109-ba67468/survey_config10.yaml">Download</a><br><code>SHA-256: 1b03c87ce94c58b8b31a3ab1f45f312a83566d22205da878bd5112620070bce6</code></p>
+        <p><strong>Swahili — survey_config_sw_10.yaml</strong><br><a href="https://github.com/ishizuki-tech/Survey2026/blob/ba67468382b417e8d9e34fe93bc426e9e6d54101/app/src/main/assets/survey_config_sw_10.yaml">View in browser</a> · <a href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-109-ba67468/survey_config_sw_10.yaml">Download</a><br><code>SHA-256: e9240a22e089c2f9782c78994edc60278f6fa0f05fdf2ea01b99f60603b6b1cb</code></p>
       </section>
       <div class="qr-panel">
-        <div class="qr-box"><img src="qr.png" alt="QR code that downloads the Survey2026 APK for build-108-86049ce" width="300" height="300"></div>
-        <div><h2>Scan with Android</h2><p class="subtitle">This QR code downloads the APK for this build (build-108-86049ce).</p><code>https://github.com/ishizuki-tech/Survey2026/releases/download/build-108-86049ce/Survey2026-86049ce-release.apk</code></div>
+        <div class="qr-box"><img src="qr.png" alt="QR code that downloads the Survey2026 APK for build-109-ba67468" width="300" height="300"></div>
+        <div><h2>Scan with Android</h2><p class="subtitle">This QR code downloads the APK for this build (build-109-ba67468).</p><code>https://github.com/ishizuki-tech/Survey2026/releases/download/build-109-ba67468/Survey2026-ba67468-release.apk</code></div>
       </div>
       <div class="grid">
-        <div class="item"><span class="label">Release tag</span><code>build-108-86049ce</code></div>
+        <div class="item"><span class="label">Release tag</span><code>build-109-ba67468</code></div>
         <div class="item"><span class="label">Branch</span><code>main</code></div>
-        <div class="item"><span class="label">Commit SHA</span><code>86049ce</code></div>
-        <div class="item"><span class="label">APK filename</span><code>Survey2026-86049ce-release.apk</code></div>
-        <div class="item"><span class="label">Workflow run number</span><code>108</code></div>
-        <div class="item"><span class="label">APK SHA-256</span><code>033208435e126f4ebbeeee0b51554663a0352aeada5b5b0fb9ed25899315a6e0</code></div>
+        <div class="item"><span class="label">Commit SHA</span><code>ba67468</code></div>
+        <div class="item"><span class="label">APK filename</span><code>Survey2026-ba67468-release.apk</code></div>
+        <div class="item"><span class="label">Workflow run number</span><code>109</code></div>
+        <div class="item"><span class="label">APK SHA-256</span><code>b3cb5ae9fb759aba9c348f125c0d5a43f7b93c88b45d8f0892549e7306415ff7</code></div>
         <div class="item"><span class="label">Signing certificate SHA-256</span><code>d6edef47ec6734a46122ab7fddb5e4f17d19d4d51ae3eaddfb32f309ee5036ea</code></div>
-        <div class="item"><span class="label">Generated timestamp</span><code>2026-10-01T18:58:33Z</code></div>
+        <div class="item"><span class="label">Generated timestamp</span><code>2026-10-01T21:11:31Z</code></div>
       </div>
       <div class="links">
-        <a href="https://github.com/ishizuki-tech/Survey2026/releases/tag/build-108-86049ce">GitHub Release</a>
-        <a href="https://github.com/ishizuki-tech/Survey2026/actions/runs/36909606455">GitHub Actions run</a>
+        <a href="https://github.com/ishizuki-tech/Survey2026/releases/tag/build-109-ba67468">GitHub Release</a>
+        <a href="https://github.com/ishizuki-tech/Survey2026/actions/runs/36925896080">GitHub Actions run</a>
         <a href="https://github.com/ishizuki-tech/Survey2026">Repository</a>
       </div>
-      <footer>Survey2026 release metadata generated 2026-10-01T18:58:33Z.</footer>
+      <footer>Survey2026 release metadata generated 2026-10-01T21:11:31Z.</footer>
     </section>
   </main>
 </body>
