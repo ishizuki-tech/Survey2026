@@ -167,6 +167,7 @@ import com.negi.survey.vm.QuestionSpeaker
 import com.negi.survey.vm.SurveyViewModel
 import com.negi.survey.vm.composeSingleChoiceAnswer
 import com.negi.survey.vm.isValidNumberAnswer
+import com.negi.survey.vm.shouldShowOtherDetails
 import com.negi.survey.vm.SurveySessionStore
 import com.negi.survey.vm.SurveyFinalizationState
 import com.negi.survey.vm.SurveyFinalizationViewModel
@@ -1873,7 +1874,7 @@ private fun SingleChoiceNodeScreen(
                     }
                 }
 
-                if (selected == otherTextOption) {
+                if (shouldShowOtherDetails(selected, otherTextOption)) {
                     OutlinedTextField(
                         value = otherText,
                         onValueChange = { otherText = it },

@@ -97,9 +97,14 @@ class SurveyConfigConditionalNavigationTest {
             )
             assertEquals("Other / Nyingine", q1.otherTextOption)
 
+            val consent = checkNotNull(nodes["Consent"])
+            assertEquals("SINGLE_CHOICE", consent.type)
+            assertEquals(null, consent.otherTextOption)
+
             val q2 = checkNotNull(nodes["Q2"])
             assertEquals("SINGLE_CHOICE", q2.type)
             assertEquals(false, q2.readAloud)
+            assertEquals(null, q2.otherTextOption)
 
             val q3 = checkNotNull(nodes["Q3"])
             assertEquals("NUMBER", q3.type)

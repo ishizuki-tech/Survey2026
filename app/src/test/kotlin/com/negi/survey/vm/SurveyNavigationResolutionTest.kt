@@ -166,6 +166,17 @@ class SurveyNavigationResolutionTest {
         assertEquals("Known", node.composeSingleChoiceAnswer("Known", null))
     }
 
+    @Test
+    fun other_details_visibility_requires_a_configured_exact_other_selection() {
+        val other = "Other / Nyingine"
+
+        assertEquals(false, shouldShowOtherDetails(selected = null, otherTextOption = null))
+        assertEquals(false, shouldShowOtherDetails(selected = "Yes", otherTextOption = null))
+        assertEquals(false, shouldShowOtherDetails(selected = null, otherTextOption = other))
+        assertEquals(false, shouldShowOtherDetails(selected = "Known", otherTextOption = other))
+        assertEquals(true, shouldShowOtherDetails(selected = other, otherTextOption = other))
+    }
+
     private fun choiceNode(routes: Map<String, String>): Node =
         Node(
             id = "Choice",
