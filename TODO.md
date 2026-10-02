@@ -11,28 +11,10 @@ Do not copy completed baseline work back into this file. Issues #1-#8 are intent
 
 ## P0 — Field Deployment Readiness
 
-### #36 — Kiambu questionnaire acceptance
-
-- [ ] Run a full English Introduction -> Consent -> Q1-Q16 target-device acceptance pass.
-- [ ] Run a full Swahili Introduction -> Consent -> Q1-Q16 target-device acceptance pass.
-- [ ] Verify Q6 screen-out behavior on the current Kiambu branch.
-- [ ] Verify Introduction/Consent TTS behavior on both language paths.
-- [ ] Resolve or explicitly accept the remaining source-fidelity differences before merge, including the Swahili consent option parentheticals and Q1 Other/Nyingine label ordering.
-- [ ] Record final Kiambu acceptance evidence before opening/merging the production PR.
-
 ### #37 — Stable release provenance and distribution
 
 - [ ] Add verified-device / deployment-status information.
 - [ ] Add an automated consistency check between the rendered Download Page, GitHub Release, and `latest.json`.
-
-### #38 — Field verification evidence
-
-- [ ] Create one acceptance document containing the relevant commands/log evidence.
-- [ ] Record explicit device / Android / build identity for each acceptance run.
-- [ ] Record Uploaded/Pending count evidence.
-- [ ] Record one-JSON-per-survey-UUID evidence.
-- [ ] Record remote artifact/path confirmation.
-- [ ] Record direct app-side `LOCKED_BOOT_COMPLETED` evidence if this path is required for the supported-device contract.
 
 ### #39 — Microphone-denial product behavior
 
@@ -86,7 +68,16 @@ Do not copy completed baseline work back into this file. Issues #1-#8 are intent
 - [ ] Verify failure/retry states.
 - [ ] Verify transcription results remain owned by the correct survey/node across lifecycle changes.
 - [ ] Align permission-denial behavior with #39.
-- [ ] Validate Kiambu Introduction/Consent TTS on target device.
+- [ ] Validate TTS interaction with recording/transcription and lifecycle states on target device.
+
+### #51 — Galaxy S25 LiteRT-LM memory pressure / lifecycle tradeoff
+
+- [ ] Gather target-device evidence for the large GPU-resident LiteRT-LM
+  footprint with one runtime.
+- [ ] Evaluate lower-memory/runtime/lifecycle options without unrelated
+  refactoring or blindly switching production inference to CPU.
+- [ ] Define the acceptable memory, reliability, and latency tradeoff from
+  evidence before changing the production path.
 
 ## P2 — Reliability / Compatibility / CI
 
@@ -108,13 +99,15 @@ Do not copy completed baseline work back into this file. Issues #1-#8 are intent
 - [ ] Record the supported device/ABI matrix.
 - [ ] Validate Samsung Galaxy S25 after the matrix is defined.
 
-### #46 — Release, CI, and Download Page hardening
-
-- [ ] Document the local release-signing workflow without committing secrets.
-- [ ] Document main-build / GitHub Release / Pages behavior.
-- [ ] Document retained branch-preview prerelease behavior.
-
 Release/Page/`latest.json` parity and verified-device metadata are owned by P0 issue #37.
+
+### #69 — Survey2026 UI/UX redesign
+
+- [ ] Define the redesigned survey screens, navigation, interaction states,
+  and English/Swahili layout requirements.
+- [ ] Keep design and implementation work isolated from SLM/LiteRT-LM and
+  ASR/Whisper engine behavior.
+- [ ] Track any required non-UI behavior change separately.
 
 ## P3 — Documentation / Toolchain / Maintenance
 
