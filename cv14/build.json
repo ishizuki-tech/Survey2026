@@ -1,11 +1,12 @@
 {
   "original_branch": "cv14",
   "branch_slug": "cv14",
-  "commit_sha": "a4e7cb8a49e3b8038e29c560ee4353f605225eee",
-  "short_sha": "a4e7cb8",
-  "apk_name": "Survey2026-cv14-a4e7cb8.apk",
-  "apk_sha256": "02cf3ce0fadf2b59f0213288d7f7ac7d816d0ebac6fd9ca17ec90ef0edab0554",
+  "commit_sha": "d66de944e9229876284a6a8f6c0564397bd38d86",
+  "short_sha": "d66de94",
+  "apk_name": "Survey2026-cv14-d66de94.apk",
+  "apk_sha256": "ce03a52c910ed74f349e588b09b1c1c0eb053e14251a1f0acb6577f9151c9923",
+  "apk_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-cv14-d66de94-run-104/Survey2026-cv14-d66de94.apk",
   "page_url": "https://ishizuki-tech.github.io/Survey2026/cv14/",
-  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/37078473456",
-  "generated_utc": "2026-10-02T23:44:36Z"
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/37079545501",
+  "generated_utc": "2026-10-02T23:59:49Z"
 }
