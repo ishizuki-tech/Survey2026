@@ -20,25 +20,21 @@ Issues #1-#8 are historical/external LiteRT-LM or earlier app-hardening records 
 ### Stable main / release identity
 
 - Live production release identity is authoritative in the latest GitHub Release and `gh-pages/latest.json`; this file intentionally does not duplicate the moving release run number or source SHA.
-- Pre-Kiambu application behavior checkpoint: `c7d668ad26d929c819b340f4722217cef60f7aec` (`c7d668a`)
 - The production release pipeline publishes source SHA, release tag, APK SHA-256, signing-certificate SHA-256, exact English/Swahili config assets and hashes, and dynamic "What's New".
-- Pixel 9a / Android 16 remains the manually validated baseline for the core survey/upload flow.
+- Samsung SM-S731U / Android 16 API 36 is a release-device acceptance baseline
+  for the integrated Kiambu questionnaire and recovery flow.
 - Core upload/finalization/recovery behavior remains the production baseline unless new regression evidence appears.
 
-### Active Kiambu validation branch — not merged
+### Kiambu questionnaire baseline — integrated and accepted
 
-- Branch: `feature/kiambu-introduction-consent`
-- Kiambu implementation baseline: `1240cec`
-- Latest production application-code checkpoint incorporated into that implementation baseline: `c7d668a`
-- Implementation preview verified by CI: `PREVIEW #71 · feature/kiambu-introduction-consent · 1240cec`
-- Later main/branch documentation-only commits and releases do not change the Kiambu implementation baseline
-- Questionnaire migrated to Kiambu Q1-Q16 in both English and Swahili configs
-- Questionnaire Introduction is a config-driven INFO node with Android TTS read-aloud behavior
-- Consent is config-driven; decline routes to a dedicated STOP / ConsentDeclined terminal screen
-- Navigation/config unit coverage includes INFO, Consent, STOP, and language-specific routes
-- Manual English consent validation has observed Yes -> Q1 and No -> STOP
-- Swahili physical-device path and full Q1-Q16 acceptance remain pending
-- The branch remains separate from `main` until Kiambu acceptance is complete
+- Kiambu was integrated into `main` through PR #53; Issue #36 is complete.
+- Build #109 release-device acceptance on Samsung SM-S731U / Android 16 API 36
+  verified English and Swahili Q1-Q16 flows, Consent Yes/No, Q6 routing,
+  Introduction/Consent TTS, configured Other behavior, and Review -> Finish ->
+  Done.
+- Questionnaire Introduction remains a config-driven INFO node; Consent is
+  config-driven and decline routes to the dedicated ConsentDeclined STOP
+  screen.
 
 ---
 
@@ -74,14 +70,29 @@ Issues #1-#8 are historical/external LiteRT-LM or earlier app-hardening records 
 - Receiver recovery uses the same shared survey recovery path
 - Old direct `reenqueuePendingSurveyUploads()` path is not part of the current design
 
-Real-device baseline:
-- Pixel 9a / Android 16
-- Offline pending survey recovery: PASS
-- Network restore and remote upload: PASS
-- Reboot recovery: PASS
-- App-update recovery: PASS
-- Duplicate suppression: PASS
-- Post-success cleanup / no duplicate submit: PASS
+Field-evidence baseline (Issue #38 complete; see
+`docs/field-verification-evidence.md`):
+- Offline pending preservation, startup/process-restart recovery, reconnect
+  upload, reboot / `BOOT_COMPLETED` recovery, same-UUID canonical JSON upload,
+  duplicate/no-resubmit behavior, and post-success `discovered=0`: PASS with
+  durable evidence.
+- The remote snapshot retains 19 unique final JSON files with matching logcats.
+- Optional voice retention is a separate known finding: 42 of 49 referenced
+  WAV files were retained and 7 are missing. It is not a failure of mandatory
+  survey JSON acceptance.
+- Genuine release-signed update recovery is also PASS: Build #109 / versionCode
+  109 was updated in place to Build #110 / versionCode 110 with `adb install
+  -r`. Pending survey `2e0dfdba-fc52-4719-933a-11eeea283557` survived,
+  `MY_PACKAGE_REPLACED` reconciled it with `discovered=1`, `reconciled=1`,
+  `duplicates=0`, and `operationalFailures=0`; after connectivity returned,
+  the same UUID uploaded to
+  `2026-10-02/exports/2026-10-01_19-15-48_survey_SM-S731U_414A86B07D91_2e0dfdba-fc52-4719-933a-11eeea283557.json`.
+  The worker returned SUCCESS and two later recovery runs each reported zero
+  discovered, reconciled, duplicate, and operational-failure counts.
+- A diagnostic logcat worker separately recorded a FileNotFoundException,
+  retry, and failure after another worker had already uploaded that diagnostic
+  artifact. This is separate from mandatory survey JSON release-update
+  acceptance; no root cause is asserted here.
 
 Known validation limitation:
 - App-side `LOCKED_BOOT_COMPLETED` handling has not been directly evidenced in logs. This remains an observation point if that path becomes part of the supported-device contract.
@@ -129,28 +140,19 @@ Project #2 is the authoritative live execution board for these workstreams. Prio
 
 | Priority | Issue | Workstream |
 | --- | --- | --- |
-| P0 | #36 | Kiambu questionnaire acceptance |
 | P0 | #37 | Stable release provenance and distribution |
-| P0 | #38 | Field verification evidence |
 | P0 | #39 | Microphone-denial product behavior |
 | P0 | #40 | Data-handling contract |
 | P1 | #41 | AI follow-up quality and semantic acceptance |
 | P1 | #42 | Speech recognition quality benchmark |
 | P1 | #43 | Voice and microphone UX validation |
+| P1 | #51 | Galaxy S25 LiteRT-LM memory pressure / lifecycle tradeoff |
 | P2 | #44 | Reliability and lifecycle soak testing |
 | P2 | #45 | Supported-device and ABI compatibility |
-| P2 | #46 | Release, CI, and Download Page hardening |
+| P2 | #69 | Survey2026 UI/UX redesign |
 | P3 | #47 | Documentation, toolchain, and repository maintenance |
 
 ### P0 — Field Deployment Readiness
-
-**#36 Kiambu questionnaire acceptance**
-
-Outcome:
-- English and Swahili Kiambu flows are accepted on target hardware.
-- Consent accept/reject paths, Q6 screen-out, and Introduction/Consent TTS are verified.
-- Remaining source-fidelity decisions are explicit.
-- The branch is ready for a separately reviewed PR into `main`.
 
 **#37 Stable release provenance and distribution**
 
@@ -158,11 +160,6 @@ Outcome:
 - Field operators can identify the exact released APK/configs and their hashes.
 - Verified-device / deployment-status information is visible.
 - GitHub Release, rendered Download Page, and `latest.json` are automatically checked for parity.
-
-**#38 Field verification evidence**
-
-Outcome:
-- Manual Pixel 9a validation is converted into durable repository evidence with device/build identity and upload/recovery proof.
 
 **#39 Microphone-denial product behavior**
 
@@ -194,6 +191,14 @@ Outcome:
 Outcome:
 - Capture -> WAV -> Whisper -> answer -> SLM -> TTS ownership is documented and user-visible states are verified.
 
+**#51 Galaxy S25 LiteRT-LM memory pressure / lifecycle tradeoff**
+
+Outcome:
+- Evidence-backed lower-memory/runtime/lifecycle options for the large
+  LiteRT-LM GPU-resident footprint are evaluated on S25.
+- Production is not blindly switched to CPU and unrelated runtime refactoring
+  is avoided.
+
 ### P2 — Reliability / Compatibility / CI
 
 **#44 Reliability and lifecycle soak testing**
@@ -206,14 +211,13 @@ Outcome:
 Outcome:
 - Supported device/ABI policy exists before Samsung Galaxy S25 validation is treated as production evidence.
 
-**#46 Release, CI, and Download Page hardening**
+**#69 Survey2026 UI/UX redesign**
 
 Outcome:
-- The existing production/preview pipelines are documented and maintainable.
-- Local release-signing procedure is documented without secrets.
-- Main Release/Pages behavior and retained branch-preview behavior are documented.
-
-Field-release parity and verified-device metadata are owned by P0 issue #37, not duplicated here.
+- Survey layout, navigation, interaction flow, and field usability are
+  redesigned on an isolated workstream.
+- The redesign does not redefine SLM/LiteRT-LM or ASR/Whisper engine
+  boundaries; any non-UI behavior change is tracked separately.
 
 ### P3 — Documentation / Maintenance
 
@@ -230,14 +234,14 @@ Outcome:
 
 | Area | JVM | Instrumentation | Real Device | Release/CI |
 | --- | --- | --- | --- | --- |
-| Finalization/upload logic | Yes | Partial | Pixel 9a PASS | Main/branch build coverage |
-| Pending discovery/reconciliation | Yes | Partial | Pixel 9a PASS | In main |
-| Reboot/update recovery | Yes | Partial | Pixel 9a PASS | N/A |
-| Duplicate suppression | Yes | Partial | Pixel 9a PASS | N/A |
-| Release signing/update path | N/A | N/A | Pixel 9a PASS | Signed release pipeline |
-| Release provenance | N/A | N/A | Install/update baseline PASS | Config hashes + What's New complete; automated parity check pending |
+| Finalization/upload logic | Yes | Partial | Samsung SM-S731U PASS | Main/branch build coverage |
+| Pending discovery/reconciliation | Yes | Partial | Samsung SM-S731U PASS | In main |
+| Reboot recovery | Yes | Partial | Samsung SM-S731U durable PASS | N/A |
+| Duplicate suppression | Yes | Partial | Samsung SM-S731U durable PASS | N/A |
+| Genuine signed release-to-release update | N/A | N/A | Samsung SM-S731U durable PASS, Build #109 -> #110 | In-place signed update; `MY_PACKAGE_REPLACED`, same-UUID upload, and two no-resubmit checks retained |
+| Release provenance | N/A | N/A | Artifact identity and signed-update baseline PASS | Config hashes + What's New complete; automated parity check pending |
 | Follow-up deterministic policy | Yes | Scripted coverage exists | Semantic validation pending | N/A |
-| Kiambu INFO/Consent/STOP navigation | Yes | Build coverage | English consent paths observed; full EN/SW pass pending | Implementation preview #71 PASS |
+| Kiambu INFO/Consent/STOP navigation | Yes | Build coverage | Samsung SM-S731U full EN/SW acceptance PASS | Integrated through PR #53 |
 | Whisper integration | Build coverage | Limited | Benchmark pending | Release assembly |
 | Microphone denial | Pending | Pending | Pending | N/A |
 
@@ -245,7 +249,6 @@ Outcome:
 
 ## Deferred Work / Non-goals
 
-- Do not merge the current Kiambu branch into `main` until its acceptance work is complete.
 - Issues #1-#8 remain outside Project #2 and are not modified as part of roadmap maintenance.
 - No redesign of Review -> Finish -> Done without regression evidence.
 - No Exit-button upload path; Done screen remains free of survey-upload actions.
