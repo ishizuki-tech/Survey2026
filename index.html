@@ -46,75 +46,65 @@
         <h2>Build provenance</h2>
         
         <p>
-        <strong>Source:</strong> <code>3011876819095e6de9a9c85c7c22027697e29725</code></p>
+        <strong>Source:</strong> <code>c29342bf74b0bcb1528a1b9600c9778bcc845ca7</code></p>
       </section>
-      <section class="config-files"><h2>What's New</h2><h3>Document field verification evidence</h3><pre class="whats-new-body">## Summary
+      <section class="config-files"><h2>What's New</h2><h3>Sync planning after release-update verification</h3><pre class="whats-new-body">## Summary
 
-Adds the consolidated field-verification acceptance record for Issue #38.
+Synchronize `TODO.md` and `ROADMAP.md` with the current Survey2026 planning baseline after completing release-signed update verification.
 
-The document captures durable evidence for:
+## Changes
 
-- offline pending preservation
-- process-restart/startup recovery
-- reconnect -&gt; automatic upload
-- reboot -&gt; `BOOT_COMPLETED` recovery
-- same-UUID canonical remote JSON upload
-- duplicate/no-resubmit behavior
-- post-success `discovered=0`
-
-It also preserves the separate optional voice-artifact finding: 42 of 49 referenced WAV files were retained, with 7 missing.
-
-The remaining real release-to-release signed APK update / `MY_PACKAGE_REPLACED` verification is tracked separately in #71 because Build #109 / versionCode 109 is currently both the installed version and latest published release.
+- remove completed Issues #36, #38, #46, and #71 from active planning
+- record the completed Build #109 -&gt; Build #110 signed in-place update as durable PASS
+- preserve `MY_PACKAGE_REPLACED`, same-UUID upload, worker success, and no-resubmit evidence
+- keep the diagnostic logcat artifact failure separate from mandatory survey JSON acceptance
+- add current active work for #51 and #69
+- keep Project-authoritative P0 priority for #37 and #39
+- update #43 TODO wording to track remaining TTS interaction/lifecycle validation rather than already-completed Kiambu TTS acceptance
 
 ## Scope
 
-Documentation only.
+Planning/documentation only.
 
-No changes to:
-
-- runtime behavior
-- upload/recovery implementation
-- survey configuration
+Changed files:
 - `TODO.md`
 - `ROADMAP.md`
+
+No source-code or runtime behavior changes.
 
 ## Validation
 
 - `git diff --check`
-- `git diff --cached --check`
-
-## Related issues
-
-- Closes documentation follow-up for #38
-- Follow-up: #71</pre></section>
-      <a class="download" href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-110-3011876/Survey2026-3011876-release.apk">Download APK</a>
+- final diff reviewed
+- working tree clean before push</pre></section>
+      <a class="download" href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-111-c29342b/Survey2026-c29342b-release.apk">Download APK</a>
       <p class="note">Direct GitHub Release asset. No ZIP extraction is required.</p>
       <section class="config-files">
         <h2>Config files included in this APK</h2>
         <p class="note">These config files were extracted from the exact APK build shown on this page.</p>
-        <p><strong>English — survey_config10.yaml</strong><br><a href="https://github.com/ishizuki-tech/Survey2026/blob/3011876819095e6de9a9c85c7c22027697e29725/app/src/main/assets/survey_config10.yaml">View in browser</a> · <a href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-110-3011876/survey_config10.yaml">Download</a><br><code>SHA-256: 1b03c87ce94c58b8b31a3ab1f45f312a83566d22205da878bd5112620070bce6</code></p>
-        <p><strong>Swahili — survey_config_sw_10.yaml</strong><br><a href="https://github.com/ishizuki-tech/Survey2026/blob/3011876819095e6de9a9c85c7c22027697e29725/app/src/main/assets/survey_config_sw_10.yaml">View in browser</a> · <a href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-110-3011876/survey_config_sw_10.yaml">Download</a><br><code>SHA-256: e9240a22e089c2f9782c78994edc60278f6fa0f05fdf2ea01b99f60603b6b1cb</code></p>
+        <p><strong>English — survey_config10.yaml</strong><br><a href="https://github.com/ishizuki-tech/Survey2026/blob/c29342bf74b0bcb1528a1b9600c9778bcc845ca7/app/src/main/assets/survey_config10.yaml">View in browser</a> · <a href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-111-c29342b/survey_config10.yaml">Download</a><br><code>SHA-256: 1b03c87ce94c58b8b31a3ab1f45f312a83566d22205da878bd5112620070bce6</code></p>
+        <p><strong>Swahili — survey_config_sw_10.yaml</strong><br><a href="https://github.com/ishizuki-tech/Survey2026/blob/c29342bf74b0bcb1528a1b9600c9778bcc845ca7/app/src/main/assets/survey_config_sw_10.yaml">View in browser</a> · <a href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-111-c29342b/survey_config_sw_10.yaml">Download</a><br><code>SHA-256: e9240a22e089c2f9782c78994edc60278f6fa0f05fdf2ea01b99f60603b6b1cb</code></p>
       </section>
       <div class="qr-panel">
-        <div class="qr-box"><img src="qr.png" alt="QR code that downloads the Survey2026 APK for build-110-3011876" width="300" height="300"></div>
-        <div><h2>Scan with Android</h2><p class="subtitle">This QR code downloads the APK for this build (build-110-3011876).</p><code>https://github.com/ishizuki-tech/Survey2026/releases/download/build-110-3011876/Survey2026-3011876-release.apk</code></div>
+        <div class="qr-box"><img src="qr.png" alt="QR code that downloads the Survey2026 APK for build-111-c29342b" width="300" height="300"></div>
+        <div><h2>Scan with Android</h2><p class="subtitle">This QR code downloads the APK for this build (build-111-c29342b).</p><code>https://github.com/ishizuki-tech/Survey2026/releases/download/build-111-c29342b/Survey2026-c29342b-release.apk</code></div>
       </div>
       <div class="grid">
-        <div class="item"><span class="label">Release tag</span><code>build-110-3011876</code></div>
+        <div class="item"><span class="label">Release tag</span><code>build-111-c29342b</code></div>
         <div class="item"><span class="label">Branch</span><code>main</code></div>
-        <div class="item"><span class="label">Commit SHA</span><code>3011876</code></div>
-        <div class="item"><span class="label">APK filename</span><code>Survey2026-3011876-release.apk</code></div>
-        <div class="item"><span class="label">Workflow run number</span><code>110</code></div>
-        <div class="item"><span class="label">APK SHA-256</span><code>8d871001d76f3297a48d139d4d00964f195b933b809d514bcbb458774b926515</code></div>
+        <div class="item"><span class="label">Commit SHA</span><code>c29342b</code></div>
+        <div class="item"><span class="label">APK filename</span><code>Survey2026-c29342b-release.apk</code></div>
+        <div class="item"><span class="label">Workflow run number</span><code>111</code></div>
+        <div class="item"><span class="label">APK SHA-256</span><code>318b9805910bd28a04d99f88990b14a814214d486acedc4e497530763fe28e10</code></div>
         <div class="item"><span class="label">Signing certificate SHA-256</span><code>d6edef47ec6734a46122ab7fddb5e4f17d19d4d51ae3eaddfb32f309ee5036ea</code></div>
-        <div class="item"><span class="label">Generated timestamp</span><code>2026-10-02T00:12:33Z</code></div>
+        <div class="item"><span class="label">Generated timestamp</span><code>2026-10-02T00:58:05Z</code></div>
       </div>
       <div class="links">
-        <a href="https://github.com/ishizuki-tech/Survey2026/releases/tag/build-110-3011876">GitHub Release</a>
-        <a href="https://github.com/ishizuki-tech/Survey2026/actions/runs/36943994419">GitHub Actions run</a>
+        <a href="https://github.com/ishizuki-tech/Survey2026/releases/tag/build-111-c29342b">GitHub Release</a>
+        <a href="https://github.com/ishizuki-tech/Survey2026/actions/runs/36948000808">GitHub Actions run</a>
         <a href="https://github.com/ishizuki-tech/Survey2026">Repository</a>
       </div>
-      <footer>Survey2026 release metadata generated 2026-10-02T00:12:33Z.</footer>
+      <footer>Survey2026 release metadata generated 2026-10-02T00:58:05Z.</footer>
     </section>
   </main>
 </body>
