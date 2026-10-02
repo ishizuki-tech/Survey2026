@@ -55,7 +55,18 @@ jobs:
         with:
           fetch-depth: 1
           submodules: recursive
+          lfs: true
           persist-credentials: false
+
+      - name: Verify Swahili Whisper model (Git LFS)
+        run: |
+          model=app/src/main/assets/models/ggml-small-sw-cv14-q5_0.bin
+          expected=a8610565fe9ebed140d799b30771c984d85e08eb21f17365845fb4c357a510ce
+          if [[ ! -f "$model" ]] || [[ "$(sha256sum "$model" | cut -d' ' -f1)" != "$expected" ]]; then
+            echo "::error::$model is missing or is a Git LFS pointer ($(stat -c %s "$model" 2>/dev/null || echo 0) bytes). Check out with lfs: true."
+            exit 1
+          fi
+          echo "$model OK ($(stat -c %s "$model") bytes)"
 
       - name: Set up JDK 17
         uses: actions/setup-java@v5
@@ -115,10 +126,24 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
+          # No -PskipModelDownload here: downloadModel bundles the generic English
+          # Whisper model (ggml-small-q5_1.bin) next to the Swahili CV14 model.
           ./gradlew :app:assembleDebug --no-daemon \
-            -PskipModelDownload=true \
             -Pdebug.embedSecrets=true \
             -Prelease.allowSecrets=false
+
+      - name: Verify bundled Whisper models
+        run: |
+          set -euo pipefail
+          apk="$(find app/build/outputs/apk/debug -maxdepth 1 -name '*.apk' | head -n 1)"
+          for model in ggml-small-q5_1.bin ggml-small-sw-cv14-q5_0.bin; do
+            size="$(unzip -lqq "$apk" "assets/models/$model" 2>/dev/null | awk 'NR==1 {print $1}' || true)"
+            if [[ ! "$size" =~ ^[0-9]+$ ]] || (( size < 100000000 )); then
+              echo "::error::assets/models/$model is missing from the APK or too small (${size:-0} bytes)."
+              exit 1
+            fi
+            echo "assets/models/$model: $size bytes"
+          done
 
       - name: Collect branch APK metadata
         id: apk
@@ -279,7 +304,10 @@ jobs:
           TARGET_DIR="$PAGES_DIR/$BRANCH_SLUG"
           RUN_URL="$SERVER_URL/$REPOSITORY/actions/runs/$RUN_ID"
           REPOSITORY_URL="$SERVER_URL/$REPOSITORY"
-          APK_URL="$PAGE_URL$APK_NAME"
+          # The APK is too large for a normal git push (GitHub's 100 MB file limit),
+          # so the page links to the asset on this run's preview release instead.
+          RELEASE_TAG="branch-preview-$BRANCH_SLUG-$SHORT_SHA-run-$RUN_NUMBER"
+          APK_URL="$SERVER_URL/$REPOSITORY/releases/download/$RELEASE_TAG/$APK_NAME"
           GENERATED_UTC="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 
           # A branch preview may replace only a directory it already owns. This
@@ -305,7 +333,6 @@ jobs:
           BRANCH_HTML="$(html_escape "$BRANCH")"
           mkdir -p "$RUNNER_TEMP/branch-preview"
           PREVIEW_DIR="$RUNNER_TEMP/branch-preview"
-          cp "$APK_PATH" "$PREVIEW_DIR/$APK_NAME"
 
           QR_PATH="$PREVIEW_DIR/qr.png"
           curl --fail --silent --show-error --location \
@@ -374,6 +401,7 @@ jobs:
             "short_sha": "$SHORT_SHA",
             "apk_name": "$APK_NAME",
             "apk_sha256": "$APK_SHA256",
+            "apk_url": "$APK_URL",
             "page_url": "$PAGE_URL",
             "run_url": "$RUN_URL",
             "generated_utc": "$GENERATED_UTC"
@@ -480,7 +508,12 @@ jobs:
                   return html.escape(metadata[field], quote=True)
 
               page_url = escaped("page_url")
-              apk_url = f"{page_url}{escaped('apk_name')}"
+              # Newer previews link to the release asset; older ones host the APK in gh-pages.
+              release_prefix = f"{server_url}/{repository}/releases/download/"
+              if str(metadata.get("apk_url", "")).startswith(release_prefix):
+                  apk_url = escaped("apk_url")
+              else:
+                  apk_url = f"{page_url}{escaped('apk_name')}"
               cards.append(
                   "<article class=\"card\">"
                   f"<h2>{escaped('original_branch')}</h2>"

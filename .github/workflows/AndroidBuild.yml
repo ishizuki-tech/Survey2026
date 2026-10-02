@@ -71,7 +71,18 @@ jobs:
         with:
           fetch-depth: 1
           submodules: recursive
+          lfs: true
           persist-credentials: false
+
+      - name: Verify Swahili Whisper model (Git LFS)
+        run: |
+          model=app/src/main/assets/models/ggml-small-sw-cv14-q5_0.bin
+          expected=a8610565fe9ebed140d799b30771c984d85e08eb21f17365845fb4c357a510ce
+          if [[ ! -f "$model" ]] || [[ "$(sha256sum "$model" | cut -d' ' -f1)" != "$expected" ]]; then
+            echo "::error::$model is missing or is a Git LFS pointer ($(stat -c %s "$model" 2>/dev/null || echo 0) bytes). Check out with lfs: true."
+            exit 1
+          fi
+          echo "$model OK ($(stat -c %s "$model") bytes)"
 
       - name: Resolve What's New metadata
         id: whats_new

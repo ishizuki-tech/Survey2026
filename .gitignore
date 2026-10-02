@@ -149,3 +149,6 @@ app/src/main/assets/models/**
 *~
 *.orig
 *.bak
+
+# Swahili Whisper model (dmusingu CV14), stored in Git LFS
+!app/src/main/assets/models/ggml-small-sw-cv14-q5_0.bin
