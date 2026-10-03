@@ -28,7 +28,9 @@ import com.negi.survey.net.GitHubUploadWorker
 import com.negi.survey.net.GitHubUploader
 import com.negi.survey.net.RuntimeLogStore
 import com.negi.survey.net.SurveyUploadRescheduler
+import com.negi.survey.runtime.HeavyRuntimeCoordinator
 import com.negi.survey.slm.LiteRtLM
+import com.negi.survey.whisper.WhisperEngine
 import java.io.File
 import java.lang.reflect.Modifier
 import java.util.concurrent.atomic.AtomicBoolean
@@ -223,6 +225,11 @@ internal class StartupSurveyRecoveryCoordinator(
  *   for CPU / IO. To reduce cold-start contention, startup upload enqueues are deferred.
  */
 class SurveyApp : Application(), Configuration.Provider {
+
+    /** Process-wide owner for LiteRT-LM and Whisper native-runtime handoff. */
+    val heavyRuntimeCoordinator = HeavyRuntimeCoordinator(
+        releaseWhisper = { WhisperEngine.release() },
+    )
 
     // Guard JNI load to avoid duplicate loads and allow retry on failure.
     private val litertJniLoadOnce = AtomicBoolean(false)

@@ -138,11 +138,15 @@ import com.negi.survey.screens.IntroScreen
 import com.negi.survey.screens.ReviewScreen
 import com.negi.survey.screens.SpeechController
 import com.negi.survey.screens.toggleSpeechRecordingWithTtsInterlock
+import com.negi.survey.runtime.HeavyRuntimeHandoff
+import com.negi.survey.runtime.NoOpHeavyRuntimeHandoff
 import com.negi.survey.slm.LiteRtLM
 import com.negi.survey.slm.LiteRtRepository
 import com.negi.survey.slm.Model
 import com.negi.survey.slm.Repository
+import com.negi.survey.slm.SLM
 import com.negi.survey.slm.buildModelConfig
+import com.negi.survey.slm.modelIdentityForPath
 import com.negi.survey.ui.theme.SurveyNavTheme
 import com.negi.survey.vm.AiViewModel
 import com.negi.survey.vm.AppViewModel
@@ -886,6 +890,8 @@ fun AppNav() {
             )
         }
 
+        val heavyRuntimeCoordinator = (appContext as SurveyApp).heavyRuntimeCoordinator
+
         InitGate(
             key = "slm_init@$sessionKey@${modelFile.absolutePath}",
             progressText = "Initializing Small Language Model…",
@@ -893,12 +899,17 @@ fun AppNav() {
             onErrorMessage = { "Failed to initialize model: ${it.message}" },
             init = {
                 withContext(Dispatchers.Default) {
-                    LiteRtLM.initializeIfNeeded(
-                        context = appContext,
-                        model = slmModel,
-                        supportImage = false,
-                        supportAudio = false
-                    )
+                    heavyRuntimeCoordinator.withLiteRt(
+                        runtimeIdentity = modelIdentityForPath(slmModel.taskPath),
+                        releaseLiteRt = { SLM.forceCleanUpAndWait(slmModel) },
+                    ) {
+                        LiteRtLM.initializeIfNeeded(
+                            context = appContext,
+                            model = slmModel,
+                            supportImage = false,
+                            supportAudio = false
+                        )
+                    }
                 }
             }
         ) {
@@ -909,6 +920,7 @@ fun AppNav() {
                     model = slmModel,
                     config = cfg,
                     appContext = appContext,
+                    heavyRuntimeHandoff = heavyRuntimeCoordinator,
                 )
             }
 
@@ -1012,6 +1024,7 @@ fun AppNav() {
                         ttsMeta = cfg.tts,
                         sessionId = sessionKey,
                         sessionVmOwner = sessionVmOwner,
+                        heavyRuntimeHandoff = heavyRuntimeCoordinator,
                         uploadStatus = uploadStatus
                     )
                 }
@@ -1025,6 +1038,7 @@ fun AppNav() {
                     ttsMeta = cfg.tts,
                     sessionId = sessionKey,
                     sessionVmOwner = sessionVmOwner,
+                    heavyRuntimeHandoff = heavyRuntimeCoordinator,
                     uploadStatus = uploadStatus
                 )
             }
@@ -1077,6 +1091,7 @@ fun SurveyNavHost(
     ttsMeta: SurveyConfig.TtsMeta = SurveyConfig.TtsMeta(),
     sessionId: String = "session",
     sessionVmOwner: ViewModelStoreOwner? = null,
+    heavyRuntimeHandoff: HeavyRuntimeHandoff = NoOpHeavyRuntimeHandoff,
     uploadStatus: UploadStatus = UploadStatus()
 ) {
     val localContext = LocalContext.current
@@ -1148,6 +1163,7 @@ fun SurveyNavHost(
                 appContext = appContext,
                 assetModelPath = assetPath,
                 languageCode = lang,
+                heavyRuntimeHandoff = heavyRuntimeHandoff,
                 onVoiceExported = onVoiceExported@{ voice ->
                     val resolvedQid =
                         voice.questionId?.takeIf { it.isNotBlank() } ?: latestNodeIdState.value
