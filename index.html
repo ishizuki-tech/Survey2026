@@ -46,117 +46,65 @@
         <h2>Build provenance</h2>
         
         <p>
-        <strong>Source:</strong> <code>602737c583c6c1121769868bc550715e0fec644a</code></p>
+        <strong>Source:</strong> <code>d71c7332d65d247ddcc3fa6dca034974421ea4e6</code></p>
       </section>
-      <section class="config-files"><h2>What's New</h2><h3>Fix Issue #75 heavy runtime handoff</h3><pre class="whats-new-body">## Summary
+      <section class="config-files"><h2>What's New</h2><h3>Prevent local uploads to production GitHub target</h3><pre class="whats-new-body">## Summary
 
-Fixes the Issue #75 heavy-runtime lifecycle gap by serializing ownership transitions between LiteRT-LM and Whisper.
+- keep the existing production GitHub upload destination for normal/GitHub builds
+- prevent local builds from falling back to `ishizuki-tech/SurveyExports`
+- centralize effective GitHub upload target resolution
+- prevent diagnostics preferences from overriding APK routing
+- reject legacy queued production-targeted GitHub work when running in local mode
+- add redacted startup diagnostics for upload mode, target, branch, path prefix, and credential availability
 
-The implementation introduces a process-wide `HeavyRuntimeCoordinator` used by Survey2026&#x27;s LiteRT and Whisper paths so the opposite heavy runtime is fully released before native initialization/acquisition begins.
+## Behavior
 
-Closes #75
+Production builds continue to use the existing configured production target, including the current `SurveyExports/main` fallback.
 
-## Scope
+Local builds require an explicit non-production development destination. If none is configured, GitHub upload fails closed rather than falling back to production.
 
-- add process-wide heavy-runtime ownership coordination
-- release LiteRT-LM before Whisper initialization
-- release Whisper before LiteRT-LM acquisition
-- preserve same-LiteRT-runtime reuse
-- distinguish LiteRT runtimes using the same filesystem-aware model identity used by LiteRtLM runtime keying
-- safely handle LiteRT A -&gt; B replacement
-- preserve release failure and cancellation behavior
-- add focused coordinator regression coverage
-
-No Issue #77 JSON handling changes are included.
-
-## Files changed
-
-- `app/src/main/kotlin/com/negi/survey/MainActivity.kt`
-- `app/src/main/kotlin/com/negi/survey/SurveyApp.kt`
-- `app/src/main/kotlin/com/negi/survey/runtime/HeavyRuntimeCoordinator.kt`
-- `app/src/main/kotlin/com/negi/survey/slm/AiRepository.kt`
-- `app/src/main/kotlin/com/negi/survey/vm/WhisperSpeechController.kt`
-- `app/src/test/kotlin/com/negi/survey/runtime/HeavyRuntimeCoordinatorTest.kt`
+Existing queued work keeps its captured routing. However, a local build will reject legacy queued work targeting `ishizuki-tech/SurveyExports` before any upload attempt.
 
 ## Validation
 
-Local validation:
+- focused `GitHubUploadTargetPolicyTest`
+- `./gradlew :app:testDebugUnitTest --no-daemon -PskipModelDownload=true -Pdebug.embedSecrets=false -Prelease.allowSecrets=false`
+- `./gradlew :app:assembleDebug --no-daemon -PskipModelDownload=true -Pdebug.embedSecrets=false -Prelease.allowSecrets=false`
+- release BuildConfig verification
+- local no-upload Gradle configuration checks
+- `git diff --check`
 
-- `git diff --check`: PASS
-- focused `HeavyRuntimeCoordinatorTest`: PASS, 15/15
-- `./gradlew :app:testDebugUnitTest`: PASS
-- `./gradlew :app:assembleDebug`: PASS
+No real GitHub upload or physical-device validation was performed.
 
-### Galaxy S25 physical-device validation
-
-Device:
-- Samsung Galaxy S25 `SM-S731U`
-- Android 16 / API 36
-- package `com.negi.survey.local`
-- versionCode 112
-- tested APK SHA-256: `09395d88ea1cac178924a84b70f39e2e7263c732c502b090da4c499afe34bfb4`
-
-| Point | Graphics KiB | PSS KiB | RSS KiB | Swap PSS KiB |
-| --- | ---: | ---: | ---: | ---: |
-| LiteRT warm | 3,343,085 | 4,011,177 | 3,849,473 | 207,534 |
-| Whisper active | 33,233 | 745,252 | 651,945 | 150,450 |
-| LiteRT reacquired | 3,369,549 | 4,140,086 | 4,029,133 | 158,166 |
-
-Observed ordering:
-- microphone requested at `20:41:22.801`
-- `SLM.forceCleanUpAndWait` began at `20:41:22.804`
-- Whisper native initialization began at `20:41:23.270`
-- Whisper initialization succeeded at `20:41:24.029`
-- recording began at `20:41:24.031`
-- Graphics dropped by 3,309,852 KiB (~99%) while Whisper was active
-- Whisper release logged at `20:45:11.965`
-- LiteRT initialization began at `20:45:12.000` and succeeded at `20:45:22.140`
-
-Functional results:
-- LiteRT release before Whisper initialization: PASS
-- LiteRT Graphics released during Whisper use: PASS
-- Whisper initialization / recording: PASS
-- transcription: PASS
-- Whisper release before LiteRT reacquisition: PASS
-- LiteRT reacquisition: PASS
-- TWO_STEP / follow-up continuity: PASS
-- duplicate LiteRT runtime: no evidence observed
-- LiteRT + Whisper overlap: no evidence observed
-- stale ownership: no evidence observed
-- crash / ANR / fatal app error: none observed
-- Issue #77 duplicated/concatenated EVAL JSON: not observed
-
-## Notes
-
-Expected non-fatal LiteRT platform warnings for unavailable NPU registration and OpenCL sampler fallback were observed; inference completed normally.</pre></section>
-      <a class="download" href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-113-602737c/Survey2026-602737c-release.apk">Download APK</a>
+Closes #78</pre></section>
+      <a class="download" href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-114-d71c733/Survey2026-d71c733-release.apk">Download APK</a>
       <p class="note">Direct GitHub Release asset. No ZIP extraction is required.</p>
       <section class="config-files">
         <h2>Config files included in this APK</h2>
         <p class="note">These config files were extracted from the exact APK build shown on this page.</p>
-        <p><strong>English — survey_config10.yaml</strong><br><a href="https://github.com/ishizuki-tech/Survey2026/blob/602737c583c6c1121769868bc550715e0fec644a/app/src/main/assets/survey_config10.yaml">View in browser</a> · <a href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-113-602737c/survey_config10.yaml">Download</a><br><code>SHA-256: 1b03c87ce94c58b8b31a3ab1f45f312a83566d22205da878bd5112620070bce6</code></p>
-        <p><strong>Swahili — survey_config_sw_10.yaml</strong><br><a href="https://github.com/ishizuki-tech/Survey2026/blob/602737c583c6c1121769868bc550715e0fec644a/app/src/main/assets/survey_config_sw_10.yaml">View in browser</a> · <a href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-113-602737c/survey_config_sw_10.yaml">Download</a><br><code>SHA-256: e9240a22e089c2f9782c78994edc60278f6fa0f05fdf2ea01b99f60603b6b1cb</code></p>
+        <p><strong>English — survey_config10.yaml</strong><br><a href="https://github.com/ishizuki-tech/Survey2026/blob/d71c7332d65d247ddcc3fa6dca034974421ea4e6/app/src/main/assets/survey_config10.yaml">View in browser</a> · <a href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-114-d71c733/survey_config10.yaml">Download</a><br><code>SHA-256: 1b03c87ce94c58b8b31a3ab1f45f312a83566d22205da878bd5112620070bce6</code></p>
+        <p><strong>Swahili — survey_config_sw_10.yaml</strong><br><a href="https://github.com/ishizuki-tech/Survey2026/blob/d71c7332d65d247ddcc3fa6dca034974421ea4e6/app/src/main/assets/survey_config_sw_10.yaml">View in browser</a> · <a href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-114-d71c733/survey_config_sw_10.yaml">Download</a><br><code>SHA-256: e9240a22e089c2f9782c78994edc60278f6fa0f05fdf2ea01b99f60603b6b1cb</code></p>
       </section>
       <div class="qr-panel">
-        <div class="qr-box"><img src="qr.png" alt="QR code that downloads the Survey2026 APK for build-113-602737c" width="300" height="300"></div>
-        <div><h2>Scan with Android</h2><p class="subtitle">This QR code downloads the APK for this build (build-113-602737c).</p><code>https://github.com/ishizuki-tech/Survey2026/releases/download/build-113-602737c/Survey2026-602737c-release.apk</code></div>
+        <div class="qr-box"><img src="qr.png" alt="QR code that downloads the Survey2026 APK for build-114-d71c733" width="300" height="300"></div>
+        <div><h2>Scan with Android</h2><p class="subtitle">This QR code downloads the APK for this build (build-114-d71c733).</p><code>https://github.com/ishizuki-tech/Survey2026/releases/download/build-114-d71c733/Survey2026-d71c733-release.apk</code></div>
       </div>
       <div class="grid">
-        <div class="item"><span class="label">Release tag</span><code>build-113-602737c</code></div>
+        <div class="item"><span class="label">Release tag</span><code>build-114-d71c733</code></div>
         <div class="item"><span class="label">Branch</span><code>main</code></div>
-        <div class="item"><span class="label">Commit SHA</span><code>602737c</code></div>
-        <div class="item"><span class="label">APK filename</span><code>Survey2026-602737c-release.apk</code></div>
-        <div class="item"><span class="label">Workflow run number</span><code>113</code></div>
-        <div class="item"><span class="label">APK SHA-256</span><code>515100d6982fb45ee1e6692b97460128d48d0968b5fa7215e3c9ca209f30d174</code></div>
+        <div class="item"><span class="label">Commit SHA</span><code>d71c733</code></div>
+        <div class="item"><span class="label">APK filename</span><code>Survey2026-d71c733-release.apk</code></div>
+        <div class="item"><span class="label">Workflow run number</span><code>114</code></div>
+        <div class="item"><span class="label">APK SHA-256</span><code>349c20bd7816249a479f4c10d67437326227952bbcc561bfdb4a8220a3be1097</code></div>
         <div class="item"><span class="label">Signing certificate SHA-256</span><code>d6edef47ec6734a46122ab7fddb5e4f17d19d4d51ae3eaddfb32f309ee5036ea</code></div>
-        <div class="item"><span class="label">Generated timestamp</span><code>2026-10-03T02:19:41Z</code></div>
+        <div class="item"><span class="label">Generated timestamp</span><code>2026-10-03T05:44:05Z</code></div>
       </div>
       <div class="links">
-        <a href="https://github.com/ishizuki-tech/Survey2026/releases/tag/build-113-602737c">GitHub Release</a>
-        <a href="https://github.com/ishizuki-tech/Survey2026/actions/runs/37088959080">GitHub Actions run</a>
+        <a href="https://github.com/ishizuki-tech/Survey2026/releases/tag/build-114-d71c733">GitHub Release</a>
+        <a href="https://github.com/ishizuki-tech/Survey2026/actions/runs/37100343217">GitHub Actions run</a>
         <a href="https://github.com/ishizuki-tech/Survey2026">Repository</a>
       </div>
-      <footer>Survey2026 release metadata generated 2026-10-03T02:19:41Z.</footer>
+      <footer>Survey2026 release metadata generated 2026-10-03T05:44:05Z.</footer>
     </section>
   </main>
 </body>
