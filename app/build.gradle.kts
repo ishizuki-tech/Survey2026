@@ -506,7 +506,9 @@ extensions.configure<ApplicationExtension> {
             ),
         environmentNames =
             listOf("GH_REPO"),
-        default = "SurveyExports",
+        // A local APK must opt into its development destination explicitly.
+        // Only non-local builds retain the production SurveyExports fallback.
+        default = if (localBuild) "" else "SurveyExports",
     )
 
     val ghBranch = propOrEnv(
@@ -722,6 +724,12 @@ extensions.configure<ApplicationExtension> {
 
             buildConfigField(
                 "String",
+                "GH_UPLOAD_MODE",
+                quote(if (localBuild) "local" else "production"),
+            )
+
+            buildConfigField(
+                "String",
                 "GH_TOKEN",
                 quote(
                     if (embedDebugSecrets) {
@@ -794,6 +802,12 @@ extensions.configure<ApplicationExtension> {
                 "String",
                 "GH_PATH_PREFIX",
                 quote(ghPathPrefix),
+            )
+
+            buildConfigField(
+                "String",
+                "GH_UPLOAD_MODE",
+                quote(if (localBuild) "local" else "production"),
             )
 
             // Allow the GitHub token only for explicitly enabled internal releases.

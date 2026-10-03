@@ -391,6 +391,17 @@ class GitHubUploadWorker(
         }
 
         if (
+            !GitHubUploadTargetPolicy.allowsCapturedRouting(
+                localBuild = BuildConfig.GH_UPLOAD_MODE == "local",
+                owner = owner,
+                repo = repo,
+            )
+        ) {
+            Log.w(TAG, "Rejecting captured production GitHub route in local mode.")
+            return null
+        }
+
+        if (
             owner.any(Char::isWhitespace) ||
             repo.any(Char::isWhitespace)
         ) {
@@ -409,48 +420,16 @@ class GitHubUploadWorker(
     }
 
     private fun buildGitHubConfigFromBuildConfig(): GitHubUploader.GitHubConfig? {
-        val token = BuildConfig.GH_TOKEN.trim()
-        val rawRepo = BuildConfig.GH_REPO.trim()
-
-        if (
-            token.isBlank() ||
-            rawRepo.isBlank()
-        ) {
-            return null
-        }
-
-        var owner = BuildConfig.GH_OWNER.trim()
-        var repo = rawRepo
-
-        if (rawRepo.contains('/')) {
-            if (owner.isBlank()) {
-                owner =
-                    rawRepo.substringBefore('/').trim()
-            }
-
-            repo =
-                rawRepo.substringAfterLast('/').trim()
-        }
-
-        if (
-            owner.isBlank() ||
-            repo.isBlank()
-        ) {
-            return null
-        }
-
-        return GitHubUploader.GitHubConfig(
-            owner = owner,
-            repo = repo,
-            token = token,
-            branch =
-                BuildConfig.GH_BRANCH
-                    .trim()
-                    .ifBlank { "main" },
-            pathPrefix =
-                BuildConfig.GH_PATH_PREFIX
-                    .trim()
-                    .trim('/')
+        return GitHubUploadTargetPolicy.resolve(
+            buildTarget =
+                GitHubUploadTargetPolicy.BuildTarget(
+                    localBuild = BuildConfig.GH_UPLOAD_MODE == "local",
+                    owner = BuildConfig.GH_OWNER,
+                    repo = BuildConfig.GH_REPO,
+                    branch = BuildConfig.GH_BRANCH,
+                    pathPrefix = BuildConfig.GH_PATH_PREFIX,
+                    token = BuildConfig.GH_TOKEN,
+                ),
         )
     }
 

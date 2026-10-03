@@ -164,21 +164,21 @@ object GitHubDiagnosticsConfigStore {
     }
 
     fun buildGitHubConfigOrNull(context: Context): GitHubUploader.GitHubConfig? {
+        // APK build routing is authoritative. Preferences retain their credential role but cannot
+        // split survey and diagnostics artifacts across different repositories.
         val cfg = load(context)
-        if (!cfg.isUsable()) return null
-
-        val normalized = normalizeOwnerRepo(cfg.owner, cfg.repo)
-        val owner = normalized.owner
-        val repoName = normalized.repoName
-
-        if (owner.isBlank() || repoName.isBlank() || cfg.token.isBlank()) return null
-
-        return GitHubUploader.GitHubConfig(
-            owner = owner,
-            repo = repoName,
-            branch = cfg.branch.ifBlank { "main" },
-            pathPrefix = cfg.pathPrefix.trim().trim('/'),
-            token = cfg.token
+        if (!cfg.enabled) return null
+        return GitHubUploadTargetPolicy.resolve(
+            buildTarget =
+                GitHubUploadTargetPolicy.BuildTarget(
+                    localBuild = BuildConfig.GH_UPLOAD_MODE == "local",
+                    owner = BuildConfig.GH_OWNER,
+                    repo = BuildConfig.GH_REPO,
+                    branch = BuildConfig.GH_BRANCH,
+                    pathPrefix = BuildConfig.GH_PATH_PREFIX,
+                    token = BuildConfig.GH_TOKEN,
+                ),
+            diagnosticsCredential = cfg.token,
         )
     }
 
