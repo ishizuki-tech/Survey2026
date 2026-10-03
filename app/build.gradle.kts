@@ -496,6 +496,7 @@ extensions.configure<ApplicationExtension> {
             ),
         environmentNames =
             listOf("GH_OWNER"),
+        default = if (localBuild) "ishizuki-tech" else "",
     )
 
     val ghRepo = propOrEnv(
@@ -506,9 +507,7 @@ extensions.configure<ApplicationExtension> {
             ),
         environmentNames =
             listOf("GH_REPO"),
-        // A local APK must opt into its development destination explicitly.
-        // Only non-local builds retain the production SurveyExports fallback.
-        default = if (localBuild) "" else "SurveyExports",
+        default = if (localBuild) "SurveyExports-Dev" else "SurveyExports",
     )
 
     val ghBranch = propOrEnv(

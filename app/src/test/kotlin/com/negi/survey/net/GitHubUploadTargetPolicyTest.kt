@@ -8,7 +8,7 @@ import org.junit.Test
 
 class GitHubUploadTargetPolicyTest {
     @Test
-    fun productionDefaultKeepsSurveyExportsMain() {
+    fun productionDefaultUsesSurveyExportsMain() {
         val config = resolve(local = false, owner = "ishizuki-tech", repo = "SurveyExports")
 
         requireNotNull(config)
@@ -18,13 +18,13 @@ class GitHubUploadTargetPolicyTest {
     }
 
     @Test
-    fun localExplicitDevelopmentTargetIsUsed() {
-        val config = resolve(local = true, owner = "dev-owner", repo = "dev-exports", branch = "dev")
+    fun localDefaultUsesSharedDevelopmentDestination() {
+        val config = resolve(local = true, owner = "ishizuki-tech", repo = "SurveyExports-Dev")
 
         requireNotNull(config)
-        assertEquals("dev-owner", config.owner)
-        assertEquals("dev-exports", config.repo)
-        assertEquals("dev", config.branch)
+        assertEquals("ishizuki-tech", config.owner)
+        assertEquals("SurveyExports-Dev", config.repo)
+        assertEquals("main", config.branch)
     }
 
     @Test
