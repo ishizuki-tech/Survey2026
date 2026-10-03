@@ -130,6 +130,7 @@ import androidx.navigation3.runtime.rememberSaveableStateHolderNavEntryDecorator
 import androidx.navigation3.ui.NavDisplay
 import com.negi.survey.config.SurveyConfig
 import com.negi.survey.config.SurveyConfigLoader
+import com.negi.survey.net.GitHubUploadTargetPolicy
 import com.negi.survey.net.GitHubUploader
 import com.negi.survey.screens.AiScreen
 import com.negi.survey.screens.ConfigOptionUi
@@ -1553,51 +1554,19 @@ private fun buildGitHubConfigOrNull(): GitHubUploader.GitHubConfig? {
      * secret credential in a distributed production app; prefer a backend or
      * short-lived scoped credential for production uploads.
      */
-    val token = BuildConfig.GH_TOKEN.trim()
-    if (token.isBlank()) {
-        return null
-    }
-
-    var owner = BuildConfig.GH_OWNER.trim()
-    var repo = BuildConfig.GH_REPO.trim()
-
-    if (repo.contains('/')) {
-        val inferredOwner = repo.substringBefore('/').trim()
-        val inferredRepo = repo.substringAfterLast('/').trim()
-
-        if (owner.isBlank()) {
-            owner = inferredOwner
-        }
-
-        repo = inferredRepo
-    }
-
-    if (owner.isBlank() || repo.isBlank()) {
-        return null
-    }
-
-    if (owner.any(Char::isWhitespace) || repo.any(Char::isWhitespace)) {
-        return null
-    }
-
-    val branch =
-        BuildConfig.GH_BRANCH
-            .trim()
-            .ifBlank { "main" }
-
-    val prefix =
-        BuildConfig.GH_PATH_PREFIX
-            .trim()
-            .trim('/')
-
-    return GitHubUploader.GitHubConfig(
-        owner = owner,
-        repo = repo,
-        branch = branch,
-        pathPrefix = prefix,
-        token = token,
+    return GitHubUploadTargetPolicy.resolve(
+        buildTarget =
+            GitHubUploadTargetPolicy.BuildTarget(
+                localBuild = BuildConfig.GH_UPLOAD_MODE == "local",
+                owner = BuildConfig.GH_OWNER,
+                repo = BuildConfig.GH_REPO,
+                branch = BuildConfig.GH_BRANCH,
+                pathPrefix = BuildConfig.GH_PATH_PREFIX,
+                token = BuildConfig.GH_TOKEN,
+            ),
+    )?.copy(
         maxRawBytesHint = INTERNAL_GH_MAX_RAW_BYTES,
-        maxRequestBytesHint = INTERNAL_GH_MAX_REQUEST_BYTES
+        maxRequestBytesHint = INTERNAL_GH_MAX_REQUEST_BYTES,
     )
 }
 

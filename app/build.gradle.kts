@@ -496,6 +496,7 @@ extensions.configure<ApplicationExtension> {
             ),
         environmentNames =
             listOf("GH_OWNER"),
+        default = if (localBuild) "ishizuki-tech" else "",
     )
 
     val ghRepo = propOrEnv(
@@ -506,7 +507,7 @@ extensions.configure<ApplicationExtension> {
             ),
         environmentNames =
             listOf("GH_REPO"),
-        default = "SurveyExports",
+        default = if (localBuild) "SurveyExports-Dev" else "SurveyExports",
     )
 
     val ghBranch = propOrEnv(
@@ -722,6 +723,12 @@ extensions.configure<ApplicationExtension> {
 
             buildConfigField(
                 "String",
+                "GH_UPLOAD_MODE",
+                quote(if (localBuild) "local" else "production"),
+            )
+
+            buildConfigField(
+                "String",
                 "GH_TOKEN",
                 quote(
                     if (embedDebugSecrets) {
@@ -794,6 +801,12 @@ extensions.configure<ApplicationExtension> {
                 "String",
                 "GH_PATH_PREFIX",
                 quote(ghPathPrefix),
+            )
+
+            buildConfigField(
+                "String",
+                "GH_UPLOAD_MODE",
+                quote(if (localBuild) "local" else "production"),
             )
 
             // Allow the GitHub token only for explicitly enabled internal releases.

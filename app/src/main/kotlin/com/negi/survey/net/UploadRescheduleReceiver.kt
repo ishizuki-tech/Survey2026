@@ -128,15 +128,8 @@ class UploadRescheduleReceiver : BroadcastReceiver() {
     }
 
     private fun rescheduleGitHub(contexts: List<Context>, action: String) {
-        val cfg = GitHubUploader.GitHubConfig(
-            owner = BuildConfig.GH_OWNER,
-            repo = BuildConfig.GH_REPO,
-            token = BuildConfig.GH_TOKEN,
-            branch = BuildConfig.GH_BRANCH,
-            pathPrefix = BuildConfig.GH_PATH_PREFIX
-        )
-
-        if (cfg.owner.isBlank() || cfg.repo.isBlank() || cfg.token.isBlank()) {
+        val cfg = buildGitHubConfigOrNull()
+        if (cfg == null) {
             Log.d(TAG, "Skip GitHub reschedule: missing credentials.")
             return
         }
@@ -281,15 +274,8 @@ class UploadRescheduleReceiver : BroadcastReceiver() {
     }
 
     private fun rescheduleRuntimeLogsUpload(contexts: List<Context>, action: String) {
-        val cfg = GitHubUploader.GitHubConfig(
-            owner = BuildConfig.GH_OWNER,
-            repo = BuildConfig.GH_REPO,
-            token = BuildConfig.GH_TOKEN,
-            branch = BuildConfig.GH_BRANCH,
-            pathPrefix = BuildConfig.GH_PATH_PREFIX
-        )
-
-        if (cfg.owner.isBlank() || cfg.repo.isBlank() || cfg.token.isBlank()) {
+        val cfg = buildGitHubConfigOrNull()
+        if (cfg == null) {
             Log.d(TAG, "Skip runtime logs upload: missing GitHub credentials.")
             return
         }
@@ -445,6 +431,19 @@ class UploadRescheduleReceiver : BroadcastReceiver() {
             ACTION_LOCKED_BOOT_COMPLETED -> true
             else -> false
         }
+
+    private fun buildGitHubConfigOrNull(): GitHubUploader.GitHubConfig? =
+        GitHubUploadTargetPolicy.resolve(
+            buildTarget =
+                GitHubUploadTargetPolicy.BuildTarget(
+                    localBuild = BuildConfig.GH_UPLOAD_MODE == "local",
+                    owner = BuildConfig.GH_OWNER,
+                    repo = BuildConfig.GH_REPO,
+                    branch = BuildConfig.GH_BRANCH,
+                    pathPrefix = BuildConfig.GH_PATH_PREFIX,
+                    token = BuildConfig.GH_TOKEN,
+                ),
+        )
 
     private fun createDeviceProtectedContextOrNull(context: Context): Context? {
         if (Build.VERSION.SDK_INT < 24) return null

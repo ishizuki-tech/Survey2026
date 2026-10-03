@@ -24,6 +24,7 @@ import android.util.Log
 import androidx.work.Configuration
 import androidx.work.WorkManager
 import com.negi.survey.net.DiagnosticUploadInstrumentationGate
+import com.negi.survey.net.GitHubUploadTargetPolicy
 import com.negi.survey.net.GitHubUploadWorker
 import com.negi.survey.net.GitHubUploader
 import com.negi.survey.net.RuntimeLogStore
@@ -430,6 +431,8 @@ class SurveyApp : Application(), Configuration.Provider {
                 val t0 = SystemClock.elapsedRealtime()
                 RuntimeLogStore.w(TAG, "Deferred startup enqueues begin...")
 
+                logEffectiveGitHubUploadTarget(appCtx)
+
                 // Startup: enqueue runtime log upload (best-effort, main process only).
                 safeEnqueueStartupRuntimeLogsUploadOnce(appCtx)
 
@@ -703,6 +706,20 @@ class SurveyApp : Application(), Configuration.Provider {
     private fun resolveGitHubConfigNormalizedBestEffort(context: Context): GitHubUploader.GitHubConfig? {
         val raw = tryLoadGitHubConfigBestEffort(context) ?: return null
         return normalizeGitHubConfig(raw)
+    }
+
+    private fun logEffectiveGitHubUploadTarget(context: Context) {
+        val target =
+            GitHubUploadTargetPolicy.BuildTarget(
+                localBuild = BuildConfig.GH_UPLOAD_MODE == "local",
+                owner = BuildConfig.GH_OWNER,
+                repo = BuildConfig.GH_REPO,
+                branch = BuildConfig.GH_BRANCH,
+                pathPrefix = BuildConfig.GH_PATH_PREFIX,
+                token = BuildConfig.GH_TOKEN,
+            )
+        val config = runCatching { resolveGitHubConfigNormalizedBestEffort(context) }.getOrNull()
+        RuntimeLogStore.i(TAG, GitHubUploadTargetPolicy.startupDiagnostic(target, config))
     }
 
     private fun normalizeGitHubConfig(cfg: GitHubUploader.GitHubConfig): GitHubUploader.GitHubConfig? {
