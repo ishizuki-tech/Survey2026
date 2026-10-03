@@ -36,6 +36,8 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.negi.survey.screens.SpeechController
+import com.negi.survey.runtime.HeavyRuntimeHandoff
+import com.negi.survey.runtime.NoOpHeavyRuntimeHandoff
 import com.negi.survey.utils.ExportUtils
 import com.negi.survey.whisper.Recorder
 import com.negi.survey.whisper.RecorderBackend
@@ -75,6 +77,7 @@ class WhisperSpeechController(
     private val assetModelPath: String = DEFAULT_ASSET_MODEL,
     languageCode: String = DEFAULT_LANGUAGE,
     private val onVoiceExported: ((ExportedVoice) -> Unit)? = null,
+    private val heavyRuntimeHandoff: HeavyRuntimeHandoff = NoOpHeavyRuntimeHandoff,
     private val recorderFactory: ((Context, (Exception) -> Unit) -> RecorderBackend)? = null,
     private val modelInitializer: (suspend () -> Unit)? = null,
     private val transcriber: (suspend (File, String) -> Result<String>)? = null,
@@ -107,7 +110,8 @@ class WhisperSpeechController(
             appContext: Context,
             assetModelPath: String = DEFAULT_ASSET_MODEL,
             languageCode: String = DEFAULT_LANGUAGE,
-            onVoiceExported: ((ExportedVoice) -> Unit)? = null
+            onVoiceExported: ((ExportedVoice) -> Unit)? = null,
+            heavyRuntimeHandoff: HeavyRuntimeHandoff = NoOpHeavyRuntimeHandoff,
         ): ViewModelProvider.Factory =
             object : ViewModelProvider.Factory {
                 @Suppress("UNCHECKED_CAST")
@@ -119,7 +123,8 @@ class WhisperSpeechController(
                         appContext = appContext.applicationContext,
                         assetModelPath = assetModelPath,
                         languageCode = languageCode,
-                        onVoiceExported = onVoiceExported
+                        onVoiceExported = onVoiceExported,
+                        heavyRuntimeHandoff = heavyRuntimeHandoff,
                     ) as T
                 }
             }
@@ -486,13 +491,23 @@ class WhisperSpeechController(
                 return
             }
 
-            WhisperTraceRegistry.event(currentSurveyId, currentQuestionId, "MODEL_INIT_STARTED", mapOf("modelKey" to assetModelPath, "language" to normalizedLanguage))
             var initTiming: InitTiming? = null
-            val result = WhisperEngine.ensureInitializedFromAsset(
-                context = appContext,
-                assetPath = assetModelPath,
-                onTiming = { timing -> initTiming = timing }
-            )
+            val result = try {
+                Result.success(
+                    heavyRuntimeHandoff.withWhisper {
+                        WhisperTraceRegistry.event(currentSurveyId, currentQuestionId, "MODEL_INIT_STARTED", mapOf("modelKey" to assetModelPath, "language" to normalizedLanguage))
+                        WhisperEngine.ensureInitializedFromAsset(
+                            context = appContext,
+                            assetPath = assetModelPath,
+                            onTiming = { timing -> initTiming = timing }
+                        ).getOrThrow()
+                    }
+                )
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (t: Throwable) {
+                Result.failure(t)
+            }
 
             result.onFailure { e ->
                 WhisperTraceRegistry.event(currentSurveyId, currentQuestionId, "MODEL_INIT_FINISHED", mapOf("success" to false, "modelKey" to assetModelPath, "error" to e.message))

@@ -21,6 +21,8 @@ import com.negi.survey.AppRingLogStore
 import com.negi.survey.BuildConfig
 import com.negi.survey.config.SurveyConfig
 import com.negi.survey.net.RuntimeLogStore
+import com.negi.survey.runtime.HeavyRuntimeHandoff
+import com.negi.survey.runtime.NoOpHeavyRuntimeHandoff
 import java.io.File
 import java.security.MessageDigest
 import java.text.SimpleDateFormat
@@ -334,6 +336,7 @@ class LiteRtRepository(
     private val model: Model,
     private val config: SurveyConfig,
     private val appContext: Context? = null,
+    private val heavyRuntimeHandoff: HeavyRuntimeHandoff = NoOpHeavyRuntimeHandoff,
     private val supportImage: Boolean = false,
     private val supportAudio: Boolean = false,
     private val systemMessage: Message? = null,
@@ -733,15 +736,20 @@ class LiteRtRepository(
                 val initAttempt: Result<Unit>? =
                     withTimeoutOrNull(INIT_TIMEOUT_MS) {
                         runCatchingSuspend {
-                            runOnSlmThread {
-                                SLM.initializeIfNeeded(
-                                    context = ctx,
-                                    model = model,
-                                    supportImage = supportImage,
-                                    supportAudio = supportAudio,
-                                    systemMessage = systemMessage,
-                                    tools = tools,
-                                )
+                            heavyRuntimeHandoff.withLiteRt(
+                                runtimeIdentity = modelIdentityForPath(model.taskPath),
+                                releaseLiteRt = { SLM.forceCleanUpAndWait(model) },
+                            ) {
+                                runOnSlmThread {
+                                    SLM.initializeIfNeeded(
+                                        context = ctx,
+                                        model = model,
+                                        supportImage = supportImage,
+                                        supportAudio = supportAudio,
+                                        systemMessage = systemMessage,
+                                        tools = tools,
+                                    )
+                                }
                             }
                         }
                     }
@@ -838,32 +846,37 @@ class LiteRtRepository(
                             PREFILL_WARMUP_TIMEOUT_MS
                         ) {
                             AI_INFERENCE_GATE.withPermit {
-                                val output =
+                                heavyRuntimeHandoff.withLiteRt(
+                                    runtimeIdentity = modelIdentityForPath(model.taskPath),
+                                    releaseLiteRt = { SLM.forceCleanUpAndWait(model) },
+                                ) {
+                                    val output =
+                                        runOnSlmThread {
+                                            SLM.generateText(
+                                                model = model,
+                                                input = PREFILL_WARMUP_INPUT,
+                                                maxOutputTokens =
+                                                    PREFILL_WARMUP_MAX_OUTPUT_TOKENS,
+                                            )
+                                        }
+
+                                    /*
+                                     * The prefill warm-up mutates Conversation history.
+                                     * Reset immediately while retaining the initialized Engine,
+                                     * so the first real Survey request starts from a clean session.
+                                     */
                                     runOnSlmThread {
-                                        SLM.generateText(
+                                        SLM.resetConversationAndWait(
                                             model = model,
-                                            input = PREFILL_WARMUP_INPUT,
-                                            maxOutputTokens =
-                                                PREFILL_WARMUP_MAX_OUTPUT_TOKENS,
+                                            supportImage = supportImage,
+                                            supportAudio = supportAudio,
+                                            systemMessage = systemMessage,
+                                            tools = tools,
                                         )
                                     }
 
-                                /*
-                                 * The prefill warm-up mutates Conversation history.
-                                 * Reset immediately while retaining the initialized Engine,
-                                 * so the first real Survey request starts from a clean session.
-                                 */
-                                runOnSlmThread {
-                                    SLM.resetConversationAndWait(
-                                        model = model,
-                                        supportImage = supportImage,
-                                        supportAudio = supportAudio,
-                                        systemMessage = systemMessage,
-                                        tools = tools,
-                                    )
+                                    output.length
                                 }
-
-                                output.length
                             }
                         }
 
@@ -1738,15 +1751,20 @@ class LiteRtRepository(
                                 val initAttempt: Result<Unit>? =
                                     withTimeoutOrNull(INIT_TIMEOUT_MS) {
                                         runCatchingSuspend {
-                                            runOnSlmThread {
-                                                SLM.initializeIfNeeded(
-                                                    context = ctx,
-                                                    model = model,
-                                                    supportImage = supportImage,
-                                                    supportAudio = supportAudio,
-                                                    systemMessage = systemMessage,
-                                                    tools = tools,
-                                                )
+                                            heavyRuntimeHandoff.withLiteRt(
+                                                runtimeIdentity = modelIdentityForPath(model.taskPath),
+                                                releaseLiteRt = { SLM.forceCleanUpAndWait(model) },
+                                            ) {
+                                                runOnSlmThread {
+                                                    SLM.initializeIfNeeded(
+                                                        context = ctx,
+                                                        model = model,
+                                                        supportImage = supportImage,
+                                                        supportAudio = supportAudio,
+                                                        systemMessage = systemMessage,
+                                                        tools = tools,
+                                                    )
+                                                }
                                             }
                                         }
                                     }
@@ -1876,8 +1894,12 @@ class LiteRtRepository(
                             var messageCount = 0L
 
                             try {
-                                runOnSlmThread {
-                                    SLM.runInference(
+                                heavyRuntimeHandoff.withLiteRt(
+                                    runtimeIdentity = modelIdentityForPath(model.taskPath),
+                                    releaseLiteRt = { SLM.forceCleanUpAndWait(model) },
+                                ) {
+                                    runOnSlmThread {
+                                        SLM.runInference(
                                         model = model,
                                         input = cappedPrompt,
                                         resultListener = { partial, done ->
@@ -2129,7 +2151,8 @@ class LiteRtRepository(
 
                                             dispatchScopedCancelIfReady()
                                         },
-                                    )
+                                        )
+                                    }
                                 }
                             } catch (ce: CancellationException) {
                                 throw ce
