@@ -8,6 +8,7 @@ import com.negi.survey.config.RequiredComponent
 import com.negi.survey.config.SurveyConfig
 import com.negi.survey.slm.PromptPhase
 import com.negi.survey.slm.Repository
+import com.negi.survey.slm.RepositoryTraceContext
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
@@ -340,7 +341,10 @@ class SurveyTwoStepFlowTest {
         val survey = survey(2)
         val repo = object : Repository {
             var requests = 0
-            override suspend fun request(prompt: String): Flow<String> = flow {
+            override suspend fun request(
+                prompt: String,
+                traceContext: RepositoryTraceContext?,
+            ): Flow<String> = flow {
                 if (requests++ == 0) {
                     entered.complete(Unit)
                     withContext(NonCancellable) { release.await() }
@@ -449,7 +453,10 @@ class SurveyTwoStepFlowTest {
             return userPrompt
         }
         override fun buildPrompt(userPrompt: String) = userPrompt
-        override suspend fun request(prompt: String): Flow<String> {
+        override suspend fun request(
+            prompt: String,
+            traceContext: RepositoryTraceContext?,
+        ): Flow<String> {
             val result = script[prompts.size]
             prompts += prompt
             return flow {

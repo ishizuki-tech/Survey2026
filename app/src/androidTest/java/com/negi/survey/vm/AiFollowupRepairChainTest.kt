@@ -3,6 +3,7 @@ package com.negi.survey.vm
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.negi.survey.slm.PromptPhase
 import com.negi.survey.slm.Repository
+import com.negi.survey.slm.RepositoryTraceContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
@@ -155,7 +156,10 @@ class AiFollowupRepairChainTest {
             private set
         val phases = mutableListOf<PromptPhase>()
 
-        override suspend fun request(prompt: String): Flow<String> {
+        override suspend fun request(
+            prompt: String,
+            traceContext: RepositoryTraceContext?,
+        ): Flow<String> {
             requestCount++
             val outcome = script[next++]
             return flow {
