@@ -46,65 +46,59 @@
         <h2>Build provenance</h2>
         
         <p>
-        <strong>Source:</strong> <code>d71c7332d65d247ddcc3fa6dca034974421ea4e6</code></p>
+        <strong>Source:</strong> <code>92ebddaf25f4bd8e6ad810ea6933fd3e724ebd0c</code></p>
       </section>
-      <section class="config-files"><h2>What's New</h2><h3>Prevent local uploads to production GitHub target</h3><pre class="whats-new-body">## Summary
+      <section class="config-files"><h2>What's New</h2><h3>Add real-model Q7-Q16 SLM validation automation</h3><pre class="whats-new-body">## Summary
 
-- keep the existing production GitHub upload destination for normal/GitHub builds
-- prevent local builds from falling back to `ishizuki-tech/SurveyExports`
-- centralize effective GitHub upload target resolution
-- prevent diagnostics preferences from overriding APK routing
-- reject legacy queued production-targeted GitHub work when running in local mode
-- add redacted startup diagnostics for upload mode, target, branch, path prefix, and credential availability
-
-## Behavior
-
-Production builds continue to use the existing configured production target, including the current `SurveyExports/main` fallback.
-
-Local builds require an explicit non-production development destination. If none is configured, GitHub upload fails closed rather than falling back to production.
-
-Existing queued work keeps its captured routing. However, a local build will reject legacy queued work targeting `ishizuki-tech/SurveyExports` before any upload attempt.
+- add reusable real-model Q7-Q16 SLM validation fixtures
+- reuse the production EVAL/FOLLOWUP parser and policy path
+- retain raw EVAL/FOLLOWUP evidence in NDJSON
+- add configurable repeated-run support and per-question summary reporting
+- preserve existing Android-test fake signature maintenance required by the current Repository interface
+- keep production source unchanged
 
 ## Validation
 
-- focused `GitHubUploadTargetPolicyTest`
-- `./gradlew :app:testDebugUnitTest --no-daemon -PskipModelDownload=true -Pdebug.embedSecrets=false -Prelease.allowSecrets=false`
-- `./gradlew :app:assembleDebug --no-daemon -PskipModelDownload=true -Pdebug.embedSecrets=false -Prelease.allowSecrets=false`
-- release BuildConfig verification
-- local no-upload Gradle configuration checks
 - `git diff --check`
+- `bash -n tools/run-real-slm-validation.sh`
+- `:app:compileDebugAndroidTestKotlin`
+- Galaxy S25 real-model Q7-Q16 run via the production path
+- wrapper run with `ITERATIONS=1`
+- 10 fixtures recorded, 0 runtime/timeout failures
+- Q14/Q15/Q16 deterministic missing-component checks passed
+- machine-readable results and human-readable summary produced
 
-No real GitHub upload or physical-device validation was performed.
+Observed semantic/model-output findings remain report-only and belong to #41/#77 as appropriate.
 
-Closes #78</pre></section>
-      <a class="download" href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-114-d71c733/Survey2026-d71c733-release.apk">Download APK</a>
+Closes #81</pre></section>
+      <a class="download" href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-115-92ebdda/Survey2026-92ebdda-release.apk">Download APK</a>
       <p class="note">Direct GitHub Release asset. No ZIP extraction is required.</p>
       <section class="config-files">
         <h2>Config files included in this APK</h2>
         <p class="note">These config files were extracted from the exact APK build shown on this page.</p>
-        <p><strong>English — survey_config10.yaml</strong><br><a href="https://github.com/ishizuki-tech/Survey2026/blob/d71c7332d65d247ddcc3fa6dca034974421ea4e6/app/src/main/assets/survey_config10.yaml">View in browser</a> · <a href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-114-d71c733/survey_config10.yaml">Download</a><br><code>SHA-256: 1b03c87ce94c58b8b31a3ab1f45f312a83566d22205da878bd5112620070bce6</code></p>
-        <p><strong>Swahili — survey_config_sw_10.yaml</strong><br><a href="https://github.com/ishizuki-tech/Survey2026/blob/d71c7332d65d247ddcc3fa6dca034974421ea4e6/app/src/main/assets/survey_config_sw_10.yaml">View in browser</a> · <a href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-114-d71c733/survey_config_sw_10.yaml">Download</a><br><code>SHA-256: e9240a22e089c2f9782c78994edc60278f6fa0f05fdf2ea01b99f60603b6b1cb</code></p>
+        <p><strong>English — survey_config10.yaml</strong><br><a href="https://github.com/ishizuki-tech/Survey2026/blob/92ebddaf25f4bd8e6ad810ea6933fd3e724ebd0c/app/src/main/assets/survey_config10.yaml">View in browser</a> · <a href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-115-92ebdda/survey_config10.yaml">Download</a><br><code>SHA-256: 1b03c87ce94c58b8b31a3ab1f45f312a83566d22205da878bd5112620070bce6</code></p>
+        <p><strong>Swahili — survey_config_sw_10.yaml</strong><br><a href="https://github.com/ishizuki-tech/Survey2026/blob/92ebddaf25f4bd8e6ad810ea6933fd3e724ebd0c/app/src/main/assets/survey_config_sw_10.yaml">View in browser</a> · <a href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-115-92ebdda/survey_config_sw_10.yaml">Download</a><br><code>SHA-256: e9240a22e089c2f9782c78994edc60278f6fa0f05fdf2ea01b99f60603b6b1cb</code></p>
       </section>
       <div class="qr-panel">
-        <div class="qr-box"><img src="qr.png" alt="QR code that downloads the Survey2026 APK for build-114-d71c733" width="300" height="300"></div>
-        <div><h2>Scan with Android</h2><p class="subtitle">This QR code downloads the APK for this build (build-114-d71c733).</p><code>https://github.com/ishizuki-tech/Survey2026/releases/download/build-114-d71c733/Survey2026-d71c733-release.apk</code></div>
+        <div class="qr-box"><img src="qr.png" alt="QR code that downloads the Survey2026 APK for build-115-92ebdda" width="300" height="300"></div>
+        <div><h2>Scan with Android</h2><p class="subtitle">This QR code downloads the APK for this build (build-115-92ebdda).</p><code>https://github.com/ishizuki-tech/Survey2026/releases/download/build-115-92ebdda/Survey2026-92ebdda-release.apk</code></div>
       </div>
       <div class="grid">
-        <div class="item"><span class="label">Release tag</span><code>build-114-d71c733</code></div>
+        <div class="item"><span class="label">Release tag</span><code>build-115-92ebdda</code></div>
         <div class="item"><span class="label">Branch</span><code>main</code></div>
-        <div class="item"><span class="label">Commit SHA</span><code>d71c733</code></div>
-        <div class="item"><span class="label">APK filename</span><code>Survey2026-d71c733-release.apk</code></div>
-        <div class="item"><span class="label">Workflow run number</span><code>114</code></div>
-        <div class="item"><span class="label">APK SHA-256</span><code>349c20bd7816249a479f4c10d67437326227952bbcc561bfdb4a8220a3be1097</code></div>
+        <div class="item"><span class="label">Commit SHA</span><code>92ebdda</code></div>
+        <div class="item"><span class="label">APK filename</span><code>Survey2026-92ebdda-release.apk</code></div>
+        <div class="item"><span class="label">Workflow run number</span><code>115</code></div>
+        <div class="item"><span class="label">APK SHA-256</span><code>61dddc6ee74d7aa6a80bcaa741fffc89b80ec6b8d8db80dba3779317d6a87711</code></div>
         <div class="item"><span class="label">Signing certificate SHA-256</span><code>d6edef47ec6734a46122ab7fddb5e4f17d19d4d51ae3eaddfb32f309ee5036ea</code></div>
-        <div class="item"><span class="label">Generated timestamp</span><code>2026-10-03T05:44:05Z</code></div>
+        <div class="item"><span class="label">Generated timestamp</span><code>2026-10-05T21:41:16Z</code></div>
       </div>
       <div class="links">
-        <a href="https://github.com/ishizuki-tech/Survey2026/releases/tag/build-114-d71c733">GitHub Release</a>
-        <a href="https://github.com/ishizuki-tech/Survey2026/actions/runs/37100343217">GitHub Actions run</a>
+        <a href="https://github.com/ishizuki-tech/Survey2026/releases/tag/build-115-92ebdda">GitHub Release</a>
+        <a href="https://github.com/ishizuki-tech/Survey2026/actions/runs/37376313677">GitHub Actions run</a>
         <a href="https://github.com/ishizuki-tech/Survey2026">Repository</a>
       </div>
-      <footer>Survey2026 release metadata generated 2026-10-03T05:44:05Z.</footer>
+      <footer>Survey2026 release metadata generated 2026-10-05T21:41:16Z.</footer>
     </section>
   </main>
 </body>
