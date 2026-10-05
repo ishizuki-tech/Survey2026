@@ -450,10 +450,18 @@ tasks.register<Exec>("downloadModel") {
     }
 }
 
+tasks.register<Exec>("verifySwahiliAsrModel") {
+    description = "Verify the exact CV14 Swahili Whisper model before APK packaging"
+    group = "verification"
+    dependsOn("downloadModel")
+    workingDir = projectDir
+    commandLine("bash", file("verify_swahili_asr_model.sh").absolutePath)
+}
+
 tasks.named("preBuild").configure {
     dependsOn(
         "checkSubmodule",
-        "downloadModel",
+        "verifySwahiliAsrModel",
     )
 }
 

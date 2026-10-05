@@ -43,6 +43,19 @@ class SurveyConfigConditionalNavigationTest {
     }
 
     @Test
+    fun swahili_whisper_config_selects_the_pinned_cv14_model_without_changing_english() {
+        val swahili = SurveyConfigLoader.fromFileStrictValidated(assetFile("survey_config_sw_10.yaml").absolutePath)
+        val english = SurveyConfigLoader.fromFileStrictValidated(assetFile("survey_config10.yaml").absolutePath)
+
+        assertEquals("models/ggml-small-sw-cv14-q5_0.bin", swahili.whisper.assetModelPath)
+        assertEquals("sw", swahili.whisper.language)
+        assertEquals(false, swahili.whisper.translate)
+        assertEquals("models/ggml-small-q5_1.bin", english.whisper.assetModelPath)
+        assertEquals("en", english.whisper.language)
+        assertEquals(false, english.whisper.translate)
+    }
+
+    @Test
     fun shipped_ai_nodes_resolve_two_step_prompt_pairs() {
         val workingDirectory = File(checkNotNull(System.getProperty("user.dir")))
         val assetDirectory = listOf(

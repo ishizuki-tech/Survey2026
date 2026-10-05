@@ -116,9 +116,15 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           ./gradlew :app:assembleDebug --no-daemon \
-            -PskipModelDownload=true \
             -Pdebug.embedSecrets=true \
             -Prelease.allowSecrets=false
+
+      - name: Verify CV14 model in branch APK
+        run: |
+          set -euo pipefail
+          mapfile -d '' apks < <(find app/build/outputs/apk/debug -maxdepth 1 -type f -name '*.apk' -print0)
+          (( ${#apks[@]} == 1 )) || { echo "::error::Expected exactly one debug APK; found ${#apks[@]}."; exit 1; }
+          bash app/verify_swahili_asr_model.sh --apk "${apks[0]}"
 
       - name: Collect branch APK metadata
         id: apk
