@@ -5,6 +5,40 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="robots" content="noindex,nofollow">
   <title>Survey2026 Android APK</title>
+  <script id="release-metadata" type="application/json">{
+  "repository": "ishizuki-tech/Survey2026",
+  "stable_tag": "",
+  "source_commit_sha": "876b968f7a2be3c72783d120708b85273ce52c2b",
+  "release_tag": "build-118-876b968",
+  "branch": "main",
+  "release_url": "https://github.com/ishizuki-tech/Survey2026/releases/tag/build-118-876b968",
+  "download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/build-118-876b968/Survey2026-876b968-release.apk",
+  "config_files": {
+    "english": {
+      "view_url": "https://github.com/ishizuki-tech/Survey2026/blob/876b968f7a2be3c72783d120708b85273ce52c2b/app/src/main/assets/survey_config10.yaml",
+      "download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/build-118-876b968/survey_config10.yaml",
+      "sha256": "1b03c87ce94c58b8b31a3ab1f45f312a83566d22205da878bd5112620070bce6"
+    },
+    "swahili": {
+      "view_url": "https://github.com/ishizuki-tech/Survey2026/blob/876b968f7a2be3c72783d120708b85273ce52c2b/app/src/main/assets/survey_config_sw_10.yaml",
+      "download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/build-118-876b968/survey_config_sw_10.yaml",
+      "sha256": "1ac8d91dd32a9e34e2d2013e35534774127a0e5a8d0281cc8e999a9351c232b4"
+    }
+  },
+  "apk_name": "Survey2026-876b968-release.apk",
+  "apk_sha256": "b656d2ae2aa61e9117c2b6ca051cfc602871789d9c59631a9b1c72fda60ef028",
+  "signing_cert_sha256": "d6edef47ec6734a46122ab7fddb5e4f17d19d4d51ae3eaddfb32f309ee5036ea",
+  "short_sha": "876b968",
+  "run_id": "37532030772",
+  "run_number": "118",
+  "generated_utc": "2026-10-06T21:21:16Z",
+  "deployment_status": "Field validated",
+  "verified_device": {
+    "model": "Samsung SM-S731U",
+    "android_version": "16",
+    "api_level": 36
+  }
+}</script>
   <style>
     :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
     * { box-sizing: border-box; }
@@ -46,82 +80,73 @@
         <h2>Build provenance</h2>
         
         <p>
-        <strong>Source:</strong> <code>faea469e15c5418ae46342c950752e9be041a450</code></p>
+        <strong>Source:</strong> <code>876b968f7a2be3c72783d120708b85273ce52c2b</code></p>
+        <p><strong>Deployment status:</strong> <code>Field validated</code></p>
+        <p><strong>Verified device:</strong> <code>Samsung SM-S731U, Android 16 (API 36)</code></p>
       </section>
-      <section class="config-files"><h2>What's New</h2><h3>Add Issue 77 real handoff regression coverage</h3><pre class="whats-new-body">## Summary
+      <section class="config-files"><h2>What's New</h2><h3>Add release parity validation and deployment metadata</h3><pre class="whats-new-body">## Summary
 
-Adds focused real-device regression coverage for Issue #77 without changing production behavior.
+Finishes the two remaining items for Issue #37:
 
-The test exercises the original runtime lifecycle:
+- add verified-device / deployment-status metadata to the production release surfaces
+- add post-publication parity validation across GitHub Release, `gh-pages/latest.json`, and the rendered Download Page
 
-- Q10 initial EVAL
-- generated follow-up
-- full LiteRT release
-- real Whisper transcription using `whisper/jfk.wav`
-- Whisper release
-- LiteRT reinitialization
-- preserved Q10 follow-up context
-- post-handoff EVAL through the strict production parser/policy
+## Changes
 
-## Findings
-
-The historical concatenated EVAL JSON output was not reproduced on the current implementation.
-
-Galaxy S25 validation completed five true LiteRT → Whisper → LiteRT handoff cycles successfully, followed by a cleaned-code confirmation run.
-
-All post-handoff EVAL results were valid single JSON objects. No concatenated JSON, trailing non-JSON output, timeout, or runtime error was reproduced.
-
-No production parser/runtime change is supported by the evidence, so existing strict fail-closed behavior remains unchanged.
-
-## Scope
-
-Changed only:
-
-- `app/src/androidTest/java/com/negi/survey/screens/RealLiteRtAiFollowupFlowInstrumentationTest.kt`
-
-No production source behavior changes.
+- Adds single-source deployment metadata for:
+  - Field validated
+  - Samsung SM-S731U
+  - Android 16 / API 36
+- Publishes the metadata in:
+  - GitHub Release notes
+  - `gh-pages/latest.json`
+  - production Download Page
+- Adds `tools/validate_release_parity.py` to validate:
+  - source SHA
+  - release tag
+  - APK filename / SHA-256
+  - signing certificate SHA-256
+  - English / Swahili config SHA-256
+  - release and APK download URLs
+  - deployment / verified-device metadata
+- The parity job checks out the exact Pages commit produced by the same run, avoiding false failures if another branch preview updates `gh-pages` afterward.
 
 ## Validation
 
-- `:app:compileDebugAndroidTestKotlin`
-- `:app:testDebugUnitTest --tests com.negi.survey.slm.RepositoryTraceContextTest`
+- YAML and embedded Bash parse
+- current Build #117 parity fixture passes
+- synthetic APK-hash mismatch fails as expected
 - `git diff --check`
-- Galaxy S25 / Android 16 cleaned-code confirmation:
-  - 1 test
-  - 0 failures/errors
-  - LiteRT released → Whisper transcribed → Whisper released → LiteRT reinitialized
-  - post-handoff EVAL: `VALID_SINGLE_OBJECT`
-  - strict parser: valid
 
-Related: #77</pre></section>
-      <a class="download" href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-117-faea469/Survey2026-faea469-release.apk">Download APK</a>
+Related: #37</pre></section>
+      <a class="download" href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-118-876b968/Survey2026-876b968-release.apk">Download APK</a>
       <p class="note">Direct GitHub Release asset. No ZIP extraction is required.</p>
       <section class="config-files">
         <h2>Config files included in this APK</h2>
         <p class="note">These config files were extracted from the exact APK build shown on this page.</p>
-        <p><strong>English — survey_config10.yaml</strong><br><a href="https://github.com/ishizuki-tech/Survey2026/blob/faea469e15c5418ae46342c950752e9be041a450/app/src/main/assets/survey_config10.yaml">View in browser</a> · <a href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-117-faea469/survey_config10.yaml">Download</a><br><code>SHA-256: 1b03c87ce94c58b8b31a3ab1f45f312a83566d22205da878bd5112620070bce6</code></p>
-        <p><strong>Swahili — survey_config_sw_10.yaml</strong><br><a href="https://github.com/ishizuki-tech/Survey2026/blob/faea469e15c5418ae46342c950752e9be041a450/app/src/main/assets/survey_config_sw_10.yaml">View in browser</a> · <a href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-117-faea469/survey_config_sw_10.yaml">Download</a><br><code>SHA-256: 1ac8d91dd32a9e34e2d2013e35534774127a0e5a8d0281cc8e999a9351c232b4</code></p>
+        <p><strong>English — survey_config10.yaml</strong><br><a href="https://github.com/ishizuki-tech/Survey2026/blob/876b968f7a2be3c72783d120708b85273ce52c2b/app/src/main/assets/survey_config10.yaml">View in browser</a> · <a href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-118-876b968/survey_config10.yaml">Download</a><br><code>SHA-256: 1b03c87ce94c58b8b31a3ab1f45f312a83566d22205da878bd5112620070bce6</code></p>
+        <p><strong>Swahili — survey_config_sw_10.yaml</strong><br><a href="https://github.com/ishizuki-tech/Survey2026/blob/876b968f7a2be3c72783d120708b85273ce52c2b/app/src/main/assets/survey_config_sw_10.yaml">View in browser</a> · <a href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-118-876b968/survey_config_sw_10.yaml">Download</a><br><code>SHA-256: 1ac8d91dd32a9e34e2d2013e35534774127a0e5a8d0281cc8e999a9351c232b4</code></p>
       </section>
       <div class="qr-panel">
-        <div class="qr-box"><img src="qr.png" alt="QR code that downloads the Survey2026 APK for build-117-faea469" width="300" height="300"></div>
-        <div><h2>Scan with Android</h2><p class="subtitle">This QR code downloads the APK for this build (build-117-faea469).</p><code>https://github.com/ishizuki-tech/Survey2026/releases/download/build-117-faea469/Survey2026-faea469-release.apk</code></div>
+        <div class="qr-box"><img src="qr.png" alt="QR code that downloads the Survey2026 APK for build-118-876b968" width="300" height="300"></div>
+        <div><h2>Scan with Android</h2><p class="subtitle">This QR code downloads the APK for this build (build-118-876b968).</p><code>https://github.com/ishizuki-tech/Survey2026/releases/download/build-118-876b968/Survey2026-876b968-release.apk</code></div>
       </div>
       <div class="grid">
-        <div class="item"><span class="label">Release tag</span><code>build-117-faea469</code></div>
+        <div class="item"><span class="label">Release tag</span><code>build-118-876b968</code></div>
         <div class="item"><span class="label">Branch</span><code>main</code></div>
-        <div class="item"><span class="label">Commit SHA</span><code>faea469</code></div>
-        <div class="item"><span class="label">APK filename</span><code>Survey2026-faea469-release.apk</code></div>
-        <div class="item"><span class="label">Workflow run number</span><code>117</code></div>
-        <div class="item"><span class="label">APK SHA-256</span><code>cd568897bbf39f1761c3b20f2c19345e45131b328bea403a4349d4e3427b9e53</code></div>
+        <div class="item"><span class="label">Commit SHA</span><code>876b968</code></div>
+        <div class="item"><span class="label">APK filename</span><code>Survey2026-876b968-release.apk</code></div>
+        <div class="item"><span class="label">Workflow run number</span><code>118</code></div>
+        <div class="item"><span class="label">APK SHA-256</span><code>b656d2ae2aa61e9117c2b6ca051cfc602871789d9c59631a9b1c72fda60ef028</code></div>
         <div class="item"><span class="label">Signing certificate SHA-256</span><code>d6edef47ec6734a46122ab7fddb5e4f17d19d4d51ae3eaddfb32f309ee5036ea</code></div>
-        <div class="item"><span class="label">Generated timestamp</span><code>2026-10-06T20:32:09Z</code></div>
+        <div class="item"><span class="label">Generated timestamp</span><code>2026-10-06T21:21:16Z</code></div>
       </div>
       <div class="links">
-        <a href="https://github.com/ishizuki-tech/Survey2026/releases/tag/build-117-faea469">GitHub Release</a>
-        <a href="https://github.com/ishizuki-tech/Survey2026/actions/runs/37525918526">GitHub Actions run</a>
+        <a href="https://github.com/ishizuki-tech/Survey2026/releases/tag/build-118-876b968">GitHub Release</a>
+        <a href="https://github.com/ishizuki-tech/Survey2026/actions/runs/37532030772">GitHub Actions run</a>
         <a href="https://github.com/ishizuki-tech/Survey2026">Repository</a>
       </div>
-      <footer>Survey2026 release metadata generated 2026-10-06T20:32:09Z.</footer>
+      <footer>Survey2026 release metadata generated 2026-10-06T21:21:16Z.</footer>
     </section>
   </main>
 </body>
