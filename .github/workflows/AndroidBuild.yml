@@ -36,6 +36,10 @@ env:
   BUILD_TOOLS_VERSION: "36.0.0"
   NDK_VERSION: "29.0.14206865"
   CMAKE_VERSION: "3.22.1"
+  DEPLOYMENT_STATUS: "Field validated"
+  VERIFIED_DEVICE_MODEL: "Samsung SM-S731U"
+  VERIFIED_DEVICE_ANDROID_VERSION: "16"
+  VERIFIED_DEVICE_API_LEVEL: "36"
 
 jobs:
   build-release-apk:
@@ -536,6 +540,10 @@ jobs:
           SHORT_SHA: ${{ steps.apk.outputs.short_sha }}
           WHATS_NEW_TITLE_B64: ${{ steps.whats_new.outputs.title_b64 }}
           WHATS_NEW_BODY_B64: ${{ steps.whats_new.outputs.body_b64 }}
+          DEPLOYMENT_STATUS: ${{ env.DEPLOYMENT_STATUS }}
+          VERIFIED_DEVICE_MODEL: ${{ env.VERIFIED_DEVICE_MODEL }}
+          VERIFIED_DEVICE_ANDROID_VERSION: ${{ env.VERIFIED_DEVICE_ANDROID_VERSION }}
+          VERIFIED_DEVICE_API_LEVEL: ${{ env.VERIFIED_DEVICE_API_LEVEL }}
         run: |
           set -euo pipefail
           test -s "$APK"
@@ -544,6 +552,37 @@ jobs:
           test -n "$SIGNING_CERT_SHA256"
           test -n "$ENGLISH_CONFIG_SHA256"
           test -n "$SWAHILI_CONFIG_SHA256"
+
+          RELEASE_METADATA="$RUNNER_TEMP/survey2026-release-metadata.json"
+          python3 - "$RELEASE_METADATA" <<'PY'
+          import json
+          import os
+          import sys
+
+          data = {
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "source_commit_sha": os.environ["GITHUB_SHA"],
+              "release_tag": os.environ["RELEASE_TAG"],
+              "release_url": f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/releases/tag/{os.environ['RELEASE_TAG']}",
+              "download_url": os.environ["DOWNLOAD_URL"],
+              "apk_name": os.environ["APK_NAME"],
+              "apk_sha256": os.environ["APK_SHA256"],
+              "signing_cert_sha256": os.environ["SIGNING_CERT_SHA256"],
+              "config_files": {
+                  "english": {"sha256": os.environ["ENGLISH_CONFIG_SHA256"]},
+                  "swahili": {"sha256": os.environ["SWAHILI_CONFIG_SHA256"]},
+              },
+              "deployment_status": os.environ["DEPLOYMENT_STATUS"],
+              "verified_device": {
+                  "model": os.environ["VERIFIED_DEVICE_MODEL"],
+                  "android_version": os.environ["VERIFIED_DEVICE_ANDROID_VERSION"],
+                  "api_level": int(os.environ["VERIFIED_DEVICE_API_LEVEL"]),
+              },
+          }
+          with open(sys.argv[1], "w", encoding="utf-8") as output:
+              json.dump(data, output, indent=2, sort_keys=True)
+              output.write("\n")
+          PY
 
           # Standalone, print-ready QR code (larger, with a quiet zone) that downloads this release's APK.
           # It is optional: a failure only warns and never blocks the release.
@@ -599,6 +638,14 @@ jobs:
             echo "- English config SHA-256: ${ENGLISH_CONFIG_SHA256}"
             echo "- Swahili config SHA-256: ${SWAHILI_CONFIG_SHA256}"
             echo "- Signing certificate SHA-256: ${SIGNING_CERT_SHA256}"
+            echo "- Deployment status: ${DEPLOYMENT_STATUS}"
+            echo "- Verified device: ${VERIFIED_DEVICE_MODEL}, Android ${VERIFIED_DEVICE_ANDROID_VERSION} (API ${VERIFIED_DEVICE_API_LEVEL})"
+            echo
+            echo "<!-- release-metadata:start -->"
+            echo '```json'
+            cat "$RELEASE_METADATA"
+            echo '```'
+            echo "<!-- release-metadata:end -->"
             if [[ -n "$QR_IMAGE_URL" ]]; then
               echo
               echo "## Scan to download"
@@ -637,6 +684,8 @@ jobs:
       # This job and BranchBuild both push to gh-pages.
       group: branch-apk-preview-pages
       cancel-in-progress: false
+    outputs:
+      pages_commit: ${{ steps.publish.outputs.pages_commit }}
 
     steps:
       - name: Generate download page
@@ -658,6 +707,10 @@ jobs:
           RUN_ID: ${{ github.run_id }}
           RUN_NUMBER: ${{ github.run_number }}
           SERVER_URL: ${{ github.server_url }}
+          DEPLOYMENT_STATUS: ${{ env.DEPLOYMENT_STATUS }}
+          VERIFIED_DEVICE_MODEL: ${{ env.VERIFIED_DEVICE_MODEL }}
+          VERIFIED_DEVICE_ANDROID_VERSION: ${{ env.VERIFIED_DEVICE_ANDROID_VERSION }}
+          VERIFIED_DEVICE_API_LEVEL: ${{ env.VERIFIED_DEVICE_API_LEVEL }}
         run: |
           set -euo pipefail
           for name in RELEASE_TAG RELEASE_URL DOWNLOAD_URL APK_NAME APK_SHA256 SIGNING_CERT_SHA256 ENGLISH_CONFIG_SHA256 SWAHILI_CONFIG_SHA256 SHORT_SHA BRANCH; do
@@ -691,6 +744,51 @@ jobs:
           SWAHILI_CONFIG_URL="${SERVER_URL}/${REPOSITORY}/releases/download/${RELEASE_TAG}/survey_config_sw_10.yaml"
           ENGLISH_CONFIG_VIEW_URL="${SERVER_URL}/${REPOSITORY}/blob/${GITHUB_SHA}/app/src/main/assets/survey_config10.yaml"
           SWAHILI_CONFIG_VIEW_URL="${SERVER_URL}/${REPOSITORY}/blob/${GITHUB_SHA}/app/src/main/assets/survey_config_sw_10.yaml"
+          export GENERATED_UTC ENGLISH_CONFIG_URL SWAHILI_CONFIG_URL ENGLISH_CONFIG_VIEW_URL SWAHILI_CONFIG_VIEW_URL
+
+          python3 - <<'PY'
+          import json
+          import os
+
+          data = {
+              "repository": os.environ["REPOSITORY"],
+              "stable_tag": os.environ["STABLE_TAG"],
+              "source_commit_sha": os.environ["GITHUB_SHA"],
+              "release_tag": os.environ["RELEASE_TAG"],
+              "branch": os.environ["BRANCH"],
+              "release_url": os.environ["RELEASE_URL"],
+              "download_url": os.environ["DOWNLOAD_URL"],
+              "config_files": {
+                  "english": {
+                      "view_url": os.environ["ENGLISH_CONFIG_VIEW_URL"],
+                      "download_url": os.environ["ENGLISH_CONFIG_URL"],
+                      "sha256": os.environ["ENGLISH_CONFIG_SHA256"],
+                  },
+                  "swahili": {
+                      "view_url": os.environ["SWAHILI_CONFIG_VIEW_URL"],
+                      "download_url": os.environ["SWAHILI_CONFIG_URL"],
+                      "sha256": os.environ["SWAHILI_CONFIG_SHA256"],
+                  },
+              },
+              "apk_name": os.environ["APK_NAME"],
+              "apk_sha256": os.environ["APK_SHA256"],
+              "signing_cert_sha256": os.environ["SIGNING_CERT_SHA256"],
+              "short_sha": os.environ["SHORT_SHA"],
+              "run_id": os.environ["RUN_ID"],
+              "run_number": os.environ["RUN_NUMBER"],
+              "generated_utc": os.environ["GENERATED_UTC"],
+              "deployment_status": os.environ["DEPLOYMENT_STATUS"],
+              "verified_device": {
+                  "model": os.environ["VERIFIED_DEVICE_MODEL"],
+                  "android_version": os.environ["VERIFIED_DEVICE_ANDROID_VERSION"],
+                  "api_level": int(os.environ["VERIFIED_DEVICE_API_LEVEL"]),
+              },
+          }
+          with open("download-page/latest.json", "w", encoding="utf-8") as output:
+              json.dump(data, output, indent=2)
+              output.write("\n")
+          PY
+          RELEASE_METADATA="$(cat download-page/latest.json)"
 
           curl --fail --silent --show-error --location \
             --retry 3 \
@@ -713,6 +811,7 @@ jobs:
             <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
             <meta name="robots" content="noindex,nofollow">
             <title>Survey2026 Android APK</title>
+            <script id="release-metadata" type="application/json">${RELEASE_METADATA}</script>
             <style>
               :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
               * { box-sizing: border-box; }
@@ -755,6 +854,8 @@ jobs:
                   ${STABLE_TAG:+<p><strong>Stable checkpoint:</strong> <code>${STABLE_TAG}</code></p>}
                   <p>
                   <strong>Source:</strong> <code>${GITHUB_SHA}</code></p>
+                  <p><strong>Deployment status:</strong> <code>${DEPLOYMENT_STATUS}</code></p>
+                  <p><strong>Verified device:</strong> <code>${VERIFIED_DEVICE_MODEL}, Android ${VERIFIED_DEVICE_ANDROID_VERSION} (API ${VERIFIED_DEVICE_API_LEVEL})</code></p>
                 </section>
                 ${WHATS_NEW_HTML}
                 <a class="download" href="${DOWNLOAD_URL}">Download APK</a>
@@ -791,37 +892,6 @@ jobs:
           </html>
           HTML
 
-          cat > download-page/latest.json <<JSON
-          {
-            "repository": "${REPOSITORY}",
-            "stable_tag": "${STABLE_TAG}",
-            "source_commit_sha": "${GITHUB_SHA}",
-            "release_tag": "${RELEASE_TAG}",
-            "branch": "${BRANCH}",
-            "release_url": "${RELEASE_URL}",
-            "download_url": "${DOWNLOAD_URL}",
-            "config_files": {
-              "english": {
-                "view_url": "${ENGLISH_CONFIG_VIEW_URL}",
-                "download_url": "${ENGLISH_CONFIG_URL}",
-                "sha256": "${ENGLISH_CONFIG_SHA256}"
-              },
-              "swahili": {
-                "view_url": "${SWAHILI_CONFIG_VIEW_URL}",
-                "download_url": "${SWAHILI_CONFIG_URL}",
-                "sha256": "${SWAHILI_CONFIG_SHA256}"
-              }
-            },
-            "apk_name": "${APK_NAME}",
-            "apk_sha256": "${APK_SHA256}",
-            "signing_cert_sha256": "${SIGNING_CERT_SHA256}",
-            "short_sha": "${SHORT_SHA}",
-            "run_id": "${RUN_ID}",
-            "run_number": "${RUN_NUMBER}",
-            "generated_utc": "${GENERATED_UTC}"
-          }
-          JSON
-
           touch download-page/.nojekyll
 
       - name: Check out existing GitHub Pages content
@@ -832,6 +902,7 @@ jobs:
           fetch-depth: 1
 
       - name: Publish root main download page
+        id: publish
         run: |
           set -euo pipefail
 
@@ -859,3 +930,85 @@ jobs:
           git -C "$PAGES_DIR" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git -C "$PAGES_DIR" commit -m "Update Survey2026 download page for ${{ needs.build-release-apk.outputs.release_tag }}"
           git -C "$PAGES_DIR" push origin HEAD:gh-pages
+          echo "pages_commit=$(git -C "$PAGES_DIR" rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  verify-release-parity:
+    name: Verify published release parity
+    runs-on: ubuntu-latest
+    needs:
+      - build-release-apk
+      - publish-download-page
+    if: ${{ github.ref == 'refs/heads/main' }}
+    steps:
+      - name: Check out workflow source
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Check out the Pages commit published by this run
+        uses: actions/checkout@v5
+        with:
+          ref: gh-pages
+          path: published-pages
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Validate GitHub Release, Pages HTML, and latest metadata
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.build-release-apk.outputs.release_tag }}
+          RELEASE_URL: ${{ needs.build-release-apk.outputs.release_url }}
+          DOWNLOAD_URL: ${{ needs.build-release-apk.outputs.download_url }}
+          APK_NAME: ${{ needs.build-release-apk.outputs.apk_name }}
+          APK_SHA256: ${{ needs.build-release-apk.outputs.apk_sha256 }}
+          SIGNING_CERT_SHA256: ${{ needs.build-release-apk.outputs.signing_cert_sha256 }}
+          ENGLISH_CONFIG_SHA256: ${{ needs.build-release-apk.outputs.english_config_sha256 }}
+          SWAHILI_CONFIG_SHA256: ${{ needs.build-release-apk.outputs.swahili_config_sha256 }}
+          PAGES_COMMIT: ${{ needs.publish-download-page.outputs.pages_commit }}
+          DEPLOYMENT_STATUS: ${{ env.DEPLOYMENT_STATUS }}
+          VERIFIED_DEVICE_MODEL: ${{ env.VERIFIED_DEVICE_MODEL }}
+          VERIFIED_DEVICE_ANDROID_VERSION: ${{ env.VERIFIED_DEVICE_ANDROID_VERSION }}
+          VERIFIED_DEVICE_API_LEVEL: ${{ env.VERIFIED_DEVICE_API_LEVEL }}
+        run: |
+          set -euo pipefail
+          test -n "$PAGES_COMMIT"
+          test "$(git -C published-pages rev-parse HEAD)" = "$PAGES_COMMIT"
+
+          python3 - "$RUNNER_TEMP/expected-release-metadata.json" <<'PY'
+          import json
+          import os
+          import sys
+
+          data = {
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "source_commit_sha": os.environ["GITHUB_SHA"],
+              "release_tag": os.environ["RELEASE_TAG"],
+              "release_url": os.environ["RELEASE_URL"],
+              "download_url": os.environ["DOWNLOAD_URL"],
+              "apk_name": os.environ["APK_NAME"],
+              "apk_sha256": os.environ["APK_SHA256"],
+              "signing_cert_sha256": os.environ["SIGNING_CERT_SHA256"],
+              "config_files": {
+                  "english": {"sha256": os.environ["ENGLISH_CONFIG_SHA256"]},
+                  "swahili": {"sha256": os.environ["SWAHILI_CONFIG_SHA256"]},
+              },
+              "deployment_status": os.environ["DEPLOYMENT_STATUS"],
+              "verified_device": {
+                  "model": os.environ["VERIFIED_DEVICE_MODEL"],
+                  "android_version": os.environ["VERIFIED_DEVICE_ANDROID_VERSION"],
+                  "api_level": int(os.environ["VERIFIED_DEVICE_API_LEVEL"]),
+              },
+          }
+          with open(sys.argv[1], "w", encoding="utf-8") as output:
+              json.dump(data, output, indent=2, sort_keys=True)
+              output.write("\n")
+          PY
+
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --json tagName,targetCommitish,url,assets,body > "$RUNNER_TEMP/release.json"
+          python3 tools/validate_release_parity.py \
+            --expected "$RUNNER_TEMP/expected-release-metadata.json" \
+            --release "$RUNNER_TEMP/release.json" \
+            --latest published-pages/latest.json \
+            --html published-pages/index.html
