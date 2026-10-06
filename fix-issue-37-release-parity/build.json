@@ -1,12 +1,12 @@
 {
   "original_branch": "fix/issue-37-release-parity",
   "branch_slug": "fix-issue-37-release-parity",
-  "commit_sha": "cb5d54955bfc48c790106da0f6eaf0ed4c3f7f53",
-  "short_sha": "cb5d549",
-  "apk_name": "Survey2026-fix-issue-37-release-parity-cb5d549.apk",
-  "apk_sha256": "9e07d11486b2e2c92c8a684ec52597fd1d2402103f892f1c8c38525d07f77cac",
-  "apk_download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-fix-issue-37-release-parity-cb5d549-run-113/Survey2026-fix-issue-37-release-parity-cb5d549.apk",
+  "commit_sha": "ed752bc41042884f22aedac81e60ad85a102fea5",
+  "short_sha": "ed752bc",
+  "apk_name": "Survey2026-fix-issue-37-release-parity-ed752bc.apk",
+  "apk_sha256": "dc8ba8652c1cce7a3cc0afad9be881aea652ecb02b54bbb16561e1694c39e779",
+  "apk_download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-fix-issue-37-release-parity-ed752bc-run-114/Survey2026-fix-issue-37-release-parity-ed752bc.apk",
   "page_url": "https://ishizuki-tech.github.io/Survey2026/fix-issue-37-release-parity/",
-  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/37529783350",
-  "generated_utc": "2026-10-06T21:00:41Z"
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/37530779478",
+  "generated_utc": "2026-10-06T21:07:20Z"
 }
