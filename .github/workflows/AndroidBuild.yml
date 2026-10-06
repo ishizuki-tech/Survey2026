@@ -391,6 +391,8 @@ jobs:
             exit 1
           fi
 
+          bash app/verify_swahili_asr_model.sh --apk "$APK"
+
           APKSIGNER="$ANDROID_SDK_ROOT/build-tools/$BUILD_TOOLS_VERSION/apksigner"
           ZIPALIGN="$ANDROID_SDK_ROOT/build-tools/$BUILD_TOOLS_VERSION/zipalign"
           if [[ ! -x "$APKSIGNER" || ! -x "$ZIPALIGN" ]]; then
