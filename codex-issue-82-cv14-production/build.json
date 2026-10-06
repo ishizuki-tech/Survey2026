@@ -1,0 +1,12 @@
+{
+  "original_branch": "codex/issue-82-cv14-production",
+  "branch_slug": "codex-issue-82-cv14-production",
+  "commit_sha": "c72b161ea9b63eb1763c8e364f865ccfe540ff6d",
+  "short_sha": "c72b161",
+  "apk_name": "Survey2026-codex-issue-82-cv14-production-c72b161.apk",
+  "apk_sha256": "fec1886aaa81454a140091f38dfc8c965dca6c8cc8d7e2767c927cc7177f002a",
+  "apk_download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-codex-issue-82-cv14-production-c72b161-run-111/Survey2026-codex-issue-82-cv14-production-c72b161.apk",
+  "page_url": "https://ishizuki-tech.github.io/Survey2026/codex-issue-82-cv14-production/",
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/37394328913",
+  "generated_utc": "2026-10-06T00:36:39Z"
+}
