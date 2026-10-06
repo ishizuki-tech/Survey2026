@@ -178,6 +178,7 @@ jobs:
           retention-days: 30
 
       - name: Create branch preview release
+        id: preview_release
         env:
           GH_TOKEN: ${{ github.token }}
           APK_PATH: ${{ steps.apk.outputs.path }}
@@ -255,6 +256,8 @@ jobs:
               --notes-file "$NOTES"
           fi
 
+          echo "apk_download_url=$APK_DOWNLOAD_URL" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
           echo "Release page: $SERVER_URL/$REPOSITORY/releases/tag/$RELEASE_TAG"
 
       - name: Check out existing GitHub Pages content
@@ -266,9 +269,9 @@ jobs:
 
       - name: Update this branch preview only
         env:
-          APK_PATH: ${{ steps.apk.outputs.path }}
           APK_NAME: ${{ steps.apk.outputs.name }}
           APK_SHA256: ${{ steps.apk.outputs.sha256 }}
+          APK_DOWNLOAD_URL: ${{ steps.preview_release.outputs.apk_download_url }}
           BRANCH: ${{ steps.apk.outputs.branch }}
           BRANCH_SLUG: ${{ steps.apk.outputs.branch_slug }}
           SHORT_SHA: ${{ steps.apk.outputs.short_sha }}
@@ -284,7 +287,7 @@ jobs:
           TARGET_DIR="$PAGES_DIR/$BRANCH_SLUG"
           RUN_URL="$SERVER_URL/$REPOSITORY/actions/runs/$RUN_ID"
           REPOSITORY_URL="$SERVER_URL/$REPOSITORY"
-          APK_URL="$PAGE_URL$APK_NAME"
+          APK_URL="$APK_DOWNLOAD_URL"
           GENERATED_UTC="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 
           # A branch preview may replace only a directory it already owns. This
@@ -310,7 +313,6 @@ jobs:
           BRANCH_HTML="$(html_escape "$BRANCH")"
           mkdir -p "$RUNNER_TEMP/branch-preview"
           PREVIEW_DIR="$RUNNER_TEMP/branch-preview"
-          cp "$APK_PATH" "$PREVIEW_DIR/$APK_NAME"
 
           QR_PATH="$PREVIEW_DIR/qr.png"
           curl --fail --silent --show-error --location \
@@ -379,6 +381,7 @@ jobs:
             "short_sha": "$SHORT_SHA",
             "apk_name": "$APK_NAME",
             "apk_sha256": "$APK_SHA256",
+            "apk_download_url": "$APK_DOWNLOAD_URL",
             "page_url": "$PAGE_URL",
             "run_url": "$RUN_URL",
             "generated_utc": "$GENERATED_UTC"
@@ -408,6 +411,7 @@ jobs:
               f"https://{owner}.github.io/{repository_name}/"
           )
           run_url_prefix = f"{server_url}/{repository}/actions/runs/"
+          release_download_prefix = f"{server_url}/{repository}/releases/download/"
           slug_pattern = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
           short_sha_pattern = re.compile(r"[0-9a-f]{7}")
           commit_sha_pattern = re.compile(r"[0-9a-f]{40}")
@@ -460,11 +464,20 @@ jobs:
 
                   expected_apk_name = f"Survey2026-{slug}-{short_sha}.apk"
                   expected_page_url = f"{page_base_url}{slug}/"
+                  apk_download_url = metadata.get("apk_download_url")
                   if (
                       metadata["apk_name"] != expected_apk_name
                       or metadata["page_url"] != expected_page_url
                       or not metadata["run_url"].startswith(run_url_prefix)
                       or not metadata["run_url"][len(run_url_prefix):].isdigit()
+                      or (
+                          apk_download_url is not None
+                          and (
+                              not isinstance(apk_download_url, str)
+                              or not apk_download_url.startswith(release_download_prefix)
+                              or not apk_download_url.endswith("/" + expected_apk_name)
+                          )
+                      )
                   ):
                       raise ValueError
 
@@ -485,7 +498,12 @@ jobs:
                   return html.escape(metadata[field], quote=True)
 
               page_url = escaped("page_url")
-              apk_url = f"{page_url}{escaped('apk_name')}"
+              apk_download_url = metadata.get("apk_download_url")
+              apk_url = (
+                  html.escape(apk_download_url, quote=True)
+                  if isinstance(apk_download_url, str) and apk_download_url
+                  else f"{page_url}{escaped('apk_name')}"
+              )
               cards.append(
                   "<article class=\"card\">"
                   f"<h2>{escaped('original_branch')}</h2>"
