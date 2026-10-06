@@ -14,7 +14,9 @@ import androidx.navigation3.runtime.rememberNavBackStack
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.filters.LargeTest
 import androidx.test.platform.app.InstrumentationRegistry
+import com.negi.survey.SurveyApp
 import com.negi.survey.slm.PromptPhase
+import com.negi.survey.slm.SLM
 import com.negi.survey.vm.AiViewModel
 import com.negi.survey.vm.AiViewModelSurveyBase
 import com.negi.survey.vm.FlowHome
@@ -22,9 +24,13 @@ import com.negi.survey.vm.SurveyAiDecision
 import com.negi.survey.vm.SurveyAiPolicy
 import com.negi.survey.vm.SurveyViewModel
 import com.negi.survey.vm.parseStrictModelJsonObject
+import com.negi.survey.whisper.WhisperEngine
 import java.io.File
+import java.io.FileOutputStream
+import kotlinx.coroutines.runBlocking
 import org.json.JSONArray
 import org.json.JSONObject
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Rule
@@ -94,6 +100,221 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
                 "stoppedAfterTimeout=$stoppedAfterTimeout " +
                 "classifications=$classifications report=${report.file.absolutePath}",
         )
+    }
+
+    /**
+     * Reproduces the Issue #77 ownership transition with the real runtimes:
+     * Q10 two-step evaluation, LiteRT release, Whisper transcription, Whisper
+     * release, LiteRT reinitialization, and Q10 re-evaluation with the
+     * answered follow-up still present in the survey context.
+     *
+     * This is intentionally separate from [q7_q16_real_model_fixture_runner]
+     * so the established warm-run evidence path does not acquire Whisper.
+     */
+    @Test
+    fun issue77_q10_real_litert_whisper_litert_handoff() {
+        val iterations = instrumentationInt("ISSUE77_HANDOFF_ITERATIONS")?.coerceAtLeast(1) ?: 1
+        val fixtureCase = FIXTURES.first { it.nodeId == ISSUE77_NODE_ID }
+        val fixture = hostAiScreen()
+
+        for (iteration in 1..iterations) {
+            runIssue77HandoffCycle(fixture, fixtureCase, iteration)
+        }
+    }
+
+    private fun runIssue77HandoffCycle(
+        fixture: Fixture,
+        fixtureCase: SemanticFixture,
+        iteration: Int,
+    ) {
+        composeRule.runOnIdle { fixture.selectNode(ISSUE77_NODE_ID) }
+        composeRule.waitForIdle()
+        composeRule.runOnIdle {
+            fixture.survey.resetToStart()
+            fixture.survey.goto(ISSUE77_NODE_ID)
+        }
+
+        val contextKey = "sid=${fixture.survey.sessionId.value}|nid=$ISSUE77_NODE_ID"
+        waitForFreshContext(contextKey)
+        val rootQuestion = fixture.survey.getQuestion(ISSUE77_NODE_ID)
+        assertTrue("Q10 root question must be present", rootQuestion.isNotBlank())
+
+        val initialSubmission = submitAndAwaitStable(
+            answer = fixtureCase.answer,
+            contextKey = contextKey,
+            nodeId = ISSUE77_NODE_ID,
+            fixture = fixture,
+        )
+        val initialEval = initialSubmission.steps.first { it.phase == PromptPhase.EVAL }
+        assertTrue("initial Q10 EVAL must not time out", !initialEval.timedOut)
+        assertTrue("initial Q10 EVAL must not fail", initialEval.error == null)
+        assertTrue(
+            "initial Q10 EVAL must be a valid strict JSON object",
+            parseStrictModelJsonObject(initialEval.raw) != null,
+        )
+
+        val initialAdmission = SurveyAiPolicy.evaluateAdmission(
+            raw = initialEval.raw,
+            timedOut = initialEval.timedOut,
+            error = initialEval.error,
+            remaining = fixture.survey.remainingFollowups(ISSUE77_NODE_ID),
+            requiredComponents = fixture.survey.requiredComponentsFor(ISSUE77_NODE_ID),
+            requiredComponentIds = fixture.survey.requiredComponentCatalogFor(ISSUE77_NODE_ID).map { it.id },
+        )
+        assertEquals(
+            "initial Q10 EVAL must require a follow-up",
+            SurveyAiDecision.GENERATE,
+            initialAdmission.decision,
+        )
+        val generatedFollowup = fixture.survey.followups.value[ISSUE77_NODE_ID]
+            .orEmpty()
+            .singleOrNull()
+            ?.question
+        assertTrue("initial Q10 FOLLOWUP must be generated", !generatedFollowup.isNullOrBlank())
+
+        val coordinator = appCtx.applicationContext as? SurveyApp
+            ?: throw AssertionError("Expected SurveyApp application context")
+        val runtimeIdentity = "issue77:${model.taskPath}"
+        val wav = copyIssue77WhisperFixture(iteration)
+        val transcript = try {
+            runBlocking {
+                // Adopt the already-real LiteRT runtime, then use the same production
+                // coordinator transition that releases it before Whisper acquisition.
+                coordinator.heavyRuntimeCoordinator.withLiteRt(
+                    runtimeIdentity = runtimeIdentity,
+                    releaseLiteRt = { SLM.forceCleanUpAndWait(model) },
+                ) { Unit }
+                coordinator.heavyRuntimeCoordinator.withWhisper {
+                    WhisperEngine.ensureInitializedFromAsset(
+                        context = appCtx,
+                        assetPath = ISSUE77_WHISPER_MODEL_ASSET,
+                    ).getOrThrow()
+                }
+                assertTrue(
+                    "Whisper must be initialized after the LiteRT-to-Whisper transition",
+                    WhisperEngine.isInitializedForAsset(ISSUE77_WHISPER_MODEL_ASSET),
+                )
+                WhisperEngine.transcribeWaveFile(wav, lang = "en").getOrThrow()
+            }
+        } finally {
+            wav.delete()
+        }
+        assertTrue("Whisper transcript must be nonblank", transcript.isNotBlank())
+
+        runBlocking {
+            coordinator.heavyRuntimeCoordinator.withLiteRt(
+                runtimeIdentity = runtimeIdentity,
+                releaseLiteRt = { SLM.forceCleanUpAndWait(model) },
+            ) {
+                SLM.initializeIfNeeded(
+                    context = appCtx,
+                    model = model,
+                    supportImage = false,
+                    supportAudio = false,
+                )
+            }
+        }
+        assertFalse(
+            "Whisper must be released before LiteRT reinitialization completes",
+            WhisperEngine.isInitializedForAsset(ISSUE77_WHISPER_MODEL_ASSET),
+        )
+
+        val beforePostEvalRunId = vm.stepHistory.value.maxOfOrNull { it.runId } ?: 0L
+        awaitMainComposerInput("Q10 post-handoff")
+        composeRule.onNode(hasSetTextAction()).performTextReplacement(transcript)
+        composeRule.onNodeWithContentDescription("Send").performClick()
+        awaitState("Q10 post-handoff inference") {
+            val newSteps = vm.stepHistory.value.filter { it.runId > beforePostEvalRunId }
+            !vm.loading.value && !vm.isRunning && newSteps.any { it.phase == PromptPhase.EVAL }
+        }
+
+        val postEval = vm.stepHistory.value
+            .filter { it.runId > beforePostEvalRunId }
+            .first { it.phase == PromptPhase.EVAL }
+        val classification = classifyIssue77PostHandoffEval(postEval)
+        val postAdmission = SurveyAiPolicy.evaluateAdmission(
+            raw = postEval.raw,
+            timedOut = postEval.timedOut,
+            error = postEval.error,
+            remaining = fixture.survey.remainingFollowups(ISSUE77_NODE_ID),
+            requiredComponents = fixture.survey.requiredComponentsFor(ISSUE77_NODE_ID),
+            requiredComponentIds = fixture.survey.requiredComponentCatalogFor(ISSUE77_NODE_ID).map { it.id },
+        )
+        val answeredFollowup = fixture.survey.followups.value[ISSUE77_NODE_ID]
+            .orEmpty()
+            .firstOrNull { it.question == generatedFollowup }
+            ?.answer
+        assertEquals(
+            "the transcribed follow-up answer must remain in the original Q10 context",
+            transcript,
+            answeredFollowup,
+        )
+
+        Log.i(
+            TAG,
+            "ISSUE77_HANDOFF_RESULT iteration=$iteration node=$ISSUE77_NODE_ID " +
+                "initialEvalRunId=${initialEval.runId} initialFollowupGenerated=${!generatedFollowup.isNullOrBlank()} " +
+                "whisperFixture=$ISSUE77_WHISPER_FIXTURE_ASSET transcriptLen=${transcript.length} " +
+                "postEvalRunId=${postEval.runId} postEvalLen=${postEval.raw.length} " +
+                "postEvalTimedOut=${postEval.timedOut} postEvalError=${postEval.error != null} " +
+                "classification=$classification parserValid=${parseStrictModelJsonObject(postEval.raw) != null} " +
+                "postPolicyDecision=${postAdmission.decision}",
+        )
+    }
+
+    /** Metadata-only classification; it does not affect the production parser or policy. */
+    private fun classifyIssue77PostHandoffEval(
+        step: AiViewModel.StepSnapshot,
+    ): Issue77PostHandoffClassification = when {
+        step.timedOut -> Issue77PostHandoffClassification.TIMEOUT
+        step.error != null -> Issue77PostHandoffClassification.RUNTIME_ERROR
+        parseStrictModelJsonObject(step.raw) != null -> Issue77PostHandoffClassification.VALID_SINGLE_OBJECT
+        else -> {
+            val firstObjectEnd = firstJsonObjectEnd(step.raw.trim())
+            val suffix = firstObjectEnd?.let { step.raw.trim().substring(it + 1).trim() }
+            when {
+                suffix?.startsWith("{") == true -> Issue77PostHandoffClassification.CONCATENATED_OBJECTS
+                !suffix.isNullOrEmpty() -> Issue77PostHandoffClassification.TRAILING_NON_JSON
+                else -> Issue77PostHandoffClassification.INVALID_SINGLE_OBJECT
+            }
+        }
+    }
+
+    /** Returns the closing offset for one JSON object while respecting quoted strings. */
+    private fun firstJsonObjectEnd(text: String): Int? {
+        if (!text.startsWith('{')) return null
+        var depth = 0
+        var quoted = false
+        var escaped = false
+        text.forEachIndexed { index, char ->
+            if (quoted) {
+                when {
+                    escaped -> escaped = false
+                    char == '\\' -> escaped = true
+                    char == '"' -> quoted = false
+                }
+            } else {
+                when (char) {
+                    '"' -> quoted = true
+                    '{' -> depth++
+                    '}' -> {
+                        depth--
+                        if (depth == 0) return index
+                    }
+                }
+            }
+        }
+        return null
+    }
+
+    private fun copyIssue77WhisperFixture(iteration: Int): File {
+        val output = File.createTempFile("issue77-q10-$iteration-", ".wav", appCtx.cacheDir)
+        InstrumentationRegistry.getInstrumentation().context.assets
+            .open(ISSUE77_WHISPER_FIXTURE_ASSET)
+            .use { input ->
+                FileOutputStream(output).use(input::copyTo)
+            }
+        return output
     }
 
     private fun hostAiScreen(): Fixture {
@@ -402,6 +623,15 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
         SEMANTIC_REVIEW,
     }
 
+    private enum class Issue77PostHandoffClassification {
+        VALID_SINGLE_OBJECT,
+        CONCATENATED_OBJECTS,
+        TRAILING_NON_JSON,
+        INVALID_SINGLE_OBJECT,
+        TIMEOUT,
+        RUNTIME_ERROR,
+    }
+
     private data class FixtureResult(
         val nodeId: String,
         val iteration: Int,
@@ -556,6 +786,9 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
         const val TAG = "RealLiteRtAiFollowup"
         const val STATE_TIMEOUT_MS = 120_000L
         const val UI_TIMEOUT_MS = 15_000L
+        const val ISSUE77_NODE_ID = "Q10"
+        const val ISSUE77_WHISPER_MODEL_ASSET = "models/ggml-small-q5_1.bin"
+        const val ISSUE77_WHISPER_FIXTURE_ASSET = "whisper/jfk.wav"
 
         val FIXTURES = listOf(
             SemanticFixture(
