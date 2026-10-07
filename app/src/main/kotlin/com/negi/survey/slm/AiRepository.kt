@@ -19,6 +19,7 @@ import android.util.Log
 import com.google.ai.edge.litertlm.Message
 import com.negi.survey.AppRingLogStore
 import com.negi.survey.BuildConfig
+import com.negi.survey.diagnostics.DiagnosticContentPolicy
 import com.negi.survey.config.SurveyConfig
 import com.negi.survey.net.RuntimeLogStore
 import com.negi.survey.runtime.HeavyRuntimeHandoff
@@ -150,19 +151,17 @@ private object AiTrace {
     private var appContext: Context? = null
 
     /** Enables verbose prompt/output tracing (FULL prompt/output). */
-    private val ENABLED_DEFAULT: Boolean = BuildConfig.DEBUG
+    private val ENABLED_DEFAULT: Boolean = DiagnosticContentPolicy.permitsRawRespondentContent
 
     @Volatile
     var enabled: Boolean = ENABLED_DEFAULT
 
     /**
-     * Full prompt/output tracing is intentionally restricted to debug builds.
-     *
-     * Even if [enabled] is changed at runtime, release builds must not dump
-     * potentially sensitive survey content to logcat or app-private trace files.
+     * Full prompt/output tracing is available to every non-Production build.
+     * Real Production is an explicit diagnostic identity, not a build variant.
      */
     private fun payloadTracingEnabled(): Boolean =
-        BuildConfig.DEBUG && enabled
+        DiagnosticContentPolicy.permitsRawRespondentContent && enabled
 
     /**
      * Ring "meta" logging is safe to keep enabled because we log only non-sensitive metadata.
@@ -186,7 +185,7 @@ private object AiTrace {
 
         // Ensure the app-owned ring logger is installed (idempotent).
         runCatching { AppRingLogStore.install(ctx) }
-            .onFailure { e -> RuntimeLogStore.w(TAG, "AppRingLogStore.install failed (ignored): ${e.message}", e) }
+            .onFailure { e -> RuntimeLogStore.w(TAG, "AppRingLogStore.install failed (ignored): ${DiagnosticContentPolicy.errorDescription(e)}", e) }
 
         RuntimeLogStore.d(TAG, "Installed (enabled=$enabled ringEnabled=$ringEnabled)")
         ringD(TAG, "Installed (enabled=$enabled ringEnabled=$ringEnabled)")
@@ -275,7 +274,7 @@ private object AiTrace {
             f.writeText(text, Charsets.UTF_8)
             f
         }.onFailure { e ->
-            RuntimeLogStore.w(TAG, "dumpToFile failed: ${e.message}", e)
+            RuntimeLogStore.w(TAG, "dumpToFile failed: ${DiagnosticContentPolicy.errorDescription(e)}", e)
         }.getOrNull()
     }
 
@@ -288,7 +287,7 @@ private object AiTrace {
         runCatching { block() }
             .onFailure { e ->
                 // Never let ring logging crash the app.
-                RuntimeLogStore.w(TAG, "ring logging failed (ignored): ${e.message}", e)
+                RuntimeLogStore.w(TAG, "ring logging failed (ignored): ${DiagnosticContentPolicy.errorDescription(e)}", e)
             }
     }
 
@@ -779,13 +778,13 @@ class LiteRtRepository(
                         RuntimeLogStore.w(
                             TAG,
                             "warmUp: initializeIfNeeded failed " +
-                                    "gateWaitMs=$gateMs initMs=$initMs err=${error?.message}",
+                                    "gateWaitMs=$gateMs initMs=$initMs err=${error?.let(DiagnosticContentPolicy::errorDescription)}",
                             error
                         )
                         AiTrace.ringW(
                             TAG,
                             "warmUp init failed initMs=$initMs " +
-                                    "gateWaitMs=$gateMs err=${error?.message}",
+                                    "gateWaitMs=$gateMs err=${error?.let(DiagnosticContentPolicy::errorDescription)}",
                             error
                         )
                         false
@@ -925,13 +924,13 @@ class LiteRtRepository(
                 RuntimeLogStore.w(
                     TAG,
                     "warmUp: prefill inference failed " +
-                            "prefillMs=$prefillMs err=${error?.message}",
+                            "prefillMs=$prefillMs err=${error?.let(DiagnosticContentPolicy::errorDescription)}",
                     error,
                 )
                 AiTrace.ringW(
                     TAG,
                     "warmUp prefill inference failed " +
-                            "prefillMs=$prefillMs err=${error?.message}",
+                            "prefillMs=$prefillMs err=${error?.let(DiagnosticContentPolicy::errorDescription)}",
                     error,
                 )
 
@@ -956,7 +955,7 @@ class LiteRtRepository(
                     RuntimeLogStore.w(
                         TAG,
                         "warmUp: prefill failure cleanup failed: " +
-                                "${cleanupError.message}",
+                                "${DiagnosticContentPolicy.errorDescription(cleanupError)}",
                         cleanupError,
                     )
                 }
@@ -1166,14 +1165,14 @@ class LiteRtRepository(
                 TAG,
                 "warmUp: representative inference failed " +
                         "inferenceMs=$inferenceMs outputChars=$outputChars " +
-                        "err=${error?.message}",
+                        "err=${error?.let(DiagnosticContentPolicy::errorDescription)}",
                 error
             )
             AiTrace.ringW(
                 TAG,
                 "warmUp representative inference failed " +
                         "inferenceMs=$inferenceMs outputChars=$outputChars " +
-                        "err=${error?.message}",
+                        "err=${error?.let(DiagnosticContentPolicy::errorDescription)}",
                 error
             )
         }
@@ -1231,8 +1230,8 @@ class LiteRtRepository(
                         }
                     }.onFailure { e ->
                         val tag = cancelTag.get()
-                        RuntimeLogStore.w(TAG, "[$requestId] cancel failed tag='$tag': ${e.message}", e)
-                        AiTrace.ringW(TAG, "[$requestId] cancel failed tag='$tag' err=${e.message}", e)
+                        RuntimeLogStore.w(TAG, "[$requestId] cancel failed tag='$tag': ${DiagnosticContentPolicy.errorDescription(e)}", e)
+                        AiTrace.ringW(TAG, "[$requestId] cancel failed tag='$tag' err=${DiagnosticContentPolicy.errorDescription(e)}", e)
                     }
                 }
             }
@@ -1401,7 +1400,7 @@ class LiteRtRepository(
                                     )
                                     if (cause != null) {
                                         appendLine("--- exception ---")
-                                        appendLine(Log.getStackTraceString(cause))
+                                        appendLine(DiagnosticContentPolicy.throwableDetails(cause))
                                     }
                                     appendLine("=== OUTPUT (FULL) ===")
                                     append(outText)
@@ -1516,13 +1515,13 @@ class LiteRtRepository(
                                     RuntimeLogStore.e(
                                         TAG,
                                         "[$requestId] forced recovery teardown " +
-                                                "failed: ${forceFailure.message}",
+                                                "failed: ${DiagnosticContentPolicy.errorDescription(forceFailure)}",
                                         forceFailure
                                     )
                                     AiTrace.ringE(
                                         TAG,
                                         "[$requestId] forced recovery teardown " +
-                                                "failed err=${forceFailure.message}",
+                                                "failed err=${DiagnosticContentPolicy.errorDescription(forceFailure)}",
                                         forceFailure
                                     )
 
@@ -1633,13 +1632,13 @@ class LiteRtRepository(
                                     RuntimeLogStore.w(
                                         TAG,
                                         "[$requestId] post-safepoint repair " +
-                                                "failed: ${t.message}",
+                                                "failed: ${DiagnosticContentPolicy.errorDescription(t)}",
                                         t
                                     )
                                     AiTrace.ringW(
                                         TAG,
                                         "[$requestId] post-safepoint repair " +
-                                                "failed err=${t.message}",
+                                                "failed err=${DiagnosticContentPolicy.errorDescription(t)}",
                                         t
                                     )
                                 } finally {
@@ -1983,6 +1982,7 @@ class LiteRtRepository(
 
                                             if (
                                                 DEBUG_STREAM &&
+                                                        DiagnosticContentPolicy.permitsRawRespondentContent &&
                                                 (
                                                         messageCount == 1L ||
                                                                 messageCount % DEBUG_STREAM_EVERY_N == 0L
@@ -2159,12 +2159,12 @@ class LiteRtRepository(
                             } catch (t: Throwable) {
                                 RuntimeLogStore.e(
                                     TAG,
-                                    "[$requestId] runInference threw: ${t.message}",
+                                    "[$requestId] runInference threw: ${DiagnosticContentPolicy.errorDescription(t)}",
                                     t
                                 )
                                 AiTrace.ringE(
                                     TAG,
-                                    "[$requestId] runInference threw err=${t.message}",
+                                    "[$requestId] runInference threw err=${DiagnosticContentPolicy.errorDescription(t)}",
                                     t
                                 )
                                 markForceReinit("exception")
@@ -2186,12 +2186,12 @@ class LiteRtRepository(
                 } catch (t: Throwable) {
                     RuntimeLogStore.e(
                         TAG,
-                        "[$requestId] inference driver failed: ${t.message}",
+                        "[$requestId] inference driver failed: ${DiagnosticContentPolicy.errorDescription(t)}",
                         t
                     )
                     AiTrace.ringE(
                         TAG,
-                        "[$requestId] inference driver failed err=${t.message}",
+                        "[$requestId] inference driver failed err=${DiagnosticContentPolicy.errorDescription(t)}",
                         t
                     )
                     runCatching { out.close(t) }

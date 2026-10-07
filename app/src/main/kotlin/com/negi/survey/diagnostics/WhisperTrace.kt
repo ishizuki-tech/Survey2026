@@ -21,7 +21,8 @@ class WhisperTrace internal constructor(private val identity: TraceIdentity, pri
             put("stream", "whisper"); put("event", name); put("surveyId", identity.surveyId); put("shortSurveyId", identity.shortSurveyId)
             put("deviceTag", identity.deviceTag); put("processId", identity.processId); identity.appVersion?.let { put("appVersion", it) }
             answerTraceId?.let { put("answerTraceId", it) }; questionId?.let { put("questionId", it) }
-            fields.forEach { (key, value) -> put(key, value ?: JSONObject.NULL) }
+            DiagnosticContentPolicy.sanitizeTraceFields(fields)
+                .forEach { (key, value) -> put(key, value ?: JSONObject.NULL) }
         }.toString())
     }
     suspend fun finalizeTrace(): File? = withContext(Dispatchers.IO) { writer.finalizeToGzip() }

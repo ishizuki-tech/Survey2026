@@ -22,6 +22,7 @@ import android.os.Looper
 import android.os.Process
 import android.os.SystemClock
 import android.util.Log
+import com.negi.survey.diagnostics.DiagnosticContentPolicy
 import androidx.annotation.RequiresApi
 import androidx.work.BackoffPolicy
 import androidx.work.Constraints
@@ -269,7 +270,7 @@ object CrashCapture {
             Thread(
                 {
                     runCatching { enqueuePendingCrashUploadsIfPossible(appCtx, "$label:bg") }
-                        .onFailure { e -> Log.w(TAG, "enqueue offload failed: ${e.message} where=$label", e) }
+                        .onFailure { e -> DiagnosticContentPolicy.logWarning(TAG, "enqueue offload failed where=$label", e) }
                 },
                 "CrashCapture-Enqueue"
             ).apply { isDaemon = true }.start()
@@ -311,22 +312,22 @@ object CrashCapture {
 
             // 0) Stage previous-run artifacts BEFORE scanning the crash dir (no WorkManager dependency).
             val stagedExitPid = runCatching { stageLastExitInfoIfNeeded(appCtx, root) }
-                .onFailure { e -> Log.w(TAG, "stageLastExitInfoIfNeeded failed: ${e.message}", e) }
+                .onFailure { e -> DiagnosticContentPolicy.logWarning(TAG, "stageLastExitInfoIfNeeded failed", e) }
                 .getOrNull()
 
             runCatching { stagePreviousSessionLogcatIfNeeded(appCtx, root, stagedExitPid) }
-                .onFailure { e -> Log.w(TAG, "stagePreviousSessionLogcatIfNeeded failed: ${e.message}", e) }
+                .onFailure { e -> DiagnosticContentPolicy.logWarning(TAG, "stagePreviousSessionLogcatIfNeeded failed", e) }
 
             // Always persist marker for the NEXT run (after staging).
             runCatching { persistCurrentLogcatMarker(appCtx) }
-                .onFailure { e -> Log.w(TAG, "persistCurrentLogcatMarker failed: ${e.message}", e) }
+                .onFailure { e -> DiagnosticContentPolicy.logWarning(TAG, "persistCurrentLogcatMarker failed", e) }
 
             // 1) WorkManager availability check.
             val wmOk = runCatching { WorkManager.getInstance(appCtx) }
                 .onFailure { e ->
                     Log.w(
                         TAG,
-                        "WorkManager not available yet; will retry on next enqueue call. where=$where err=${e.message}"
+                        "WorkManager not available yet; will retry on next enqueue call. where=$where err=${DiagnosticContentPolicy.errorDescription(e)}"
                     )
                 }
                 .isSuccess
@@ -368,7 +369,7 @@ object CrashCapture {
             Log.d(TAG, "Enqueuing GitHub crash uploads… (mirror-first) where=$where")
             targets.forEach { file ->
                 val mirror = runCatching { makeGitHubMirrorCopy(file, ghMirrorDir) }
-                    .onFailure { e -> Log.w(TAG, "GitHub mirror copy failed: ${file.name} err=${e.message}", e) }
+                    .onFailure { e -> DiagnosticContentPolicy.logWarning(TAG, "GitHub mirror copy failed: ${file.name}", e) }
                     .getOrNull()
 
                 if (mirror != null) {
@@ -391,7 +392,7 @@ object CrashCapture {
             // 2) Additionally upload raw ring body (AppRingLogStore directory) under a timestamped remote dir.
             //    This avoids WorkManager unique-name collisions because ring segment filenames are usually stable.
             runCatching { stageAndEnqueueRingStoreUploads(appCtx, root, ghMirrorDir, ghCfg, where) }
-                .onFailure { e -> Log.w(TAG, "Ring store upload staging failed: ${e.message}", e) }
+                .onFailure { e -> DiagnosticContentPolicy.logWarning(TAG, "Ring store upload staging failed", e) }
 
         } finally {
             enqueueing.set(false)
@@ -1033,11 +1034,7 @@ object CrashCapture {
                             relNorm = relNorm
                         )
                     }.onFailure { e ->
-                        Log.w(
-                            TAG,
-                            "Ring mirror copy failed: ${src.name} err=${e.message}",
-                            e
-                        )
+                        DiagnosticContentPolicy.logWarning(TAG, "Ring mirror copy failed: ${src.name}", e)
                     }.getOrNull() ?: continue
 
                 val remoteRelativePath =
@@ -1228,11 +1225,7 @@ object CrashCapture {
                     prefix = "applog"
                 )
             }.onFailure { e ->
-                Log.w(
-                    TAG,
-                    "App ring crash snapshot failed: ${e.message}",
-                    e
-                )
+                DiagnosticContentPolicy.logWarning(TAG, "App ring crash snapshot failed", e)
             }.getOrNull()
 
         val header = buildString {
@@ -1255,7 +1248,7 @@ object CrashCapture {
 
             appendLine()
             appendLine("=== Exception ===")
-            appendLine(Log.getStackTraceString(throwable))
+            appendLine(DiagnosticContentPolicy.throwableDetails(throwable))
             appendLine()
             appendLine("=== Logcat (best-effort) ===")
         }.toByteArray(Charsets.UTF_8)
@@ -1330,7 +1323,7 @@ object CrashCapture {
                 maxMs = maxMs
             ).requireUsefulLogcat()
         }.getOrElse { e ->
-            ("(logcat capture failed: ${e.message})\n")
+            ("(logcat capture failed: ${DiagnosticContentPolicy.errorDescription(e)})\n")
                 .toByteArray(Charsets.UTF_8)
         }
     }
@@ -1400,7 +1393,7 @@ object CrashCapture {
                 maxMs = maxMs
             ).requireUsefulLogcat()
         }.getOrElse { e ->
-            ("(prev-session logcat capture failed: ${e.message})\n")
+            ("(prev-session logcat capture failed: ${DiagnosticContentPolicy.errorDescription(e)})\n")
                 .toByteArray(Charsets.UTF_8)
         }
     }
@@ -1915,11 +1908,7 @@ object CrashCapture {
                             throwable = throwable
                         )
                     }.onFailure { e ->
-                        Log.e(
-                            TAG,
-                            "Crash capture failed: ${e.message}",
-                            e
-                        )
+                        DiagnosticContentPolicy.logError(TAG, "Crash capture failed", e)
                     }.getOrNull()
 
                 if (file != null) {
@@ -1930,11 +1919,7 @@ object CrashCapture {
                     )
                 }
             } catch (t: Throwable) {
-                Log.e(
-                    TAG,
-                    "Crash capture unexpected failure: ${t.message}",
-                    t
-                )
+                DiagnosticContentPolicy.logError(TAG, "Crash capture unexpected failure", t)
             } finally {
                 try {
                     val currentDelegate = delegate

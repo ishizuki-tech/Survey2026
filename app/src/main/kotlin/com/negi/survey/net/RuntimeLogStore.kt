@@ -19,6 +19,7 @@ import android.os.Process
 import android.os.SystemClock
 import android.util.Log
 import com.negi.survey.BuildConfig
+import com.negi.survey.diagnostics.DiagnosticContentPolicy
 import java.io.BufferedWriter
 import java.io.File
 import java.io.FileOutputStream
@@ -273,7 +274,7 @@ object RuntimeLogStore {
                 )
                 enforceRetentionLocked("start")
             }.onFailure { e ->
-                Log.w(TAG, "start: init failed: ${e.message}", e)
+                DiagnosticContentPolicy.logWarning(TAG, "start: init failed", e)
             }
 
             for (cmd in ch) {
@@ -303,7 +304,7 @@ object RuntimeLogStore {
                         }
                     }
                 } catch (t: Throwable) {
-                    Log.w(TAG, "actor: failed: ${t.message}", t)
+                    DiagnosticContentPolicy.logWarning(TAG, "actor: failed", t)
                     runCatching { rotateLocked("actor-error") }
                 }
             }
@@ -403,7 +404,7 @@ object RuntimeLogStore {
                 copyFile(src, dst)
                 prepared.add(dst)
             }.onFailure { t ->
-                skipped.add("${src.name}: ${t.javaClass.simpleName}:${t.message}")
+                skipped.add("${src.name}:${DiagnosticContentPolicy.errorDescription(t)}")
             }
         }
 
@@ -496,7 +497,7 @@ object RuntimeLogStore {
         if (tr == null) {
             Log.println(level.logcatPriority, safeTag, message)
         } else {
-            Log.println(level.logcatPriority, safeTag, "$message\n${Log.getStackTraceString(tr)}")
+            Log.println(level.logcatPriority, safeTag, "$message\n${DiagnosticContentPolicy.throwableDetails(tr)}")
         }
     }
 
@@ -522,7 +523,7 @@ object RuntimeLogStore {
         return if (tr == null) {
             base + "\n"
         } else {
-            val stack = Log.getStackTraceString(tr)
+            val stack = DiagnosticContentPolicy.throwableDetails(tr)
             base + "\n" + stack + "\n"
         }
     }

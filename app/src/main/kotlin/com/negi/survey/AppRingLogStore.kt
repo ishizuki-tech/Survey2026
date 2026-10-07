@@ -17,6 +17,7 @@ import android.content.Context
 import android.os.Process
 import android.os.SystemClock
 import android.util.Log
+import com.negi.survey.diagnostics.DiagnosticContentPolicy
 import java.io.BufferedOutputStream
 import java.io.File
 import java.io.FileOutputStream
@@ -185,11 +186,7 @@ object AppRingLogStore {
             currentIndex = 0
             installed.set(false)
 
-            Log.w(
-                TAG,
-                "install failed: ${t.message}",
-                t
-            )
+            DiagnosticContentPolicy.logWarning(TAG, "install failed", t)
 
             throw t
         }
@@ -276,11 +273,7 @@ object AppRingLogStore {
 
             out
         } catch (t: Throwable) {
-            Log.w(
-                TAG,
-                "stageSnapshotForCrash failed: ${t.message}",
-                t
-            )
+            DiagnosticContentPolicy.logWarning(TAG, "stageSnapshotForCrash failed", t)
             null
         }
     }
@@ -370,22 +363,14 @@ object AppRingLogStore {
                         syncToDisk = syncToDisk
                     )
                 } catch (t: Throwable) {
-                    Log.w(
-                        TAG,
-                        "write failed: ${t.message}",
-                        t
-                    )
+                    DiagnosticContentPolicy.logWarning(TAG, "write failed", t)
                 }
             }
         } catch (t: Throwable) {
             /**
              * Executor rejection should never escape into application code.
              */
-            Log.w(
-                TAG,
-                "enqueueWrite failed: ${t.message}",
-                t
-            )
+            DiagnosticContentPolicy.logWarning(TAG, "enqueueWrite failed", t)
         }
     }
 
@@ -631,7 +616,7 @@ object AppRingLogStore {
         val stack =
             truncate(
                 sanitizeInline(
-                    Log.getStackTraceString(tr)
+                    DiagnosticContentPolicy.throwableDetails(tr)
                 ),
                 MAX_STACK_CHARS
             )

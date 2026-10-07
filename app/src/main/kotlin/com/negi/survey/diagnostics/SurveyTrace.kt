@@ -37,7 +37,8 @@ class SurveyTrace private constructor(
             identity.appVersion?.let { put("appVersion", it) }
             answerTraceId?.let { put("answerTraceId", it) }
             questionId?.let { put("questionId", it) }
-            fields.forEach { (key, value) -> put(key, value ?: JSONObject.NULL) }
+            DiagnosticContentPolicy.sanitizeTraceFields(fields)
+                .forEach { (key, value) -> put(key, value ?: JSONObject.NULL) }
         }
         writer.append(record.toString())
     }

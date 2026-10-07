@@ -76,6 +76,22 @@ fun prop(name: String, default: String = ""): String {
     return default
 }
 
+/**
+ * Parses an explicit Gradle boolean instead of inferring policy from a build variant.
+ *
+ * An invalid value must fail configuration: silently treating a typo as false could
+ * accidentally ship an APK with the wrong diagnostic-content policy.
+ */
+fun requiredBooleanProperty(name: String, default: Boolean = false): Boolean {
+    val value = providers.gradleProperty(name).orNull?.trim().orEmpty()
+    if (value.isEmpty()) return default
+    return when {
+        value.equals("true", ignoreCase = true) -> true
+        value.equals("false", ignoreCase = true) -> false
+        else -> throw GradleException("$name must be either true or false when set; was '$value'.")
+    }
+}
+
 /** Return the first non-blank property from the supplied names. */
 fun propAny(vararg names: String, default: String = ""): String {
     for (name in names) {
@@ -487,6 +503,9 @@ extensions.configure<ApplicationExtension> {
         )
     val localBuild =
         providers.gradleProperty("localBuild").orNull.equals("true", ignoreCase = true)
+    // This is deliberately independent from build type, CI, upload routing, signing, and secrets.
+    // Full diagnostics remain the default unless a real Production APK explicitly opts in.
+    val diagnosticsProduction = requiredBooleanProperty("diagnostics.production")
     val applicationIdForBuild =
         if (localBuild) "com.negi.survey.local" else appId
     val appLabelResource =
@@ -661,6 +680,12 @@ extensions.configure<ApplicationExtension> {
             "String",
             "GIT_COMMIT_SHA",
             quote(resolveGitCommitSha()),
+        )
+
+        buildConfigField(
+            "boolean",
+            "DIAGNOSTICS_PRODUCTION",
+            diagnosticsProduction.toString(),
         )
 
         testInstrumentationRunner =
