@@ -19,6 +19,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.negi.survey.AppRingLogStore
 import com.negi.survey.BuildConfig
+import com.negi.survey.diagnostics.DiagnosticContentPolicy
 import com.negi.survey.net.RuntimeLogStore
 import com.negi.survey.slm.FollowupExtractor
 import com.negi.survey.slm.PromptPhase
@@ -517,7 +518,7 @@ class AiViewModel(
         var traceParseSuccess = false
         val evalPrompt = survey.getEvalPrompt(nodeId, rootQuestion, answer)
         survey.traceEvent("AI_EVAL_STARTED", answerTraceId, nodeId, mapOf(
-            "prompt" to evalPrompt, "promptLength" to evalPrompt.length,
+            "prompt" to DiagnosticContentPolicy.rawOrNull(evalPrompt), "promptLength" to evalPrompt.length,
             "modelPhase" to "EVAL"
         ))
         beginValidationTurn(contextKey)
@@ -554,7 +555,7 @@ class AiViewModel(
                     survey.resolvedRequiredComponentsFor(nodeId, admittedMissingPoints),
                 ).also { prompt ->
                     survey.traceEvent("AI_FOLLOWUP_STARTED", answerTraceId, nodeId, mapOf(
-                        "prompt" to prompt, "promptLength" to prompt.length,
+                        "prompt" to DiagnosticContentPolicy.rawOrNull(prompt), "promptLength" to prompt.length,
                         "followupIndex" to (survey.followups.value[nodeId].orEmpty().size + 1),
                         "modelPhase" to "FOLLOWUP"
                     ))
@@ -562,15 +563,22 @@ class AiViewModel(
             },
             onFinished = { evaluation, generation ->
                 if (survey.surveyUuid.value == runUuid) {
+                    val diagnosticMissingPoints = if (DiagnosticContentPolicy.permitsRawRespondentContent) {
+                        traceMissingPoints
+                    } else {
+                        admittedMissingPoints
+                    }
                     survey.traceEvent("AI_EVAL_FINISHED", answerTraceId, nodeId, mapOf(
-                        "rawResponse" to evaluation.raw, "responseLength" to evaluation.raw.length,
-                        "timedOut" to evaluation.timedOut, "error" to evaluation.error, "aiViewModelRunId" to evaluation.runId
+                        "rawResponse" to DiagnosticContentPolicy.rawOrNull(evaluation.raw), "responseLength" to evaluation.raw.length,
+                        "timedOut" to evaluation.timedOut, "error" to DiagnosticContentPolicy.rawOrNull(evaluation.error), "errorPresent" to (evaluation.error != null), "aiViewModelRunId" to evaluation.runId
                     ))
                     survey.traceEvent("AI_EVAL_PARSED", answerTraceId, nodeId, mapOf(
-                        "score" to evaluation.score, "extractedFollowups" to evaluation.followups,
-                        "missing_points" to traceMissingPoints,
+                        "score" to evaluation.score,
+                        "extractedFollowups" to if (DiagnosticContentPolicy.permitsRawRespondentContent) evaluation.followups else emptyList<String>(),
+                        "extractedFollowupCount" to evaluation.followups.size,
+                        "missing_points" to diagnosticMissingPoints,
                         "followup_needed" to traceFollowupNeeded,
-                        "parseSuccess" to traceParseSuccess, "error" to evaluation.error
+                        "parseSuccess" to traceParseSuccess, "error" to DiagnosticContentPolicy.rawOrNull(evaluation.error)
                     ))
                     upsertChatItem(contextKey, ChatItem(
                         id = "eval-$nodeId-${evaluation.runId}", sender = ChatSender.AI, json = evaluation.raw
@@ -585,7 +593,7 @@ class AiViewModel(
                     )
                     survey.traceEvent("AI_POLICY_DECISION", answerTraceId, nodeId, mapOf(
                         "decision" to decision.name, "score" to evaluation.score,
-                        "missing_points" to traceMissingPoints,
+                        "missing_points" to diagnosticMissingPoints,
                         "followup_needed" to traceFollowupNeeded,
                         "remainingFollowupCapacity" to remaining, "policyMissingPoints" to admittedMissingPoints
                     ))
@@ -606,23 +614,23 @@ class AiViewModel(
                             }
                             if (generation != null) {
                                 survey.traceEvent("AI_FOLLOWUP_FINISHED", answerTraceId, nodeId, mapOf(
-                                    "rawResponse" to generation.raw, "responseLength" to generation.raw.length,
-                                    "timedOut" to generation.timedOut, "error" to generation.error,
+                                    "rawResponse" to DiagnosticContentPolicy.rawOrNull(generation.raw), "responseLength" to generation.raw.length,
+                                    "timedOut" to generation.timedOut, "error" to DiagnosticContentPolicy.rawOrNull(generation.error), "errorPresent" to (generation.error != null),
                                     "aiViewModelRunId" to generation.runId
                                 ))
                                 survey.traceEvent("AI_FOLLOWUP_EXTRACTED", answerTraceId, nodeId, mapOf(
-                                    "candidate" to generation.followups.firstOrNull(), "extractionSuccess" to (question != null)
+                                    "candidate" to DiagnosticContentPolicy.rawOrNull(generation.followups.firstOrNull()), "candidateLength" to (generation.followups.firstOrNull()?.length ?: 0), "extractionSuccess" to (question != null)
                                 ))
                             }
                             if (question != null && survey.addFollowupQuestion(nodeId, question)) {
-                                survey.traceEvent("AI_FOLLOWUP_ACCEPTED", answerTraceId, nodeId, mapOf("followup" to question))
+                                survey.traceEvent("AI_FOLLOWUP_ACCEPTED", answerTraceId, nodeId, mapOf("followup" to DiagnosticContentPolicy.rawOrNull(question), "followupLength" to question.length))
                                 upsertChatItem(contextKey, ChatItem(
                                     id = "fu-$nodeId-${generation.runId}", sender = ChatSender.AI, text = question
                                 ))
                                 setFollowupMode(contextKey, question)
                                 null
                             } else {
-                                survey.traceEvent("AI_FOLLOWUP_REJECTED", answerTraceId, nodeId, mapOf("candidate" to generation?.followups?.firstOrNull()))
+                                survey.traceEvent("AI_FOLLOWUP_REJECTED", answerTraceId, nodeId, mapOf("candidate" to DiagnosticContentPolicy.rawOrNull(generation?.followups?.firstOrNull()), "candidateLength" to (generation?.followups?.firstOrNull()?.length ?: 0)))
                                 SurveyAiReason.FAILURE
                             }
                         }
@@ -648,16 +656,19 @@ class AiViewModel(
                                 "AI_REPOSITORY_REQUEST", traceId, nodeId, mapOf(
                                     "repositoryRequestId" to event.requestId,
                                     "modelIdentity" to event.modelIdentity,
-                                    "finalPrompt" to event.finalPrompt,
+                                    "finalPrompt" to DiagnosticContentPolicy.rawOrNull(event.finalPrompt),
+                                    "promptLength" to event.finalPrompt.length,
                                     "requestPhase" to phase.name
                                 )
                             )
                             is RepositoryTraceEvent.Finished -> survey.traceEvent(
                                 "AI_REPOSITORY_FINISHED", traceId, nodeId, mapOf(
                                     "repositoryRequestId" to event.requestId,
-                                    "rawResponse" to event.rawResponse,
+                                    "rawResponse" to DiagnosticContentPolicy.rawOrNull(event.rawResponse),
+                                    "responseLength" to event.rawResponse.length,
                                     "terminalStatus" to event.terminalStatus,
-                                    "error" to event.error,
+                                    "error" to DiagnosticContentPolicy.rawOrNull(event.error),
+                                    "errorPresent" to (event.error != null),
                                     "liteRtRunId" to event.liteRtRunId
                                 )
                             )
@@ -1486,11 +1497,18 @@ class AiViewModel(
             // Ring-safe: do not include follow-up text. Use fingerprint/length only.
             val q0Len = q0?.length ?: 0
             val q0Sha = q0?.let { sha256Hex(it).take(16) } ?: "none"
+            val diagnosticError = if (DiagnosticContentPolicy.permitsRawRespondentContent) {
+                stepError ?: "<none>"
+            } else if (stepError == null) {
+                "<none>"
+            } else {
+                "<redacted>"
+            }
             logI(
                 TAG,
                 "run[$runId] done: phase=$phase mode=$mode score=$parsedScore " +
                         "FU0.len=$q0Len FU0.sha16=$q0Sha commit=$commitToPrimaryState " +
-                        "err=${stepError ?: "<none>"}"
+                        "err=$diagnosticError"
             )
 
             if (enableFullLogs) {

@@ -162,6 +162,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.negi.survey.BuildConfig
 import com.negi.survey.net.RuntimeLogStore
+import com.negi.survey.diagnostics.DiagnosticContentPolicy
 import com.negi.survey.diagnostics.WhisperTraceRegistry
 import com.negi.survey.slm.FollowupExtractor
 import com.negi.survey.slm.PromptPhase
@@ -764,7 +765,16 @@ fun AiScreen(
 
                 if (conv.role == AiViewModel.ComposerRole.MAIN) {
                     vmSurvey.acceptVoiceTranscript(nid, text)
-                    WhisperTraceRegistry.start(localContext, surveyUuid)?.event("TRANSCRIPT_ACCEPTED", vmSurvey.answerTraceId(nid), nid, mapOf("transcript" to text, "inputSource" to "voice"))
+                    WhisperTraceRegistry.start(localContext, surveyUuid)?.event(
+                        "TRANSCRIPT_ACCEPTED",
+                        vmSurvey.answerTraceId(nid),
+                        nid,
+                        mapOf(
+                            "transcript" to DiagnosticContentPolicy.rawOrNull(text),
+                            "transcriptLength" to text.length,
+                            "inputSource" to "voice",
+                        ),
+                    )
                 }
 
                 RuntimeLogStore.d(TAG, "Speech committed (node=$nid role=${conv.role} len=${text.length})")

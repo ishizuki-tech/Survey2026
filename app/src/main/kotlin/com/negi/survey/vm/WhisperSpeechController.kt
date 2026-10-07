@@ -31,6 +31,7 @@ package com.negi.survey.vm
 import android.content.Context
 import android.os.SystemClock
 import android.util.Log
+import com.negi.survey.diagnostics.DiagnosticContentPolicy
 import com.negi.survey.diagnostics.WhisperTraceRegistry
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
@@ -263,7 +264,7 @@ class WhisperSpeechController(
                     deleteTempFileQuietly(tmp, reason = "start_cancelled")
                     activeSession.compareAndSet(session, null)
                 } catch (t: Throwable) {
-                    Log.e(TAG, "startRecording: failed", t)
+                    DiagnosticContentPolicy.logError(TAG, "startRecording: failed", t)
                     if (!owns(session)) return@withLock
                     _error.value = t.message ?: "Speech recognition start failed"
                     _isRecording.value = false
@@ -376,7 +377,7 @@ class WhisperSpeechController(
                     val exported = exportRecordedVoiceSafely(wav, session)
                     if (exported != null && owns(session)) {
                         val checksum = runCatching { computeSha256(exported) }
-                            .onFailure { e -> Log.w(TAG, "computeSha256 failed", e) }
+                            .onFailure { e -> DiagnosticContentPolicy.logWarning(TAG, "computeSha256 failed", e) }
                             .getOrNull()
 
                         onVoiceExported?.invoke(
@@ -430,21 +431,33 @@ class WhisperSpeechController(
                                 Log.w(TAG, "Transcription produced empty text (qid=${session.questionId})")
                                 _error.value = buildEmptyTranscriptionReason(wav)
                             } else {
-                                Log.d(TAG, "Transcription success: ${trimmed.take(80)}")
-                                WhisperTraceRegistry.event(session.surveyId, session.questionId, "TRANSCRIPTION_FINISHED", mapOf("transcript" to trimmed, "success" to true, "language" to normalizedLanguage))
+                                if (DiagnosticContentPolicy.permitsRawRespondentContent) {
+                                    Log.d(TAG, "Transcription success: ${trimmed.take(80)}")
+                                } else {
+                                    Log.d(TAG, "Transcription success: transcriptLength=${trimmed.length}")
+                                }
+                                WhisperTraceRegistry.event(session.surveyId, session.questionId, "TRANSCRIPTION_FINISHED", mapOf(
+                                    "transcript" to DiagnosticContentPolicy.rawOrNull(trimmed),
+                                    "transcriptLength" to trimmed.length,
+                                    "success" to true,
+                                    "language" to normalizedLanguage,
+                                ))
                             }
                             updatePartialText(trimmed)
                         }
                         .onFailure { e ->
                             if (!owns(session)) return@onFailure
-                            Log.e(TAG, "Transcription failed", e)
-                            WhisperTraceRegistry.event(session.surveyId, session.questionId, "TRANSCRIPTION_FAILED", mapOf("error" to e.message))
+                            DiagnosticContentPolicy.logError(TAG, "Transcription failed", e)
+                            WhisperTraceRegistry.event(session.surveyId, session.questionId, "TRANSCRIPTION_FAILED", mapOf(
+                                "error" to DiagnosticContentPolicy.rawOrNull(e.message),
+                                "errorClass" to e.javaClass.simpleName,
+                            ))
                             _error.value = e.message ?: "Transcription failed"
                         }
                 } catch (ce: CancellationException) {
                     Log.d(TAG, "stopRecording: cancelled")
                 } catch (t: Throwable) {
-                    Log.e(TAG, "stopRecording: failed", t)
+                    DiagnosticContentPolicy.logError(TAG, "stopRecording: failed", t)
                     if (owns(session)) _error.value = t.message ?: "Speech recognition failed"
                 } finally {
                     if (owns(session) && !session.poisoned) {
@@ -510,8 +523,13 @@ class WhisperSpeechController(
             }
 
             result.onFailure { e ->
-                WhisperTraceRegistry.event(currentSurveyId, currentQuestionId, "MODEL_INIT_FINISHED", mapOf("success" to false, "modelKey" to assetModelPath, "error" to e.message))
-                Log.e(TAG, "ensureModelInitializedFromAssetsOnce failed: assets/$assetModelPath", e)
+                WhisperTraceRegistry.event(currentSurveyId, currentQuestionId, "MODEL_INIT_FINISHED", mapOf(
+                    "success" to false,
+                    "modelKey" to assetModelPath,
+                    "error" to DiagnosticContentPolicy.rawOrNull(e.message),
+                    "errorClass" to e.javaClass.simpleName,
+                ))
+                DiagnosticContentPolicy.logError(TAG, "ensureModelInitializedFromAssetsOnce failed: assets/$assetModelPath", e)
                 throw IllegalStateException(
                     "Failed to initialize Whisper model from assets/$assetModelPath",
                     e
@@ -543,7 +561,7 @@ class WhisperSpeechController(
                     questionId = session.questionId
                 )
             }.onFailure { e ->
-                Log.w(TAG, "exportRecordedVoice failed", e)
+                DiagnosticContentPolicy.logWarning(TAG, "exportRecordedVoice failed", e)
             }.getOrNull()
         }
 
@@ -570,7 +588,7 @@ class WhisperSpeechController(
                 Log.d(TAG, "temp delete=$ok reason=$reason -> ${file.path}")
             }
         }.onFailure { e ->
-            Log.w(TAG, "temp delete failed reason=$reason -> ${file.path}", e)
+            DiagnosticContentPolicy.logWarning(TAG, "temp delete failed reason=$reason -> ${file.path}", e)
         }
     }
 
@@ -585,7 +603,7 @@ class WhisperSpeechController(
 
     private fun newRecorder(session: RecordingSession): RecorderBackend {
         val onError: (Exception) -> Unit = onError@{ e ->
-            Log.e(TAG, "Recorder error", e)
+            DiagnosticContentPolicy.logError(TAG, "Recorder error", e)
             if (!owns(session)) {
                 Log.d(TAG, "Ignoring stale recorder error for session=${session.id}")
                 return@onError
@@ -631,7 +649,9 @@ class WhisperSpeechController(
 
         when {
             closeRes == null -> Log.e(TAG, "recorder.close TIMEOUT (reason=$reason)")
-            closeRes.isFailure -> Log.w(TAG, "recorder.close failed (reason=$reason)", closeRes.exceptionOrNull())
+            closeRes.isFailure -> closeRes.exceptionOrNull()?.let {
+                DiagnosticContentPolicy.logWarning(TAG, "recorder.close failed (reason=$reason)", it)
+            }
             else -> Log.d(TAG, "recorder.close OK (reason=$reason)")
         }
 
@@ -649,7 +669,7 @@ class WhisperSpeechController(
                 cleanupScope.launch {
                     if (!owns(session) || !session.poisoned) return@launch
                     closeResult.onFailure { e ->
-                        Log.e(TAG, "Recorder.close failed after stop timeout", e)
+                        DiagnosticContentPolicy.logError(TAG, "Recorder.close failed after stop timeout", e)
                         _error.value = e.message ?: "Recorder recovery failed"
                     }.onSuccess {
                         Log.w(TAG, "Recorder.close completed after stop timeout; releasing session=${session.id}")
@@ -911,11 +931,11 @@ class WhisperSpeechController(
         val job = cleanupScope.launch {
             withContext(NonCancellable) {
                 runCatching { WhisperEngine.detach() }
-                    .onFailure { e -> Log.w(TAG, "WhisperEngine.detach failed", e) }
+                    .onFailure { e -> DiagnosticContentPolicy.logWarning(TAG, "WhisperEngine.detach failed", e) }
 
                 session?.let { active ->
                     runCatching { active.recorder?.close() }
-                        .onFailure { e -> Log.w(TAG, "Recorder.close failed", e) }
+                        .onFailure { e -> DiagnosticContentPolicy.logWarning(TAG, "Recorder.close failed", e) }
                     deleteTempFileQuietly(active.outputFile, reason = "view_model_cleared")
                 }
             }
