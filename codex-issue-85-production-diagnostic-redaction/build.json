@@ -1,0 +1,12 @@
+{
+  "original_branch": "codex-issue-85-production-diagnostic-redaction",
+  "branch_slug": "codex-issue-85-production-diagnostic-redaction",
+  "commit_sha": "f32313c5a90bc0eb041c090be873c24d17c3b6f6",
+  "short_sha": "f32313c",
+  "apk_name": "Survey2026-codex-issue-85-production-diagnostic-redaction-f32313c.apk",
+  "apk_sha256": "f6c9eb2b91a26be7ebe73d989bea0777e24cc85a3fa4074a1434a4bfde42d9c8",
+  "apk_download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-codex-issue-85-production-diagnostic-redaction-f32313c-run-115/Survey2026-codex-issue-85-production-diagnostic-redaction-f32313c.apk",
+  "page_url": "https://ishizuki-tech.github.io/Survey2026/codex-issue-85-production-diagnostic-redaction/",
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/37552670885",
+  "generated_utc": "2026-10-07T00:40:54Z"
+}
