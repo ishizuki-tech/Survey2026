@@ -156,10 +156,19 @@ class TtsController(
 
         val tts = engine ?: return
         val locale = resolveLocale(languageCode)
+        Log.d(
+            TAG,
+            "TextToSpeech initialized: defaultEngine=${tts.defaultEngine} " +
+                "requestedLocale=$locale"
+        )
         val result = tts.setLanguage(locale)
 
         if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
-            Log.w(TAG, "TTS language unavailable for locale=$locale (result=$result)")
+            Log.w(
+                TAG,
+                "TTS language unavailable: defaultEngine=${tts.defaultEngine} " +
+                    "locale=$locale result=$result"
+            )
             _error.value = "Text-to-speech voice for '$languageCode' isn't installed on this device"
             _isReady.value = false
             return
@@ -190,7 +199,11 @@ class TtsController(
         })
 
         _isReady.value = true
-        Log.d(TAG, "TextToSpeech ready: locale=$locale rate=$speechRate pitch=$pitch")
+        Log.d(
+            TAG,
+            "TextToSpeech ready: defaultEngine=${tts.defaultEngine} requestedLocale=$locale " +
+                "languageResult=$result activeVoice=${tts.voice} rate=$speechRate pitch=$pitch"
+        )
 
         val text = pendingText
         val uid = pendingUtteranceId
