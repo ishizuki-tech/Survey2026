@@ -45,6 +45,76 @@ done
 
 [[ "$ITERATIONS" =~ ^[1-9][0-9]*$ ]] || { echo "--iterations must be a positive integer" >&2; exit 2; }
 
+EXPECTED_RECORD_COUNT=$(( ${#QUESTIONS[@]} * ITERATIONS ))
+QUESTION_LIST_JSON="$(printf '%s\n' "${QUESTIONS[@]}" | jq -R . | jq -sc .)"
+
+# A candidate must contain the complete Q7-Q16 fixture matrix for this run.
+# Keeping this as the single acceptance predicate makes the direct app-private
+# file and reconstructed structured-logcat artifact subject to the same checks.
+artifact_validation_report() {
+  jq -s \
+    --arg run_id "$RESULT_RUN_ID" \
+    --argjson expected_count "$EXPECTED_RECORD_COUNT" \
+    --argjson iterations "$ITERATIONS" \
+    --argjson questions "$QUESTION_LIST_JSON" '
+      def pair: "\(.nodeId)\u0000\(.iteration)";
+      def expected_pairs:
+        [ $questions[] as $node
+          | range(1; $iterations + 1) as $iteration
+          | "\($node)\u0000\($iteration)"
+        ];
+      . as $records
+      | [ $records[] | select(type != "object") ] as $non_objects
+      | [ $records[]
+          | select(type == "object")
+          | select(
+              .runId != $run_id or
+              (.questionText | type != "string") or
+              (.initialAnswer | type != "string") or
+              (.rawEval | type != "string") or
+              ((.nodeId | type) != "string") or
+              ((.iteration | type) != "number") or
+              (.iteration as $iteration | ($iteration | floor) != $iteration) or
+              (.iteration < 1 or .iteration > $iterations) or
+              (.nodeId as $node | ($questions | index($node)) == null)
+            )
+        ] as $invalid_records
+      | [ $records[] | select(type == "object") | pair ] as $actual_pairs
+      | expected_pairs as $expected_pairs
+      | [ $expected_pairs[] as $pair
+          | select(($actual_pairs | index($pair)) == null)
+          | $pair
+        ] as $missing_pairs
+      | [ $actual_pairs | group_by(.)[]
+          | select(length > 1)
+          | { pair: .[0], count: length }
+        ] as $duplicate_pairs
+      | [ $actual_pairs[] as $pair
+          | select(($expected_pairs | index($pair)) == null)
+          | $pair
+        ] as $unexpected_pairs
+      | {
+          expectedRecordCount: $expected_count,
+          actualRecordCount: ($records | length),
+          missingPairs: $missing_pairs,
+          duplicatePairs: $duplicate_pairs,
+          unexpectedPairs: $unexpected_pairs,
+          invalidRecordCount: (($non_objects | length) + ($invalid_records | length))
+        }
+      | .valid = (
+          .actualRecordCount == .expectedRecordCount and
+          .missingPairs == [] and
+          .duplicatePairs == [] and
+          .unexpectedPairs == [] and
+          .invalidRecordCount == 0
+        )
+    ' "$1"
+}
+
+is_valid_result() {
+  artifact_validation_report "$1" | jq -e '.valid' >/dev/null 2>&1
+}
+
 if [[ -z "$SERIAL" ]]; then
   DEVICES=()
   while IFS= read -r device; do
@@ -121,13 +191,6 @@ set -e
 
 adb -s "$SERIAL" logcat -d -v threadtime -s 'RealLiteRtAiFollowup:I' \
   > "$RESULT_DIR/device-logcat.txt" 2>&1 || true
-
-is_valid_result() {
-  jq -se --arg run_id "$RESULT_RUN_ID" \
-    'length > 0 and all(.[]; type == "object" and .runId == $run_id and
-      (.questionText | type == "string") and (.initialAnswer | type == "string") and
-      (.rawEval | type == "string"))' "$1" >/dev/null 2>&1
-}
 
 APP_PRIVATE_RESULT="$RESULT_DIR/app-private-extraction.out"
 set +e
@@ -229,6 +292,14 @@ else
     adb -s "$SERIAL" shell run-as "$APP_PACKAGE" ls -la files/real_model_test_results 2>&1 || true
     echo "logcat_export_status=${LOGCAT_EXPORT_STATUS:-not_attempted}"
     echo "logcat_decode_status=${LOGCAT_DECODE_STATUS:-not_attempted}"
+    echo "expected_record_count=$EXPECTED_RECORD_COUNT"
+    for candidate in "$APP_PRIVATE_RESULT" "${LOGCAT_RECONSTRUCTED:-}"; do
+      [[ -n "$candidate" && -s "$candidate" ]] || continue
+      echo "artifact_validation_candidate=$candidate"
+      if ! artifact_validation_report "$candidate"; then
+        echo "artifact_validation_report=unavailable (candidate is not parseable NDJSON)"
+      fi
+    done
     echo "device_log_markers:"
     rg 'REAL_AI_FIXTURE_(REPORT_PATH|SUMMARY|RESULT|NDJSON|EXPORT)' "$RESULT_DIR/device-logcat.txt" || true
   } > "$RESULT_DIR/result-extraction-diagnostics.txt"
