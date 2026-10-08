@@ -1,12 +1,12 @@
 {
   "original_branch": "codex/issue-81-real-model-artifacts",
   "branch_slug": "codex-issue-81-real-model-artifacts",
-  "commit_sha": "426d9c89dea951c227f62aa852e16b18a82894ed",
-  "short_sha": "426d9c8",
-  "apk_name": "Survey2026-codex-issue-81-real-model-artifacts-426d9c8.apk",
-  "apk_sha256": "257e6d52b5a4c93ad77fc4eb96e2adeb66feab0196d5ceae05aa237ae1874bfb",
-  "apk_download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-codex-issue-81-real-model-artifacts-426d9c8-run-116/Survey2026-codex-issue-81-real-model-artifacts-426d9c8.apk",
+  "commit_sha": "ca9e0a88d6ea29047987a88880932390dbb89305",
+  "short_sha": "ca9e0a8",
+  "apk_name": "Survey2026-codex-issue-81-real-model-artifacts-ca9e0a8.apk",
+  "apk_sha256": "5e9a0d6d44bd7cbc9428e4bcd30ff3748d2dd1a5221835bab8cd5ae013c5ff5f",
+  "apk_download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-codex-issue-81-real-model-artifacts-ca9e0a8-run-117/Survey2026-codex-issue-81-real-model-artifacts-ca9e0a8.apk",
   "page_url": "https://ishizuki-tech.github.io/Survey2026/codex-issue-81-real-model-artifacts/",
-  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/37723918078",
-  "generated_utc": "2026-10-08T03:47:08Z"
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/37725239045",
+  "generated_utc": "2026-10-08T04:06:03Z"
 }
