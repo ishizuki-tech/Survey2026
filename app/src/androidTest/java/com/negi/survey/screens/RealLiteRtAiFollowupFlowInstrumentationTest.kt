@@ -100,7 +100,7 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
 
         Log.i(
             TAG,
-            "REAL_AI_FIXTURE_SUMMARY iterations=$iterations fixtures=${FIXTURES.map { it.nodeId }} " +
+            "REAL_AI_FIXTURE_SUMMARY iterations=$iterations fixtures=${FIXTURES.map { it.fixtureId }} " +
                 "stoppedAfterTimeout=$stoppedAfterTimeout " +
                 "classifications=$classifications report=${report.file.absolutePath}",
         )
@@ -404,6 +404,7 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
         val generation = mainSteps.lastOrNull { it.phase == PromptPhase.FOLLOWUP }
         val conversation = vm.conversationStateFlow(contextKey).value
         val expectedIdsMatch = fixtureCase.expectedMissingIds?.let { it == admission.missingPoints }
+        val expectedDecisionMatch = admission.decision == fixtureCase.expectedDecision
         val requiredMissingIdsMatch = fixtureCase.requiredMissingIds.takeIf { it.isNotEmpty() }
             ?.let { requiredIds -> requiredIds.all { it in admission.missingPoints } }
         val allowedMissingIdsMatch = fixtureCase.allowedMissingIds?.let { allowedIds ->
@@ -418,6 +419,12 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
             )
         }
         val acceptedFollowup = entries.singleOrNull()?.question
+        val unexpectedNoFollowup = fixtureCase.expectsFollowup && acceptedFollowup == null
+        val unnecessaryFollowup = !fixtureCase.expectsFollowup && acceptedFollowup != null
+        val followupBehaviorMatch = when {
+            fixtureCase.expectsFollowup -> generation != null && policyAcceptedFollowup != null && acceptedFollowup != null
+            else -> generation == null && acceptedFollowup == null
+        }
         val followupReasksSuppliedInformation = fixtureCase.rejectDirectSuppliedInformationReask
             .takeIf { it }
             ?.let { isDirectQ14SuppliedInformationReask(acceptedFollowup) }
@@ -439,13 +446,16 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
         )
 
         return FixtureResult(
+            fixtureId = fixtureCase.fixtureId,
             nodeId = nodeId,
+            category = fixtureCase.category,
             iteration = iteration,
             questionText = questionText,
             answer = fixtureCase.answer,
             semanticUnresolvedTarget = fixtureCase.semanticUnresolvedTarget,
             suppliedInformation = fixtureCase.suppliedInformation,
             expectedDecision = fixtureCase.expectedDecision,
+            expectedDecisionMatch = expectedDecisionMatch,
             expectedMissingIds = fixtureCase.expectedMissingIds,
             requiredMissingIds = fixtureCase.requiredMissingIds,
             allowedMissingIds = fixtureCase.allowedMissingIds,
@@ -462,6 +472,10 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
             policyFollowupAccepted = policyAcceptedFollowup != null,
             followupAccepted = acceptedFollowup != null,
             acceptedFollowup = acceptedFollowup,
+            expectedFollowup = fixtureCase.expectsFollowup,
+            followupBehaviorMatch = followupBehaviorMatch,
+            unnecessaryFollowup = unnecessaryFollowup,
+            unexpectedNoFollowup = unexpectedNoFollowup,
             evalTimedOut = evaluation.timedOut,
             followupTimedOut = generation?.timedOut ?: false,
             evalError = evaluation.error,
@@ -618,7 +632,9 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
     )
 
     private data class SemanticFixture(
+        val fixtureId: String,
         val nodeId: String,
+        val category: FixtureCategory,
         val answer: String,
         val expectedDecision: SurveyAiDecision,
         val expectedMissingIds: List<String>?,
@@ -629,6 +645,12 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
         val allowedMissingIds: List<String>? = null,
         val rejectDirectSuppliedInformationReask: Boolean = false,
     )
+
+    private enum class FixtureCategory {
+        COMPLETE,
+        PARTIAL,
+        UNHELPFUL,
+    }
 
     private enum class ResultClassification {
         PASS,
@@ -663,13 +685,16 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
     }
 
     private data class FixtureResult(
+        val fixtureId: String,
         val nodeId: String,
+        val category: FixtureCategory,
         val iteration: Int,
         val questionText: String,
         val answer: String,
         val semanticUnresolvedTarget: String,
         val suppliedInformation: String,
         val expectedDecision: SurveyAiDecision,
+        val expectedDecisionMatch: Boolean,
         val expectedMissingIds: List<String>?,
         val requiredMissingIds: List<String>,
         val allowedMissingIds: List<String>?,
@@ -686,6 +711,10 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
         val policyFollowupAccepted: Boolean,
         val followupAccepted: Boolean,
         val acceptedFollowup: String?,
+        val expectedFollowup: Boolean,
+        val followupBehaviorMatch: Boolean,
+        val unnecessaryFollowup: Boolean,
+        val unexpectedNoFollowup: Boolean,
         val evalTimedOut: Boolean,
         val followupTimedOut: Boolean,
         val evalError: String?,
@@ -729,13 +758,16 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
     ): FixtureResult {
         val timedOut = error.message?.contains("Timed out waiting for real LiteRT state") == true
         return FixtureResult(
+            fixtureId = fixtureCase.fixtureId,
             nodeId = fixtureCase.nodeId,
+            category = fixtureCase.category,
             iteration = iteration,
             questionText = runCatching { fixture.survey.getQuestion(fixtureCase.nodeId) }.getOrDefault(""),
             answer = fixtureCase.answer,
             semanticUnresolvedTarget = fixtureCase.semanticUnresolvedTarget,
             suppliedInformation = fixtureCase.suppliedInformation,
             expectedDecision = fixtureCase.expectedDecision,
+            expectedDecisionMatch = false,
             expectedMissingIds = fixtureCase.expectedMissingIds,
             requiredMissingIds = fixtureCase.requiredMissingIds,
             allowedMissingIds = fixtureCase.allowedMissingIds,
@@ -752,6 +784,10 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
             policyFollowupAccepted = false,
             followupAccepted = false,
             acceptedFollowup = null,
+            expectedFollowup = fixtureCase.expectsFollowup,
+            followupBehaviorMatch = false,
+            unnecessaryFollowup = false,
+            unexpectedNoFollowup = fixtureCase.expectsFollowup,
             evalTimedOut = timedOut,
             followupTimedOut = false,
             evalError = error.message ?: error.javaClass.simpleName,
@@ -774,7 +810,7 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
         private val normalizedRunId = runId
             ?.replace(Regex("[^A-Za-z0-9_.-]"), "_")
             ?.takeIf { it.isNotBlank() }
-            ?: "issue81_${System.currentTimeMillis()}"
+            ?: "issue92_${System.currentTimeMillis()}"
         private var nextRecordSequence = 1
         val file = File(
             File(filesDir, "real_model_test_results").apply { mkdirs() },
@@ -790,13 +826,16 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
             val record = JSONObject().apply {
                 put("schemaVersion", 2)
                 put("runId", normalizedRunId)
+                put("fixtureId", result.fixtureId)
                 put("nodeId", result.nodeId)
+                put("category", result.category.name)
                 put("iteration", result.iteration)
                 put("questionText", result.questionText)
                 put("initialAnswer", result.answer)
                 put("semanticUnresolvedTarget", result.semanticUnresolvedTarget)
                 put("suppliedInformation", result.suppliedInformation)
                 put("expectedPolicyDecision", result.expectedDecision.name)
+                put("expectedDecisionMatch", result.expectedDecisionMatch)
                 put("expectedMissingIds", result.expectedMissingIds?.let { JSONArray(it) } ?: JSONObject.NULL)
                 put("requiredMissingIds", JSONArray(result.requiredMissingIds))
                 put("allowedMissingIds", result.allowedMissingIds?.let { JSONArray(it) } ?: JSONObject.NULL)
@@ -813,6 +852,10 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
                 put("productionFollowupPolicyAccepted", result.policyFollowupAccepted)
                 put("followupAccepted", result.followupAccepted)
                 put("acceptedFollowup", result.acceptedFollowup ?: JSONObject.NULL)
+                put("expectedFollowup", result.expectedFollowup)
+                put("followupBehaviorMatch", result.followupBehaviorMatch)
+                put("unnecessaryFollowup", result.unnecessaryFollowup)
+                put("unexpectedNoFollowup", result.unexpectedNoFollowup)
                 put("evalTimedOut", result.evalTimedOut)
                 put("followupTimedOut", result.followupTimedOut)
                 put("evalError", result.evalError ?: JSONObject.NULL)
@@ -842,7 +885,7 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
             )
             Log.i(
                 TAG,
-                "REAL_AI_FIXTURE_RESULT node=${result.nodeId} iter=${result.iteration} " +
+                "REAL_AI_FIXTURE_RESULT fixture=${result.fixtureId} node=${result.nodeId} category=${result.category} iter=${result.iteration} " +
                     "classification=${result.classification} decision=${result.policyDecision} " +
                     "missing=${result.canonicalMissingPoints} report=${file.absolutePath}",
             )
@@ -875,9 +918,13 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
         const val ISSUE77_WHISPER_FIXTURE_ASSET = "whisper/jfk.wav"
         const val LOGCAT_EXPORT_CHUNK_CHARS = 2_500
 
-        val FIXTURES = listOf(
+        val FIXTURES = partialFixtures() + completeFixtures() + unhelpfulFixtures()
+
+        private fun partialFixtures() = listOf(
             SemanticFixture(
+                fixtureId = "Q7_PARTIAL",
                 nodeId = "Q7",
+                category = FixtureCategory.PARTIAL,
                 answer = "Ndiyo, funza jeshi walikuja shambani kwangu mwaka jana. Ilikuwa mbaya kweli.",
                 expectedDecision = SurveyAiDecision.GENERATE,
                 expectedMissingIds = null,
@@ -886,7 +933,9 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
                 expectsFollowup = true,
             ),
             SemanticFixture(
+                fixtureId = "Q8_PARTIAL",
                 nodeId = "Q8",
+                category = FixtureCategory.PARTIAL,
                 answer = "Ningekubali kupoteza kidogo tu, siyo mengi.",
                 expectedDecision = SurveyAiDecision.GENERATE,
                 expectedMissingIds = null,
@@ -895,7 +944,9 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
                 expectsFollowup = true,
             ),
             SemanticFixture(
+                fixtureId = "Q9_PARTIAL",
                 nodeId = "Q9",
+                category = FixtureCategory.PARTIAL,
                 answer = "Kama uharibifu ni mkubwa sana, ningebadilisha aina ya mbegu.",
                 expectedDecision = SurveyAiDecision.GENERATE,
                 expectedMissingIds = null,
@@ -904,7 +955,9 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
                 expectsFollowup = true,
             ),
             SemanticFixture(
+                fixtureId = "Q10_PARTIAL",
                 nodeId = "Q10",
+                category = FixtureCategory.PARTIAL,
                 answer = "Ingehitaji tu kuwa nzuri kuliko hii ninayopanda sasa.",
                 expectedDecision = SurveyAiDecision.GENERATE,
                 expectedMissingIds = null,
@@ -913,7 +966,9 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
                 expectsFollowup = true,
             ),
             SemanticFixture(
+                fixtureId = "Q11_PARTIAL",
                 nodeId = "Q11",
+                category = FixtureCategory.PARTIAL,
                 answer = "Hata kama mavuno ni machache, bado ningeendelea kupanda, kwa sababu nimeizoea.",
                 expectedDecision = SurveyAiDecision.GENERATE,
                 expectedMissingIds = null,
@@ -922,7 +977,9 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
                 expectsFollowup = true,
             ),
             SemanticFixture(
+                fixtureId = "Q12_PARTIAL",
                 nodeId = "Q12",
+                category = FixtureCategory.PARTIAL,
                 answer = "Ukame ni mbaya wakati wowote, lakini hasa mvua zikikatika mapema.",
                 expectedDecision = SurveyAiDecision.GENERATE,
                 expectedMissingIds = null,
@@ -931,7 +988,9 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
                 expectsFollowup = true,
             ),
             SemanticFixture(
+                fixtureId = "Q13_PARTIAL",
                 nodeId = "Q13",
+                category = FixtureCategory.PARTIAL,
                 answer = "Aah, tunagawa tu kama kawaida.",
                 expectedDecision = SurveyAiDecision.GENERATE,
                 expectedMissingIds = null,
@@ -940,7 +999,9 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
                 expectsFollowup = true,
             ),
             SemanticFixture(
+                fixtureId = "Q14_PARTIAL",
                 nodeId = "Q14",
+                category = FixtureCategory.PARTIAL,
                 answer = "Ndiyo, nawapa mifugo mahindi wakati mwingine.",
                 expectedDecision = SurveyAiDecision.GENERATE,
                 expectedMissingIds = null,
@@ -952,7 +1013,9 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
                 expectsFollowup = true,
             ),
             SemanticFixture(
+                fixtureId = "Q15_PARTIAL",
                 nodeId = "Q15",
+                category = FixtureCategory.PARTIAL,
                 answer = "Mara nyingi nanunua dukani.",
                 expectedDecision = SurveyAiDecision.GENERATE,
                 expectedMissingIds = listOf("source_reason"),
@@ -961,7 +1024,9 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
                 expectsFollowup = true,
             ),
             SemanticFixture(
+                fixtureId = "Q16_PARTIAL",
                 nodeId = "Q16",
+                category = FixtureCategory.PARTIAL,
                 answer = "Nauza kwa wanunuzi wanaokuja kijijini.",
                 expectedDecision = SurveyAiDecision.GENERATE,
                 expectedMissingIds = listOf("destination_reason"),
@@ -969,6 +1034,44 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
                 suppliedInformation = "sale_destination is supplied; destination_reason is unresolved.",
                 expectsFollowup = true,
             ),
+        )
+
+        private fun completeFixtures() = listOf(
+            sourceFixture("Q7", FixtureCategory.COMPLETE, "Ndiyo, funza jeshi walishambulia mahindi yangu msimu uliopita. Walikula majani na masuke, nikapoteza karibu robo ya mavuno.", "No unresolved information; FAW occurrence and damage/loss are supplied.", "FAW occurrence, crop damage, and approximate harvest loss are supplied."),
+            sourceFixture("Q8", FixtureCategory.COMPLETE, "Ningekubali kupoteza hadi asilimia kumi ya mavuno, yaani kama magunia mawili kwa ekari, ili nivune siku 20 mapema.", "No unresolved information; maximum acceptable loss is supplied.", "Ten percent / two bags per acre is supplied."),
+            sourceFixture("Q9", FixtureCategory.COMPLETE, "Kama zaidi ya asilimia thelathini ya mimea yangu itaharibiwa na wadudu au magonjwa, ningebadilisha aina ya mahindi.", "No unresolved information; damage threshold is supplied.", "More than thirty percent plant damage is supplied."),
+            sourceFixture("Q10", FixtureCategory.COMPLETE, "Ningetaka aina inayokomaa kwa miezi minne, inayostahimili ukame na funza jeshi, na inayotoa angalau magunia ishirini kwa ekari.", "No unresolved information; priority traits and measurable criterion are supplied.", "Maturity, drought and FAW tolerance, and yield target are supplied."),
+            sourceFixture("Q11", FixtureCategory.COMPLETE, "Msimu ukiwa mbaya, nikivuna angalau magunia kumi kwa ekari, bado ningeendelea kupanda aina hii.", "No unresolved information; minimum acceptable yield is supplied.", "Ten bags per acre is supplied."),
+            sourceFixture("Q12", FixtureCategory.COMPLETE, "Ukame unaleta hasara kubwa zaidi wakati mahindi yanatoa kishada na hariri, kwa sababu masuke hayajai vizuri.", "No unresolved information; growth stage is supplied.", "Tasseling and silking stage is supplied."),
+            sourceFixture("Q13", FixtureCategory.COMPLETE, "Kwanza tunaweka chakula cha kutosha familia hadi mavuno yajayo, kisha kidogo kwa mifugo, na kinachobaki tunauza bei ikiwa nzuri.", "No unresolved information; allocation criteria are supplied.", "Household food, livestock allocation, and sale-price criterion are supplied."),
+            sourceFixture("Q14", FixtureCategory.COMPLETE, "Nawalisha ng'ombe wangu wawili na kuku mahindi meupe kila siku wakati wa kiangazi.", "No unresolved information; animals and frequency are supplied.", "Two cows, chickens, and daily dry-season frequency are supplied.", expectedMissingIds = emptyList()),
+            sourceFixture("Q15", FixtureCategory.COMPLETE, "Kwa kawaida nanunua mbegu zilizothibitishwa kwenye duka la pembejeo la kijijini, kwa sababu ni karibu na mbegu zao huota vizuri.", "No unresolved information; seed source and reason are supplied.", "Certified seed from village agro-dealer, proximity, and germination reason are supplied.", expectedMissingIds = emptyList()),
+            sourceFixture("Q16", FixtureCategory.COMPLETE, "Nauza mahindi yangu kwa wafanyabiashara wa soko la Githunguri, kwa sababu wanalipa pesa taslimu siku hiyo hiyo.", "No unresolved information; sale destination and reason are supplied.", "Githunguri market traders and same-day cash reason are supplied.", expectedMissingIds = emptyList()),
+        )
+
+        private fun unhelpfulFixtures() = listOf(
+            sourceFixture("Q7", FixtureCategory.UNHELPFUL, "Funza jeshi ni wadudu wabaya sana, wakulima wengi huwaongelea.", "Whether the respondent was affected and resulting damage/loss.", "Only a general statement about FAW is supplied."),
+            sourceFixture("Q8", FixtureCategory.UNHELPFUL, "Kuvuna mapema ni jambo zuri, lakini inategemea na mvua.", "Maximum acceptable yield loss for earlier harvest.", "Only a general view of early harvest is supplied."),
+            sourceFixture("Q9", FixtureCategory.UNHELPFUL, "Wadudu na magonjwa ni changamoto kubwa kwa wakulima wote.", "A measurable threshold for changing variety.", "Only a general statement about pests and diseases is supplied."),
+            sourceFixture("Q10", FixtureCategory.UNHELPFUL, "Aina mpya za mahindi zinatoka kila mwaka siku hizi.", "Required characteristics of a replacement variety.", "Only a general statement about new varieties is supplied."),
+            sourceFixture("Q11", FixtureCategory.UNHELPFUL, "Misimu mibaya imekuwa mingi siku hizi kwa sababu ya hali ya hewa.", "Lowest acceptable yield in a bad season.", "Only a general statement about bad seasons is supplied."),
+            sourceFixture("Q12", FixtureCategory.UNHELPFUL, "Ukame ni tatizo kubwa sana hapa kwetu.", "Maize growth stage with greatest drought loss.", "Only a general statement about drought is supplied."),
+            sourceFixture("Q13", FixtureCategory.UNHELPFUL, "Mahindi ni muhimu sana kwa kila familia.", "Criteria for allocating maize.", "Only a general statement about maize is supplied."),
+            sourceFixture("Q14", FixtureCategory.UNHELPFUL, "Mahindi meupe ni chakula kizuri, kwa watu na kwa mifugo.", "Animals fed white maize and feeding frequency.", "No respondent livestock or frequency is supplied.", expectedMissingIds = listOf("animals", "feeding_frequency")),
+            sourceFixture("Q15", FixtureCategory.UNHELPFUL, "Mbegu nzuri ni muhimu ili upate mavuno mazuri.", "Usual seed source and reason for preferring it.", "No source or preference reason is supplied.", expectedMissingIds = listOf("seed_source", "source_reason")),
+            sourceFixture("Q16", FixtureCategory.UNHELPFUL, "Bei ya mahindi hubadilika sana kila msimu.", "Usual sale destination and reason for preferring it.", "No destination or preference reason is supplied.", expectedMissingIds = listOf("sale_destination", "destination_reason")),
+        )
+
+        private fun sourceFixture(nodeId: String, category: FixtureCategory, answer: String, semanticUnresolvedTarget: String, suppliedInformation: String, expectedMissingIds: List<String>? = null) = SemanticFixture(
+            fixtureId = "${nodeId}_${category.name}",
+            nodeId = nodeId,
+            category = category,
+            answer = answer,
+            expectedDecision = if (category == FixtureCategory.COMPLETE) SurveyAiDecision.ACHIEVED else SurveyAiDecision.GENERATE,
+            expectedMissingIds = expectedMissingIds,
+            semanticUnresolvedTarget = semanticUnresolvedTarget,
+            suppliedInformation = suppliedInformation,
+            expectsFollowup = category != FixtureCategory.COMPLETE,
         )
     }
 }

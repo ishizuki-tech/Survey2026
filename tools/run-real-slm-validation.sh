@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Runs the Issue #81 real-model fixtures against a local, side-by-side debug build.
+# Runs the Issue #92 categorized real-model fixtures against a local, side-by-side debug build.
 set -euo pipefail
 
 APP_PACKAGE="com.negi.survey.local"
 TEST_CLASS="com.negi.survey.screens.RealLiteRtAiFollowupFlowInstrumentationTest"
 TEST_METHOD="${TEST_CLASS}#q7_q16_real_model_fixture_runner"
 QUESTIONS=(Q7 Q8 Q9 Q10 Q11 Q12 Q13 Q14 Q15 Q16)
+CATEGORIES=(COMPLETE PARTIAL UNHELPFUL)
 ITERATIONS=1
 SERIAL=""
 
@@ -14,7 +15,7 @@ usage() {
 Usage: ./tools/run-real-slm-validation.sh [--serial SERIAL] [--iterations N]
 
 Builds a local debug package with a versionCode one greater than the installed
-com.negi.survey.local package, runs the Issue #81 Q7-Q16 instrumentation
+com.negi.survey.local package, runs the Issue #92 categorized Q7-Q16 instrumentation
 fixtures, and copies that run's NDJSON and CSV results into
 build/real-model-validation/.
 EOF
@@ -45,8 +46,9 @@ done
 
 [[ "$ITERATIONS" =~ ^[1-9][0-9]*$ ]] || { echo "--iterations must be a positive integer" >&2; exit 2; }
 
-EXPECTED_RECORD_COUNT=$(( ${#QUESTIONS[@]} * ITERATIONS ))
+EXPECTED_RECORD_COUNT=$(( ${#QUESTIONS[@]} * ${#CATEGORIES[@]} * ITERATIONS ))
 QUESTION_LIST_JSON="$(printf '%s\n' "${QUESTIONS[@]}" | jq -R . | jq -sc .)"
+CATEGORY_LIST_JSON="$(printf '%s\n' "${CATEGORIES[@]}" | jq -R . | jq -sc .)"
 
 # A candidate must contain the complete Q7-Q16 fixture matrix for this run.
 # Keeping this as the single acceptance predicate makes the direct app-private
@@ -56,12 +58,14 @@ artifact_validation_report() {
     --arg run_id "$RESULT_RUN_ID" \
     --argjson expected_count "$EXPECTED_RECORD_COUNT" \
     --argjson iterations "$ITERATIONS" \
-    --argjson questions "$QUESTION_LIST_JSON" '
-      def pair: "\(.nodeId)\u0000\(.iteration)";
+    --argjson questions "$QUESTION_LIST_JSON" \
+    --argjson categories "$CATEGORY_LIST_JSON" '
+      def pair: "\(.category)\u0000\(.nodeId)\u0000\(.iteration)";
       def expected_pairs:
-        [ $questions[] as $node
+        [ $categories[] as $category
+          | $questions[] as $node
           | range(1; $iterations + 1) as $iteration
-          | "\($node)\u0000\($iteration)"
+          | "\($category)\u0000\($node)\u0000\($iteration)"
         ];
       . as $records
       | [ $records[] | select(type != "object") ] as $non_objects
@@ -69,6 +73,8 @@ artifact_validation_report() {
           | select(type == "object")
           | select(
               .runId != $run_id or
+              (.fixtureId | type != "string") or
+              (.category | type != "string") or
               (.questionText | type != "string") or
               (.initialAnswer | type != "string") or
               (.rawEval | type != "string") or
@@ -76,7 +82,8 @@ artifact_validation_report() {
               ((.iteration | type) != "number") or
               (.iteration as $iteration | ($iteration | floor) != $iteration) or
               (.iteration < 1 or .iteration > $iterations) or
-              (.nodeId as $node | ($questions | index($node)) == null)
+              (.nodeId as $node | ($questions | index($node)) == null) or
+              (.category as $category | ($categories | index($category)) == null)
             )
         ] as $invalid_records
       | [ $records[] | select(type == "object") | pair ] as $actual_pairs
@@ -112,7 +119,19 @@ artifact_validation_report() {
 }
 
 is_valid_result() {
-  artifact_validation_report "$1" | jq -e '.valid' >/dev/null 2>&1
+  local candidate="$1"
+  local diagnostics="$RESULT_DIR/$(basename "$candidate").jq-validation.stderr"
+
+  # `adb shell run-as` can print a textual package error while returning zero.
+  # This is an intentionally probed, non-authoritative candidate: retain jq's
+  # diagnostic for inspection and fall through to the structured-logcat source
+  # instead of emitting an unexplained parser error during a successful run.
+  if ! jq -e -s 'all(type == "object")' "$candidate" >/dev/null 2>"$diagnostics"; then
+    echo "Skipping non-NDJSON result candidate: $candidate (jq diagnostic: $diagnostics)" >&2
+    return 1
+  fi
+
+  artifact_validation_report "$candidate" | jq -e '.valid' >/dev/null
 }
 
 if [[ -z "$SERIAL" ]]; then
@@ -142,7 +161,7 @@ VALIDATION_VERSION_CODE=$((INSTALLED_VERSION_CODE + 1))
 
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 RESULT_DIR="build/real-model-validation/$STAMP"
-RESULT_RUN_ID="issue81_${STAMP}_$$"
+RESULT_RUN_ID="issue92_${STAMP}_$$"
 DEVICE_RESULT_PATH="files/real_model_test_results/${RESULT_RUN_ID}.ndjson"
 mkdir -p "$RESULT_DIR"
 
@@ -272,12 +291,13 @@ fi
 
 if [[ "$ARTIFACT_VALID" == true ]]; then
   jq -sr '
-    ["runId", "questionId", "iteration", "question", "answer", "rawEval", "rawFollowup", "acceptedFollowup", "productionParseSuccess", "productionPolicyDecision", "canonicalMissingPoints", "deterministicExpectationMatch", "classification", "expectedLanguage", "languageReviewStatus", "languageReviewNote", "evalTimedOut", "followupTimedOut", "evalError", "followupError", "evalObservedElapsedMs", "followupObservedElapsedMs", "overallElapsedMs"],
+    ["runId", "fixtureId", "questionId", "category", "iteration", "question", "answer", "rawEval", "rawFollowup", "acceptedFollowup", "productionParseSuccess", "productionPolicyDecision", "expectedDecisionMatch", "canonicalMissingPoints", "deterministicExpectationMatch", "expectedFollowup", "followupBehaviorMatch", "unnecessaryFollowup", "unexpectedNoFollowup", "classification", "expectedLanguage", "languageReviewStatus", "languageReviewNote", "evalTimedOut", "followupTimedOut", "evalError", "followupError", "evalObservedElapsedMs", "followupObservedElapsedMs", "overallElapsedMs"],
     (.[] | [
-      .runId, .nodeId, .iteration, .questionText, .initialAnswer, .rawEval,
+      .runId, .fixtureId, .nodeId, .category, .iteration, .questionText, .initialAnswer, .rawEval,
       .rawFollowup, .acceptedFollowup, .productionParseSuccess,
-      .productionPolicyDecision, (.canonicalMissingPoints | @json),
-      .deterministicExpectationMatch, .classification, .expectedLanguage,
+      .productionPolicyDecision, .expectedDecisionMatch, (.canonicalMissingPoints | @json),
+      .deterministicExpectationMatch, .expectedFollowup, .followupBehaviorMatch,
+      .unnecessaryFollowup, .unexpectedNoFollowup, .classification, .expectedLanguage,
       .languageReviewStatus, .languageReviewNote, .evalTimedOut,
       .followupTimedOut, .evalError, .followupError, .evalObservedElapsedMs,
       .followupObservedElapsedMs, .overallElapsedMs
@@ -323,32 +343,34 @@ if [[ "$GRADLE_STATUS" -ne 0 ]]; then
 fi
 
 if [[ "$ARTIFACT_VALID" != true ]]; then
-  echo "Instrumentation passed, but Issue #81 artifact extraction failed." >&2
+  echo "Instrumentation passed, but Issue #92 artifact extraction failed." >&2
   echo "Expected: $DEVICE_RESULT_PATH" >&2
   echo "Diagnostics: $RESULT_DIR/result-extraction-diagnostics.txt" >&2
   exit 3
 fi
 
 echo
-echo "Per-question fixture summary"
-printf '%-5s %-5s %-10s %-12s %-10s %-14s %-8s %-10s\n' \
-  "Question" "Runs" "ValidEval" "MissingMatch" "Followup" "SemanticReview" "Failures" "AvgMs"
+echo "Per-question and category fixture summary"
+printf '%-5s %-10s %-5s %-10s %-12s %-10s %-10s %-10s %-10s %-8s %-10s\n' \
+  "Question" "Category" "Runs" "ValidEval" "MissingMatch" "Followup" "NoFollowup" "Unnecessary" "DecisionMis" "Failures" "AvgMs"
 for NODE in "${QUESTIONS[@]}"; do
-  RUNS="$(jq -s --arg node "$NODE" '[.[] | select(.nodeId == $node)] | length' "$RESULT_DIR/results.ndjson")"
-  VALID_EVAL="$(jq -s --arg node "$NODE" '[.[] | select(.nodeId == $node and .productionParseSuccess == true and .productionPolicyDecision != "FAILURE")] | length' "$RESULT_DIR/results.ndjson")"
-  DETERMINISTIC_COUNT="$(jq -s --arg node "$NODE" '[.[] | select(.nodeId == $node and .deterministicExpectationMatch != null)] | length' "$RESULT_DIR/results.ndjson")"
-  if [[ "$DETERMINISTIC_COUNT" -eq 0 ]]; then
-    MISSING_MATCH="n/a"
-  else
-    MATCHED="$(jq -s --arg node "$NODE" '[.[] | select(.nodeId == $node and .deterministicExpectationMatch == true)] | length' "$RESULT_DIR/results.ndjson")"
-    MISSING_MATCH="$MATCHED/$DETERMINISTIC_COUNT"
-  fi
-  FOLLOWUP="$(jq -s --arg node "$NODE" '[.[] | select(.nodeId == $node and .followupAccepted == true)] | length' "$RESULT_DIR/results.ndjson")"
-  SEMANTIC_REVIEW="$(jq -s --arg node "$NODE" '[.[] | select(.nodeId == $node and .classification == "SEMANTIC_REVIEW")] | length' "$RESULT_DIR/results.ndjson")"
-  FAILURES="$(jq -s --arg node "$NODE" '[.[] | select(.nodeId == $node and (.classification == "TIMEOUT" or .classification == "RUNTIME_ERROR"))] | length' "$RESULT_DIR/results.ndjson")"
-  AVG_MS="$(jq -sr --arg node "$NODE" '[.[] | select(.nodeId == $node) | .overallElapsedMs] | if length == 0 then "n/a" else ((add / length) | floor | tostring) end' "$RESULT_DIR/results.ndjson")"
-  printf '%-5s %-5s %-10s %-12s %-10s %-14s %-8s %-10s\n' \
-    "$NODE" "$RUNS" "$VALID_EVAL/$RUNS" "$MISSING_MATCH" "$FOLLOWUP/$RUNS" "$SEMANTIC_REVIEW" "$FAILURES" "$AVG_MS"
+  for CATEGORY in "${CATEGORIES[@]}"; do
+    RUNS="$(jq -s --arg node "$NODE" --arg category "$CATEGORY" '[.[] | select(.nodeId == $node and .category == $category)] | length' "$RESULT_DIR/results.ndjson")"
+    VALID_EVAL="$(jq -s --arg node "$NODE" --arg category "$CATEGORY" '[.[] | select(.nodeId == $node and .category == $category and .productionParseSuccess == true and .productionPolicyDecision != "FAILURE")] | length' "$RESULT_DIR/results.ndjson")"
+    DETERMINISTIC_COUNT="$(jq -s --arg node "$NODE" --arg category "$CATEGORY" '[.[] | select(.nodeId == $node and .category == $category and .deterministicExpectationMatch != null)] | length' "$RESULT_DIR/results.ndjson")"
+    if [[ "$DETERMINISTIC_COUNT" -eq 0 ]]; then MISSING_MATCH="n/a"; else
+      MATCHED="$(jq -s --arg node "$NODE" --arg category "$CATEGORY" '[.[] | select(.nodeId == $node and .category == $category and .deterministicExpectationMatch == true)] | length' "$RESULT_DIR/results.ndjson")"
+      MISSING_MATCH="$MATCHED/$DETERMINISTIC_COUNT"
+    fi
+    FOLLOWUP="$(jq -s --arg node "$NODE" --arg category "$CATEGORY" '[.[] | select(.nodeId == $node and .category == $category and .followupAccepted == true)] | length' "$RESULT_DIR/results.ndjson")"
+    NO_FOLLOWUP="$(jq -s --arg node "$NODE" --arg category "$CATEGORY" '[.[] | select(.nodeId == $node and .category == $category and .unexpectedNoFollowup == true)] | length' "$RESULT_DIR/results.ndjson")"
+    UNNECESSARY="$(jq -s --arg node "$NODE" --arg category "$CATEGORY" '[.[] | select(.nodeId == $node and .category == $category and .unnecessaryFollowup == true)] | length' "$RESULT_DIR/results.ndjson")"
+    DECISION_MISMATCH="$(jq -s --arg node "$NODE" --arg category "$CATEGORY" '[.[] | select(.nodeId == $node and .category == $category and .expectedDecisionMatch == false)] | length' "$RESULT_DIR/results.ndjson")"
+    FAILURES="$(jq -s --arg node "$NODE" --arg category "$CATEGORY" '[.[] | select(.nodeId == $node and .category == $category and (.classification == "TIMEOUT" or .classification == "RUNTIME_ERROR"))] | length' "$RESULT_DIR/results.ndjson")"
+    AVG_MS="$(jq -sr --arg node "$NODE" --arg category "$CATEGORY" '[.[] | select(.nodeId == $node and .category == $category) | .overallElapsedMs] | if length == 0 then "n/a" else ((add / length) | floor | tostring) end' "$RESULT_DIR/results.ndjson")"
+    printf '%-5s %-10s %-5s %-10s %-12s %-10s %-10s %-10s %-10s %-8s %-10s\n' \
+      "$NODE" "$CATEGORY" "$RUNS" "$VALID_EVAL/$RUNS" "$MISSING_MATCH" "$FOLLOWUP/$RUNS" "$NO_FOLLOWUP" "$UNNECESSARY" "$DECISION_MISMATCH" "$FAILURES" "$AVG_MS"
+  done
 done
 echo
 echo "Classification counts"
