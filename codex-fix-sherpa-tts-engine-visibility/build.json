@@ -1,0 +1,12 @@
+{
+  "original_branch": "codex/fix-sherpa-tts-engine-visibility",
+  "branch_slug": "codex-fix-sherpa-tts-engine-visibility",
+  "commit_sha": "db8f96600c71ae4a2e3bfe3d9f0987da2a0f5119",
+  "short_sha": "db8f966",
+  "apk_name": "Survey2026-codex-fix-sherpa-tts-engine-visibility-db8f966.apk",
+  "apk_sha256": "38b66f41b8ce4ed845e9811019029f1ed7a6685b56fcf284b4c7b30d5e4a3c51",
+  "apk_download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-codex-fix-sherpa-tts-engine-visibility-db8f966-run-119/Survey2026-codex-fix-sherpa-tts-engine-visibility-db8f966.apk",
+  "page_url": "https://ishizuki-tech.github.io/Survey2026/codex-fix-sherpa-tts-engine-visibility/",
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/37828233755",
+  "generated_utc": "2026-10-08T19:22:37Z"
+}
