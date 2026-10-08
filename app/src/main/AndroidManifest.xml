@@ -143,6 +143,13 @@
         android:name="android.hardware.microphone"
         android:required="false" />
 
+    <!-- Allow discovery of installed Android TTS engines. -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.TTS_SERVICE" />
+        </intent>
+    </queries>
+
 
     <!-- ============================================================= -->
     <!-- Application -->
