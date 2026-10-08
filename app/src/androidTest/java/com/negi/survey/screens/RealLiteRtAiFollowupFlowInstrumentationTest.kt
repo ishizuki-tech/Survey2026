@@ -1,6 +1,7 @@
 package com.negi.survey.screens
 
 import android.os.SystemClock
+import android.util.Base64
 import android.util.Log
 import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.mutableStateOf
@@ -58,7 +59,10 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
     @Test
     fun q7_q16_real_model_fixture_runner() {
         val iterations = instrumentationInt("ITERATIONS")?.coerceAtLeast(1) ?: 1
-        val report = ResultReporter(appCtx.filesDir)
+        val report = ResultReporter(
+            filesDir = appCtx.filesDir,
+            runId = instrumentationString("RESULT_RUN_ID"),
+        )
         val classifications = linkedMapOf<ResultClassification, Int>()
         var stoppedAfterTimeout = false
         val fixture = hostAiScreen()
@@ -73,7 +77,7 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
                     )
                 }
                 val result = attempt.getOrElse { error ->
-                    failedFixtureResult(fixtureCase, iteration, error)
+                    failedFixtureResult(fixture, fixtureCase, iteration, error)
                 }
                 report.append(result)
                 classifications[result.classification] =
@@ -334,6 +338,7 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
             )
         }
         composeRule.waitForIdle()
+        Log.i(TAG, "REAL_AI_FIXTURE_HOST_READY")
         return Fixture(vmSurvey) { nodeId -> activeNodeId.value = nodeId }
     }
 
@@ -362,6 +367,8 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
         val surveyUuid = fixture.survey.surveyUuid.value
         val contextKey = "sid=$sessionId|nid=$nodeId"
         waitForFreshContext(contextKey)
+        val questionText = fixture.survey.getQuestion(nodeId)
+        assertTrue("$nodeId question text must be present", questionText.isNotBlank())
 
         assertTrue("sessionId must change for $nodeId iteration $iteration", sessionId != previousSessionId)
         assertTrue("surveyUuid must change for $nodeId iteration $iteration", surveyUuid != previousSurveyUuid)
@@ -434,6 +441,7 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
         return FixtureResult(
             nodeId = nodeId,
             iteration = iteration,
+            questionText = questionText,
             answer = fixtureCase.answer,
             semanticUnresolvedTarget = fixtureCase.semanticUnresolvedTarget,
             suppliedInformation = fixtureCase.suppliedInformation,
@@ -463,6 +471,16 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
             overallElapsedMs = SystemClock.elapsedRealtime() - startedAt,
             composerRole = conversation.role.name,
             classification = classification,
+            languageReviewStatus = if (generation?.raw.isNullOrBlank()) {
+                LanguageReviewStatus.NOT_APPLICABLE
+            } else {
+                LanguageReviewStatus.REVIEW
+            },
+            languageReviewNote = if (generation?.raw.isNullOrBlank()) {
+                "No generated follow-up is available for language review."
+            } else {
+                "Manual Swahili review required; no automatic language detector is used."
+            },
         )
     }
 
@@ -623,6 +641,18 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
         SEMANTIC_REVIEW,
     }
 
+    /**
+     * Report-only language review state. The test deliberately does not infer
+     * language quality from word lists: a reviewer classifies generated text
+     * as PASS, REVIEW, or FAIL after inspecting the saved artifact.
+     */
+    private enum class LanguageReviewStatus {
+        PASS,
+        REVIEW,
+        FAIL,
+        NOT_APPLICABLE,
+    }
+
     private enum class Issue77PostHandoffClassification {
         VALID_SINGLE_OBJECT,
         CONCATENATED_OBJECTS,
@@ -635,6 +665,7 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
     private data class FixtureResult(
         val nodeId: String,
         val iteration: Int,
+        val questionText: String,
         val answer: String,
         val semanticUnresolvedTarget: String,
         val suppliedInformation: String,
@@ -664,6 +695,8 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
         val overallElapsedMs: Long,
         val composerRole: String,
         val classification: ResultClassification,
+        val languageReviewStatus: LanguageReviewStatus,
+        val languageReviewNote: String,
     )
 
     private fun classify(
@@ -689,6 +722,7 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
     }
 
     private fun failedFixtureResult(
+        fixture: Fixture,
         fixtureCase: SemanticFixture,
         iteration: Int,
         error: Throwable,
@@ -697,6 +731,7 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
         return FixtureResult(
             nodeId = fixtureCase.nodeId,
             iteration = iteration,
+            questionText = runCatching { fixture.survey.getQuestion(fixtureCase.nodeId) }.getOrDefault(""),
             answer = fixtureCase.answer,
             semanticUnresolvedTarget = fixtureCase.semanticUnresolvedTarget,
             suppliedInformation = fixtureCase.suppliedInformation,
@@ -726,21 +761,38 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
             overallElapsedMs = 0L,
             composerRole = "UNKNOWN",
             classification = if (timedOut) ResultClassification.TIMEOUT else ResultClassification.RUNTIME_ERROR,
+            languageReviewStatus = LanguageReviewStatus.NOT_APPLICABLE,
+            languageReviewNote = "No generated follow-up is available for language review.",
         )
     }
 
     /** Test-only NDJSON evidence sink; it is intentionally outside production trace directories. */
-    private class ResultReporter(filesDir: File) {
+    private class ResultReporter(
+        filesDir: File,
+        runId: String?,
+    ) {
+        private val normalizedRunId = runId
+            ?.replace(Regex("[^A-Za-z0-9_.-]"), "_")
+            ?.takeIf { it.isNotBlank() }
+            ?: "issue81_${System.currentTimeMillis()}"
+        private var nextRecordSequence = 1
         val file = File(
             File(filesDir, "real_model_test_results").apply { mkdirs() },
-            "issue81_${System.currentTimeMillis()}.ndjson",
+            "$normalizedRunId.ndjson",
         )
+
+        init {
+            file.createNewFile()
+            Log.i(TAG, "REAL_AI_FIXTURE_REPORT_PATH runId=$normalizedRunId path=${file.absolutePath}")
+        }
 
         fun append(result: FixtureResult) {
             val record = JSONObject().apply {
-                put("schemaVersion", 1)
+                put("schemaVersion", 2)
+                put("runId", normalizedRunId)
                 put("nodeId", result.nodeId)
                 put("iteration", result.iteration)
+                put("questionText", result.questionText)
                 put("initialAnswer", result.answer)
                 put("semanticUnresolvedTarget", result.semanticUnresolvedTarget)
                 put("suppliedInformation", result.suppliedInformation)
@@ -770,15 +822,47 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
                 put("overallElapsedMs", result.overallElapsedMs)
                 put("composerRole", result.composerRole)
                 put("classification", result.classification.name)
+                put("expectedLanguage", "sw")
+                put("languageReviewStatus", result.languageReviewStatus.name)
+                put("languageReviewNote", result.languageReviewNote)
             }
-            file.appendText(record.toString() + "\n")
-            Log.i(TAG, "REAL_AI_FIXTURE_NDJSON $record")
+            val recordText = record.toString()
+            // The shell runner first tries this app-private file. It is fsynced
+            // before the teardown-safe logcat export is emitted.
+            // Sync each fixture so a process teardown cannot lose already-observed evidence.
+            FileOutputStream(file, true).use { output ->
+                output.write((recordText + "\n").toByteArray(Charsets.UTF_8))
+                output.fd.sync()
+            }
+            val recordSequence = nextRecordSequence++
+            exportToLogcat(recordText, recordSequence)
+            Log.i(
+                TAG,
+                "REAL_AI_FIXTURE_NDJSON runId=$normalizedRunId record=$recordSequence bytes=${recordText.length}",
+            )
             Log.i(
                 TAG,
                 "REAL_AI_FIXTURE_RESULT node=${result.nodeId} iter=${result.iteration} " +
                     "classification=${result.classification} decision=${result.policyDecision} " +
                     "missing=${result.canonicalMissingPoints} report=${file.absolutePath}",
             )
+        }
+
+        /**
+         * Connected instrumentation can uninstall the side-by-side target package
+         * before the host runner can use run-as. Emit a bounded, exact-run export
+         * after the durable app-private append so the runner can reconstruct raw
+         * NDJSON from its run-scoped logcat capture without selecting stale output.
+         */
+        private fun exportToLogcat(recordText: String, recordSequence: Int) {
+            val encoded = Base64.encodeToString(recordText.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
+            val chunks = encoded.chunked(LOGCAT_EXPORT_CHUNK_CHARS)
+            chunks.forEachIndexed { index, chunk ->
+                Log.i(
+                    TAG,
+                    "REAL_AI_FIXTURE_EXPORT|$normalizedRunId|$recordSequence|${index + 1}|${chunks.size}|$chunk",
+                )
+            }
         }
     }
 
@@ -789,6 +873,7 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
         const val ISSUE77_NODE_ID = "Q10"
         const val ISSUE77_WHISPER_MODEL_ASSET = "models/ggml-small-q5_1.bin"
         const val ISSUE77_WHISPER_FIXTURE_ASSET = "whisper/jfk.wav"
+        const val LOGCAT_EXPORT_CHUNK_CHARS = 2_500
 
         val FIXTURES = listOf(
             SemanticFixture(

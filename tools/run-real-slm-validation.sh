@@ -4,6 +4,7 @@ set -euo pipefail
 
 APP_PACKAGE="com.negi.survey.local"
 TEST_CLASS="com.negi.survey.screens.RealLiteRtAiFollowupFlowInstrumentationTest"
+TEST_METHOD="${TEST_CLASS}#q7_q16_real_model_fixture_runner"
 QUESTIONS=(Q7 Q8 Q9 Q10 Q11 Q12 Q13 Q14 Q15 Q16)
 ITERATIONS=1
 SERIAL=""
@@ -14,7 +15,8 @@ Usage: ./tools/run-real-slm-validation.sh [--serial SERIAL] [--iterations N]
 
 Builds a local debug package with a versionCode one greater than the installed
 com.negi.survey.local package, runs the Issue #81 Q7-Q16 instrumentation
-fixtures, and copies the newest NDJSON result into build/real-model-validation/.
+fixtures, and copies that run's NDJSON and CSV results into
+build/real-model-validation/.
 EOF
 }
 
@@ -70,6 +72,8 @@ VALIDATION_VERSION_CODE=$((INSTALLED_VERSION_CODE + 1))
 
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 RESULT_DIR="build/real-model-validation/$STAMP"
+RESULT_RUN_ID="issue81_${STAMP}_$$"
+DEVICE_RESULT_PATH="files/real_model_test_results/${RESULT_RUN_ID}.ndjson"
 mkdir -p "$RESULT_DIR"
 
 cat > "$RESULT_DIR/metadata.txt" <<EOF
@@ -82,6 +86,8 @@ package=$APP_PACKAGE
 installed_version_code=$INSTALLED_VERSION_CODE
 validation_version_code=$VALIDATION_VERSION_CODE
 iterations=$ITERATIONS
+result_run_id=$RESULT_RUN_ID
+expected_device_result_path=$DEVICE_RESULT_PATH
 EOF
 
 echo "Real SLM validation"
@@ -91,6 +97,12 @@ echo "Android: $ANDROID_VERSION (API $API_LEVEL)"
 echo "Installed $APP_PACKAGE versionCode: $INSTALLED_VERSION_CODE"
 echo "Validation build versionCode: $VALIDATION_VERSION_CODE"
 echo "Iterations: $ITERATIONS"
+echo "Expected device result: $DEVICE_RESULT_PATH"
+
+# Gradle's connected-test reports do not contain Android Log.i output. Capture
+# this run's logcat before testing: app-private NDJSON is preferred, while the
+# exact-run structured export survives connected-test package teardown.
+adb -s "$SERIAL" logcat -c
 
 set +e
 ANDROID_SERIAL="$SERIAL" ./gradlew :app:connectedDebugAndroidTest --no-daemon \
@@ -100,28 +112,150 @@ ANDROID_SERIAL="$SERIAL" ./gradlew :app:connectedDebugAndroidTest --no-daemon \
   -Pdebug.embedSecrets=false \
   -Prelease.allowSecrets=false \
   -Pandroid.testInstrumentationRunnerArguments.clearPackageData=false \
-  -Pandroid.testInstrumentationRunnerArguments.class="$TEST_CLASS" \
+  -Pandroid.testInstrumentationRunnerArguments.class="$TEST_METHOD" \
   -Pandroid.testInstrumentationRunnerArguments.ITERATIONS="$ITERATIONS" \
+  -Pandroid.testInstrumentationRunnerArguments.RESULT_RUN_ID="$RESULT_RUN_ID" \
   2>&1 | tee "$RESULT_DIR/gradle.log"
 GRADLE_STATUS=${PIPESTATUS[0]}
 set -e
 
-NDJSON_PATH="$(adb -s "$SERIAL" shell run-as "$APP_PACKAGE" sh -c 'ls -1t files/real_model_test_results/*.ndjson 2>/dev/null | head -n 1' 2>/dev/null | tr -d '\r')"
-if [[ -n "$NDJSON_PATH" ]]; then
-  adb -s "$SERIAL" shell run-as "$APP_PACKAGE" cat "$NDJSON_PATH" > "$RESULT_DIR/results.ndjson"
-  RESULT_SOURCE="app-private NDJSON"
+adb -s "$SERIAL" logcat -d -v threadtime -s 'RealLiteRtAiFollowup:I' \
+  > "$RESULT_DIR/device-logcat.txt" 2>&1 || true
+
+is_valid_result() {
+  jq -se --arg run_id "$RESULT_RUN_ID" \
+    'length > 0 and all(.[]; type == "object" and .runId == $run_id and
+      (.questionText | type == "string") and (.initialAnswer | type == "string") and
+      (.rawEval | type == "string"))' "$1" >/dev/null 2>&1
+}
+
+APP_PRIVATE_RESULT="$RESULT_DIR/app-private-extraction.out"
+set +e
+adb -s "$SERIAL" exec-out run-as "$APP_PACKAGE" cat "$DEVICE_RESULT_PATH" \
+  > "$APP_PRIVATE_RESULT" 2> "$RESULT_DIR/result-extraction.stderr"
+EXTRACTION_STATUS=$?
+set -e
+
+RESULT_SOURCE=""
+ARTIFACT_VALID=false
+if [[ "$EXTRACTION_STATUS" -eq 0 ]] && is_valid_result "$APP_PRIVATE_RESULT"; then
+  cp "$APP_PRIVATE_RESULT" "$RESULT_DIR/results.ndjson"
+  ARTIFACT_VALID=true
+  RESULT_SOURCE="app-private run-specific NDJSON ($DEVICE_RESULT_PATH)"
 else
-  LOGCAT_REPORT="$(rg -l 'REAL_AI_FIXTURE_NDJSON' app/build/outputs/androidTest-results/connected/debug 2>/dev/null | tail -n 1 || true)"
-  if [[ -n "$LOGCAT_REPORT" ]]; then
-    cp "$LOGCAT_REPORT" "$RESULT_DIR/instrumentation-logcat.txt"
-    sed -n 's/.*REAL_AI_FIXTURE_NDJSON //p' "$LOGCAT_REPORT" > "$RESULT_DIR/results.ndjson"
-    RESULT_SOURCE="instrumentation log fallback"
+  LOGCAT_EXPORT="$RESULT_DIR/logcat-export.base64"
+  set +e
+  awk -F '|' -v run_id="$RESULT_RUN_ID" '
+    BEGIN { bad = 0; found = 0 }
+    index($1, "REAL_AI_FIXTURE_EXPORT") == 0 { next }
+    $2 != run_id { next }
+    $3 !~ /^[0-9]+$/ || $4 !~ /^[0-9]+$/ || $5 !~ /^[0-9]+$/ ||
+      $6 !~ /^[A-Za-z0-9+\/=]+$/ { bad = 1; next }
+    {
+      record = $3
+      if (!(record in total)) {
+        total[record] = $5
+        next_chunk[record] = 1
+      }
+      if ($5 != total[record] || $4 != next_chunk[record]) {
+        bad = 1
+      } else {
+        payload[record] = payload[record] $6
+        next_chunk[record]++
+        found = 1
+      }
+    }
+    END {
+      if (!found) bad = 1
+      for (record in total) {
+        if (next_chunk[record] - 1 != total[record]) {
+          bad = 1
+        } else {
+          print record "\t" payload[record]
+        }
+      }
+      exit bad
+    }
+  ' "$RESULT_DIR/device-logcat.txt" | sort -n -k1,1 | cut -f2 > "$LOGCAT_EXPORT"
+  LOGCAT_EXPORT_STATUS=${PIPESTATUS[0]}
+  set -e
+
+  LOGCAT_RECONSTRUCTED="$RESULT_DIR/logcat-reconstructed.ndjson"
+  : > "$LOGCAT_RECONSTRUCTED"
+  LOGCAT_DECODE_STATUS=0
+  if printf 'TQ==' | base64 -d >/dev/null 2>&1; then
+    BASE64_DECODE_FLAG="-d"
+  else
+    BASE64_DECODE_FLAG="-D"
+  fi
+  if [[ "$LOGCAT_EXPORT_STATUS" -eq 0 ]]; then
+    while IFS= read -r encoded; do
+      if ! printf '%s' "$encoded" | base64 "$BASE64_DECODE_FLAG" >> "$LOGCAT_RECONSTRUCTED"; then
+        LOGCAT_DECODE_STATUS=1
+        break
+      fi
+      printf '\n' >> "$LOGCAT_RECONSTRUCTED"
+    done < "$LOGCAT_EXPORT"
+  else
+    LOGCAT_DECODE_STATUS=1
+  fi
+
+  if [[ "$LOGCAT_DECODE_STATUS" -eq 0 ]] && is_valid_result "$LOGCAT_RECONSTRUCTED"; then
+    cp "$LOGCAT_RECONSTRUCTED" "$RESULT_DIR/results.ndjson"
+    ARTIFACT_VALID=true
+    RESULT_SOURCE="run-specific structured logcat export ($RESULT_RUN_ID)"
   fi
 fi
 
-if [[ ! -s "$RESULT_DIR/results.ndjson" ]]; then
-  echo "No Issue #81 structured result was found in app-private storage or instrumentation output." >&2
-  exit 1
+if [[ "$ARTIFACT_VALID" == true ]]; then
+  jq -sr '
+    ["runId", "questionId", "iteration", "question", "answer", "rawEval", "rawFollowup", "acceptedFollowup", "productionParseSuccess", "productionPolicyDecision", "canonicalMissingPoints", "deterministicExpectationMatch", "classification", "expectedLanguage", "languageReviewStatus", "languageReviewNote", "evalTimedOut", "followupTimedOut", "evalError", "followupError", "evalObservedElapsedMs", "followupObservedElapsedMs", "overallElapsedMs"],
+    (.[] | [
+      .runId, .nodeId, .iteration, .questionText, .initialAnswer, .rawEval,
+      .rawFollowup, .acceptedFollowup, .productionParseSuccess,
+      .productionPolicyDecision, (.canonicalMissingPoints | @json),
+      .deterministicExpectationMatch, .classification, .expectedLanguage,
+      .languageReviewStatus, .languageReviewNote, .evalTimedOut,
+      .followupTimedOut, .evalError, .followupError, .evalObservedElapsedMs,
+      .followupObservedElapsedMs, .overallElapsedMs
+    ]) | @csv
+  ' "$RESULT_DIR/results.ndjson" > "$RESULT_DIR/results.csv"
+else
+  {
+    echo "result_extraction_status=$EXTRACTION_STATUS"
+    echo "expected_device_result_path=$DEVICE_RESULT_PATH"
+    echo "app_private_result=$APP_PRIVATE_RESULT"
+    echo "app_private_directory_listing:"
+    adb -s "$SERIAL" shell run-as "$APP_PACKAGE" ls -la files/real_model_test_results 2>&1 || true
+    echo "logcat_export_status=${LOGCAT_EXPORT_STATUS:-not_attempted}"
+    echo "logcat_decode_status=${LOGCAT_DECODE_STATUS:-not_attempted}"
+    echo "device_log_markers:"
+    rg 'REAL_AI_FIXTURE_(REPORT_PATH|SUMMARY|RESULT|NDJSON|EXPORT)' "$RESULT_DIR/device-logcat.txt" || true
+  } > "$RESULT_DIR/result-extraction-diagnostics.txt"
+fi
+
+{
+  echo "gradle_status=$GRADLE_STATUS"
+  echo "artifact_valid=$ARTIFACT_VALID"
+  echo "result_source=${RESULT_SOURCE:-none}"
+  echo "result_extraction_status=$EXTRACTION_STATUS"
+} >> "$RESULT_DIR/metadata.txt"
+
+if [[ "$GRADLE_STATUS" -ne 0 ]]; then
+  echo "Instrumentation test failed; Gradle exit=$GRADLE_STATUS." >&2
+  if [[ "$ARTIFACT_VALID" == true ]]; then
+    echo "Partial fixture evidence was extracted from: $RESULT_SOURCE" >&2
+  else
+    echo "No valid result artifact was extracted; see $RESULT_DIR/result-extraction-diagnostics.txt" >&2
+  fi
+  exit "$GRADLE_STATUS"
+fi
+
+if [[ "$ARTIFACT_VALID" != true ]]; then
+  echo "Instrumentation passed, but Issue #81 artifact extraction failed." >&2
+  echo "Expected: $DEVICE_RESULT_PATH" >&2
+  echo "Diagnostics: $RESULT_DIR/result-extraction-diagnostics.txt" >&2
+  exit 3
 fi
 
 echo
