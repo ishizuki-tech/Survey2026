@@ -193,9 +193,6 @@ private const val TAG = "AiScreen"
 private const val TYPING_UPDATE_THROTTLE_MS = 90L
 private const val AUTO_SCROLL_THROTTLE_MS = 40L
 
-/** Debug-only crash button visibility. */
-private val SHOW_DEBUG_CRASH_BUTTON: Boolean = BuildConfig.DEBUG
-
 internal fun followupCapacityRemaining(entries: List<SurveyViewModel.FollowupEntry>, maxFollowups: Int = 2): Int =
     (maxFollowups - entries.size).coerceAtLeast(0)
 
@@ -1085,12 +1082,6 @@ fun AiScreen(
                             .fillMaxWidth()
                             .padding(top = 6.dp)
                     ) {
-                        if (SHOW_DEBUG_CRASH_BUTTON) {
-                            OutlinedButton(onClick = { throw RuntimeException("Debug crash button pressed") }) {
-                                Text("Crash now (debug)")
-                            }
-                        }
-
                         if (isTwoStepNode) {
                             if (BuildConfig.DEBUG) {
                                 aiReason?.let { Text("Status: ${it.wireValue.replace('_', ' ')}", modifier = Modifier.padding(horizontal = 12.dp)) }

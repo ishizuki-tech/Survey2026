@@ -49,6 +49,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -60,6 +61,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.outlined.NavigateBefore
 import androidx.compose.material.icons.automirrored.outlined.NavigateNext
 import androidx.compose.material.icons.automirrored.outlined.Send
 import androidx.compose.material.icons.filled.Mic
@@ -548,6 +550,7 @@ fun AudioPermissionGate(
         modifier = modifier
             .fillMaxSize()
             .imePadding()
+            .navigationBarsPadding()
             .background(backplate)
             .padding(24.dp),
         contentAlignment = Alignment.Center
@@ -1280,11 +1283,27 @@ fun SurveyNavHost(
                         }
                     }
 
+                    val homeBackScope = rememberCoroutineScope()
+
                     HomeScreen(
                         vmSurvey = vmSurvey,
                         speechController = speechController,
                         ttsController = ttsController,
                         speechEnabled = voiceEnabled,
+                        onBack = {
+                            Log.d(
+                                MainActivity.TAG,
+                                "Home -> Back requested; closing SLM and returning to selector. session=$sessionId"
+                            )
+                            homeBackScope.launch {
+                                runCatching { heavyRuntimeHandoff.releaseCurrent() }
+                                    .onFailure { t ->
+                                        Log.w(MainActivity.TAG, "Failed to release SLM on Home back.", t)
+                                    }
+                                vmAI.resetStates()
+                                onResetToSelector()
+                            }
+                        },
                         onStart = {
                             /** Snapshot the home note text before resetting the run. */
                             val homeNote = runFreeTextShadow
@@ -1588,6 +1607,7 @@ private fun InfoNodeScreen(
         modifier = Modifier
             .fillMaxSize()
             .imePadding()
+            .navigationBarsPadding()
             .background(backplate)
             .padding(24.dp),
         contentAlignment = Alignment.Center,
@@ -1652,6 +1672,7 @@ private fun StopNodeScreen(
         modifier = Modifier
             .fillMaxSize()
             .imePadding()
+            .navigationBarsPadding()
             .background(backplate)
             .padding(24.dp),
         contentAlignment = Alignment.Center,
@@ -1709,6 +1730,7 @@ internal fun TextNodeScreen(
         modifier = Modifier
             .fillMaxSize()
             .imePadding()
+            .navigationBarsPadding()
             .background(backplate)
             .padding(24.dp),
         contentAlignment = Alignment.Center
@@ -1788,6 +1810,7 @@ private fun SingleChoiceNodeScreen(
         modifier = Modifier
             .fillMaxSize()
             .imePadding()
+            .navigationBarsPadding()
             .background(backplate)
             .padding(24.dp),
         contentAlignment = Alignment.Center
@@ -1896,6 +1919,7 @@ private fun NumberNodeScreen(
         modifier = Modifier
             .fillMaxSize()
             .imePadding()
+            .navigationBarsPadding()
             .background(backplate)
             .padding(24.dp),
         contentAlignment = Alignment.Center,
@@ -1983,6 +2007,7 @@ private fun MultiChoiceNodeScreen(
         modifier = Modifier
             .fillMaxSize()
             .imePadding()
+            .navigationBarsPadding()
             .background(backplate)
             .padding(24.dp),
         contentAlignment = Alignment.Center
@@ -2065,12 +2090,36 @@ private fun RowButtons(
     secondaryLabel: String,
     onSecondary: () -> Unit
 ) {
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Button(onClick = onPrimary, enabled = primaryEnabled, modifier = Modifier.fillMaxWidth()) {
-            Text(primaryLabel)
-        }
-        OutlinedButton(onClick = onSecondary, modifier = Modifier.fillMaxWidth()) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        FilledTonalButton(
+            onClick = onSecondary,
+            shape = CircleShape,
+            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp)
+        ) {
+            Icon(
+                imageVector = Icons.AutoMirrored.Outlined.NavigateBefore,
+                contentDescription = secondaryLabel
+            )
+            Spacer(Modifier.width(8.dp))
             Text(secondaryLabel)
+        }
+
+        FilledTonalButton(
+            onClick = onPrimary,
+            enabled = primaryEnabled,
+            shape = CircleShape,
+            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp)
+        ) {
+            Text(primaryLabel)
+            Spacer(Modifier.width(8.dp))
+            Icon(
+                imageVector = Icons.AutoMirrored.Outlined.NavigateNext,
+                contentDescription = primaryLabel
+            )
         }
     }
 }
@@ -2087,6 +2136,7 @@ private fun HomeFreeTextComposer(
     speechTranscribing: Boolean,
     onToggleSpeech: (() -> Unit)?,
     onSend: () -> Unit,
+    onBack: () -> Unit,
     speechStatusText: String?,
     speechStatusIsError: Boolean,
     modifier: Modifier = Modifier
@@ -2178,18 +2228,38 @@ private fun HomeFreeTextComposer(
             )
         }
 
-        FilledTonalButton(
-            onClick = onSend,
-            enabled = enabled,
-            shape = CircleShape,
-            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp)
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
         ) {
-            Icon(
-                imageVector = Icons.AutoMirrored.Outlined.NavigateNext,
-                contentDescription = "Start"
-            )
-            Spacer(Modifier.width(8.dp))
-            Text("Start")
+            FilledTonalButton(
+                onClick = onBack,
+                enabled = enabled,
+                shape = CircleShape,
+                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.AutoMirrored.Outlined.NavigateBefore,
+                    contentDescription = "Back"
+                )
+                Spacer(Modifier.width(8.dp))
+                Text("Back")
+            }
+
+            FilledTonalButton(
+                onClick = onSend,
+                enabled = enabled,
+                shape = CircleShape,
+                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp)
+            ) {
+                Text("Start")
+                Spacer(Modifier.width(8.dp))
+                Icon(
+                    imageVector = Icons.AutoMirrored.Outlined.NavigateNext,
+                    contentDescription = "Start"
+                )
+            }
         }
     }
 }
@@ -2201,6 +2271,7 @@ private fun HomeScreen(
     ttsController: QuestionSpeaker,
     speechEnabled: Boolean,
     onStart: () -> Unit,
+    onBack: () -> Unit,
     onUpdateFreeText: (String) -> Unit
 ) {
     val backplate = appBackplate()
@@ -2382,6 +2453,7 @@ private fun HomeScreen(
         modifier = Modifier
             .fillMaxSize()
             .imePadding()
+            .navigationBarsPadding()
             .background(backplate)
             .padding(24.dp),
         contentAlignment = Alignment.Center
@@ -2450,7 +2522,8 @@ private fun HomeScreen(
                                     HOME_START_TIMEOUT_MS
                     },
                     speechStatusText = speechStatusText,
-                    speechStatusIsError = speechStatusIsError
+                    speechStatusIsError = speechStatusIsError,
+                    onBack = onBack
                 )
             }
         }
@@ -2790,6 +2863,7 @@ private fun PlaceholderScreen(
         modifier = Modifier
             .fillMaxSize()
             .imePadding()
+            .navigationBarsPadding()
             .background(backplate)
             .padding(24.dp),
         contentAlignment = Alignment.Center

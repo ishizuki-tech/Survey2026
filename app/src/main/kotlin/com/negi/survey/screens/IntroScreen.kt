@@ -66,6 +66,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
@@ -188,6 +189,7 @@ fun IntroScreen(
     Box(
         modifier = Modifier
             .fillMaxSize()
+            .navigationBarsPadding()
             .background(bgBrush)
             .semantics { contentDescription = "Survey intro screen" }
             .testTag("IntroScreenRoot")
@@ -208,19 +210,6 @@ fun IntroScreen(
                 onRestart = onRestart,
                 onResolveConfigDetails = onResolveConfigDetails,
             )
-
-            // Debug-only crash button.
-            if (BuildConfig.DEBUG) {
-                OutlinedButton(
-                    onClick = { throw RuntimeException("Debug crash button pressed") },
-                    modifier = Modifier
-                        .align(Alignment.BottomEnd)
-                        .padding(16.dp)
-                        .testTag("IntroDebugCrashButton")
-                ) {
-                    Text("Crash now (debug)")
-                }
-            }
         }
     }
 }
@@ -316,7 +305,7 @@ private fun IntroCardMono(
             contentColor = textPrimary
         ),
         modifier = Modifier
-            .padding(horizontal = 24.dp)
+            .padding(horizontal = 24.dp, vertical = 24.dp)
             .widthIn(max = cardMaxWidth)
             .wrapContentHeight()
             .wrapContentWidth()
