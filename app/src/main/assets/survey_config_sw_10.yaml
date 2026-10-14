@@ -8,6 +8,34 @@ graph:
       type: START
       title: Start
       question: Start
+      nextId: Observer
+
+    - id: Observer
+      type: TEXT
+      title: Mwangalizi
+      question: Jina la Mwangalizi
+      read_aloud: false
+      nextId: Interviewer
+
+    - id: Interviewer
+      type: TEXT
+      title: Mhoji
+      question: Jina la Mhoji
+      read_aloud: false
+      nextId: Respondent
+
+    - id: Respondent
+      type: TEXT
+      title: Mhojiwa
+      question: Jina la Mhojiwa
+      read_aloud: false
+      nextId: RespondentId
+
+    - id: RespondentId
+      type: TEXT
+      title: Kitambulisho cha Mhojiwa
+      question: Kitambulisho cha Mhojiwa
+      read_aloud: false
       nextId: Introduction
 
     - id: Introduction
@@ -55,7 +83,7 @@ graph:
 
     - id: Q1
       type: SINGLE_CHOICE
-      title: Sub-county na Ward
+      title: "Q1: Mahali"
       question: Unaishi sub-county na ward gani?
       options:
         - Githunguri – Githunguri
@@ -70,7 +98,7 @@ graph:
 
     - id: Q2
       type: SINGLE_CHOICE
-      title: Jinsia ya Mhojiwa
+      title: "Q2: Jinsia"
       question: Jinsia ya Mhojiwa
       options:
         - Mwanaume
@@ -80,7 +108,7 @@ graph:
 
     - id: Q3
       type: NUMBER
-      title: Umri wa Mhojiwa
+      title: "Q3: Umri"
       question: Una miaka mingapi?
       special_options:
         - Sipendi kusema
@@ -88,19 +116,19 @@ graph:
 
     - id: Q4
       type: TEXT
-      title: Mimea Inayolimwa
+      title: "Q4: Mazao"
       question: Unalima mazao gani?
       nextId: Q5
 
     - id: Q5
       type: TEXT
-      title: Wanyama Wanaofugwa
+      title: "Q5: Wanyama"
       question: Unafuga wanyama gani?
       nextId: Q6
 
     - id: Q6
       type: NUMBER
-      title: Miaka ya Kulima Mahindi Meupe
+      title: "Q6: Uzoefu"
       question: Umekuwa ukilima mahindi meupe kwa miaka mingapi?
       special_options:
         - Sipendi kusema

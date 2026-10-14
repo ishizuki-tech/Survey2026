@@ -8,6 +8,34 @@ graph:
       type: START
       title: Start
       question: Start
+      nextId: Observer
+
+    - id: Observer
+      type: TEXT
+      title: Observer
+      question: Observer Name
+      read_aloud: false
+      nextId: Interviewer
+
+    - id: Interviewer
+      type: TEXT
+      title: Interviewer
+      question: Interviewer Name
+      read_aloud: false
+      nextId: Respondent
+
+    - id: Respondent
+      type: TEXT
+      title: Respondent
+      question: Respondent Name
+      read_aloud: false
+      nextId: RespondentId
+
+    - id: RespondentId
+      type: TEXT
+      title: Respondent ID
+      question: Respondent ID
+      read_aloud: false
       nextId: Introduction
 
     - id: Introduction
@@ -55,7 +83,7 @@ graph:
 
     - id: Q1
       type: SINGLE_CHOICE
-      title: Sub-county and Ward
+      title: "Q1: Location"
       question: Which sub-county and ward do you live in?
       options:
         - Githunguri – Githunguri
@@ -70,7 +98,7 @@ graph:
 
     - id: Q2
       type: SINGLE_CHOICE
-      title: Respondent Gender
+      title: "Q2: Gender"
       question: Respondent Gender
       options:
         - Male
@@ -80,7 +108,7 @@ graph:
 
     - id: Q3
       type: NUMBER
-      title: Respondent Age
+      title: "Q3: Age"
       question: What is your age?
       special_options:
         - Prefer not to say
@@ -88,19 +116,19 @@ graph:
 
     - id: Q4
       type: TEXT
-      title: Crops Grown
+      title: "Q4: Crops"
       question: Which crops do you grow?
       nextId: Q5
 
     - id: Q5
       type: TEXT
-      title: Animals Kept
+      title: "Q5: Animals"
       question: Which animals do you keep?
       nextId: Q6
 
     - id: Q6
       type: NUMBER
-      title: Years Growing White Maize
+      title: "Q6: Experience"
       question: How many years have you been growing white maize?
       special_options:
         - Prefer not to say
