@@ -1272,6 +1272,8 @@ fun SurveyNavHost(
             entryProvider = entryProvider {
 
                 entry<FlowHome> {
+                    val node by vmSurvey.currentNode.collectAsStateWithLifecycle()
+
                     // Restore the note if ViewModel was cleared unexpectedly when navigating back.
                     LaunchedEffect(runFreeTextShadow) {
                         val vmValue = vmSurvey.runFreeText.value
@@ -1291,6 +1293,8 @@ fun SurveyNavHost(
                         speechController = speechController,
                         ttsController = ttsController,
                         speechEnabled = voiceEnabled,
+                        title = node.title,
+                        text = node.question,
                         onBack = {
                             Log.d(
                                 MainActivity.TAG,
@@ -1842,22 +1846,29 @@ private fun SingleChoiceNodeScreen(
                     .verticalScroll(scroll),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                if (title.isNotBlank()) {
-                    Text(text = title, style = MaterialTheme.typography.titleLarge)
-                }
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
-                    Text(
-                        text = question.ifBlank { "(no question text)" },
-                        style = MaterialTheme.typography.bodyLarge,
-                        modifier = Modifier.weight(1f)
-                    )
+                    if (title.isNotBlank()) {
+                        Text(
+                            text = title,
+                            style = MaterialTheme.typography.titleLarge,
+                            modifier = Modifier.weight(1f)
+                        )
+                    } else {
+                        Spacer(Modifier.weight(1f))
+                    }
                     IconButton(onClick = onReplay) {
                         Text(if (isSpeaking) "\u23F9" else "\uD83D\uDD0A")
                     }
                 }
+
+                Text(
+                    text = question.ifBlank { "(no question text)" },
+                    style = MaterialTheme.typography.bodyLarge,
+                    modifier = Modifier.fillMaxWidth()
+                )
 
                 Spacer(Modifier.height(8.dp))
 
@@ -2191,7 +2202,6 @@ private fun HomeFreeTextComposer(
                 modifier = Modifier
                     .weight(1f)
                     .focusRequester(focusRequester),
-                placeholder = { Text("Type a note…") },
                 minLines = 1,
                 maxLines = 5,
                 enabled = enabled,
@@ -2289,6 +2299,8 @@ private fun HomeScreen(
     speechController: SpeechController,
     ttsController: QuestionSpeaker,
     speechEnabled: Boolean,
+    title: String,
+    text: String,
     onStart: () -> Unit,
     onBack: () -> Unit,
     onUpdateFreeText: (String) -> Unit
@@ -2494,12 +2506,12 @@ private fun HomeScreen(
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
                 Text(
-                    text = "Survey ready",
+                    text = title,
                     style = MaterialTheme.typography.titleLarge
                 )
 
                 Text(
-                    text = "Tap Start to begin. You can optionally dictate or type a note for this run.",
+                    text = text,
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )

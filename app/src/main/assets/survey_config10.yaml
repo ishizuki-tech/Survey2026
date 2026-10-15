@@ -6,41 +6,42 @@ graph:
   nodes:
     - id: Start
       type: START
-      title: Start
-      question: Start
-      nextId: Observer
+      title: Survey Note
+      question: Add any general notes and press Start.
+      read_aloud: false
+      nextId: Pre1
 
-    - id: Observer
+    - id: Pre1
       type: TEXT
       title: Observer
       question: Observer Name
       read_aloud: false
-      nextId: Interviewer
+      nextId: Pre2
 
-    - id: Interviewer
+    - id: Pre2
       type: TEXT
       title: Interviewer
       question: Interviewer Name
       read_aloud: false
-      nextId: Respondent
+      nextId: Pre3
 
-    - id: Respondent
+    - id: Pre3
       type: TEXT
       title: Respondent
       question: Respondent Name
       read_aloud: false
-      nextId: RespondentId
+      nextId: Pre4
 
-    - id: RespondentId
+    - id: Pre4
       type: TEXT
       title: Respondent ID
       question: Respondent ID
       read_aloud: false
-      nextId: Introduction
+      nextId: Q00
 
-    - id: Introduction
-      type: INFO
-      title: Introduction
+    - id: Q00
+      type: SINGLE_CHOICE
+      title: Introduction & Consent
       question: |-
         Hallo. Thank you for making time for us today.
 
@@ -59,20 +60,15 @@ graph:
         The study is led by Dr. Mercy Mbugua. If you have any questions or concerns about the study, you can contact her on +254 724 740 197.
 
         If you have any concerns or questions, you can reach her by mobile: +254 724 740 197.
-      read_aloud: true
-      nextId: Consent
 
-    - id: Consent
-      type: SINGLE_CHOICE
-      title: Consent
-      question: Do you agree to participate?
+        Do you agree to participate?
       options:
         - Yes, and proceed
         - No, and stop the interview
       read_aloud: true
-      nextId: Q1
+      nextId: Q01
       nextIdByAnswer:
-        "Yes, and proceed": Q1
+        "Yes, and proceed": Q01
         "No, and stop the interview": ConsentDeclined
 
     - id: ConsentDeclined
@@ -81,9 +77,9 @@ graph:
       question: The interview has been stopped.
       read_aloud: false
 
-    - id: Q1
+    - id: Q01
       type: SINGLE_CHOICE
-      title: "Q1: Location"
+      title: "Q01: Location"
       question: Which sub-county and ward do you live in?
       options:
         - Githunguri – Githunguri
@@ -94,66 +90,66 @@ graph:
         - Other / Nyingine
       read_aloud: false
       other_text_option: Other / Nyingine
-      nextId: Q2
+      nextId: Q02
 
-    - id: Q2
+    - id: Q02
       type: SINGLE_CHOICE
-      title: "Q2: Gender"
+      title: "Q02: Gender"
       question: Respondent Gender
       options:
         - Male
         - Female
       read_aloud: false
-      nextId: Q3
+      nextId: Q03
 
-    - id: Q3
+    - id: Q03
       type: NUMBER
-      title: "Q3: Age"
+      title: "Q03: Age"
       question: What is your age?
       special_options:
         - Prefer not to say
-      nextId: Q4
+      nextId: Q04
 
-    - id: Q4
+    - id: Q04
       type: TEXT
-      title: "Q4: Crops"
+      title: "Q04: Crops"
       question: Which crops do you grow?
-      nextId: Q5
+      nextId: Q05
 
-    - id: Q5
+    - id: Q05
       type: TEXT
-      title: "Q5: Animals"
+      title: "Q05: Animals"
       question: Which animals do you keep?
-      nextId: Q6
+      nextId: Q06
 
-    - id: Q6
+    - id: Q06
       type: NUMBER
-      title: "Q6: Experience"
+      title: "Q06: Experience"
       question: How many years have you been growing white maize?
       special_options:
         - Prefer not to say
       numeric_routes:
         - less_than_or_equal: 2
           next_id: Done
-      nextId: Q7
+      nextId: Q07
       nextIdByAnswer:
         "Prefer not to say": Done
 
-    - id: Q7
+    - id: Q07
       type: AI
       title: FAW Impact on Maize
       question: >-
         Has fall armyworm ever affected your maize? If yes, what damage or losses did it cause?
-      nextId: Q8
+      nextId: Q08
 
-    - id: Q8
+    - id: Q08
       type: AI
       title: Yield Trade-off for 20-Day Earlier Harvest
       question: >-
         If you could harvest your maize 20 days earlier but this reduced your yield, how much yield would you be willing to lose to harvest earlier?
-      nextId: Q9
+      nextId: Q09
 
-    - id: Q9
+    - id: Q09
       type: AI
       title: Damage Threshold to Switch Variety
       question: >-
@@ -222,6 +218,13 @@ graph:
           text: "Usual market or buyer after harvest"
         - id: destination_reason
           text: "Reason for choosing that market or buyer"
+      nextId: Q17
+
+    - id: Q17
+      type: INFO
+      title: End of Interview
+      question: Thank you very much for taking your time to answer these questions.
+      read_aloud: true
       nextId: Review
 
     - id: Review
@@ -280,7 +283,7 @@ slm:
   length_budget_followup: "Keep the question short and single-scope."
 
 prompts:
-  - nodeId: Q7
+  - nodeId: Q07
     eval_prompt: |-
       Expected answer target: Whether FAW affected the crop and, if yes, at least one concrete description of its effect, such as yield loss or a type of crop damage.
       Question: {{QUESTION}}
@@ -293,7 +296,7 @@ prompts:
       Answered followup pairs: {{HISTORY}}
       EVAL_JSON: {{EVAL_JSON}}
 
-  - nodeId: Q8
+  - nodeId: Q08
     eval_prompt: |-
       Expected answer target: Maximum yield loss acceptable for harvesting 20 days earlier (% or bags/acre).
       Question: {{QUESTION}}
@@ -306,7 +309,7 @@ prompts:
       Answered followup pairs: {{HISTORY}}
       EVAL_JSON: {{EVAL_JSON}}
 
-  - nodeId: Q9
+  - nodeId: Q09
     eval_prompt: |-
       Expected answer target: A clear pest/disease damage threshold that would trigger switching maize varieties.
       Question: {{QUESTION}}
