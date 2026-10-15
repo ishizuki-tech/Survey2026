@@ -62,6 +62,7 @@ import com.negi.survey.utils.DeviceUploadTag
 import com.negi.survey.utils.buildSurveyFileName
 import com.negi.survey.vm.SurveyViewModel
 import com.negi.survey.vm.UploadStatus
+import com.negi.survey.vm.UploadStatusDetails
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -75,6 +76,8 @@ import kotlinx.coroutines.withTimeoutOrNull
 fun DoneScreen(
     vm: SurveyViewModel,
     uploadStatus: UploadStatus,
+    onResolveUploadStatusDetails: suspend () -> UploadStatusDetails,
+    onClearCompletedSurveys: suspend () -> Unit,
     onRestart: () -> Unit,
     autoSaveToDevice: Boolean = false
 ) {
@@ -169,15 +172,14 @@ fun DoneScreen(
                     text = "Device ID: ${deviceUploadTag.value}",
                     style = MaterialTheme.typography.labelLarge
                 )
-                Spacer(Modifier.height(4.dp))
-                Text(
-                    text = "Uploaded Surveys on This Device: ${uploadStatus.uploadedCount}",
-                    style = MaterialTheme.typography.labelLarge
-                )
-                Spacer(Modifier.height(4.dp))
-                Text(
-                    text = "Pending Survey Uploads: ${uploadStatus.pendingCount}",
-                    style = MaterialTheme.typography.labelLarge
+                Spacer(Modifier.height(16.dp))
+                UploadStatusSummary(
+                    uploadStatus = uploadStatus,
+                    onResolveUploadStatusDetails = onResolveUploadStatusDetails,
+                    onClearCompletedSurveys = onClearCompletedSurveys,
+                    titleColor = Color.Black,
+                    countColor = Color.Black,
+                    actionColor = Color.Black
                 )
 
                 Spacer(Modifier.height(16.dp))

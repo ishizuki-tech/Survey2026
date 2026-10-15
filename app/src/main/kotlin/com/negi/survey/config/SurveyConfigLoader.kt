@@ -59,6 +59,14 @@ private const val TAG = "SurveyConfigLoader"
 @Serializable
 data class SurveyConfig(
     /**
+     * Human-readable display title for this configuration, shown wherever the
+     * app lets the user pick which survey configuration to run (e.g. the
+     * config selection screen). Optional for backward compatibility with
+     * configs that do not define one.
+     */
+    val title: String? = null,
+
+    /**
      * Legacy prompt list:
      * - One-step: prompt
      * - Inline two-step: eval_prompt + followup_prompt

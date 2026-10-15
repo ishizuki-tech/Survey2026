@@ -59,6 +59,24 @@ internal object PendingSurveyUploads {
     fun pendingSurveyIds(context: Context): Set<String> =
         pendingSurveyIds(File(context.filesDir, PENDING_DIR_GH))
 
+    /** Returns the `exported_at` stamp embedded in [text] (a staged survey JSON payload), or null. */
+    fun exportedAtFromJsonText(text: String): String? =
+        runCatching {
+            val root = Json.parseToJsonElement(text) as? JsonObject
+                ?: return@runCatching null
+            (root["exported_at"] as? JsonPrimitive)
+                ?.takeIf { it.isString }
+                ?.content
+                ?.trim()
+                ?.takeIf { it.isNotBlank() }
+        }.getOrNull()
+
+    /** Returns a nonblank `exported_at` stamp from [file], or null when absent/unreadable. */
+    fun exportedAtFromFile(file: File): String? {
+        if (!file.isFile || !file.extension.equals("json", ignoreCase = true)) return null
+        return runCatching { file.readText(Charsets.UTF_8) }.getOrNull()?.let(::exportedAtFromJsonText)
+    }
+
     /** Returns one deterministic existing staged JSON file for [surveyId], if present. */
     fun findPendingSurveyFile(context: Context, surveyId: String): File? =
         findPendingSurveyFile(File(context.filesDir, PENDING_DIR_GH), surveyId)

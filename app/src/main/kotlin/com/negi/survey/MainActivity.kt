@@ -181,6 +181,7 @@ import com.negi.survey.vm.SurveyFinalizationViewModel
 import com.negi.survey.vm.TtsController
 import com.negi.survey.vm.UploadStatusViewModel
 import com.negi.survey.vm.UploadStatus
+import com.negi.survey.vm.UploadStatusDetails
 import com.negi.survey.vm.WhisperSpeechController
 import com.negi.survey.vm.shouldAutoPlayQuestion
 import com.negi.survey.vm.toggleQuestionSpeaker
@@ -670,7 +671,7 @@ fun AppNav() {
 
         val mapped = yamlFiles.map { path ->
             val fileName = path.substringAfterLast('/')
-            configOptionFromFileName(fileName = fileName).copy(id = path)
+            configOptionFromAsset(assetManager = assetManager, path = path, fileName = fileName)
         }
 
         mapped.ifEmpty {
@@ -703,6 +704,8 @@ fun AppNav() {
             defaultOptionId = options.firstOrNull()?.id,
             uploadStatus = uploadStatus,
             onUploadStatusActive = uploadStatusViewModel::refresh,
+            onResolveUploadStatusDetails = uploadStatusViewModel::loadDetails,
+            onClearCompletedSurveys = uploadStatusViewModel::clearCompletedSurveys,
             onStart = { option ->
                 selectionEpoch += 1
                 chosenId = option.id
@@ -1030,7 +1033,9 @@ fun AppNav() {
                         sessionId = sessionKey,
                         sessionVmOwner = sessionVmOwner,
                         heavyRuntimeHandoff = heavyRuntimeCoordinator,
-                        uploadStatus = uploadStatus
+                        uploadStatus = uploadStatus,
+                        onResolveUploadStatusDetails = uploadStatusViewModel::loadDetails,
+                        onClearCompletedSurveys = uploadStatusViewModel::clearCompletedSurveys
                     )
                 }
             } else {
@@ -1044,7 +1049,9 @@ fun AppNav() {
                     sessionId = sessionKey,
                     sessionVmOwner = sessionVmOwner,
                     heavyRuntimeHandoff = heavyRuntimeCoordinator,
-                    uploadStatus = uploadStatus
+                    uploadStatus = uploadStatus,
+                    onResolveUploadStatusDetails = uploadStatusViewModel::loadDetails,
+                    onClearCompletedSurveys = uploadStatusViewModel::clearCompletedSurveys
                 )
             }
         }
@@ -1097,7 +1104,9 @@ fun SurveyNavHost(
     sessionId: String = "session",
     sessionVmOwner: ViewModelStoreOwner? = null,
     heavyRuntimeHandoff: HeavyRuntimeHandoff = NoOpHeavyRuntimeHandoff,
-    uploadStatus: UploadStatus = UploadStatus()
+    uploadStatus: UploadStatus = UploadStatus(),
+    onResolveUploadStatusDetails: suspend () -> UploadStatusDetails,
+    onClearCompletedSurveys: suspend () -> Unit
 ) {
     val localContext = LocalContext.current
     val appContext = localContext.applicationContext
@@ -1545,6 +1554,8 @@ fun SurveyNavHost(
                     DoneScreen(
                         vm = vmSurvey,
                         uploadStatus = uploadStatus,
+                        onResolveUploadStatusDetails = onResolveUploadStatusDetails,
+                        onClearCompletedSurveys = onClearCompletedSurveys,
                         onRestart = {
                             Log.d(MainActivity.TAG, "Done -> Restart requested (return to selector)")
                             vmAI.resetStates()
@@ -2592,6 +2603,26 @@ private val KNOWN_CONFIG_LABELS: Map<String, String> = mapOf(
     "survey_config10" to "English",
     "survey_config_sw_10" to "Swahili",
 )
+
+/**
+ * Build a config option for the selection screen, preferring the YAML's own
+ * top-level `title:` field (when present and non-blank) over the
+ * filename-derived label.
+ */
+private fun configOptionFromAsset(
+    assetManager: AssetManager,
+    path: String,
+    fileName: String
+): ConfigOptionUi {
+    val base = configOptionFromFileName(fileName = fileName).copy(id = path)
+
+    val yamlTitle = runCatching {
+        val raw = assetManager.open(path).bufferedReader(Charsets.UTF_8).use { it.readText() }
+        SurveyConfigLoader.fromString(text = raw, fileNameHint = fileName).title
+    }.getOrNull()?.trim()?.takeIf { it.isNotEmpty() }
+
+    return if (yamlTitle != null) base.copy(label = yamlTitle) else base
+}
 
 private fun configOptionFromFileName(fileName: String): ConfigOptionUi {
     val stem = fileName.replace(Regex("""(?i)\.ya?ml$"""), "")

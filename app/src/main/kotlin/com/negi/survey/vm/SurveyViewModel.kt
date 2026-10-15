@@ -37,7 +37,7 @@ import com.negi.survey.diagnostics.TraceIdentity
 import com.negi.survey.diagnostics.AnswerTraceTransactions
 import com.negi.survey.net.RuntimeLogStore
 import android.content.Context
-import java.util.UUID
+import com.negi.survey.utils.newTimeOrderedSurveyId
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -179,7 +179,7 @@ open class SurveyViewModel(
     private val _sessionId = MutableStateFlow(0L)
     val sessionId: StateFlow<Long> = _sessionId.asStateFlow()
 
-    private val _surveyUuid = MutableStateFlow(UUID.randomUUID().toString())
+    private val _surveyUuid = MutableStateFlow(newTimeOrderedSurveyId())
     val surveyUuid: StateFlow<String> = _surveyUuid.asStateFlow()
     private var trace: SurveyTrace? = traceContext?.let { SurveyTraceRegistry.start(it, _surveyUuid.value) }
     private val answerTraceIds = AnswerTraceTransactions()
@@ -311,7 +311,7 @@ open class SurveyViewModel(
     }
 
     private fun regenerateSurveyUuid() {
-        _surveyUuid.value = UUID.randomUUID().toString()
+        _surveyUuid.value = newTimeOrderedSurveyId()
     }
 
     private val _currentNode = MutableStateFlow(
