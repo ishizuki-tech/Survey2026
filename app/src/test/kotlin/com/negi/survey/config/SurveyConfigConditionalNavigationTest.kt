@@ -68,7 +68,7 @@ class SurveyConfigConditionalNavigationTest {
         configNames.forEach { name ->
             val config = SurveyConfigLoader.fromFileStrictValidated(File(assetDirectory, name).absolutePath)
             (7..16).forEach { number ->
-                val nodeId = "Q$number"
+                val nodeId = "Q" + number.toString().padStart(2, '0')
                 val hasTwoStepPair =
                     !config.resolveEvalPrompt(nodeId).isNullOrBlank() &&
                             !config.resolveFollowupPrompt(nodeId).isNullOrBlank()
@@ -91,10 +91,15 @@ class SurveyConfigConditionalNavigationTest {
             val config = SurveyConfigLoader.fromFileStrictValidated(assetFile(name).absolutePath)
             val nodes = config.graph.nodes.associateBy { it.id }
 
-            (1..16).forEach { number -> assertTrue("$name is missing Q$number", "Q$number" in nodes) }
-            assertTrue("$name must not retain Q17", "Q17" !in nodes)
+            /** Node ids 1-9 are zero-padded ("Q01".."Q09"); 10-16 are already two digits. */
+            (1..16).forEach { number ->
+                val id = "Q" + number.toString().padStart(2, '0')
+                assertTrue("$name is missing $id", id in nodes)
+            }
+            /** Q17 ("End of Interview") now sits between Q16 and Review; Q18 does not exist. */
+            assertTrue("$name must not retain Q18", "Q18" !in nodes)
 
-            val q1 = checkNotNull(nodes["Q1"])
+            val q1 = checkNotNull(nodes["Q01"])
             assertEquals("SINGLE_CHOICE", q1.type)
             assertEquals(false, q1.readAloud)
             assertEquals(
@@ -110,23 +115,23 @@ class SurveyConfigConditionalNavigationTest {
             )
             assertEquals("Other / Nyingine", q1.otherTextOption)
 
-            val consent = checkNotNull(nodes["Consent"])
+            val consent = checkNotNull(nodes["Q00"])
             assertEquals("SINGLE_CHOICE", consent.type)
             assertEquals(null, consent.otherTextOption)
 
-            val q2 = checkNotNull(nodes["Q2"])
+            val q2 = checkNotNull(nodes["Q02"])
             assertEquals("SINGLE_CHOICE", q2.type)
             assertEquals(false, q2.readAloud)
             assertEquals(null, q2.otherTextOption)
 
-            val q3 = checkNotNull(nodes["Q3"])
+            val q3 = checkNotNull(nodes["Q03"])
             assertEquals("NUMBER", q3.type)
             assertEquals(listOf(preferNotToSay), q3.specialOptions)
 
-            assertEquals("TEXT", checkNotNull(nodes["Q4"]).type)
-            assertEquals("TEXT", checkNotNull(nodes["Q5"]).type)
+            assertEquals("TEXT", checkNotNull(nodes["Q04"]).type)
+            assertEquals("TEXT", checkNotNull(nodes["Q05"]).type)
 
-            val q6 = checkNotNull(nodes["Q6"])
+            val q6 = checkNotNull(nodes["Q06"])
             assertEquals("NUMBER", q6.type)
             assertEquals(listOf(preferNotToSay), q6.specialOptions)
             assertEquals(preferNotToSay, q6.nextIdByAnswer.keys.single())
@@ -134,18 +139,20 @@ class SurveyConfigConditionalNavigationTest {
             assertEquals(1, q6.numericRoutes.size)
             assertEquals(2, q6.numericRoutes.single().lessThanOrEqual)
             assertEquals("Done", q6.numericRoutes.single().nextId)
-            assertEquals("Q7", q6.nextId)
+            assertEquals("Q07", q6.nextId)
 
-            assertEquals("Review", checkNotNull(nodes["Q16"]).nextId)
+            /** Q16 is followed by the Q17 "End of Interview" node, then Review. */
+            assertEquals("Q17", checkNotNull(nodes["Q16"]).nextId)
+            assertEquals("Review", checkNotNull(nodes["Q17"]).nextId)
             assertEquals("Done", checkNotNull(nodes["Review"]).nextId)
 
             val expectedQuestions = if (name.contains("_sw_")) {
                 mapOf(
-                    "Q4" to "Unalima mazao gani?",
-                    "Q5" to "Unafuga wanyama gani?",
-                    "Q7" to "Mahindi yako yamewahi kushambuliwa na funza jeshi (Fall Armyworm)? Ikiwa ndiyo, yalipata hasara gani?",
-                    "Q8" to "Kama ungeweza kuvuna mahindi yako siku 20 mapema, lakini mavuno yangepungua, ungekubali kupoteza kiasi gani cha mavuno ili uvune mapema?",
-                    "Q9" to "Ni kiwango gani cha uharibifu wa mahindi unaosababishwa na wadudu au magonjwa ambacho kingekufanya ubadilishe aina ya mahindi unayopanda?",
+                    "Q04" to "Unalima mazao gani?",
+                    "Q05" to "Unafuga wanyama gani?",
+                    "Q07" to "Mahindi yako yamewahi kushambuliwa na funza jeshi (Fall Armyworm)? Ikiwa ndiyo, yalipata hasara gani?",
+                    "Q08" to "Kama ungeweza kuvuna mahindi yako siku 20 mapema, lakini mavuno yangepungua, ungekubali kupoteza kiasi gani cha mavuno ili uvune mapema?",
+                    "Q09" to "Ni kiwango gani cha uharibifu wa mahindi unaosababishwa na wadudu au magonjwa ambacho kingekufanya ubadilishe aina ya mahindi unayopanda?",
                     "Q10" to "Kama kungekuwa na aina mpya ya mahindi, ingehitaji kuwa na sifa gani ili uamue kuipanda badala ya aina unayopanda sasa?",
                     "Q11" to "Msimu ukiwa mbaya, ni mavuno ya chini kiasi gani ambayo bado yangekufanya uendelee kupanda aina hii ya mahindi?",
                     "Q12" to "Ukame huwa unasababisha hasara kubwa zaidi wakati gani katika ukuaji wa mahindi?",
@@ -156,11 +163,11 @@ class SurveyConfigConditionalNavigationTest {
                 )
             } else {
                 mapOf(
-                    "Q4" to "Which crops do you grow?",
-                    "Q5" to "Which animals do you keep?",
-                    "Q7" to "Has fall armyworm ever affected your maize? If yes, what damage or losses did it cause?",
-                    "Q8" to "If you could harvest your maize 20 days earlier but this reduced your yield, how much yield would you be willing to lose to harvest earlier?",
-                    "Q9" to "What level of pest or disease damage would make you switch to a different maize variety?",
+                    "Q04" to "Which crops do you grow?",
+                    "Q05" to "Which animals do you keep?",
+                    "Q07" to "Has fall armyworm ever affected your maize? If yes, what damage or losses did it cause?",
+                    "Q08" to "If you could harvest your maize 20 days earlier but this reduced your yield, how much yield would you be willing to lose to harvest earlier?",
+                    "Q09" to "What level of pest or disease damage would make you switch to a different maize variety?",
                     "Q10" to "If there were a new maize variety, what characteristics would it need to have for you to decide to plant it instead of your current variety?",
                     "Q11" to "In a bad season, what is the lowest maize yield that would still make you continue planting this variety?",
                     "Q12" to "At what stage of maize growth does drought cause the greatest losses?",
@@ -181,9 +188,9 @@ class SurveyConfigConditionalNavigationTest {
         val config = SurveyConfigLoader.fromFileStrictValidated(assetFile("survey_config10.yaml").absolutePath)
 
         val expectedEvalTargetByNewId = mapOf(
-            "Q7" to "Whether FAW affected the crop",
-            "Q8" to "Maximum yield loss acceptable",
-            "Q9" to "A clear pest/disease damage threshold",
+            "Q07" to "Whether FAW affected the crop",
+            "Q08" to "Maximum yield loss acceptable",
+            "Q09" to "A clear pest/disease damage threshold",
             "Q10" to "Priority traits a new maize variety",
             "Q11" to "The lowest yield in a bad season",
             "Q12" to "The maize growth stage where drought",
