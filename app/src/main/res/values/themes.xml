@@ -1,5 +1,22 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
 
-    <style name="Theme.SurveyNav" parent="android:Theme.Material.Light.NoActionBar" />
+    <!--
+        android:windowBackground here is what the OS paints as the native
+        "starting window" before MainActivity.onCreate() runs and Compose
+        draws its first frame, and briefly again on activity recreation
+        (e.g. a rotation). Left unset, it falls back to this theme's parent
+        (Theme.Material.Light), i.e. plain white — a visible flash before
+        the first Compose frame even on a seamless screen.
+
+        This is the default (Light) variant, matched to the lightest stop
+        of the shared monotone palette (LightMonotoneColors.introBgStops,
+        see MonotonePalette.kt) so the handoff from native window to first
+        Compose frame is seamless in Light mode. See values-night/themes.xml
+        for the Dark counterpart — Android picks between them automatically
+        based on Settings > Display > Dark theme (Configuration.uiMode).
+    -->
+    <style name="Theme.SurveyNav" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">#FFFAFAFA</item>
+    </style>
 </resources>

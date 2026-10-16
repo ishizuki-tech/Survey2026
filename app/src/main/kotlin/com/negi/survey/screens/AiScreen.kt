@@ -169,6 +169,7 @@ import com.negi.survey.diagnostics.DiagnosticContentPolicy
 import com.negi.survey.diagnostics.WhisperTraceRegistry
 import com.negi.survey.slm.FollowupExtractor
 import com.negi.survey.slm.PromptPhase
+import com.negi.survey.ui.theme.monotoneColors
 import com.negi.survey.vm.AiViewModel
 import com.negi.survey.vm.QuestionSpeaker
 import com.negi.survey.vm.SurveyViewModel
@@ -1213,10 +1214,11 @@ private fun CompactTopBar(
     isSpeaking: Boolean = false
 ) {
     val cs = MaterialTheme.colorScheme
+    val mono = monotoneColors()
     val topBrush = Brush.horizontalGradient(
         listOf(
             cs.surface.copy(alpha = 0.96f),
-            Color(0xFF1A1A1A).copy(alpha = 0.75f)
+            mono.buttonContainer.copy(alpha = 0.75f)
         )
     )
     Surface(color = Color.Transparent, tonalElevation = 0.dp) {
@@ -1295,7 +1297,7 @@ private fun BubbleMono(
     isTyping: Boolean,
     maxWidth: Dp = 520.dp
 ) {
-    val cs = MaterialTheme.colorScheme
+    val mono = monotoneColors()
 
     val corner = 12.dp
     val padH = 10.dp
@@ -1303,11 +1305,30 @@ private fun BubbleMono(
     val tailW = 7f
     val tailH = 6f
 
-    val stops = if (isAi) {
-        listOf(Color(0xFF111111), Color(0xFF1E1E1E), Color(0xFF2A2A2A))
-    } else {
-        listOf(Color(0xFFEDEDED), Color(0xFFD9D9D9), Color(0xFFC8C8C8))
-    }
+    // Both bubble roles now follow the active Light/Dark scheme: the AI
+    // bubble uses the same neutral "card" tone as the rest of the app
+    // (mono.cardBg), and the user bubble is shifted a step toward
+    // textPrimary so the two stay visually distinct in either theme.
+    // Previously these were pinned to a fixed near-black (AI) / near-white
+    // (user) regardless of the system theme, which is why the AI bubble
+    // kept showing white text on a black background even after the rest
+    // of the screen started following Light mode.
+    //
+    // Deliberately NOT blended toward MaterialTheme.colorScheme.surface
+    // (as an earlier pass here did): with dynamicColor enabled (see
+    // SurveyNavTheme), that surface tone comes from the device's Material
+    // You wallpaper palette and can land on a noticeably darker/grayer tone
+    // than expected, which is what made the Light-mode AI bubble read as
+    // "too dark a gray" even though mono.cardBg itself is pure white there.
+    // Every other Mono-prefixed component in this app stays off
+    // colorScheme.surface for the same reason -- this just brings bubbles
+    // in line with that.
+    val base = if (isAi) mono.cardBg else lerp(mono.cardBg, mono.textPrimary, 0.16f)
+    val stops = listOf(
+        base,
+        lerp(base, mono.textPrimary, 0.05f),
+        lerp(base, mono.textPrimary, 0.10f)
+    )
 
     val t = rememberInfiniteTransition(label = "bubble-mono")
     val p by t.animateFloat(
@@ -1320,12 +1341,12 @@ private fun BubbleMono(
         label = "p"
     )
     val grad = Brush.linearGradient(
-        colors = stops.map { c -> lerp(c, cs.surface, 0.12f) },
+        colors = stops,
         start = Offset(0f, 0f),
         end = Offset(400f + 220f * p, 360f - 180f * p)
     )
 
-    val textColor = if (isAi) Color(0xFFECECEC) else Color(0xFF111111)
+    val textColor = mono.textPrimary
     val shape = RoundedCornerShape(
         topStart = corner,
         topEnd = corner,
@@ -1333,10 +1354,16 @@ private fun BubbleMono(
         bottomEnd = if (isAi) corner else 4.dp
     )
 
+    // shadowElevation here was rendering as a flat gray tint across the
+    // WHOLE bubble on-device (not just a drop shadow at the edges), pulling
+    // every fill color down by ~40-50 points regardless of theme -- which is
+    // what kept the AI bubble looking "dark gray" even after its fill color
+    // itself was fixed to follow Light/Dark. Dropped to 0.dp; the bubble
+    // still reads as a distinct shape via its own fill + border sweep below.
     Surface(
         color = Color.Transparent,
         tonalElevation = 0.dp,
-        shadowElevation = 3.dp,
+        shadowElevation = 0.dp,
         shape = shape,
         modifier = Modifier
             .widthIn(max = maxWidth)
@@ -1367,9 +1394,9 @@ private fun BubbleMono(
 
                 drawRoundRect(
                     brush = Brush.sweepGradient(
-                        0f to Color(0xFF101010).copy(alpha = 0.12f),
-                        0.5f to Color(0xFF7A7A7A).copy(alpha = 0.10f),
-                        1f to Color(0xFF101010).copy(alpha = 0.12f)
+                        0f to mono.edgeSweepDark.copy(alpha = 0.12f),
+                        0.5f to mono.cardBorderMid.copy(alpha = 0.10f),
+                        1f to mono.edgeSweepDark.copy(alpha = 0.12f)
                     ),
                     style = Stroke(width = 0.8.dp.toPx()),
                     cornerRadius = cr
@@ -1397,6 +1424,7 @@ private fun JsonBubbleMono(
     var expanded by remember(pretty) { mutableStateOf(false) }
 
     val cs = MaterialTheme.colorScheme
+    val mono = monotoneColors()
     val clipboard = LocalClipboard.current
     val scope = rememberCoroutineScope()
     val clip = RoundedCornerShape(10.dp)
@@ -1421,9 +1449,9 @@ private fun JsonBubbleMono(
                     .background(
                         Brush.horizontalGradient(
                             listOf(
-                                Color(0xFF1F1F1F).copy(alpha = 0.22f),
-                                Color(0xFF3A3A3A).copy(alpha = 0.22f),
-                                Color(0xFF6A6A6A).copy(alpha = 0.22f)
+                                mono.buttonContainer.copy(alpha = 0.22f),
+                                mono.edgeSweepMid.copy(alpha = 0.22f),
+                                mono.cardBorderMid.copy(alpha = 0.22f)
                             )
                         )
                     )
@@ -1617,7 +1645,7 @@ private fun ChatComposer(
 
 @Composable
 private fun animatedMonotoneBackplate(): Brush {
-    val cs = MaterialTheme.colorScheme
+    val mono = monotoneColors()
     val t = rememberInfiniteTransition(label = "bg-mono")
     val p by t.animateFloat(
         initialValue = 0f,
@@ -1629,16 +1657,11 @@ private fun animatedMonotoneBackplate(): Brush {
         label = "bgp"
     )
 
-    val c0 = lerp(Color(0xFF0F0F10), cs.surface, 0.10f)
-    val c1 = lerp(Color(0xFF1A1A1B), cs.surface, 0.12f)
-    val c2 = lerp(Color(0xFF2A2A2B), cs.surface, 0.14f)
-    val c3 = lerp(Color(0xFF3A3A3B), cs.surface, 0.16f)
-
     val endX = 1200f + 240f * p
     val endY = 820f - 180f * p
 
     return Brush.linearGradient(
-        colors = listOf(c0, c1, c2, c3),
+        colors = mono.introBgStops,
         start = Offset(0f, 0f),
         end = Offset(endX, endY)
     )
@@ -1649,23 +1672,26 @@ private fun Modifier.neutralEdge(
     alpha: Float = 0.16f,
     corner: Dp = 12.dp,
     stroke: Dp = 1.dp
-): Modifier = this.then(
-    Modifier.drawBehind {
-        val cr = CornerRadius(corner.toPx(), corner.toPx())
-        val sweep = Brush.sweepGradient(
-            0f to Color(0xFF101010).copy(alpha = alpha),
-            0.25f to Color(0xFF3A3A3A).copy(alpha = alpha),
-            0.5f to Color(0xFF7A7A7A).copy(alpha = alpha * 0.9f),
-            0.75f to Color(0xFF3A3A3A).copy(alpha = alpha),
-            1f to Color(0xFF101010).copy(alpha = alpha)
-        )
-        drawRoundRect(
-            brush = sweep,
-            style = Stroke(width = stroke.toPx()),
-            cornerRadius = cr
-        )
-    }
-)
+): Modifier {
+    val mono = monotoneColors()
+    return this.then(
+        Modifier.drawBehind {
+            val cr = CornerRadius(corner.toPx(), corner.toPx())
+            val sweep = Brush.sweepGradient(
+                0f to mono.edgeSweepDark.copy(alpha = alpha),
+                0.25f to mono.edgeSweepMid.copy(alpha = alpha),
+                0.5f to mono.cardBorderMid.copy(alpha = alpha * 0.9f),
+                0.75f to mono.edgeSweepMid.copy(alpha = alpha),
+                1f to mono.edgeSweepDark.copy(alpha = alpha)
+            )
+            drawRoundRect(
+                brush = sweep,
+                style = Stroke(width = stroke.toPx()),
+                cornerRadius = cr
+            )
+        }
+    )
+}
 
 private fun zeroInsetsSafe(): WindowInsets = WindowInsets(0, 0, 0, 0)
 

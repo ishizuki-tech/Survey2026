@@ -127,6 +127,7 @@ import androidx.compose.ui.unit.max
 import androidx.compose.ui.unit.min
 import androidx.compose.ui.unit.sp
 import com.negi.survey.BuildConfig
+import com.negi.survey.ui.theme.monotoneColors
 import com.negi.survey.vm.UploadStatus
 import com.negi.survey.vm.UploadStatusDetails
 import com.negi.survey.vm.UploadStatusEntry
@@ -240,14 +241,15 @@ private fun IntroCardMono(
     val cs = MaterialTheme.colorScheme
     val corner = 20.dp
 
-    /** Readability palette (explicit, monotone). */
-    val textPrimary = Color(0xFFF2F2F2)
-    val textSecondary = Color(0xFFD2D2D2)
-    val textMuted = Color(0xFFB0B0B0)
-    val textHint = Color(0xFF9A9A9A)
+    /** Readability palette (shared light/dark monotone tokens). */
+    val mono = monotoneColors()
+    val textPrimary = mono.textPrimary
+    val textSecondary = mono.textSecondary
+    val textMuted = mono.textMuted
+    val textHint = mono.textHint
 
     /** A slightly stronger card scrim to lift text from the animated background. */
-    val cardBg = Color(0xFF101010).copy(alpha = 0.86f)
+    val cardBg = mono.cardBg.copy(alpha = 0.86f)
 
     val optionIds = remember(options) { options.map { it.id } }
     val optionIdSet = remember(optionIds) { optionIds.toHashSet() }
@@ -318,9 +320,9 @@ private fun IntroCardMono(
             .wrapContentHeight()
             .wrapContentWidth()
             .drawBehind {
-                val dark = Color(0xFF2A2A2A).copy(alpha = 0.65f)
-                val mid = Color(0xFF7A7A7A).copy(alpha = 0.35f)
-                val light = Color(0xFFF0F0F0).copy(alpha = 0.18f)
+                val dark = mono.cardBorderDark.copy(alpha = 0.65f)
+                val mid = mono.cardBorderMid.copy(alpha = 0.35f)
+                val light = mono.cardBorderLight.copy(alpha = 0.18f)
                 val sweep = Brush.sweepGradient(
                     0f to dark,
                     0.25f to mid,
@@ -348,8 +350,8 @@ private fun IntroCardMono(
         ) {
             GradientHeadlineMono(
                 text = title,
-                colorTop = Color(0xFFF5F5F5),
-                colorBottom = Color(0xFFCFCFCF)
+                colorTop = mono.headlineTop,
+                colorBottom = mono.headlineBottom
             )
 
             Spacer(Modifier.padding(top = 14.dp))
@@ -376,7 +378,8 @@ private fun IntroCardMono(
                 onResolveUploadStatusDetails = onResolveUploadStatusDetails,
                 onClearCompletedSurveys = onClearCompletedSurveys,
                 titleColor = textMuted,
-                countColor = textSecondary
+                countColor = textSecondary,
+                actionColor = mono.actionText
             )
 
             Spacer(Modifier.padding(top = 16.dp))
@@ -464,9 +467,9 @@ internal fun UploadStatusSummary(
     onResolveUploadStatusDetails: suspend () -> UploadStatusDetails,
     onClearCompletedSurveys: suspend () -> Unit,
     modifier: Modifier = Modifier,
-    titleColor: Color = Color(0xFFB0B0B0),
-    countColor: Color = Color(0xFFD2D2D2),
-    actionColor: Color = Color(0xFFE6E6E6),
+    titleColor: Color = monotoneColors().textMuted,
+    countColor: Color = monotoneColors().textSecondary,
+    actionColor: Color = monotoneColors().actionText,
 ) {
     var showUploadStatusDetails by remember { mutableStateOf(false) }
 
@@ -731,8 +734,9 @@ private fun SelectedConfigDetailsMono(
     textMuted: Color,
     onRetry: () -> Unit,
 ) {
-    val bg = Color(0xFF0E0E0E).copy(alpha = 0.85f)
-    val border = Color(0xFF7A7A7A).copy(alpha = 0.35f)
+    val mono = monotoneColors()
+    val bg = mono.detailsPanelBg.copy(alpha = 0.85f)
+    val border = mono.detailsPanelBorder.copy(alpha = 0.35f)
 
     var expanded by remember(configId) { mutableStateOf(false) }
 
@@ -768,7 +772,7 @@ private fun SelectedConfigDetailsMono(
                     Text(
                         text = "Loading config: $configId …",
                         style = MaterialTheme.typography.bodySmall.copy(lineHeight = 18.sp),
-                        color = Color(0xFFBDBDBD),
+                        color = mono.chipLabel,
                         modifier = Modifier.testTag("ConfigDetailsLoading")
                     )
                 }
@@ -777,7 +781,7 @@ private fun SelectedConfigDetailsMono(
                     Text(
                         text = "Failed to load config: $configId",
                         style = MaterialTheme.typography.bodySmall.copy(lineHeight = 18.sp),
-                        color = Color(0xFFFFC8C8),
+                        color = mono.errorText,
                         modifier = Modifier.testTag("ConfigDetailsErrorTitle")
                     )
 
@@ -786,7 +790,7 @@ private fun SelectedConfigDetailsMono(
                     Text(
                         text = (state.error.message ?: state.error::class.java.simpleName).take(240),
                         style = MaterialTheme.typography.bodySmall.copy(lineHeight = 18.sp),
-                        color = Color(0xFFE0A0A0),
+                        color = mono.errorTextMuted,
                         modifier = Modifier.testTag("ConfigDetailsErrorMessage")
                     )
 
@@ -803,7 +807,7 @@ private fun SelectedConfigDetailsMono(
                             Text(
                                 text = "Retry",
                                 style = MaterialTheme.typography.labelLarge.copy(letterSpacing = 0.2.sp),
-                                color = Color(0xFFE6E6E6)
+                                color = mono.actionText
                             )
                         }
                     }
@@ -815,7 +819,7 @@ private fun SelectedConfigDetailsMono(
                     Text(
                         text = d.summary,
                         style = MaterialTheme.typography.bodySmall.copy(lineHeight = 18.sp),
-                        color = Color(0xFFCFCFCF),
+                        color = mono.textSecondary,
                         modifier = Modifier.testTag("ConfigDetailsSummary")
                     )
 
@@ -824,7 +828,7 @@ private fun SelectedConfigDetailsMono(
                     Text(
                         text = d.longText,
                         style = MaterialTheme.typography.bodySmall.copy(lineHeight = 18.sp),
-                        color = Color(0xFFBDBDBD),
+                        color = mono.chipLabel,
                         modifier = Modifier.testTag("ConfigDetailsLongText")
                     )
                 }
@@ -859,7 +863,7 @@ private fun SelectedConfigDetailsMono(
                 Text(
                     text = if (expanded) "Show less" else "Show more",
                     style = MaterialTheme.typography.labelLarge.copy(letterSpacing = 0.2.sp),
-                    color = Color(0xFFE6E6E6)
+                    color = mono.actionText
                 )
             }
         }
@@ -875,14 +879,15 @@ private fun SelectedConfigDetailsMono(
  */
 @Composable
 private fun MetaChipMono(label: String, value: String) {
+    val mono = monotoneColors()
     val safeLabel = remember(label) { label.safeTestTagToken(32) }
 
     Row(
         modifier = Modifier
             .clip(RoundedCornerShape(999.dp))
-            .background(Color(0xFF151515))
+            .background(mono.chipBg)
             .border(
-                BorderStroke(1.dp, Color(0xFF8A8A8A).copy(alpha = 0.35f)),
+                BorderStroke(1.dp, mono.chipBorder.copy(alpha = 0.35f)),
                 RoundedCornerShape(999.dp)
             )
             .padding(horizontal = 10.dp, vertical = 6.dp)
@@ -891,7 +896,7 @@ private fun MetaChipMono(label: String, value: String) {
         Text(
             text = "$label: ",
             style = MaterialTheme.typography.labelSmall.copy(letterSpacing = 0.2.sp),
-            color = Color(0xFFBDBDBD)
+            color = mono.chipLabel
         )
         Text(
             text = value,
@@ -899,7 +904,7 @@ private fun MetaChipMono(label: String, value: String) {
                 fontWeight = FontWeight.SemiBold,
                 letterSpacing = 0.2.sp
             ),
-            color = Color(0xFFF0F0F0),
+            color = mono.chipValue,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis
         )
@@ -917,6 +922,7 @@ private fun CtaRowMono(
     onRestart: (() -> Unit)?,
 ) {
     var confirmRestart by remember { mutableStateOf(false) }
+    val mono = monotoneColors()
 
     Row(
         modifier = Modifier.fillMaxWidth(),
@@ -927,8 +933,8 @@ private fun CtaRowMono(
             onClick = onStart,
             shape = CircleShape,
             colors = ButtonDefaults.buttonColors(
-                containerColor = Color(0xFF1A1A1A),
-                contentColor = Color(0xFFF2F2F2)
+                containerColor = mono.buttonContainer,
+                contentColor = mono.buttonContent
             ),
             modifier = Modifier.testTag("StartButton")
         ) {
@@ -952,9 +958,9 @@ private fun CtaRowMono(
             OutlinedButton(
                 enabled = !isRestarting,
                 onClick = { confirmRestart = true },
-                border = BorderStroke(1.dp, Color(0xFF8A8A8A).copy(alpha = 0.65f)),
+                border = BorderStroke(1.dp, mono.outlineBorder.copy(alpha = 0.65f)),
                 colors = ButtonDefaults.outlinedButtonColors(
-                    contentColor = Color(0xFFE0E0E0)
+                    contentColor = mono.outlineContent
                 ),
                 modifier = Modifier.testTag("RestartButton")
             ) {
@@ -1032,13 +1038,14 @@ private fun MonoConfigOptionChip(
     textPrimary: Color,
     textSecondary: Color
 ) {
-    val background = if (selected) Color(0xFF1A1A1A) else Color(0xFF141414)
+    val mono = monotoneColors()
+    val background = if (selected) mono.optionSelectedBg else mono.optionUnselectedBg
     val borderColor = if (selected) {
-        Color(0xFFE6E6E6).copy(alpha = 0.90f)
+        mono.optionSelectedBorder.copy(alpha = 0.90f)
     } else {
-        Color(0xFF8A8A8A).copy(alpha = 0.55f)
+        mono.optionUnselectedBorder.copy(alpha = 0.55f)
     }
-    val labelColor = if (selected) textPrimary else Color(0xFFE8E8E8)
+    val labelColor = if (selected) textPrimary else mono.optionUnselectedLabel
 
     Row(
         modifier = Modifier
@@ -1080,11 +1087,11 @@ private fun MonoConfigOptionChip(
                     .drawBehind {
                         val strokeWidth = 1.6.dp.toPx()
                         drawCircle(
-                            color = Color.White.copy(alpha = 0.88f),
+                            color = mono.optionSelectedBorder.copy(alpha = 0.88f),
                             style = Stroke(width = strokeWidth)
                         )
                         drawCircle(
-                            color = Color.White.copy(alpha = 0.88f),
+                            color = mono.optionSelectedBorder.copy(alpha = 0.88f),
                             radius = size.minDimension / 2.5f
                         )
                     }
@@ -1111,16 +1118,13 @@ private fun animatedMonotoneBackground(): Brush {
         label = "mono-bg-p"
     )
 
-    val c0 = Color(0xFF080808)
-    val c1 = Color(0xFF101010)
-    val c2 = Color(0xFF181818)
-    val c3 = Color(0xFF222222)
+    val mono = monotoneColors()
 
     val endX = 900f + 280f * p
     val endY = 720f - 220f * p
 
     return Brush.linearGradient(
-        colors = listOf(c0, c1, c2, c3),
+        colors = mono.introBgStops,
         start = Offset(0f, 0f),
         end = Offset(endX, endY)
     )

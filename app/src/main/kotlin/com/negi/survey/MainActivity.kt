@@ -18,6 +18,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.AssetManager
+import android.content.res.Configuration
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -152,6 +153,7 @@ import com.negi.survey.slm.SLM
 import com.negi.survey.slm.buildModelConfig
 import com.negi.survey.slm.modelIdentityForPath
 import com.negi.survey.ui.theme.SurveyNavTheme
+import com.negi.survey.ui.theme.monotoneColors
 import com.negi.survey.vm.AiViewModel
 import com.negi.survey.vm.AppViewModel
 import com.negi.survey.vm.DlState
@@ -255,21 +257,24 @@ class MainActivity : ComponentActivity() {
      */
     private fun configureEdgeToEdge() {
         val black = "#000000".toColorInt()
+        val white = "#FFFFFF".toColorInt()
+        val isDark = (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
+            Configuration.UI_MODE_NIGHT_YES
 
         // Force edge-to-edge in both paths for consistency.
         WindowCompat.setDecorFitsSystemWindows(window, false)
 
         runCatching {
             enableEdgeToEdge(
-                statusBarStyle = SystemBarStyle.dark(black),
-                navigationBarStyle = SystemBarStyle.dark(black),
+                statusBarStyle = if (isDark) SystemBarStyle.dark(black) else SystemBarStyle.light(white, white),
+                navigationBarStyle = if (isDark) SystemBarStyle.dark(black) else SystemBarStyle.light(white, white),
             )
         }.onFailure { t ->
             Log.w(TAG, "enableEdgeToEdge failed; using legacy insets path: ${t.message}", t)
 
             WindowInsetsControllerCompat(window, window.decorView).apply {
-                isAppearanceLightStatusBars = false
-                isAppearanceLightNavigationBars = false
+                isAppearanceLightStatusBars = !isDark
+                isAppearanceLightNavigationBars = !isDark
             }
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -286,11 +291,13 @@ class MainActivity : ComponentActivity() {
 /* ───────────────────────────── Visual Utilities ───────────────────────────── */
 
 @Composable
-private fun appBackplate(): Brush =
-    Brush.verticalGradient(
-        0f to Color(0xFF202020),
-        1f to Color(0xFF040404)
+private fun appBackplate(): Brush {
+    val mono = monotoneColors()
+    return Brush.verticalGradient(
+        0f to mono.screenTop,
+        1f to mono.screenBottom
     )
+}
 
 @Composable
 private fun Modifier.neonEdgeThin(
@@ -317,23 +324,26 @@ private fun Modifier.neutralEdge(
     alpha: Float = 0.16f,
     corner: Dp = 12.dp,
     stroke: Dp = 1.dp
-): Modifier = this.then(
-    Modifier.drawBehind {
-        val cr = CornerRadius(corner.toPx(), corner.toPx())
-        val sweep = Brush.sweepGradient(
-            0f to Color(0xFF101010).copy(alpha = alpha),
-            0.25f to Color(0xFF3A3A3A).copy(alpha = alpha),
-            0.5f to Color(0xFF7A7A7A).copy(alpha = alpha * 0.9f),
-            0.75f to Color(0xFF3A3A3A).copy(alpha = alpha),
-            1f to Color(0xFF101010).copy(alpha = alpha)
-        )
-        drawRoundRect(
-            brush = sweep,
-            style = Stroke(width = stroke.toPx()),
-            cornerRadius = cr
-        )
-    }
-)
+): Modifier {
+    val mono = monotoneColors()
+    return this.then(
+        Modifier.drawBehind {
+            val cr = CornerRadius(corner.toPx(), corner.toPx())
+            val sweep = Brush.sweepGradient(
+                0f to mono.edgeSweepDark.copy(alpha = alpha),
+                0.25f to mono.edgeSweepMid.copy(alpha = alpha),
+                0.5f to mono.cardBorderMid.copy(alpha = alpha * 0.9f),
+                0.75f to mono.edgeSweepMid.copy(alpha = alpha),
+                1f to mono.edgeSweepDark.copy(alpha = alpha)
+            )
+            drawRoundRect(
+                brush = sweep,
+                style = Stroke(width = stroke.toPx()),
+                cornerRadius = cr
+            )
+        }
+    )
+}
 
 /* ───────────────────────────── Init Gate ───────────────────────────── */
 

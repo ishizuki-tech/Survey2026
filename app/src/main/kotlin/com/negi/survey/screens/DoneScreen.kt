@@ -176,10 +176,13 @@ fun DoneScreen(
                 UploadStatusSummary(
                     uploadStatus = uploadStatus,
                     onResolveUploadStatusDetails = onResolveUploadStatusDetails,
-                    onClearCompletedSurveys = onClearCompletedSurveys,
-                    titleColor = Color.Black,
-                    countColor = Color.Black,
-                    actionColor = Color.Black
+                    onClearCompletedSurveys = onClearCompletedSurveys
+                    // titleColor/countColor/actionColor intentionally left at
+                    // UploadStatusSummary's own defaults (monotoneColors()),
+                    // so this follows Light/Dark like the rest of the app.
+                    // Previously hardcoded to Color.Black, which made this
+                    // section invisible in Dark mode (black text on a themed
+                    // dark background).
                 )
 
                 Spacer(Modifier.height(16.dp))

@@ -18,7 +18,9 @@ import android.net.Uri
 import android.util.Log
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -32,11 +34,14 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.negi.survey.utils.HeavyInitializer
+import com.negi.survey.ui.theme.monotoneColors
 import com.negi.survey.utils.PersistentModelStore
 import java.io.File
 import kotlinx.coroutines.CancellationException
@@ -468,7 +473,17 @@ fun DownloadGate(
     when (state) {
         is DlState.Idle -> {
             // Transient: ensureModelDownloaded() runs immediately after this frame
-            // and moves state on, so nothing is rendered here to avoid a one-frame flash.
+            // and moves state on. This still paints the same dark backdrop as the
+            // Intro/loading screens before it (rather than rendering nothing) so this
+            // one frame never exposes the app theme's base background underneath —
+            // on a device in light mode that base is white, which is what showed up
+            // as a brief white flash here before reaching the (intentionally light)
+            // survey screens.
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(downloadGateBackplate())
+            )
         }
 
         is DlState.NeedsModel -> {
@@ -489,6 +504,7 @@ fun DownloadGate(
             Column(
                 modifier = Modifier
                     .fillMaxSize()
+                    .background(downloadGateBackplate())
                     .padding(24.dp),
                 verticalArrangement = Arrangement.Center
             ) {
@@ -516,6 +532,7 @@ fun DownloadGate(
             Column(
                 modifier = Modifier
                     .fillMaxSize()
+                    .background(downloadGateBackplate())
                     .padding(24.dp),
                 verticalArrangement = Arrangement.Center
             ) {
@@ -531,6 +548,24 @@ fun DownloadGate(
             content(state.file)
         }
     }
+}
+
+/**
+ * The same backdrop used by the Intro/config-loading/model-init screens (see
+ * MainActivity's appBackplate()), duplicated here so this pre-survey "loading
+ * phase" of the flow stays visually consistent with the screen before it
+ * (Intro) and never falls back to the app theme's default Surface background
+ * underneath for a frame — which previously caused a brief flash when they
+ * didn't match. Follows the system Light/Dark setting via [monotoneColors],
+ * same as appBackplate() and IntroScreen.
+ */
+@Composable
+private fun downloadGateBackplate(): Brush {
+    val mono = monotoneColors()
+    return Brush.verticalGradient(
+        0f to mono.screenTop,
+        1f to mono.screenBottom
+    )
 }
 
 /**
