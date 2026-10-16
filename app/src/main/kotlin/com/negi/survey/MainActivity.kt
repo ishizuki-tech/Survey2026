@@ -166,7 +166,6 @@ import com.negi.survey.vm.FlowReview
 import com.negi.survey.vm.FlowSingle
 import com.negi.survey.vm.FlowStop
 import com.negi.survey.vm.FlowText
-import com.negi.survey.vm.ModelPersistenceDialog
 import com.negi.survey.vm.NoOpQuestionSpeaker
 import com.negi.survey.vm.NodeType
 import com.negi.survey.vm.QuestionSpeaker
@@ -862,7 +861,6 @@ fun AppNav() {
     )
 
     val state by appVm.state.collectAsStateWithLifecycle()
-    val persistenceNotice by appVm.persistenceNotice.collectAsStateWithLifecycle()
 
     LaunchedEffect(state) {
         if (state is DlState.Idle) {
@@ -871,16 +869,19 @@ fun AppNav() {
         }
     }
 
-    ModelPersistenceDialog(
-        notice = persistenceNotice,
-        onDismiss = { appVm.dismissPersistenceNotice() }
-    )
-
     DownloadGate(
         state = state,
         onRetry = {
             Log.d(MainActivity.TAG, "DownloadGate retry. session=$sessionKey")
             appVm.ensureModelDownloaded(appContext)
+        },
+        onManualModelSelected = { uri ->
+            Log.d(MainActivity.TAG, "DownloadGate manual model selected. session=$sessionKey")
+            appVm.useManuallySelectedModel(appContext, uri)
+        },
+        onSkipManualSelection = {
+            Log.d(MainActivity.TAG, "DownloadGate manual selection skipped -> downloading. session=$sessionKey")
+            appVm.proceedWithDownload(appContext)
         }
     ) { modelFile ->
 

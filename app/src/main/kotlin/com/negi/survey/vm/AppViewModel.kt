@@ -14,7 +14,10 @@
 package com.negi.survey.vm
 
 import android.content.Context
+import android.net.Uri
 import android.util.Log
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
@@ -28,7 +31,6 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
@@ -40,7 +42,6 @@ import java.io.File
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -51,6 +52,18 @@ import kotlinx.coroutines.launch
 
 sealed class DlState {
     data object Idle : DlState()
+
+    /**
+     * No local or persisted copy of the model was found automatically. Before
+     * starting the (potentially large) network download, the UI pauses here
+     * so the user can point at a copy already saved on this device by another
+     * install of the app (e.g. a different build/version that already
+     * downloaded the same model), via the system file picker. Calling
+     * [AppViewModel.proceedWithDownload] dismisses this and starts the normal
+     * download; calling [AppViewModel.useManuallySelectedModel] with a picked
+     * file skips the download entirely.
+     */
+    data object NeedsModel : DlState()
 
     data class Downloading(
         val downloaded: Long,
@@ -64,21 +77,6 @@ sealed class DlState {
     data class Error(
         val message: String
     ) : DlState()
-}
-
-/* ───────────────────────────── Persistence Notice ───────────────────────────── */
-
-/**
- * One-shot notice describing an interaction with the on-device persisted
- * (survives-uninstall) model cache, meant to be surfaced to the user via a
- * dialog and then dismissed.
- */
-sealed class ModelPersistenceNotice {
-    /** A previously persisted copy of [fileName] was reused with no network call. */
-    data class Reused(val fileName: String, val bytes: Long) : ModelPersistenceNotice()
-
-    /** A stale persisted copy [oldFileName] was removed to make room for [newFileName]. */
-    data class Replacing(val oldFileName: String, val newFileName: String) : ModelPersistenceNotice()
 }
 
 /* ───────────────────────────── ViewModel ───────────────────────────── */
@@ -98,16 +96,6 @@ class AppViewModel(
 
     @Volatile
     private var downloadJob: Job? = null
-
-    private val _persistenceNotice = MutableStateFlow<ModelPersistenceNotice?>(null)
-
-    /** Exposes a one-shot persisted-storage reuse/replace notice for the UI to show and dismiss. */
-    val persistenceNotice: StateFlow<ModelPersistenceNotice?> = _persistenceNotice.asStateFlow()
-
-    /** Call after the UI has shown [persistenceNotice] to clear it. */
-    fun dismissPersistenceNotice() {
-        _persistenceNotice.value = null
-    }
 
     /**
      * Ensures the target model exists locally, downloading if needed.
@@ -141,16 +129,151 @@ class AppViewModel(
             val safeName = suggestFileName(modelUrl, fileName)
             findExistingModelFile(app, safeName)?.let { existing ->
                 Log.i("AppViewModel", "private model reused: name=$safeName bytes=${existing.length()}")
-                _persistenceNotice.value = ModelPersistenceNotice.Reused(safeName, existing.length())
-                downloadJob = viewModelScope.launch {
-                    // Hold here so the "Using saved model" notice is fully visible
-                    // before the UI advances to model initialization.
-                    delay(REUSED_NOTICE_DISPLAY_MS)
-                    _state.value = DlState.Done(existing)
-                    downloadJob = null
-                }
+                _state.value = DlState.Done(existing)
                 return
             }
+        }
+
+        // An explicit forced re-download (e.g. "Retry" after choosing to
+        // redownload, or a debug reset) skips the manual-file prompt below
+        // and goes straight to the network.
+        if (forceFresh) {
+            startDownload(app, forceFresh = true)
+            return
+        }
+
+        downloadJob = viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val nowState = _state.value
+                if (nowState is DlState.Downloading || nowState is DlState.Done) {
+                    return@launch
+                }
+
+                val safeName = suggestFileName(modelUrl, fileName)
+                val privateDestination = File(app.filesDir, safeName)
+                val reused = runCatching {
+                    PersistentModelStore.reuseOrReplace(
+                        context = app,
+                        targetFileName = safeName,
+                        privateDestination = privateDestination,
+                        onReused = { bytes ->
+                            Log.i("AppViewModel", "Reused persisted model '$safeName' ($bytes bytes)")
+                        },
+                        onReplacing = { oldFileName ->
+                            Log.i("AppViewModel", "Removing stale persisted model '$oldFileName' before downloading '$safeName'")
+                        }
+                    )
+                }.getOrElse { e ->
+                    Log.w("AppViewModel", "Persisted model store check failed: ${e.message}")
+                    false
+                }
+
+                if (reused && privateDestination.exists() && privateDestination.length() > 0L) {
+                    _state.value = DlState.Done(privateDestination)
+                    return@launch
+                }
+
+                // Nothing found automatically in this app's own storage or the
+                // shared persisted-model folder. Pause here (instead of starting
+                // the network download immediately) so the UI can offer the user
+                // a chance to pick a copy saved elsewhere on the device — e.g. by
+                // another install of this app. proceedWithDownload() or
+                // useManuallySelectedModel() resumes from here.
+                _state.value = DlState.NeedsModel
+            } catch (ce: CancellationException) {
+                if (_state.value !is DlState.Error) {
+                    _state.value = DlState.Error("Canceled by user")
+                }
+            } catch (t: Throwable) {
+                _state.value = DlState.Error(t.message ?: "Failed to check for an existing model")
+            } finally {
+                if (downloadJob === this.coroutineContext[Job]) {
+                    downloadJob = null
+                }
+            }
+        }
+    }
+
+    /**
+     * Dismisses [DlState.NeedsModel] and starts the normal network download,
+     * for when the user doesn't have (or can't find) a copy saved elsewhere
+     * on the device to pick instead.
+     */
+    fun proceedWithDownload(appContext: Context) {
+        startDownload(appContext.applicationContext, forceFresh = false)
+    }
+
+    /**
+     * Copies a model file the user picked via the system file/document picker
+     * (e.g. a copy saved by another install of this app) into private storage
+     * and marks the model ready, skipping the network download entirely.
+     *
+     * On failure, surfaces a [DlState.Error] so the user can try picking again
+     * (via "Retry", which re-enters [ensureModelDownloaded] and will offer the
+     * prompt again) or fall back to downloading.
+     */
+    fun useManuallySelectedModel(appContext: Context, uri: Uri) {
+        val app = appContext.applicationContext
+
+        val running = downloadJob
+        if (running?.isActive == true) {
+            running.cancel(CancellationException("manual model file selected"))
+            HeavyInitializer.cancel()
+        }
+
+        downloadJob = viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val safeName = suggestFileName(modelUrl, fileName)
+                val destination = File(app.filesDir, safeName)
+                val tmp = File(app.filesDir, "$safeName.fromPicker.tmp")
+
+                val copied = runCatching {
+                    app.contentResolver.openInputStream(uri)?.use { input ->
+                        tmp.outputStream().use { out -> input.copyTo(out, bufferSize = 1 shl 20) }
+                        true
+                    } ?: false
+                }.getOrElse { e ->
+                    Log.w("AppViewModel", "Failed to read manually selected model file: ${e.message}")
+                    false
+                }
+
+                if (!copied || !tmp.exists() || tmp.length() <= 0L) {
+                    tmp.delete()
+                    _state.value = DlState.Error(
+                        "Couldn't read the selected file. Choose another file, or retry to download the model instead."
+                    )
+                    return@launch
+                }
+
+                if (!tmp.renameTo(destination)) {
+                    tmp.copyTo(destination, overwrite = true)
+                    tmp.delete()
+                }
+
+                if (!isActive) return@launch
+
+                runCatching { PersistentModelStore.persistFromPrivate(app, safeName, destination) }
+                    .onFailure { e -> Log.w("AppViewModel", "Failed to persist manually selected model: ${e.message}") }
+
+                Log.i("AppViewModel", "Using manually selected model file: name=$safeName bytes=${destination.length()}")
+                _state.value = DlState.Done(destination)
+            } catch (t: Throwable) {
+                _state.value = DlState.Error(t.message ?: "Couldn't use the selected file.")
+            } finally {
+                if (downloadJob === this.coroutineContext[Job]) {
+                    downloadJob = null
+                }
+            }
+        }
+    }
+
+    /** Starts the actual network download; the only path that calls [HeavyInitializer.ensureInitialized]. */
+    private fun startDownload(app: Context, forceFresh: Boolean) {
+        val running = downloadJob
+        if (running?.isActive == true) {
+            if (!forceFresh) return
+            running.cancel(CancellationException("forceFresh requested"))
+            HeavyInitializer.cancel()
         }
 
         downloadJob = viewModelScope.launch(Dispatchers.IO) {
@@ -162,36 +285,6 @@ class AppViewModel(
                 }
 
                 val safeName = suggestFileName(modelUrl, fileName)
-
-                if (!forceFresh) {
-                    val privateDestination = File(app.filesDir, safeName)
-                    val reused = runCatching {
-                        PersistentModelStore.reuseOrReplace(
-                            context = app,
-                            targetFileName = safeName,
-                            privateDestination = privateDestination,
-                            onReused = { bytes ->
-                                Log.i("AppViewModel", "Reused persisted model '$safeName' ($bytes bytes)")
-                                _persistenceNotice.value = ModelPersistenceNotice.Reused(safeName, bytes)
-                            },
-                            onReplacing = { oldFileName ->
-                                Log.i("AppViewModel", "Removing stale persisted model '$oldFileName' before downloading '$safeName'")
-                                _persistenceNotice.value = ModelPersistenceNotice.Replacing(oldFileName, safeName)
-                            }
-                        )
-                    }.getOrElse { e ->
-                        Log.w("AppViewModel", "Persisted model store check failed: ${e.message}")
-                        false
-                    }
-
-                    if (reused && privateDestination.exists() && privateDestination.length() > 0L) {
-                        // Hold here so the "Using saved model" notice is fully visible
-                        // before the UI advances to model initialization.
-                        delay(REUSED_NOTICE_DISPLAY_MS)
-                        _state.value = DlState.Done(privateDestination)
-                        return@launch
-                    }
-                }
 
                 _state.value = DlState.Downloading(downloaded = 0L, total = null)
 
@@ -368,12 +461,21 @@ class AppViewModel(
 fun DownloadGate(
     state: DlState,
     onRetry: () -> Unit,
+    onManualModelSelected: (Uri) -> Unit = {},
+    onSkipManualSelection: () -> Unit = {},
     content: @Composable (modelFile: File) -> Unit
 ) {
     when (state) {
         is DlState.Idle -> {
             // Transient: ensureModelDownloaded() runs immediately after this frame
             // and moves state on, so nothing is rendered here to avoid a one-frame flash.
+        }
+
+        is DlState.NeedsModel -> {
+            ManualModelSelectionDialog(
+                onFilePicked = onManualModelSelected,
+                onSkip = onSkipManualSelection
+            )
         }
 
         is DlState.Downloading -> {
@@ -431,60 +533,48 @@ fun DownloadGate(
     }
 }
 
-/* ───────────────────────────── Persistence Dialog ───────────────────────────── */
-
-/** How long the "Using saved model" notice blocks/displays before model init proceeds. */
-private const val REUSED_NOTICE_DISPLAY_MS: Long = 3_000L
-
 /**
- * Surfaces [notice] (a one-shot reuse/replace event from the persisted,
- * survives-uninstall model cache) to the user as an alert dialog, then
- * calls [onDismiss] to clear it.
+ * Lets the user pick a model file already saved on this device — e.g. by
+ * another install of the app — instead of starting the network download.
+ *
+ * "Select File" opens the system document picker (any location the user's
+ * Files app/provider can browse, including another app's exported storage).
+ * "Cancel" dismisses this and lets the download proceed normally via
+ * [onSkip]; there is no outside-dismiss, so the user makes an explicit choice.
  */
 @Composable
-fun ModelPersistenceDialog(
-    notice: ModelPersistenceNotice?,
-    onDismiss: () -> Unit
+private fun ManualModelSelectionDialog(
+    onFilePicked: (Uri) -> Unit,
+    onSkip: () -> Unit
 ) {
-    when (notice) {
-        null -> Unit
-
-        is ModelPersistenceNotice.Reused -> {
-            LaunchedEffect(notice) {
-                delay(REUSED_NOTICE_DISPLAY_MS)
-                onDismiss()
-            }
-
-            val mb = notice.bytes / (1024L * 1024L)
-            AlertDialog(
-                onDismissRequest = onDismiss,
-                title = { Text("Using saved model") },
-                text = {
-                    Text(
-                        "Found \"${notice.fileName}\" already saved on this device " +
-                            "(${mb} MB). Loading it from local storage — no download needed."
-                    )
-                },
-                confirmButton = {
-                    TextButton(onClick = onDismiss) { Text("OK") }
-                }
-            )
-        }
-
-        is ModelPersistenceNotice.Replacing -> {
-            AlertDialog(
-                onDismissRequest = onDismiss,
-                title = { Text("Updating model") },
-                text = {
-                    Text(
-                        "A different saved model (\"${notice.oldFileName}\") is no longer needed. " +
-                            "Removing it and downloading \"${notice.newFileName}\" instead."
-                    )
-                },
-                confirmButton = {
-                    TextButton(onClick = onDismiss) { Text("OK") }
-                }
-            )
-        }
+    val filePickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) onFilePicked(uri)
     }
+
+    AlertDialog(
+        // Back-press/outside-tap behaves the same as the explicit Cancel button:
+        // the download proceeds rather than leaving the user stuck on the dialog.
+        onDismissRequest = onSkip,
+        title = { Text("Use an existing model file?") },
+        text = {
+            Text(
+                "The on-device AI model isn't on this device yet. If another " +
+                    "install of this app already downloaded it, you can select " +
+                    "that file instead of downloading it again. If you can't find " +
+                    "it, cancel and the download will continue."
+            )
+        },
+        confirmButton = {
+            TextButton(onClick = { filePickerLauncher.launch(arrayOf("*/*")) }) {
+                Text("Select File")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onSkip) {
+                Text("Cancel")
+            }
+        }
+    )
 }
