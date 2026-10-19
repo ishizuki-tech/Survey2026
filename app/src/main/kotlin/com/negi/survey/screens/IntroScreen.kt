@@ -450,6 +450,23 @@ private fun IntroCardMono(
                 isRestarting = isRestarting,
                 onRestart = onRestart
             )
+
+            // About: version, build, and credits/licences for voices, models and libraries.
+            var showAbout by remember { mutableStateOf(false) }
+            Spacer(Modifier.padding(top = 4.dp))
+            TextButton(
+                onClick = { showAbout = true },
+                modifier = Modifier.testTag("AboutButton")
+            ) {
+                Text(
+                    text = "About · Credits & licences",
+                    style = MaterialTheme.typography.labelLarge.copy(letterSpacing = 0.2.sp),
+                    color = textMuted
+                )
+            }
+            if (showAbout) {
+                AboutScreen(onClose = { showAbout = false })
+            }
         }
     }
 
