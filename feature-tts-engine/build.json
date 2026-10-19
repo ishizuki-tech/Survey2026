@@ -1,0 +1,12 @@
+{
+  "original_branch": "feature/tts-engine",
+  "branch_slug": "feature-tts-engine",
+  "commit_sha": "322c9455849c9ccfeabf4fc36c90ecd2038d60dd",
+  "short_sha": "322c945",
+  "apk_name": "Survey2026-feature-tts-engine-322c945.apk",
+  "apk_sha256": "bcbd6b22b1d0a54d4e8b65effc2bc0d735460903dceb91b658bfe9f39653df85",
+  "apk_download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-feature-tts-engine-322c945-run-128/Survey2026-feature-tts-engine-322c945.apk",
+  "page_url": "https://ishizuki-tech.github.io/Survey2026/feature-tts-engine/",
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/39320431516",
+  "generated_utc": "2026-10-19T20:42:43Z"
+}
