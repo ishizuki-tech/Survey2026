@@ -180,6 +180,11 @@ import com.negi.survey.vm.SurveyFinalizationState
 import com.negi.survey.vm.SurveyFinalizationStatePolicy
 import com.negi.survey.vm.SurveyFinalizationViewModel
 import com.negi.survey.vm.TtsController
+import androidx.lifecycle.compose.LifecycleResumeEffect
+import com.negi.survey.screens.TtsEngineMissingScreen
+import com.negi.survey.vm.isTtsEngineInstalled
+import com.negi.survey.vm.TtsVoiceCheck
+import com.negi.survey.vm.checkTtsOfflineVoice
 import com.negi.survey.vm.UploadStatusViewModel
 import com.negi.survey.vm.UploadStatus
 import com.negi.survey.vm.UploadStatusDetails
@@ -854,6 +859,80 @@ fun AppNav() {
 
     val cfg = config!!
 
+    /*
+     * TTS readiness check. Runs before the SLM is downloaded or initialized, so a phone
+     * missing its voice fails fast instead of after a long model load:
+     *  - tts.require_engine: the tts.engine app must be installed.
+     *  - tts.require_offline_voice: that engine must also have a downloaded (offline) voice
+     *    for tts.language.
+     * Once it passes (or the interviewer continues without voice) it isn't checked again
+     * for this session.
+     */
+    val ttsGateEngine = remember(cfg) { cfg.tts.engine?.trim()?.ifBlank { null } }
+    val ttsGateLang = remember(cfg) {
+        cfg.tts.language?.trim()?.lowercase(Locale.US)?.ifBlank { null } ?: DEFAULT_TTS_LANGUAGE
+    }
+    val ttsGateNeedsVoice = remember(cfg, ttsGateEngine) {
+        (cfg.tts.enabled ?: true) && (cfg.tts.requireOfflineVoice ?: false) && ttsGateEngine != null
+    }
+    val ttsGateNeedsEngine = remember(cfg, ttsGateEngine) {
+        (cfg.tts.enabled ?: true) && (cfg.tts.requireEngine ?: false) && ttsGateEngine != null
+    }
+    // null = check still running.
+    var ttsGateResult by remember(sessionKey, ttsGateEngine) {
+        mutableStateOf(if (ttsGateNeedsVoice || ttsGateNeedsEngine) null else TtsVoiceCheck.OK)
+    }
+    var ttsGateContinue by remember(sessionKey) { mutableStateOf(false) }
+    var ttsGateTick by remember(sessionKey) { mutableIntStateOf(0) }
+
+    LaunchedEffect(sessionKey, ttsGateEngine, ttsGateTick) {
+        if (ttsGateResult == TtsVoiceCheck.OK || ttsGateContinue) return@LaunchedEffect
+        val engine = ttsGateEngine ?: return@LaunchedEffect
+        val result = when {
+            ttsGateNeedsVoice -> checkTtsOfflineVoice(appContext, engine, ttsGateLang)
+            ttsGateNeedsEngine ->
+                if (isTtsEngineInstalled(appContext, engine)) TtsVoiceCheck.OK else TtsVoiceCheck.ENGINE_MISSING
+            else -> TtsVoiceCheck.OK
+        }
+        Log.d(MainActivity.TAG, "TTS gate: engine=$engine lang=$ttsGateLang result=$result session=$sessionKey")
+        ttsGateResult = result
+    }
+
+    if (ttsGateResult != TtsVoiceCheck.OK && !ttsGateContinue) {
+        val gateContext = LocalContext.current
+        // Re-check on return to the app, e.g. after downloading the voice in Settings.
+        LifecycleResumeEffect(ttsGateEngine) {
+            if (ttsGateResult != null) ttsGateTick++
+            onPauseOrDispose { }
+        }
+        val result = ttsGateResult
+        if (result == null) {
+            Box(
+                modifier = Modifier.fillMaxSize().imePadding(),
+                contentAlignment = Alignment.Center
+            ) {
+                CircularProgressIndicator()
+            }
+        } else {
+            TtsEngineMissingScreen(
+                enginePackage = ttsGateEngine.orEmpty(),
+                languageCode = ttsGateLang,
+                onContinueWithoutVoice = {
+                    Log.w(MainActivity.TAG, "TTS gate failed ($result); continuing without read-aloud")
+                    ttsGateContinue = true
+                },
+                onExit = {
+                    Log.w(MainActivity.TAG, "TTS gate failed ($result) -> exiting app. session=$sessionKey")
+                    sessionStore.clearSession(sessionKey)
+                    chosenId = null
+                    (gateContext as? android.app.Activity)?.finishAndRemoveTask()
+                },
+                modifier = Modifier.fillMaxSize().imePadding()
+            )
+        }
+        return
+    }
+
     val sessionVmOwner = remember(sessionStore, sessionKey) {
         sessionStore.ownerFor(sessionKey)
     }
@@ -1254,22 +1333,35 @@ fun SurveyNavHost(
             ?.ifBlank { null }
             ?: DEFAULT_TTS_LANGUAGE
     }
-    val ttsRate = remember(ttsMeta.speechRate) { ttsMeta.speechRate?.takeIf { it > 0f } ?: 1.0f }
-    val ttsPitch = remember(ttsMeta.pitch) { ttsMeta.pitch?.takeIf { it > 0f } ?: 1.0f }
+    // Null when omitted from the YAML: the TTS engine's own rate/pitch settings apply.
+    val ttsRate = remember(ttsMeta.speechRate) { ttsMeta.speechRate?.takeIf { it > 0f } }
+    val ttsPitch = remember(ttsMeta.pitch) { ttsMeta.pitch?.takeIf { it > 0f } }
+    val ttsEngine = remember(ttsMeta.engine) { ttsMeta.engine?.trim()?.ifBlank { null } }
+    val ttsRequireEngine = remember(ttsMeta.requireEngine, ttsMeta.requireOfflineVoice) {
+        (ttsMeta.requireEngine ?: false) || (ttsMeta.requireOfflineVoice ?: false)
+    }
+
+    // The required-engine check (and its error screen) runs earlier in AppNav, before the
+    // SLM loads. Here we only note whether the engine exists so the controller binds to it.
+    val ttsEngineInstalled = remember(ttsEngine) {
+        ttsEngine?.let { isTtsEngineInstalled(appContext, it) } ?: true
+    }
 
     val ttsController: QuestionSpeaker = if (ttsEnabled) {
-        val ttsFactory = remember(appContext, ttsLang, ttsRate, ttsPitch) {
+        val ttsFactory = remember(appContext, ttsLang, ttsRate, ttsPitch, ttsEngine, ttsRequireEngine) {
             TtsController.provideFactory(
                 appContext = appContext,
                 languageCode = ttsLang,
                 speechRate = ttsRate,
-                pitch = ttsPitch
+                pitch = ttsPitch,
+                enginePackage = ttsEngine,
+                requireEngine = ttsRequireEngine
             )
         }
 
         val ttsVm: TtsController = viewModel(
             viewModelStoreOwner = owner,
-            key = "TtsController_${sessionId}_$ttsLang",
+            key = "TtsController_${sessionId}_${ttsLang}_${ttsEngine.orEmpty()}_$ttsEngineInstalled",
             factory = ttsFactory
         )
 

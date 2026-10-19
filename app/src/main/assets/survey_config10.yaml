@@ -435,6 +435,11 @@ whisper:
 tts:
   enabled: true
   language: "en"
+  # Use only Google's TTS engine for English, so English questions are never read
+  # by the Swahili engine even if it is the phone's default.
+  # require_offline_voice: Google TTS must be installed AND have an English voice
+  # downloaded for offline use; otherwise an error screen is shown before the SLM loads.
+  engine: "com.google.android.tts"
+  require_offline_voice: true
   auto_play: true
   speech_rate: 1.0
-  pitch: 1.0

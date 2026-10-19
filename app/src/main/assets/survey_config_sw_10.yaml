@@ -436,6 +436,12 @@ whisper:
 tts:
   enabled: true
   language: "sw"
+  # Separate engine app (own process): sherpa-onnx + Piper sw_CD-lanfrica-medium.
+  # require_engine: true = use only this engine; if it isn't installed, read-aloud
+  # is turned off with an error message instead of using another voice.
+  engine: "com.k2fsa.sherpa.onnx.tts.engine"
+  require_engine: true
   auto_play: true
-  speech_rate: 1.0
-  pitch: 1.0
+  # Read-aloud speed sent to the TTS engine (1.0 = normal). Overrides the engine's
+  # own speed setting on the phone; remove this line to use that setting instead.
+  speech_rate: 0.6

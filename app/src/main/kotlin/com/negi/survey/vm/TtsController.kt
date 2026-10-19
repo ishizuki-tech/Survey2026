@@ -16,6 +16,7 @@
 package com.negi.survey.vm
 
 import android.content.Context
+import android.content.Intent
 import android.os.Bundle
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
@@ -23,6 +24,10 @@ import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import java.util.Locale
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 
@@ -83,6 +88,66 @@ internal fun toggleQuestionSpeaker(
 }
 
 /**
+ * True when [pkg] exposes a TextToSpeech service.
+ * Requires the TTS_SERVICE `<queries>` entry in the manifest on Android 11+.
+ */
+internal fun isTtsEngineInstalled(context: Context, pkg: String): Boolean =
+    runCatching {
+        val intent = Intent(TextToSpeech.Engine.INTENT_ACTION_TTS_SERVICE).setPackage(pkg)
+        context.packageManager.queryIntentServices(intent, 0).isNotEmpty()
+    }.getOrDefault(false)
+
+/** Result of [checkTtsOfflineVoice]. */
+enum class TtsVoiceCheck { OK, ENGINE_MISSING, VOICE_MISSING, ERROR }
+
+/**
+ * Checks that [enginePkg] is installed and offers a voice for [languageCode] that works
+ * offline: not network-only, and its data downloaded (no KEY_FEATURE_NOT_INSTALLED).
+ * Briefly starts a TextToSpeech instance bound to that engine, then shuts it down.
+ */
+internal suspend fun checkTtsOfflineVoice(
+    context: Context,
+    enginePkg: String,
+    languageCode: String,
+    timeoutMs: Long = 8_000L
+): TtsVoiceCheck {
+    if (!isTtsEngineInstalled(context, enginePkg)) return TtsVoiceCheck.ENGINE_MISSING
+    val wantIso3 = runCatching { Locale.forLanguageTag(languageCode).isO3Language }
+        .getOrDefault(languageCode)
+
+    return withContext(Dispatchers.Main) {
+        val initStatus = CompletableDeferred<Int>()
+        val tts = TextToSpeech(
+            context.applicationContext,
+            { status -> initStatus.complete(status) },
+            enginePkg
+        )
+        try {
+            val status = withTimeoutOrNull(timeoutMs) { initStatus.await() }
+            if (status != TextToSpeech.SUCCESS) {
+                Log.w("TtsController", "Offline voice check: engine=$enginePkg init status=$status")
+                return@withContext TtsVoiceCheck.ERROR
+            }
+            val voices = runCatching { tts.voices }.getOrNull().orEmpty()
+            val offline = voices.filter { v ->
+                val iso3 = runCatching { v.locale.isO3Language }.getOrDefault(v.locale.language)
+                iso3.equals(wantIso3, ignoreCase = true) &&
+                    !v.isNetworkConnectionRequired &&
+                    !v.features.orEmpty().contains(TextToSpeech.Engine.KEY_FEATURE_NOT_INSTALLED)
+            }
+            Log.d(
+                "TtsController",
+                "Offline voice check: engine=$enginePkg lang=$languageCode voices=${voices.size} " +
+                    "offline=${offline.map { it.name }}"
+            )
+            if (offline.isNotEmpty()) TtsVoiceCheck.OK else TtsVoiceCheck.VOICE_MISSING
+        } finally {
+            runCatching { tts.shutdown() }
+        }
+    }
+}
+
+/**
  * [QuestionSpeaker] backed by [android.speech.tts.TextToSpeech].
  *
  * Notes:
@@ -98,8 +163,12 @@ internal fun toggleQuestionSpeaker(
 class TtsController(
     private val appContext: Context,
     private val languageCode: String = DEFAULT_LANGUAGE,
-    private val speechRate: Float = 1.0f,
-    private val pitch: Float = 1.0f
+    /** Null = don't set; the TTS engine's own speech-rate setting applies. */
+    private val speechRate: Float? = null,
+    /** Null = don't set; the TTS engine's own pitch setting applies. */
+    private val pitch: Float? = null,
+    private val enginePackage: String? = null,
+    private val requireEngine: Boolean = false
 ) : ViewModel(), QuestionSpeaker {
 
     companion object {
@@ -109,8 +178,10 @@ class TtsController(
         fun provideFactory(
             appContext: Context,
             languageCode: String = DEFAULT_LANGUAGE,
-            speechRate: Float = 1.0f,
-            pitch: Float = 1.0f
+            speechRate: Float? = null,
+            pitch: Float? = null,
+            enginePackage: String? = null,
+            requireEngine: Boolean = false
         ): ViewModelProvider.Factory =
             object : ViewModelProvider.Factory {
                 @Suppress("UNCHECKED_CAST")
@@ -122,7 +193,9 @@ class TtsController(
                         appContext = appContext.applicationContext,
                         languageCode = languageCode,
                         speechRate = speechRate,
-                        pitch = pitch
+                        pitch = pitch,
+                        enginePackage = enginePackage,
+                        requireEngine = requireEngine
                     ) as T
                 }
             }
@@ -143,8 +216,26 @@ class TtsController(
     private var engine: TextToSpeech? = null
 
     init {
-        engine = TextToSpeech(appContext) { status -> onEngineInit(status) }
+        val requested = enginePackage?.trim()?.ifBlank { null }
+        val installed = requested != null && isEngineInstalled(requested)
+        engine = if (installed) {
+            Log.d(TAG, "Binding to TTS engine app: $requested")
+            TextToSpeech(appContext, { status -> onEngineInit(status) }, requested)
+        } else if (requested != null && requireEngine) {
+            // Forced engine missing: never read questions with a different voice.
+            Log.e(TAG, "Required TTS engine '$requested' is not installed; read-aloud disabled")
+            _error.value = "Read-aloud needs the voice app $requested for '$languageCode'. Please install it."
+            _isReady.value = false
+            null
+        } else {
+            if (requested != null) {
+                Log.w(TAG, "TTS engine '$requested' not installed; using device default engine")
+            }
+            TextToSpeech(appContext) { status -> onEngineInit(status) }
+        }
     }
+
+    private fun isEngineInstalled(pkg: String): Boolean = isTtsEngineInstalled(appContext, pkg)
 
     private fun onEngineInit(status: Int) {
         if (status != TextToSpeech.SUCCESS) {
@@ -174,8 +265,9 @@ class TtsController(
             return
         }
 
-        runCatching { tts.setSpeechRate(speechRate) }
-        runCatching { tts.setPitch(pitch) }
+        // Only override the engine's own rate/pitch when the survey YAML sets them.
+        speechRate?.let { r -> runCatching { tts.setSpeechRate(r) } }
+        pitch?.let { p -> runCatching { tts.setPitch(p) } }
 
         tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
             override fun onStart(utteranceId: String?) {
@@ -201,8 +293,10 @@ class TtsController(
         _isReady.value = true
         Log.d(
             TAG,
-            "TextToSpeech ready: defaultEngine=${tts.defaultEngine} requestedLocale=$locale " +
-                "languageResult=$result activeVoice=${tts.voice} rate=$speechRate pitch=$pitch"
+            "TextToSpeech ready: requestedEngine=${enginePackage ?: "default"} " +
+                "defaultEngine=${tts.defaultEngine} requestedLocale=$locale " +
+                "languageResult=$result activeVoice=${tts.voice} " +
+                "rate=${speechRate ?: "engine"} pitch=${pitch ?: "engine"}"
         )
 
         val text = pendingText
