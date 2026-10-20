@@ -1,12 +1,12 @@
 {
   "original_branch": "fix/issue-86-upload-idempotency",
   "branch_slug": "fix-issue-86-upload-idempotency",
-  "commit_sha": "b20b03f6a0d5b66ce364fc27cf202d76acb91b38",
-  "short_sha": "b20b03f",
-  "apk_name": "Survey2026-fix-issue-86-upload-idempotency-b20b03f.apk",
-  "apk_sha256": "3e5dc94043307377c5e4cba7070c8b4456e6aa94e7d1514acc90a3f959162a8f",
-  "apk_download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-fix-issue-86-upload-idempotency-b20b03f-run-130/Survey2026-fix-issue-86-upload-idempotency-b20b03f.apk",
+  "commit_sha": "2448fac34d3605f35d3d67a10acc2eb2c115e93a",
+  "short_sha": "2448fac",
+  "apk_name": "Survey2026-fix-issue-86-upload-idempotency-2448fac.apk",
+  "apk_sha256": "23acee5354998426da1705226a41371b4c6f4f4dce4e9a0e8f29cec848551d9b",
+  "apk_download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-fix-issue-86-upload-idempotency-2448fac-run-131/Survey2026-fix-issue-86-upload-idempotency-2448fac.apk",
   "page_url": "https://ishizuki-tech.github.io/Survey2026/fix-issue-86-upload-idempotency/",
-  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/39477034057",
-  "generated_utc": "2026-10-20T18:49:29Z"
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/39477075470",
+  "generated_utc": "2026-10-20T18:56:34Z"
 }
