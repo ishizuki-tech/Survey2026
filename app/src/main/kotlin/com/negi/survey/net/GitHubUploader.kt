@@ -107,6 +107,22 @@ object GitHubUploader {
         val commitSha: String?
     )
 
+    internal data class SurveyRemoteRecord(
+        val content: String,
+        val fileUrl: String? = null
+    )
+
+    internal sealed interface SurveyCreateResult {
+        data class Created(val upload: UploadResult) : SurveyCreateResult
+        data object Conflict : SurveyCreateResult
+    }
+
+    /** Narrow survey-only seam; generic upload transport remains unchanged. */
+    internal interface SurveyContentsTransport {
+        suspend fun getExisting(): SurveyRemoteRecord?
+        suspend fun createOnly(): SurveyCreateResult
+    }
+
     // ---------------------------------------------------------------------
     // Public APIs — JSON/Text Upload
     // ---------------------------------------------------------------------
@@ -183,6 +199,90 @@ object GitHubUploader {
         maxRawBytesHint = cfg.maxRawBytesHint,
         maxRequestBytesHint = cfg.maxRequestBytesHint
     )
+
+    /** Builds a stable path without the execution-date segment used by generic uploads. */
+    fun buildStablePath(prefix: String, relativePath: String): String =
+        listOf(prefix.trim('/'), relativePath.trim('/'))
+            .filter { it.isNotBlank() }
+            .joinToString("/")
+
+    /**
+     * Creates a survey JSON record only when its canonical target is absent. If the target already
+     * exists, only byte-for-byte matching content for the same survey ID is accepted as success.
+     * A 409 is reconciled by re-reading the target, never by updating it with a fetched SHA.
+     */
+    internal suspend fun uploadSurveyJsonIdempotentlyAtPath(
+        cfg: GitHubConfig,
+        path: String,
+        localIdentity: SurveyUploadIdempotency.LocalSurveyIdentity,
+        content: String,
+        message: String = DEFAULT_MESSAGE,
+        onProgress: (Int) -> Unit = {}
+    ): UploadResult = withContext(Dispatchers.IO) {
+        require(cfg.owner.isNotBlank()) { "GitHub owner cannot be blank." }
+        require(cfg.repo.isNotBlank()) { "GitHub repo cannot be blank." }
+        require(cfg.branch.isNotBlank()) { "GitHub branch cannot be blank." }
+        require(cfg.token.isNotBlank()) { "GitHub token cannot be blank." }
+        require(path.isNotBlank()) { "GitHub path cannot be blank." }
+        val bytes = content.toByteArray(Charsets.UTF_8)
+        require(bytes.size <= cfg.maxRawBytesHint) { "Survey JSON exceeds the upload size guard." }
+        val repoName = normalizeRepoName(cfg.repo)
+        val encodedPath = encodePath(path)
+        reconcileSurveyJsonUpload(
+            localIdentity = localIdentity,
+            content = content,
+            transport = object : SurveyContentsTransport {
+                override suspend fun getExisting(): SurveyRemoteRecord? =
+                    getExistingContents(cfg.owner, repoName, cfg.branch, encodedPath, cfg.token)?.let {
+                        SurveyRemoteRecord(it.content, it.fileUrl)
+                    }
+
+                override suspend fun createOnly(): SurveyCreateResult = try {
+                    val response = putContents(
+                        owner = cfg.owner, repoName = repoName, branch = cfg.branch, path = path,
+                        encodedPath = encodedPath, token = cfg.token, rawSize = bytes.size.toLong(),
+                        openStream = { bytes.inputStream() }, message = message, sha = null,
+                        onProgress = onProgress, maxRequestBytesHint = cfg.maxRequestBytesHint
+                    )
+                    SurveyCreateResult.Created(parseUploadResult(response.body))
+                } catch (failure: HttpFailureException) {
+                    if (SurveyUploadIdempotency.shouldReconcileAfterCreateFailure(failure.code)) {
+                        SurveyCreateResult.Conflict
+                    } else {
+                        throw failure
+                    }
+                }
+            }
+        )
+    }
+
+    /** Actual create/read-back state machine, shared by the HTTP implementation and JVM tests. */
+    internal suspend fun reconcileSurveyJsonUpload(
+        localIdentity: SurveyUploadIdempotency.LocalSurveyIdentity,
+        content: String,
+        transport: SurveyContentsTransport
+    ): UploadResult {
+        if (SurveyUploadIdempotency.classifyExisting(localIdentity, content, content) !=
+            SurveyUploadIdempotency.ExistingRecord.MATCHING
+        ) throw IOException("Survey payload does not match its logical survey ID.")
+
+        fun matchingResult(existing: SurveyRemoteRecord): UploadResult {
+            if (SurveyUploadIdempotency.classifyExisting(localIdentity, content, existing.content) !=
+                SurveyUploadIdempotency.ExistingRecord.MATCHING
+            ) throw IOException("Canonical survey target already contains conflicting content.")
+            return UploadResult(existing.fileUrl, null)
+        }
+
+        transport.getExisting()?.let(::matchingResult)?.let { return it }
+        return when (val create = transport.createOnly()) {
+            is SurveyCreateResult.Created -> create.upload
+            SurveyCreateResult.Conflict -> {
+                val existing = transport.getExisting()
+                    ?: throw IOException("Canonical survey target conflicted but could not be read.")
+                matchingResult(existing)
+            }
+        }
+    }
 
     // ---------------------------------------------------------------------
     // Public APIs — Binary Upload (ByteArray)
@@ -598,6 +698,12 @@ object GitHubUploader {
         val headers: Map<String, List<String>>
     )
 
+    private data class ExistingContents(
+        val sha: String,
+        val content: String,
+        val fileUrl: String?
+    )
+
     private class TransientHttpException(
         val code: Int,
         val body: String,
@@ -869,6 +975,43 @@ object GitHubUploader {
         return runCatching {
             JSONObject(resp.body).optString("sha").takeIf { it.isNotBlank() }
         }.getOrNull()
+    }
+
+    /** Reads an existing UTF-8 Contents API payload for immutable survey reconciliation. */
+    private suspend fun getExistingContents(
+        owner: String,
+        repo: String,
+        branch: String,
+        encodedPath: String,
+        token: String
+    ): ExistingContents? {
+        val refEncoded = URLEncoder.encode(branch.trim(), "UTF-8").replace("+", "%20")
+        val url = URL("$API_BASE/repos/$owner/$repo/contents/$encodedPath?ref=$refEncoded")
+        val response = executeWithRetry(
+            method = "GET", url = url, token = token, writeBody = null,
+            connectTimeoutMs = 15_000, readTimeoutMs = 20_000,
+            maxAttempts = DEFAULT_MAX_ATTEMPTS, allowNon2xxCodes = setOf(404)
+        )
+        if (response.code == 404) return null
+        val json = try {
+            JSONObject(response.body)
+        } catch (error: JSONException) {
+            throw IOException("Malformed JSON while reading canonical survey target.", error)
+        }
+        val sha = json.optString("sha").takeIf { it.isNotBlank() }
+            ?: throw IOException("Canonical survey target has no SHA.")
+        val encodedContent = json.optString("content").filterNot(Char::isWhitespace)
+        if (encodedContent.isBlank()) throw IOException("Canonical survey target has no content.")
+        val content = try {
+            Base64.decode(encodedContent, Base64.DEFAULT).toString(Charsets.UTF_8)
+        } catch (error: IllegalArgumentException) {
+            throw IOException("Canonical survey target content is not Base64.", error)
+        }
+        return ExistingContents(
+            sha = sha,
+            content = content,
+            fileUrl = json.optString("html_url").takeIf { it.isNotBlank() }
+        )
     }
 
     /**

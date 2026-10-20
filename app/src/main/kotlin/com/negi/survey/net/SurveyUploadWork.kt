@@ -129,6 +129,15 @@ internal object SurveyUploadWork {
     fun remoteRelativePath(fileName: String): String =
         "$REMOTE_EXPORT_DIR/${fileName.trim().trimStart('/')}"
 
+    /**
+     * Returns the immutable survey JSON target for one logical survey ID.
+     *
+     * The hash avoids placing an arbitrary historical ID directly in a GitHub path. Unlike the
+     * legacy file-name target, this target does not depend on the day a worker happens to run.
+     */
+    fun canonicalRemotePath(surveyId: String): String =
+        "$REMOTE_EXPORT_DIR/surveys/${sha256Hex(requireNotNull(normalizeLogicalSurveyId(surveyId)))}.json"
+
     fun safeWorkNameSegment(value: String): String =
         value.trim()
             .replace(Regex("""[^\w\-.]+"""), "_")
@@ -198,7 +207,7 @@ internal object SurveyUploadWork {
         canonicalFile: File,
         surveyId: String
     ): OneTimeWorkRequest {
-        val remotePath = remoteRelativePath(canonicalFile.name)
+        val remotePath = canonicalRemotePath(surveyId)
         val data = Data.Builder()
             .putString(GitHubUploadWorker.KEY_MODE, "file")
             .putString(GitHubUploadWorker.KEY_OWNER, config.owner)

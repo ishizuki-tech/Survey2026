@@ -447,7 +447,7 @@ class GitHubUploadWorker(
         val filePath = inputData.getString(KEY_FILE_PATH).orEmpty()
         val fileName = inputData.getString(KEY_FILE_NAME) ?: File(filePath).name
         val uploadKind = inputData.getString(KEY_UPLOAD_KIND).orEmpty()
-        val surveyId = inputData.getString(KEY_SURVEY_ID).orEmpty()
+        val expectedSurveyId = inputData.getString(KEY_SURVEY_ID)
 
         if (filePath.isBlank()) return Result.failure(workDataOf(ERROR_MESSAGE to "Missing file path."))
 
@@ -473,24 +473,45 @@ class GitHubUploadWorker(
             return Result.failure(workDataOf(ERROR_MESSAGE to msg))
         }
 
-        val remotePathForUi = buildDatedRemotePathUtc(cfg.pathPrefix, fileName)
+        val extension = pendingFile.extension.lowercase(Locale.US)
+        val isText = TEXT_EXTENSIONS.contains(extension)
+        val isSurveyJson = isText && uploadKind == UPLOAD_KIND_SURVEY_JSON
+        var remotePathForUi = buildDatedRemotePathUtc(cfg.pathPrefix, fileName)
+        var uploadedSurveyId: String? = null
 
         return try {
-            val extension = pendingFile.extension.lowercase(Locale.US)
-            val isText = TEXT_EXTENSIONS.contains(extension)
-
             val result = if (isText) {
                 val text = runCatching { pendingFile.readText(Charsets.UTF_8) }.getOrElse {
                     return Result.failure(workDataOf(ERROR_MESSAGE to "Failed to read text file: ${it.message}"))
                 }
-
-                GitHubUploader.uploadJson(
-                    cfg = cfg,
-                    relativePath = fileName,
-                    content = text,
-                    message = "Upload $fileName (deferred)",
-                    onProgress = onProgress
-                )
+                if (isSurveyJson) {
+                    val localUpload = SurveyUploadIdempotency.resolveLocalSurveyUpload(expectedSurveyId, text)
+                        ?: return Result.failure(
+                            workDataOf(ERROR_MESSAGE to "Survey JSON does not match its logical survey ID.")
+                        )
+                    uploadedSurveyId = localUpload.identity.normalizedSurveyId
+                    // Do not trust KEY_FILE_NAME: persisted legacy work can retain the old path.
+                    remotePathForUi = GitHubUploader.buildStablePath(
+                        cfg.pathPrefix,
+                        localUpload.canonicalRelativePath
+                    )
+                    GitHubUploader.uploadSurveyJsonIdempotentlyAtPath(
+                        cfg = cfg,
+                        path = remotePathForUi,
+                        localIdentity = localUpload.identity,
+                        content = text,
+                        message = "Upload $fileName (deferred)",
+                        onProgress = onProgress
+                    )
+                } else {
+                    GitHubUploader.uploadJson(
+                        cfg = cfg,
+                        relativePath = fileName,
+                        content = text,
+                        message = "Upload $fileName (deferred)",
+                        onProgress = onProgress
+                    )
+                }
             } else {
                 GitHubUploader.uploadFile(
                     cfg = cfg,
@@ -501,12 +522,14 @@ class GitHubUploadWorker(
                 )
             }
 
-            if (
-                isText &&
-                uploadKind == UPLOAD_KIND_SURVEY_JSON &&
-                surveyId.isNotBlank()
-            ) {
-                UploadedSurveyStore(applicationContext).markUploaded(surveyId)
+            uploadedSurveyId?.let { uploadedId ->
+                SurveyUploadIdempotency.completeLocalSurveySuccess(
+                    surveyId = uploadedId,
+                    markUploaded = UploadedSurveyStore(applicationContext)::markUploaded,
+                    deleteStagedFile = pendingFile::delete
+                )
+            } ?: run {
+                runCatching { pendingFile.delete() }
             }
 
             runCatching {
@@ -519,8 +542,6 @@ class GitHubUploadWorker(
                     )
                 )
             }
-
-            runCatching { pendingFile.delete() }
 
             Result.success(
                 workDataOf(

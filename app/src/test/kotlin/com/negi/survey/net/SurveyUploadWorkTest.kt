@@ -136,7 +136,10 @@ class SurveyUploadWorkTest {
         assertEquals("branch", data.getString(GitHubUploadWorker.KEY_BRANCH))
         assertEquals("prefix", data.getString(GitHubUploadWorker.KEY_PATH_PREFIX))
         assertEquals(file.absolutePath, data.getString(GitHubUploadWorker.KEY_FILE_PATH))
-        assertEquals("exports/canonical.json", data.getString(GitHubUploadWorker.KEY_FILE_NAME))
+        assertEquals(
+            SurveyUploadWork.canonicalRemotePath("Survey-Id"),
+            data.getString(GitHubUploadWorker.KEY_FILE_NAME)
+        )
         assertEquals(123L, data.getLong(GitHubUploadWorker.KEY_FILE_MAX_BYTES_HINT, -1L))
         assertEquals(456, data.getInt(GitHubUploadWorker.KEY_FILE_MAX_REQUEST_BYTES_HINT, -1))
         assertEquals(GitHubUploadWorker.UPLOAD_KIND_SURVEY_JSON, data.getString(GitHubUploadWorker.KEY_UPLOAD_KIND))
@@ -146,7 +149,12 @@ class SurveyUploadWorkTest {
         assertEquals(androidx.work.BackoffPolicy.EXPONENTIAL, request.workSpec.backoffPolicy)
         assertTrue(request.workSpec.expedited)
         assertTrue(request.tags.contains(GitHubUploadWorker.TAG))
-        assertTrue(request.tags.contains("${GitHubUploadWorker.TAG}:file:exports_canonical.json"))
+        assertTrue(
+            request.tags.contains(
+                "${GitHubUploadWorker.TAG}:file:" +
+                    SurveyUploadWork.safeWorkNameSegment(SurveyUploadWork.canonicalRemotePath("Survey-Id"))
+            )
+        )
     }
 
     @Test
@@ -162,7 +170,10 @@ class SurveyUploadWorkTest {
         val request = SurveyUploadWork.buildSurveyJsonRequest(config(), candidate)
 
         assertEquals(canonical.absolutePath, request.workSpec.input.getString(GitHubUploadWorker.KEY_FILE_PATH))
-        assertEquals("exports/a.json", request.workSpec.input.getString(GitHubUploadWorker.KEY_FILE_NAME))
+        assertEquals(
+            SurveyUploadWork.canonicalRemotePath("Same"),
+            request.workSpec.input.getString(GitHubUploadWorker.KEY_FILE_NAME)
+        )
         assertEquals("Same", request.workSpec.input.getString(GitHubUploadWorker.KEY_SURVEY_ID))
     }
 
