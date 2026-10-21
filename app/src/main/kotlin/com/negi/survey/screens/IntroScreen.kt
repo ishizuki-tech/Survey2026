@@ -66,6 +66,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
@@ -126,7 +127,10 @@ import androidx.compose.ui.unit.max
 import androidx.compose.ui.unit.min
 import androidx.compose.ui.unit.sp
 import com.negi.survey.BuildConfig
+import com.negi.survey.ui.theme.monotoneColors
 import com.negi.survey.vm.UploadStatus
+import com.negi.survey.vm.UploadStatusDetails
+import com.negi.survey.vm.UploadStatusEntry
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -179,6 +183,8 @@ fun IntroScreen(
     isRestarting: Boolean = false,
     onRestart: (() -> Unit)? = null,
     onResolveConfigDetails: suspend (configId: String) -> ConfigDetails,
+    onResolveUploadStatusDetails: suspend () -> UploadStatusDetails,
+    onClearCompletedSurveys: suspend () -> Unit,
 ) {
     require(options.isNotEmpty()) { "IntroScreen requires at least one ConfigOptionUi." }
 
@@ -188,6 +194,7 @@ fun IntroScreen(
     Box(
         modifier = Modifier
             .fillMaxSize()
+            .navigationBarsPadding()
             .background(bgBrush)
             .semantics { contentDescription = "Survey intro screen" }
             .testTag("IntroScreenRoot")
@@ -207,20 +214,9 @@ fun IntroScreen(
                 isRestarting = isRestarting,
                 onRestart = onRestart,
                 onResolveConfigDetails = onResolveConfigDetails,
+                onResolveUploadStatusDetails = onResolveUploadStatusDetails,
+                onClearCompletedSurveys = onClearCompletedSurveys,
             )
-
-            // Debug-only crash button.
-            if (BuildConfig.DEBUG) {
-                OutlinedButton(
-                    onClick = { throw RuntimeException("Debug crash button pressed") },
-                    modifier = Modifier
-                        .align(Alignment.BottomEnd)
-                        .padding(16.dp)
-                        .testTag("IntroDebugCrashButton")
-                ) {
-                    Text("Crash now (debug)")
-                }
-            }
         }
     }
 }
@@ -239,18 +235,21 @@ private fun IntroCardMono(
     isRestarting: Boolean,
     onRestart: (() -> Unit)?,
     onResolveConfigDetails: suspend (configId: String) -> ConfigDetails,
+    onResolveUploadStatusDetails: suspend () -> UploadStatusDetails,
+    onClearCompletedSurveys: suspend () -> Unit,
 ) {
     val cs = MaterialTheme.colorScheme
     val corner = 20.dp
 
-    /** Readability palette (explicit, monotone). */
-    val textPrimary = Color(0xFFF2F2F2)
-    val textSecondary = Color(0xFFD2D2D2)
-    val textMuted = Color(0xFFB0B0B0)
-    val textHint = Color(0xFF9A9A9A)
+    /** Readability palette (shared light/dark monotone tokens). */
+    val mono = monotoneColors()
+    val textPrimary = mono.textPrimary
+    val textSecondary = mono.textSecondary
+    val textMuted = mono.textMuted
+    val textHint = mono.textHint
 
     /** A slightly stronger card scrim to lift text from the animated background. */
-    val cardBg = Color(0xFF101010).copy(alpha = 0.86f)
+    val cardBg = mono.cardBg.copy(alpha = 0.86f)
 
     val optionIds = remember(options) { options.map { it.id } }
     val optionIdSet = remember(optionIds) { optionIds.toHashSet() }
@@ -316,14 +315,14 @@ private fun IntroCardMono(
             contentColor = textPrimary
         ),
         modifier = Modifier
-            .padding(horizontal = 24.dp)
+            .padding(horizontal = 24.dp, vertical = 24.dp)
             .widthIn(max = cardMaxWidth)
             .wrapContentHeight()
             .wrapContentWidth()
             .drawBehind {
-                val dark = Color(0xFF2A2A2A).copy(alpha = 0.65f)
-                val mid = Color(0xFF7A7A7A).copy(alpha = 0.35f)
-                val light = Color(0xFFF0F0F0).copy(alpha = 0.18f)
+                val dark = mono.cardBorderDark.copy(alpha = 0.65f)
+                val mid = mono.cardBorderMid.copy(alpha = 0.35f)
+                val light = mono.cardBorderLight.copy(alpha = 0.18f)
                 val sweep = Brush.sweepGradient(
                     0f to dark,
                     0.25f to mid,
@@ -351,18 +350,12 @@ private fun IntroCardMono(
         ) {
             GradientHeadlineMono(
                 text = title,
-                colorTop = Color(0xFFF5F5F5),
-                colorBottom = Color(0xFFCFCFCF)
+                colorTop = mono.headlineTop,
+                colorBottom = mono.headlineBottom
             )
 
             Spacer(Modifier.padding(top = 14.dp))
 
-            Text(
-                text = "Upload Status",
-                style = MaterialTheme.typography.labelMedium.copy(letterSpacing = 0.2.sp),
-                color = textMuted,
-                modifier = Modifier.align(Alignment.Start)
-            )
             Text(
                 text = "Device ID: ${uploadStatus.deviceTag}",
                 style = MaterialTheme.typography.bodyMedium,
@@ -370,23 +363,30 @@ private fun IntroCardMono(
                 modifier = Modifier.align(Alignment.Start)
             )
             Text(
-                text = "Uploaded Surveys on This Device: ${uploadStatus.uploadedCount}",
+                text = "Build: ${BuildConfig.GIT_COMMIT_SHA} ${BuildConfig.BUILD_TIMESTAMP}",
                 style = MaterialTheme.typography.bodyMedium,
                 color = textSecondary,
-                modifier = Modifier.align(Alignment.Start)
+                modifier = Modifier
+                    .align(Alignment.Start)
+                    .testTag("BuildTimestamp")
             )
-            Text(
-                text = "Pending Survey Uploads: ${uploadStatus.pendingCount}",
-                style = MaterialTheme.typography.bodyMedium,
-                color = textSecondary,
-                modifier = Modifier.align(Alignment.Start)
+
+            Spacer(Modifier.padding(top = 14.dp))
+
+            UploadStatusSummary(
+                uploadStatus = uploadStatus,
+                onResolveUploadStatusDetails = onResolveUploadStatusDetails,
+                onClearCompletedSurveys = onClearCompletedSurveys,
+                titleColor = textMuted,
+                countColor = textSecondary,
+                actionColor = mono.actionText
             )
 
             Spacer(Modifier.padding(top = 16.dp))
 
             Text(
                 text = "Select survey configuration",
-                style = MaterialTheme.typography.labelMedium.copy(letterSpacing = 0.2.sp),
+                style = MaterialTheme.typography.titleMedium.copy(letterSpacing = 0.2.sp),
                 color = textMuted,
                 modifier = Modifier
                     .align(Alignment.Start)
@@ -450,6 +450,274 @@ private fun IntroCardMono(
                 isRestarting = isRestarting,
                 onRestart = onRestart
             )
+
+            // About: version, build, and credits/licences for voices, models and libraries.
+            var showAbout by remember { mutableStateOf(false) }
+            Spacer(Modifier.padding(top = 4.dp))
+            TextButton(
+                onClick = { showAbout = true },
+                modifier = Modifier.testTag("AboutButton")
+            ) {
+                Text(
+                    text = "About · Credits & licences",
+                    style = MaterialTheme.typography.labelLarge.copy(letterSpacing = 0.2.sp),
+                    color = textMuted
+                )
+            }
+            if (showAbout) {
+                AboutScreen(onClose = { showAbout = false })
+            }
+        }
+    }
+
+}
+
+/**
+ * Tappable "Survey Upload Status" summary (title, pending/completed counts,
+ * "Show more") that opens [UploadStatusDetailsDialog] with the full
+ * pending/completed list. Shared by the config-selection screen and the
+ * post-survey Done screen so both show identical upload-status information.
+ */
+@Composable
+internal fun UploadStatusSummary(
+    uploadStatus: UploadStatus,
+    onResolveUploadStatusDetails: suspend () -> UploadStatusDetails,
+    onClearCompletedSurveys: suspend () -> Unit,
+    modifier: Modifier = Modifier,
+    titleColor: Color = monotoneColors().textMuted,
+    countColor: Color = monotoneColors().textSecondary,
+    actionColor: Color = monotoneColors().actionText,
+) {
+    var showUploadStatusDetails by remember { mutableStateOf(false) }
+
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp))
+            .clickable { showUploadStatusDetails = true }
+            .padding(vertical = 4.dp)
+            .testTag("UploadStatusArea"),
+        horizontalAlignment = Alignment.Start
+    ) {
+        Text(
+            text = "Survey Upload Status",
+            style = MaterialTheme.typography.titleMedium.copy(letterSpacing = 0.2.sp),
+            color = titleColor,
+            modifier = Modifier.align(Alignment.Start)
+        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(horizontalAlignment = Alignment.Start) {
+                Text(
+                    text = "Pending uploads: ${uploadStatus.pendingCount}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = countColor,
+                    modifier = Modifier.align(Alignment.Start)
+                )
+                Text(
+                    text = "Completed uploads: ${uploadStatus.uploadedCount}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = countColor,
+                    modifier = Modifier.align(Alignment.Start)
+                )
+            }
+            Column(horizontalAlignment = Alignment.End) {
+                Text(
+                    text = "Show",
+                    style = MaterialTheme.typography.labelLarge.copy(letterSpacing = 0.2.sp),
+                    color = actionColor
+                )
+                Text(
+                    text = "more",
+                    style = MaterialTheme.typography.labelLarge.copy(letterSpacing = 0.2.sp),
+                    color = actionColor
+                )
+            }
+        }
+    }
+
+    if (showUploadStatusDetails) {
+        UploadStatusDetailsDialog(
+            onDismiss = { showUploadStatusDetails = false },
+            onResolve = onResolveUploadStatusDetails,
+            onClearCompleted = onClearCompletedSurveys
+        )
+    }
+}
+
+/**
+ * Modal listing pending and completed survey uploads, opened by tapping the
+ * Survey Upload Status area.
+ *
+ * Shows only each entry's run-start timestamp (decoded from its time-ordered
+ * survey ID) — never the survey ID, respondent names, or any other content.
+ */
+private sealed class UploadStatusDetailsState {
+    data object Loading : UploadStatusDetailsState()
+    data class Ready(val details: UploadStatusDetails) : UploadStatusDetailsState()
+    data class Error(val error: Throwable) : UploadStatusDetailsState()
+}
+
+@Composable
+private fun UploadStatusDetailsDialog(
+    onDismiss: () -> Unit,
+    onResolve: suspend () -> UploadStatusDetails,
+    onClearCompleted: suspend () -> Unit,
+) {
+    val resolve by rememberUpdatedState(newValue = onResolve)
+    val clearCompleted by rememberUpdatedState(newValue = onClearCompleted)
+    val scope = rememberCoroutineScope()
+    var state by remember {
+        mutableStateOf<UploadStatusDetailsState>(UploadStatusDetailsState.Loading)
+    }
+
+    suspend fun reload() {
+        state = UploadStatusDetailsState.Loading
+        state = try {
+            UploadStatusDetailsState.Ready(resolve())
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (t: Throwable) {
+            Log.e(TAG, "Failed to resolve upload status details.", t)
+            UploadStatusDetailsState.Error(t)
+        }
+    }
+
+    LaunchedEffect(Unit) { reload() }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Survey Upload Status") },
+        text = {
+            when (val s = state) {
+                is UploadStatusDetailsState.Loading -> {
+                    Text(
+                        text = "Loading…",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+
+                is UploadStatusDetailsState.Error -> {
+                    Text(
+                        text = "Failed to load upload status: " +
+                                (s.error.message ?: s.error::class.java.simpleName),
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+
+                is UploadStatusDetailsState.Ready -> {
+                    val scroll = rememberScrollState()
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 420.dp)
+                            .verticalScroll(scroll)
+                            .testTag("UploadStatusDetailsReady")
+                    ) {
+                        UploadStatusDetailsSection(
+                            heading = "Pending (${s.details.pending.size})",
+                            entries = s.details.pending
+                        )
+
+                        Spacer(Modifier.padding(top = 14.dp))
+
+                        UploadStatusDetailsSection(
+                            heading = "Completed (${s.details.completed.size})",
+                            entries = s.details.completed,
+                            showColumnHeaders = true
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            /**
+             * Both buttons live in this single slot (not dismissButton) so they can share
+             * one full-width row, spread to opposite ends — Material3's AlertDialog always
+             * clusters confirmButton/dismissButton together otherwise.
+             */
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                TextButton(
+                    onClick = {
+                        scope.launch {
+                            clearCompleted()
+                            reload()
+                        }
+                    },
+                    contentPadding = ButtonDefaults.TextButtonContentPadding,
+                    modifier = Modifier.testTag("ClearCompletedUploadsButton")
+                ) {
+                    Text("Clear List")
+                }
+                TextButton(onClick = onDismiss) { Text("Close") }
+            }
+        }
+    )
+}
+
+@Composable
+private fun UploadStatusDetailsSection(
+    heading: String,
+    entries: List<UploadStatusEntry>,
+    showColumnHeaders: Boolean = false,
+) {
+    Text(
+        text = heading,
+        style = MaterialTheme.typography.labelLarge.copy(letterSpacing = 0.2.sp)
+    )
+
+    Spacer(Modifier.padding(top = 6.dp))
+
+    if (entries.isEmpty()) {
+        Text(
+            text = "None",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+    } else if (showColumnHeaders) {
+        Row(modifier = Modifier.fillMaxWidth()) {
+            Text(
+                text = "Survey ID",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.weight(0.4f)
+            )
+            Text(
+                text = "Survey End Time",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.weight(0.6f)
+            )
+        }
+
+        Spacer(Modifier.padding(top = 4.dp))
+
+        entries.forEach { entry ->
+            Row(modifier = Modifier.fillMaxWidth()) {
+                Text(
+                    text = entry.idPrefix,
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.weight(0.4f)
+                )
+                Text(
+                    text = entry.displayTime,
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.weight(0.6f)
+                )
+            }
+        }
+    } else {
+        entries.forEach { entry ->
+            Text(
+                text = "${entry.idPrefix} \u00b7 ${entry.displayTime}",
+                style = MaterialTheme.typography.bodySmall
+            )
         }
     }
 }
@@ -463,12 +731,10 @@ private sealed class ResolvedDetailsState {
 /**
  * Details panel for the currently selected configuration.
  *
- * Shows:
- * - UI label/desc (always)
- * - Resolved config details (loading/ready/error)
+ * Collapsed, it shows only the config id chip and a "Show more" button.
+ * Tapping "Show more" reveals the resolved config details (loading/ready/error).
  *
  * Debug fixes applied:
- * - "Show more" appears only if it can actually expand content.
  * - When expanding, auto-scroll this panel into view (after layout settles).
  * - animateContentSize only while collapsed to reduce jank on huge expansions.
  * - Retry action for errors.
@@ -485,15 +751,11 @@ private fun SelectedConfigDetailsMono(
     textMuted: Color,
     onRetry: () -> Unit,
 ) {
-    val bg = Color(0xFF0E0E0E).copy(alpha = 0.85f)
-    val border = Color(0xFF7A7A7A).copy(alpha = 0.35f)
+    val mono = monotoneColors()
+    val bg = mono.detailsPanelBg.copy(alpha = 0.85f)
+    val border = mono.detailsPanelBorder.copy(alpha = 0.35f)
 
     var expanded by remember(configId) { mutableStateOf(false) }
-
-    /** Overflow detection for collapse-mode only. */
-    var descOverflow by remember(configId) { mutableStateOf(false) }
-    var summaryOverflow by remember(configId) { mutableStateOf(false) }
-    var longOverflow by remember(configId) { mutableStateOf(false) }
 
     val bringIntoViewRequester = remember(configId) { BringIntoViewRequester() }
     val scope = rememberCoroutineScope()
@@ -521,108 +783,76 @@ private fun SelectedConfigDetailsMono(
         modifier = if (!expanded) panelModifier.animateContentSize() else panelModifier,
         horizontalAlignment = Alignment.Start
     ) {
-        /** Always-visible build stamp, shown first regardless of load state. */
-        Text(
-            text = "Build: ${BuildConfig.GIT_COMMIT_SHA} ${BuildConfig.BUILD_TIMESTAMP}",
-            style = MaterialTheme.typography.labelSmall.copy(letterSpacing = 0.2.sp),
-            color = textMuted,
-            modifier = Modifier.testTag("BuildTimestamp")
-        )
+        if (expanded) {
+            when (state) {
+                is ResolvedDetailsState.Loading -> {
+                    Text(
+                        text = "Loading config: $configId …",
+                        style = MaterialTheme.typography.bodySmall.copy(lineHeight = 18.sp),
+                        color = mono.chipLabel,
+                        modifier = Modifier.testTag("ConfigDetailsLoading")
+                    )
+                }
 
-        Spacer(Modifier.padding(top = 8.dp))
+                is ResolvedDetailsState.Error -> {
+                    Text(
+                        text = "Failed to load config: $configId",
+                        style = MaterialTheme.typography.bodySmall.copy(lineHeight = 18.sp),
+                        color = mono.errorText,
+                        modifier = Modifier.testTag("ConfigDetailsErrorTitle")
+                    )
 
-        when (state) {
-            is ResolvedDetailsState.Loading -> {
-                Text(
-                    text = "Loading config: $configId …",
-                    style = MaterialTheme.typography.bodySmall.copy(lineHeight = 18.sp),
-                    color = Color(0xFFBDBDBD),
-                    modifier = Modifier.testTag("ConfigDetailsLoading")
-                )
-            }
+                    Spacer(Modifier.padding(top = 6.dp))
 
-            is ResolvedDetailsState.Error -> {
-                Text(
-                    text = "Failed to load config: $configId",
-                    style = MaterialTheme.typography.bodySmall.copy(lineHeight = 18.sp),
-                    color = Color(0xFFFFC8C8),
-                    modifier = Modifier.testTag("ConfigDetailsErrorTitle")
-                )
+                    Text(
+                        text = (state.error.message ?: state.error::class.java.simpleName).take(240),
+                        style = MaterialTheme.typography.bodySmall.copy(lineHeight = 18.sp),
+                        color = mono.errorTextMuted,
+                        modifier = Modifier.testTag("ConfigDetailsErrorMessage")
+                    )
 
-                Spacer(Modifier.padding(top = 6.dp))
+                    Spacer(Modifier.padding(top = 10.dp))
 
-                Text(
-                    text = (state.error.message ?: state.error::class.java.simpleName).take(240),
-                    style = MaterialTheme.typography.bodySmall.copy(lineHeight = 18.sp),
-                    color = Color(0xFFE0A0A0),
-                    modifier = Modifier.testTag("ConfigDetailsErrorMessage")
-                )
-
-                Spacer(Modifier.padding(top = 10.dp))
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.End
-                ) {
-                    TextButton(
-                        onClick = onRetry,
-                        modifier = Modifier.testTag("ConfigDetailsRetryButton")
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.End
                     ) {
-                        Text(
-                            text = "Retry",
-                            style = MaterialTheme.typography.labelLarge.copy(letterSpacing = 0.2.sp),
-                            color = Color(0xFFE6E6E6)
-                        )
+                        TextButton(
+                            onClick = onRetry,
+                            modifier = Modifier.testTag("ConfigDetailsRetryButton")
+                        ) {
+                            Text(
+                                text = "Retry",
+                                style = MaterialTheme.typography.labelLarge.copy(letterSpacing = 0.2.sp),
+                                color = mono.actionText
+                            )
+                        }
                     }
+                }
+
+                is ResolvedDetailsState.Ready -> {
+                    val d = state.details
+
+                    Text(
+                        text = d.summary,
+                        style = MaterialTheme.typography.bodySmall.copy(lineHeight = 18.sp),
+                        color = mono.textSecondary,
+                        modifier = Modifier.testTag("ConfigDetailsSummary")
+                    )
+
+                    Spacer(Modifier.padding(top = 8.dp))
+
+                    Text(
+                        text = d.longText,
+                        style = MaterialTheme.typography.bodySmall.copy(lineHeight = 18.sp),
+                        color = mono.chipLabel,
+                        modifier = Modifier.testTag("ConfigDetailsLongText")
+                    )
                 }
             }
 
-            is ResolvedDetailsState.Ready -> {
-                val d = state.details
-
-                Text(
-                    text = d.summary,
-                    style = MaterialTheme.typography.bodySmall.copy(lineHeight = 18.sp),
-                    color = Color(0xFFCFCFCF),
-                    maxLines = if (expanded) Int.MAX_VALUE else 2,
-                    overflow = TextOverflow.Ellipsis,
-                    onTextLayout = { r ->
-                        if (!expanded) {
-                            val v = r.hasVisualOverflow
-                            if (summaryOverflow != v) summaryOverflow = v
-                        }
-                    },
-                    modifier = Modifier.testTag("ConfigDetailsSummary")
-                )
-
-                Spacer(Modifier.padding(top = 8.dp))
-
-                Text(
-                    text = d.longText,
-                    style = MaterialTheme.typography.bodySmall.copy(lineHeight = 18.sp),
-                    color = Color(0xFFBDBDBD),
-                    maxLines = if (expanded) Int.MAX_VALUE else 3,
-                    overflow = TextOverflow.Ellipsis,
-                    onTextLayout = { r ->
-                        if (!expanded) {
-                            val v = r.hasVisualOverflow
-                            if (longOverflow != v) longOverflow = v
-                        }
-                    },
-                    modifier = Modifier.testTag("ConfigDetailsLongText")
-                )
-            }
+            Spacer(Modifier.padding(top = 10.dp))
         }
-
-        Spacer(Modifier.padding(top = 10.dp))
-
-        val canExpandOptionDesc = descOverflow
-        val canExpandReadyContent = (state is ResolvedDetailsState.Ready) && (summaryOverflow || longOverflow)
-
-        /** Only show expand when there is actual overflow in collapsed state. */
-        val showExpand = (!expanded) && (canExpandReadyContent || canExpandOptionDesc)
-        /** When expanded, always allow collapsing back. */
-        val showCollapse = expanded
 
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -631,29 +861,27 @@ private fun SelectedConfigDetailsMono(
         ) {
             MetaChipMono(label = "id", value = configId)
 
-            if (showExpand || showCollapse) {
-                TextButton(
-                    onClick = {
-                        val next = !expanded
-                        expanded = next
-                        Log.d(TAG, "ShowMore toggle: optionId=$configId expanded=$expanded")
-                        if (next) {
-                            /** Defensive: also request bring into view in case effect is delayed. */
-                            scope.launch {
-                                delay(BRING_INTO_VIEW_DELAY_MS)
-                                bringIntoViewRequester.bringIntoView()
-                            }
+            TextButton(
+                onClick = {
+                    val next = !expanded
+                    expanded = next
+                    Log.d(TAG, "ShowMore toggle: optionId=$configId expanded=$expanded")
+                    if (next) {
+                        /** Defensive: also request bring into view in case effect is delayed. */
+                        scope.launch {
+                            delay(BRING_INTO_VIEW_DELAY_MS)
+                            bringIntoViewRequester.bringIntoView()
                         }
-                    },
-                    modifier = Modifier.testTag("ShowMoreButton"),
-                    contentPadding = ButtonDefaults.TextButtonContentPadding
-                ) {
-                    Text(
-                        text = if (expanded) "Show less" else "Show more",
-                        style = MaterialTheme.typography.labelLarge.copy(letterSpacing = 0.2.sp),
-                        color = Color(0xFFE6E6E6)
-                    )
-                }
+                    }
+                },
+                modifier = Modifier.testTag("ShowMoreButton"),
+                contentPadding = ButtonDefaults.TextButtonContentPadding
+            ) {
+                Text(
+                    text = if (expanded) "Show less" else "Show more",
+                    style = MaterialTheme.typography.labelLarge.copy(letterSpacing = 0.2.sp),
+                    color = mono.actionText
+                )
             }
         }
     }
@@ -668,14 +896,15 @@ private fun SelectedConfigDetailsMono(
  */
 @Composable
 private fun MetaChipMono(label: String, value: String) {
+    val mono = monotoneColors()
     val safeLabel = remember(label) { label.safeTestTagToken(32) }
 
     Row(
         modifier = Modifier
             .clip(RoundedCornerShape(999.dp))
-            .background(Color(0xFF151515))
+            .background(mono.chipBg)
             .border(
-                BorderStroke(1.dp, Color(0xFF8A8A8A).copy(alpha = 0.35f)),
+                BorderStroke(1.dp, mono.chipBorder.copy(alpha = 0.35f)),
                 RoundedCornerShape(999.dp)
             )
             .padding(horizontal = 10.dp, vertical = 6.dp)
@@ -684,7 +913,7 @@ private fun MetaChipMono(label: String, value: String) {
         Text(
             text = "$label: ",
             style = MaterialTheme.typography.labelSmall.copy(letterSpacing = 0.2.sp),
-            color = Color(0xFFBDBDBD)
+            color = mono.chipLabel
         )
         Text(
             text = value,
@@ -692,7 +921,7 @@ private fun MetaChipMono(label: String, value: String) {
                 fontWeight = FontWeight.SemiBold,
                 letterSpacing = 0.2.sp
             ),
-            color = Color(0xFFF0F0F0),
+            color = mono.chipValue,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis
         )
@@ -710,6 +939,7 @@ private fun CtaRowMono(
     onRestart: (() -> Unit)?,
 ) {
     var confirmRestart by remember { mutableStateOf(false) }
+    val mono = monotoneColors()
 
     Row(
         modifier = Modifier.fillMaxWidth(),
@@ -720,8 +950,8 @@ private fun CtaRowMono(
             onClick = onStart,
             shape = CircleShape,
             colors = ButtonDefaults.buttonColors(
-                containerColor = Color(0xFF1A1A1A),
-                contentColor = Color(0xFFF2F2F2)
+                containerColor = mono.buttonContainer,
+                contentColor = mono.buttonContent
             ),
             modifier = Modifier.testTag("StartButton")
         ) {
@@ -745,9 +975,9 @@ private fun CtaRowMono(
             OutlinedButton(
                 enabled = !isRestarting,
                 onClick = { confirmRestart = true },
-                border = BorderStroke(1.dp, Color(0xFF8A8A8A).copy(alpha = 0.65f)),
+                border = BorderStroke(1.dp, mono.outlineBorder.copy(alpha = 0.65f)),
                 colors = ButtonDefaults.outlinedButtonColors(
-                    contentColor = Color(0xFFE0E0E0)
+                    contentColor = mono.outlineContent
                 ),
                 modifier = Modifier.testTag("RestartButton")
             ) {
@@ -825,13 +1055,14 @@ private fun MonoConfigOptionChip(
     textPrimary: Color,
     textSecondary: Color
 ) {
-    val background = if (selected) Color(0xFF1A1A1A) else Color(0xFF141414)
+    val mono = monotoneColors()
+    val background = if (selected) mono.optionSelectedBg else mono.optionUnselectedBg
     val borderColor = if (selected) {
-        Color(0xFFE6E6E6).copy(alpha = 0.90f)
+        mono.optionSelectedBorder.copy(alpha = 0.90f)
     } else {
-        Color(0xFF8A8A8A).copy(alpha = 0.55f)
+        mono.optionUnselectedBorder.copy(alpha = 0.55f)
     }
-    val labelColor = if (selected) textPrimary else Color(0xFFE8E8E8)
+    val labelColor = if (selected) textPrimary else mono.optionUnselectedLabel
 
     Row(
         modifier = Modifier
@@ -873,11 +1104,11 @@ private fun MonoConfigOptionChip(
                     .drawBehind {
                         val strokeWidth = 1.6.dp.toPx()
                         drawCircle(
-                            color = Color.White.copy(alpha = 0.88f),
+                            color = mono.optionSelectedBorder.copy(alpha = 0.88f),
                             style = Stroke(width = strokeWidth)
                         )
                         drawCircle(
-                            color = Color.White.copy(alpha = 0.88f),
+                            color = mono.optionSelectedBorder.copy(alpha = 0.88f),
                             radius = size.minDimension / 2.5f
                         )
                     }
@@ -904,16 +1135,13 @@ private fun animatedMonotoneBackground(): Brush {
         label = "mono-bg-p"
     )
 
-    val c0 = Color(0xFF080808)
-    val c1 = Color(0xFF101010)
-    val c2 = Color(0xFF181818)
-    val c3 = Color(0xFF222222)
+    val mono = monotoneColors()
 
     val endX = 900f + 280f * p
     val endY = 720f - 220f * p
 
     return Brush.linearGradient(
-        colors = listOf(c0, c1, c2, c3),
+        colors = mono.introBgStops,
         start = Offset(0f, 0f),
         end = Offset(endX, endY)
     )

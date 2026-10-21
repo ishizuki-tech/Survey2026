@@ -19,6 +19,13 @@ interface HeavyRuntimeHandoff {
     ): T
 
     suspend fun <T> withWhisper(acquire: suspend () -> T): T
+
+    /**
+     * Releases whichever runtime is currently owned (if any), without acquiring
+     * a replacement. Use this to explicitly shut down a heavy runtime the user
+     * has backed away from, rather than leaving release to the next acquisition.
+     */
+    suspend fun releaseCurrent()
 }
 
 /** Default for isolated callers that do not participate in app-level runtime handoff. */
@@ -30,6 +37,8 @@ object NoOpHeavyRuntimeHandoff : HeavyRuntimeHandoff {
     ): T = acquire()
 
     override suspend fun <T> withWhisper(acquire: suspend () -> T): T = acquire()
+
+    override suspend fun releaseCurrent() = Unit
 }
 
 class HeavyRuntimeCoordinator(
@@ -88,6 +97,17 @@ class HeavyRuntimeCoordinator(
                 acquire = acquire,
             )
         }
+
+    override suspend fun releaseCurrent() {
+        transitionMutex.withLock {
+            when (owner) {
+                Owner.LITERT -> releaseOwnedLiteRt()
+                Owner.WHISPER -> releaseWhisper()
+                Owner.NONE -> Unit
+            }
+            owner = Owner.NONE
+        }
+    }
 
     private suspend fun releaseOwnedLiteRt() {
         checkNotNull(activeLiteRtIdentity) {

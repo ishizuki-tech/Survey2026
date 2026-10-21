@@ -59,6 +59,14 @@ private const val TAG = "SurveyConfigLoader"
 @Serializable
 data class SurveyConfig(
     /**
+     * Human-readable display title for this configuration, shown wherever the
+     * app lets the user pick which survey configuration to run (e.g. the
+     * config selection screen). Optional for backward compatibility with
+     * configs that do not define one.
+     */
+    val title: String? = null,
+
+    /**
      * Legacy prompt list:
      * - One-step: prompt
      * - Inline two-step: eval_prompt + followup_prompt
@@ -262,7 +270,23 @@ data class SurveyConfig(
         @SerialName("language") val language: String? = null,
         @SerialName("auto_play") val autoPlay: Boolean? = null,
         @SerialName("speech_rate") val speechRate: Float? = null,
-        @SerialName("pitch") val pitch: Float? = null
+        @SerialName("pitch") val pitch: Float? = null,
+        /**
+         * Optional package name of a separately installed TTS engine app to bind to
+         * (e.g. "com.k2fsa.sherpa.onnx.tts.engine"). The engine runs in its own process.
+         * When blank or not installed, the device's default engine is used.
+         */
+        @SerialName("engine") val engine: String? = null,
+        /**
+         * When true, only [engine] may be used: if it is not installed, read-aloud is
+         * disabled with an error instead of falling back to the device default engine.
+         */
+        @SerialName("require_engine") val requireEngine: Boolean? = null,
+        /**
+         * When true, [engine] must be installed AND offer a voice for [language] whose data is
+         * downloaded for offline use. Checked before the SLM loads; failing shows an error screen.
+         */
+        @SerialName("require_offline_voice") val requireOfflineVoice: Boolean? = null
     )
 
     @Serializable

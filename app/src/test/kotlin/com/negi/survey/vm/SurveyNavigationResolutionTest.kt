@@ -26,19 +26,20 @@ class SurveyNavigationResolutionTest {
     fun english_config_routes_start_through_introduction_and_consent() {
         val config = loadAsset("survey_config10.yaml")
         val start = config.graph.nodes.single { it.id == "Start" }.toVmNode()
-        val introduction = config.graph.nodes.single { it.id == "Introduction" }.toVmNode()
-        val consent = config.graph.nodes.single { it.id == "Consent" }.toVmNode()
+        val introductionConsent = config.graph.nodes.single { it.id == "Q00" }.toVmNode()
 
-        assertEquals("Introduction", start.resolveNextId(null))
-        assertEquals(NodeType.INFO, introduction.type)
-        assertEquals(true, introduction.readAloud)
-        assertEquals("Consent", introduction.resolveNextId(null))
-        assertEquals(true, introduction.question.startsWith("Hallo. Thank you for making time for us today."))
+        /** Start now leads through the Pre1-Pre4 observer/interviewer/respondent
+         *  intake chain before reaching the merged introduction+consent node. */
+        assertEquals("Pre1", start.resolveNextId(null))
 
-        assertEquals(NodeType.SINGLE_CHOICE, consent.type)
-        assertEquals(true, consent.readAloud)
-        assertEquals("Q1", consent.resolveNextId("Yes, and proceed"))
-        assertEquals("ConsentDeclined", consent.resolveNextId("No, and stop the interview"))
+        assertEquals(NodeType.SINGLE_CHOICE, introductionConsent.type)
+        assertEquals(true, introductionConsent.readAloud)
+        assertEquals(
+            true,
+            introductionConsent.question.startsWith("Hallo. Thank you for making time for us today.")
+        )
+        assertEquals("Q01", introductionConsent.resolveNextId("Yes, and proceed"))
+        assertEquals("ConsentDeclined", introductionConsent.resolveNextId("No, and stop the interview"))
 
         val declined = config.graph.nodes.single { it.id == "ConsentDeclined" }.toVmNode()
         assertEquals(NodeType.STOP, declined.type)
@@ -49,19 +50,20 @@ class SurveyNavigationResolutionTest {
     fun swahili_config_routes_start_through_introduction_and_consent() {
         val config = loadAsset("survey_config_sw_10.yaml")
         val start = config.graph.nodes.single { it.id == "Start" }.toVmNode()
-        val introduction = config.graph.nodes.single { it.id == "Introduction" }.toVmNode()
-        val consent = config.graph.nodes.single { it.id == "Consent" }.toVmNode()
+        val introductionConsent = config.graph.nodes.single { it.id == "Q00" }.toVmNode()
 
-        assertEquals("Introduction", start.resolveNextId(null))
-        assertEquals(NodeType.INFO, introduction.type)
-        assertEquals(true, introduction.readAloud)
-        assertEquals("Consent", introduction.resolveNextId(null))
-        assertEquals(true, introduction.question.startsWith("Habari yako leo? Asante kwa kutupatia muda wako leo."))
+        /** Start now leads through the Pre1-Pre4 observer/interviewer/respondent
+         *  intake chain before reaching the merged introduction+consent node. */
+        assertEquals("Pre1", start.resolveNextId(null))
 
-        assertEquals(NodeType.SINGLE_CHOICE, consent.type)
-        assertEquals(true, consent.readAloud)
-        assertEquals("Q1", consent.resolveNextId("Ndiyo, nakubali kushiriki"))
-        assertEquals("ConsentDeclined", consent.resolveNextId("Hapana, sikubali kushiriki"))
+        assertEquals(NodeType.SINGLE_CHOICE, introductionConsent.type)
+        assertEquals(true, introductionConsent.readAloud)
+        assertEquals(
+            true,
+            introductionConsent.question.startsWith("Habari yako leo? Asante kwa kutupatia muda wako leo.")
+        )
+        assertEquals("Q01", introductionConsent.resolveNextId("Ndiyo, nakubali kushiriki"))
+        assertEquals("ConsentDeclined", introductionConsent.resolveNextId("Hapana, sikubali kushiriki"))
 
         val declined = config.graph.nodes.single { it.id == "ConsentDeclined" }.toVmNode()
         assertEquals(NodeType.STOP, declined.type)
@@ -97,14 +99,14 @@ class SurveyNavigationResolutionTest {
     fun english_q6_routes_numeric_screen_out_answers_and_falls_back_for_eligible_years() {
         val q6 = loadAsset("survey_config10.yaml")
             .graph.nodes
-            .single { it.id == "Q6" }
+            .single { it.id == "Q06" }
             .toVmNode()
 
         assertEquals("Done", q6.resolveNextId("0"))
         assertEquals("Done", q6.resolveNextId("1"))
         assertEquals("Done", q6.resolveNextId("2"))
-        assertEquals("Q7", q6.resolveNextId("3"))
-        assertEquals("Q7", q6.resolveNextId("10"))
+        assertEquals("Q07", q6.resolveNextId("3"))
+        assertEquals("Q07", q6.resolveNextId("10"))
         assertEquals("Done", q6.resolveNextId("Prefer not to say"))
     }
 
@@ -112,11 +114,11 @@ class SurveyNavigationResolutionTest {
     fun swahili_q6_routes_numeric_screen_out_answers_and_falls_back_for_eligible_years() {
         val q6 = loadAsset("survey_config_sw_10.yaml")
             .graph.nodes
-            .single { it.id == "Q6" }
+            .single { it.id == "Q06" }
             .toVmNode()
 
         assertEquals("Done", q6.resolveNextId("2"))
-        assertEquals("Q7", q6.resolveNextId("3"))
+        assertEquals("Q07", q6.resolveNextId("3"))
         assertEquals("Done", q6.resolveNextId("Sipendi kusema"))
     }
 

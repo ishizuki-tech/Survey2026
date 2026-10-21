@@ -479,9 +479,16 @@ class GitHubUploadWorker(
             val extension = pendingFile.extension.lowercase(Locale.US)
             val isText = TEXT_EXTENSIONS.contains(extension)
 
+            /** Only set for a survey JSON payload — read before the file is deleted below. */
+            var exportedAtFromJson: String? = null
+
             val result = if (isText) {
                 val text = runCatching { pendingFile.readText(Charsets.UTF_8) }.getOrElse {
                     return Result.failure(workDataOf(ERROR_MESSAGE to "Failed to read text file: ${it.message}"))
+                }
+
+                if (uploadKind == UPLOAD_KIND_SURVEY_JSON) {
+                    exportedAtFromJson = PendingSurveyUploads.exportedAtFromJsonText(text)
                 }
 
                 GitHubUploader.uploadJson(
@@ -506,7 +513,7 @@ class GitHubUploadWorker(
                 uploadKind == UPLOAD_KIND_SURVEY_JSON &&
                 surveyId.isNotBlank()
             ) {
-                UploadedSurveyStore(applicationContext).markUploaded(surveyId)
+                UploadedSurveyStore(applicationContext).markUploaded(surveyId, exportedAtFromJson)
             }
 
             runCatching {

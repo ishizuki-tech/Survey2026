@@ -18,6 +18,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.AssetManager
+import android.content.res.Configuration
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -49,6 +50,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -60,6 +62,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.outlined.NavigateBefore
 import androidx.compose.material.icons.automirrored.outlined.NavigateNext
 import androidx.compose.material.icons.automirrored.outlined.Send
 import androidx.compose.material.icons.filled.Mic
@@ -105,6 +108,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.Dp
@@ -149,6 +153,7 @@ import com.negi.survey.slm.SLM
 import com.negi.survey.slm.buildModelConfig
 import com.negi.survey.slm.modelIdentityForPath
 import com.negi.survey.ui.theme.SurveyNavTheme
+import com.negi.survey.ui.theme.monotoneColors
 import com.negi.survey.vm.AiViewModel
 import com.negi.survey.vm.AppViewModel
 import com.negi.survey.vm.DlState
@@ -163,7 +168,6 @@ import com.negi.survey.vm.FlowReview
 import com.negi.survey.vm.FlowSingle
 import com.negi.survey.vm.FlowStop
 import com.negi.survey.vm.FlowText
-import com.negi.survey.vm.ModelPersistenceDialog
 import com.negi.survey.vm.NoOpQuestionSpeaker
 import com.negi.survey.vm.NodeType
 import com.negi.survey.vm.QuestionSpeaker
@@ -176,8 +180,14 @@ import com.negi.survey.vm.SurveyFinalizationState
 import com.negi.survey.vm.SurveyFinalizationStatePolicy
 import com.negi.survey.vm.SurveyFinalizationViewModel
 import com.negi.survey.vm.TtsController
+import androidx.lifecycle.compose.LifecycleResumeEffect
+import com.negi.survey.screens.TtsEngineMissingScreen
+import com.negi.survey.vm.isTtsEngineInstalled
+import com.negi.survey.vm.TtsVoiceCheck
+import com.negi.survey.vm.checkTtsOfflineVoice
 import com.negi.survey.vm.UploadStatusViewModel
 import com.negi.survey.vm.UploadStatus
+import com.negi.survey.vm.UploadStatusDetails
 import com.negi.survey.vm.WhisperSpeechController
 import com.negi.survey.vm.shouldAutoPlayQuestion
 import com.negi.survey.vm.toggleQuestionSpeaker
@@ -252,21 +262,24 @@ class MainActivity : ComponentActivity() {
      */
     private fun configureEdgeToEdge() {
         val black = "#000000".toColorInt()
+        val white = "#FFFFFF".toColorInt()
+        val isDark = (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
+            Configuration.UI_MODE_NIGHT_YES
 
         // Force edge-to-edge in both paths for consistency.
         WindowCompat.setDecorFitsSystemWindows(window, false)
 
         runCatching {
             enableEdgeToEdge(
-                statusBarStyle = SystemBarStyle.dark(black),
-                navigationBarStyle = SystemBarStyle.dark(black),
+                statusBarStyle = if (isDark) SystemBarStyle.dark(black) else SystemBarStyle.light(white, white),
+                navigationBarStyle = if (isDark) SystemBarStyle.dark(black) else SystemBarStyle.light(white, white),
             )
         }.onFailure { t ->
             Log.w(TAG, "enableEdgeToEdge failed; using legacy insets path: ${t.message}", t)
 
             WindowInsetsControllerCompat(window, window.decorView).apply {
-                isAppearanceLightStatusBars = false
-                isAppearanceLightNavigationBars = false
+                isAppearanceLightStatusBars = !isDark
+                isAppearanceLightNavigationBars = !isDark
             }
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -283,11 +296,13 @@ class MainActivity : ComponentActivity() {
 /* ───────────────────────────── Visual Utilities ───────────────────────────── */
 
 @Composable
-private fun appBackplate(): Brush =
-    Brush.verticalGradient(
-        0f to Color(0xFF202020),
-        1f to Color(0xFF040404)
+private fun appBackplate(): Brush {
+    val mono = monotoneColors()
+    return Brush.verticalGradient(
+        0f to mono.screenTop,
+        1f to mono.screenBottom
     )
+}
 
 @Composable
 private fun Modifier.neonEdgeThin(
@@ -314,23 +329,26 @@ private fun Modifier.neutralEdge(
     alpha: Float = 0.16f,
     corner: Dp = 12.dp,
     stroke: Dp = 1.dp
-): Modifier = this.then(
-    Modifier.drawBehind {
-        val cr = CornerRadius(corner.toPx(), corner.toPx())
-        val sweep = Brush.sweepGradient(
-            0f to Color(0xFF101010).copy(alpha = alpha),
-            0.25f to Color(0xFF3A3A3A).copy(alpha = alpha),
-            0.5f to Color(0xFF7A7A7A).copy(alpha = alpha * 0.9f),
-            0.75f to Color(0xFF3A3A3A).copy(alpha = alpha),
-            1f to Color(0xFF101010).copy(alpha = alpha)
-        )
-        drawRoundRect(
-            brush = sweep,
-            style = Stroke(width = stroke.toPx()),
-            cornerRadius = cr
-        )
-    }
-)
+): Modifier {
+    val mono = monotoneColors()
+    return this.then(
+        Modifier.drawBehind {
+            val cr = CornerRadius(corner.toPx(), corner.toPx())
+            val sweep = Brush.sweepGradient(
+                0f to mono.edgeSweepDark.copy(alpha = alpha),
+                0.25f to mono.edgeSweepMid.copy(alpha = alpha),
+                0.5f to mono.cardBorderMid.copy(alpha = alpha * 0.9f),
+                0.75f to mono.edgeSweepMid.copy(alpha = alpha),
+                1f to mono.edgeSweepDark.copy(alpha = alpha)
+            )
+            drawRoundRect(
+                brush = sweep,
+                style = Stroke(width = stroke.toPx()),
+                cornerRadius = cr
+            )
+        }
+    )
+}
 
 /* ───────────────────────────── Init Gate ───────────────────────────── */
 
@@ -548,6 +566,7 @@ fun AudioPermissionGate(
         modifier = modifier
             .fillMaxSize()
             .imePadding()
+            .navigationBarsPadding()
             .background(backplate)
             .padding(24.dp),
         contentAlignment = Alignment.Center
@@ -666,7 +685,7 @@ fun AppNav() {
 
         val mapped = yamlFiles.map { path ->
             val fileName = path.substringAfterLast('/')
-            configOptionFromFileName(fileName = fileName).copy(id = path)
+            configOptionFromAsset(assetManager = assetManager, path = path, fileName = fileName)
         }
 
         mapped.ifEmpty {
@@ -699,6 +718,8 @@ fun AppNav() {
             defaultOptionId = options.firstOrNull()?.id,
             uploadStatus = uploadStatus,
             onUploadStatusActive = uploadStatusViewModel::refresh,
+            onResolveUploadStatusDetails = uploadStatusViewModel::loadDetails,
+            onClearCompletedSurveys = uploadStatusViewModel::clearCompletedSurveys,
             onStart = { option ->
                 selectionEpoch += 1
                 chosenId = option.id
@@ -838,6 +859,80 @@ fun AppNav() {
 
     val cfg = config!!
 
+    /*
+     * TTS readiness check. Runs before the SLM is downloaded or initialized, so a phone
+     * missing its voice fails fast instead of after a long model load:
+     *  - tts.require_engine: the tts.engine app must be installed.
+     *  - tts.require_offline_voice: that engine must also have a downloaded (offline) voice
+     *    for tts.language.
+     * Once it passes (or the interviewer continues without voice) it isn't checked again
+     * for this session.
+     */
+    val ttsGateEngine = remember(cfg) { cfg.tts.engine?.trim()?.ifBlank { null } }
+    val ttsGateLang = remember(cfg) {
+        cfg.tts.language?.trim()?.lowercase(Locale.US)?.ifBlank { null } ?: DEFAULT_TTS_LANGUAGE
+    }
+    val ttsGateNeedsVoice = remember(cfg, ttsGateEngine) {
+        (cfg.tts.enabled ?: true) && (cfg.tts.requireOfflineVoice ?: false) && ttsGateEngine != null
+    }
+    val ttsGateNeedsEngine = remember(cfg, ttsGateEngine) {
+        (cfg.tts.enabled ?: true) && (cfg.tts.requireEngine ?: false) && ttsGateEngine != null
+    }
+    // null = check still running.
+    var ttsGateResult by remember(sessionKey, ttsGateEngine) {
+        mutableStateOf(if (ttsGateNeedsVoice || ttsGateNeedsEngine) null else TtsVoiceCheck.OK)
+    }
+    var ttsGateContinue by remember(sessionKey) { mutableStateOf(false) }
+    var ttsGateTick by remember(sessionKey) { mutableIntStateOf(0) }
+
+    LaunchedEffect(sessionKey, ttsGateEngine, ttsGateTick) {
+        if (ttsGateResult == TtsVoiceCheck.OK || ttsGateContinue) return@LaunchedEffect
+        val engine = ttsGateEngine ?: return@LaunchedEffect
+        val result = when {
+            ttsGateNeedsVoice -> checkTtsOfflineVoice(appContext, engine, ttsGateLang)
+            ttsGateNeedsEngine ->
+                if (isTtsEngineInstalled(appContext, engine)) TtsVoiceCheck.OK else TtsVoiceCheck.ENGINE_MISSING
+            else -> TtsVoiceCheck.OK
+        }
+        Log.d(MainActivity.TAG, "TTS gate: engine=$engine lang=$ttsGateLang result=$result session=$sessionKey")
+        ttsGateResult = result
+    }
+
+    if (ttsGateResult != TtsVoiceCheck.OK && !ttsGateContinue) {
+        val gateContext = LocalContext.current
+        // Re-check on return to the app, e.g. after downloading the voice in Settings.
+        LifecycleResumeEffect(ttsGateEngine) {
+            if (ttsGateResult != null) ttsGateTick++
+            onPauseOrDispose { }
+        }
+        val result = ttsGateResult
+        if (result == null) {
+            Box(
+                modifier = Modifier.fillMaxSize().imePadding(),
+                contentAlignment = Alignment.Center
+            ) {
+                CircularProgressIndicator()
+            }
+        } else {
+            TtsEngineMissingScreen(
+                enginePackage = ttsGateEngine.orEmpty(),
+                languageCode = ttsGateLang,
+                onContinueWithoutVoice = {
+                    Log.w(MainActivity.TAG, "TTS gate failed ($result); continuing without read-aloud")
+                    ttsGateContinue = true
+                },
+                onExit = {
+                    Log.w(MainActivity.TAG, "TTS gate failed ($result) -> exiting app. session=$sessionKey")
+                    sessionStore.clearSession(sessionKey)
+                    chosenId = null
+                    (gateContext as? android.app.Activity)?.finishAndRemoveTask()
+                },
+                modifier = Modifier.fillMaxSize().imePadding()
+            )
+        }
+        return
+    }
+
     val sessionVmOwner = remember(sessionStore, sessionKey) {
         sessionStore.ownerFor(sessionKey)
     }
@@ -855,7 +950,6 @@ fun AppNav() {
     )
 
     val state by appVm.state.collectAsStateWithLifecycle()
-    val persistenceNotice by appVm.persistenceNotice.collectAsStateWithLifecycle()
 
     LaunchedEffect(state) {
         if (state is DlState.Idle) {
@@ -864,16 +958,19 @@ fun AppNav() {
         }
     }
 
-    ModelPersistenceDialog(
-        notice = persistenceNotice,
-        onDismiss = { appVm.dismissPersistenceNotice() }
-    )
-
     DownloadGate(
         state = state,
         onRetry = {
             Log.d(MainActivity.TAG, "DownloadGate retry. session=$sessionKey")
             appVm.ensureModelDownloaded(appContext)
+        },
+        onManualModelSelected = { uri ->
+            Log.d(MainActivity.TAG, "DownloadGate manual model selected. session=$sessionKey")
+            appVm.useManuallySelectedModel(appContext, uri)
+        },
+        onSkipManualSelection = {
+            Log.d(MainActivity.TAG, "DownloadGate manual selection skipped -> downloading. session=$sessionKey")
+            appVm.proceedWithDownload(appContext)
         }
     ) { modelFile ->
 
@@ -1026,7 +1123,9 @@ fun AppNav() {
                         sessionId = sessionKey,
                         sessionVmOwner = sessionVmOwner,
                         heavyRuntimeHandoff = heavyRuntimeCoordinator,
-                        uploadStatus = uploadStatus
+                        uploadStatus = uploadStatus,
+                        onResolveUploadStatusDetails = uploadStatusViewModel::loadDetails,
+                        onClearCompletedSurveys = uploadStatusViewModel::clearCompletedSurveys
                     )
                 }
             } else {
@@ -1040,7 +1139,9 @@ fun AppNav() {
                     sessionId = sessionKey,
                     sessionVmOwner = sessionVmOwner,
                     heavyRuntimeHandoff = heavyRuntimeCoordinator,
-                    uploadStatus = uploadStatus
+                    uploadStatus = uploadStatus,
+                    onResolveUploadStatusDetails = uploadStatusViewModel::loadDetails,
+                    onClearCompletedSurveys = uploadStatusViewModel::clearCompletedSurveys
                 )
             }
         }
@@ -1093,7 +1194,9 @@ fun SurveyNavHost(
     sessionId: String = "session",
     sessionVmOwner: ViewModelStoreOwner? = null,
     heavyRuntimeHandoff: HeavyRuntimeHandoff = NoOpHeavyRuntimeHandoff,
-    uploadStatus: UploadStatus = UploadStatus()
+    uploadStatus: UploadStatus = UploadStatus(),
+    onResolveUploadStatusDetails: suspend () -> UploadStatusDetails,
+    onClearCompletedSurveys: suspend () -> Unit
 ) {
     val localContext = LocalContext.current
     val appContext = localContext.applicationContext
@@ -1230,22 +1333,35 @@ fun SurveyNavHost(
             ?.ifBlank { null }
             ?: DEFAULT_TTS_LANGUAGE
     }
-    val ttsRate = remember(ttsMeta.speechRate) { ttsMeta.speechRate?.takeIf { it > 0f } ?: 1.0f }
-    val ttsPitch = remember(ttsMeta.pitch) { ttsMeta.pitch?.takeIf { it > 0f } ?: 1.0f }
+    // Null when omitted from the YAML: the TTS engine's own rate/pitch settings apply.
+    val ttsRate = remember(ttsMeta.speechRate) { ttsMeta.speechRate?.takeIf { it > 0f } }
+    val ttsPitch = remember(ttsMeta.pitch) { ttsMeta.pitch?.takeIf { it > 0f } }
+    val ttsEngine = remember(ttsMeta.engine) { ttsMeta.engine?.trim()?.ifBlank { null } }
+    val ttsRequireEngine = remember(ttsMeta.requireEngine, ttsMeta.requireOfflineVoice) {
+        (ttsMeta.requireEngine ?: false) || (ttsMeta.requireOfflineVoice ?: false)
+    }
+
+    // The required-engine check (and its error screen) runs earlier in AppNav, before the
+    // SLM loads. Here we only note whether the engine exists so the controller binds to it.
+    val ttsEngineInstalled = remember(ttsEngine) {
+        ttsEngine?.let { isTtsEngineInstalled(appContext, it) } ?: true
+    }
 
     val ttsController: QuestionSpeaker = if (ttsEnabled) {
-        val ttsFactory = remember(appContext, ttsLang, ttsRate, ttsPitch) {
+        val ttsFactory = remember(appContext, ttsLang, ttsRate, ttsPitch, ttsEngine, ttsRequireEngine) {
             TtsController.provideFactory(
                 appContext = appContext,
                 languageCode = ttsLang,
                 speechRate = ttsRate,
-                pitch = ttsPitch
+                pitch = ttsPitch,
+                enginePackage = ttsEngine,
+                requireEngine = ttsRequireEngine
             )
         }
 
         val ttsVm: TtsController = viewModel(
             viewModelStoreOwner = owner,
-            key = "TtsController_${sessionId}_$ttsLang",
+            key = "TtsController_${sessionId}_${ttsLang}_${ttsEngine.orEmpty()}_$ttsEngineInstalled",
             factory = ttsFactory
         )
 
@@ -1268,6 +1384,8 @@ fun SurveyNavHost(
             entryProvider = entryProvider {
 
                 entry<FlowHome> {
+                    val node by vmSurvey.currentNode.collectAsStateWithLifecycle()
+
                     // Restore the note if ViewModel was cleared unexpectedly when navigating back.
                     LaunchedEffect(runFreeTextShadow) {
                         val vmValue = vmSurvey.runFreeText.value
@@ -1280,11 +1398,29 @@ fun SurveyNavHost(
                         }
                     }
 
+                    val homeBackScope = rememberCoroutineScope()
+
                     HomeScreen(
                         vmSurvey = vmSurvey,
                         speechController = speechController,
                         ttsController = ttsController,
                         speechEnabled = voiceEnabled,
+                        title = node.title,
+                        text = node.question,
+                        onBack = {
+                            Log.d(
+                                MainActivity.TAG,
+                                "Home -> Back requested; closing SLM and returning to selector. session=$sessionId"
+                            )
+                            homeBackScope.launch {
+                                runCatching { heavyRuntimeHandoff.releaseCurrent() }
+                                    .onFailure { t ->
+                                        Log.w(MainActivity.TAG, "Failed to release SLM on Home back.", t)
+                                    }
+                                vmAI.resetStates()
+                                onResetToSelector()
+                            }
+                        },
                         onStart = {
                             /** Snapshot the home note text before resetting the run. */
                             val homeNote = runFreeTextShadow
@@ -1521,6 +1657,8 @@ fun SurveyNavHost(
                     DoneScreen(
                         vm = vmSurvey,
                         uploadStatus = uploadStatus,
+                        onResolveUploadStatusDetails = onResolveUploadStatusDetails,
+                        onClearCompletedSurveys = onClearCompletedSurveys,
                         onRestart = {
                             Log.d(MainActivity.TAG, "Done -> Restart requested (return to selector)")
                             vmAI.resetStates()
@@ -1588,6 +1726,7 @@ private fun InfoNodeScreen(
         modifier = Modifier
             .fillMaxSize()
             .imePadding()
+            .navigationBarsPadding()
             .background(backplate)
             .padding(24.dp),
         contentAlignment = Alignment.Center,
@@ -1652,6 +1791,7 @@ private fun StopNodeScreen(
         modifier = Modifier
             .fillMaxSize()
             .imePadding()
+            .navigationBarsPadding()
             .background(backplate)
             .padding(24.dp),
         contentAlignment = Alignment.Center,
@@ -1704,11 +1844,19 @@ internal fun TextNodeScreen(
 ) {
     val backplate = appBackplate()
     val scroll = rememberScrollState()
+    val focusRequester = remember { FocusRequester() }
+    val keyboardController = LocalSoftwareKeyboardController.current
+
+    LaunchedEffect(Unit) {
+        runCatching { focusRequester.requestFocus() }
+        keyboardController?.show()
+    }
 
     Box(
         modifier = Modifier
             .fillMaxSize()
             .imePadding()
+            .navigationBarsPadding()
             .background(backplate)
             .padding(24.dp),
         contentAlignment = Alignment.Center
@@ -1750,7 +1898,9 @@ internal fun TextNodeScreen(
                 OutlinedTextField(
                     value = value,
                     onValueChange = onValueChange,
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .focusRequester(focusRequester),
                     minLines = 3
                 )
 
@@ -1788,6 +1938,7 @@ private fun SingleChoiceNodeScreen(
         modifier = Modifier
             .fillMaxSize()
             .imePadding()
+            .navigationBarsPadding()
             .background(backplate)
             .padding(24.dp),
         contentAlignment = Alignment.Center
@@ -1809,22 +1960,29 @@ private fun SingleChoiceNodeScreen(
                     .verticalScroll(scroll),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                if (title.isNotBlank()) {
-                    Text(text = title, style = MaterialTheme.typography.titleLarge)
-                }
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
-                    Text(
-                        text = question.ifBlank { "(no question text)" },
-                        style = MaterialTheme.typography.bodyLarge,
-                        modifier = Modifier.weight(1f)
-                    )
+                    if (title.isNotBlank()) {
+                        Text(
+                            text = title,
+                            style = MaterialTheme.typography.titleLarge,
+                            modifier = Modifier.weight(1f)
+                        )
+                    } else {
+                        Spacer(Modifier.weight(1f))
+                    }
                     IconButton(onClick = onReplay) {
                         Text(if (isSpeaking) "\u23F9" else "\uD83D\uDD0A")
                     }
                 }
+
+                Text(
+                    text = question.ifBlank { "(no question text)" },
+                    style = MaterialTheme.typography.bodyLarge,
+                    modifier = Modifier.fillMaxWidth()
+                )
 
                 Spacer(Modifier.height(8.dp))
 
@@ -1891,11 +2049,19 @@ private fun NumberNodeScreen(
     val backplate = appBackplate()
     val scroll = rememberScrollState()
     val isSpecialAnswer = value in specialOptions
+    val focusRequester = remember { FocusRequester() }
+    val keyboardController = LocalSoftwareKeyboardController.current
+
+    LaunchedEffect(Unit) {
+        runCatching { focusRequester.requestFocus() }
+        keyboardController?.show()
+    }
 
     Box(
         modifier = Modifier
             .fillMaxSize()
             .imePadding()
+            .navigationBarsPadding()
             .background(backplate)
             .padding(24.dp),
         contentAlignment = Alignment.Center,
@@ -1933,7 +2099,9 @@ private fun NumberNodeScreen(
                 OutlinedTextField(
                     value = if (isSpecialAnswer) "" else value,
                     onValueChange = onValueChange,
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .focusRequester(focusRequester),
                     label = { Text("Number") },
                     singleLine = true,
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
@@ -1983,6 +2151,7 @@ private fun MultiChoiceNodeScreen(
         modifier = Modifier
             .fillMaxSize()
             .imePadding()
+            .navigationBarsPadding()
             .background(backplate)
             .padding(24.dp),
         contentAlignment = Alignment.Center
@@ -2065,12 +2234,36 @@ private fun RowButtons(
     secondaryLabel: String,
     onSecondary: () -> Unit
 ) {
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Button(onClick = onPrimary, enabled = primaryEnabled, modifier = Modifier.fillMaxWidth()) {
-            Text(primaryLabel)
-        }
-        OutlinedButton(onClick = onSecondary, modifier = Modifier.fillMaxWidth()) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        FilledTonalButton(
+            onClick = onSecondary,
+            shape = CircleShape,
+            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp)
+        ) {
+            Icon(
+                imageVector = Icons.AutoMirrored.Outlined.NavigateBefore,
+                contentDescription = secondaryLabel
+            )
+            Spacer(Modifier.width(8.dp))
             Text(secondaryLabel)
+        }
+
+        FilledTonalButton(
+            onClick = onPrimary,
+            enabled = primaryEnabled,
+            shape = CircleShape,
+            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp)
+        ) {
+            Text(primaryLabel)
+            Spacer(Modifier.width(8.dp))
+            Icon(
+                imageVector = Icons.AutoMirrored.Outlined.NavigateNext,
+                contentDescription = primaryLabel
+            )
         }
     }
 }
@@ -2087,6 +2280,7 @@ private fun HomeFreeTextComposer(
     speechTranscribing: Boolean,
     onToggleSpeech: (() -> Unit)?,
     onSend: () -> Unit,
+    onBack: () -> Unit,
     speechStatusText: String?,
     speechStatusIsError: Boolean,
     modifier: Modifier = Modifier
@@ -2122,7 +2316,6 @@ private fun HomeFreeTextComposer(
                 modifier = Modifier
                     .weight(1f)
                     .focusRequester(focusRequester),
-                placeholder = { Text("Type a note…") },
                 minLines = 1,
                 maxLines = 5,
                 enabled = enabled,
@@ -2178,18 +2371,38 @@ private fun HomeFreeTextComposer(
             )
         }
 
-        FilledTonalButton(
-            onClick = onSend,
-            enabled = enabled,
-            shape = CircleShape,
-            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp)
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
         ) {
-            Icon(
-                imageVector = Icons.AutoMirrored.Outlined.NavigateNext,
-                contentDescription = "Start"
-            )
-            Spacer(Modifier.width(8.dp))
-            Text("Start")
+            FilledTonalButton(
+                onClick = onBack,
+                enabled = enabled,
+                shape = CircleShape,
+                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.AutoMirrored.Outlined.NavigateBefore,
+                    contentDescription = "Back"
+                )
+                Spacer(Modifier.width(8.dp))
+                Text("Back")
+            }
+
+            FilledTonalButton(
+                onClick = onSend,
+                enabled = enabled,
+                shape = CircleShape,
+                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp)
+            ) {
+                Text("Start")
+                Spacer(Modifier.width(8.dp))
+                Icon(
+                    imageVector = Icons.AutoMirrored.Outlined.NavigateNext,
+                    contentDescription = "Start"
+                )
+            }
         }
     }
 }
@@ -2200,7 +2413,10 @@ private fun HomeScreen(
     speechController: SpeechController,
     ttsController: QuestionSpeaker,
     speechEnabled: Boolean,
+    title: String,
+    text: String,
     onStart: () -> Unit,
+    onBack: () -> Unit,
     onUpdateFreeText: (String) -> Unit
 ) {
     val backplate = appBackplate()
@@ -2382,6 +2598,7 @@ private fun HomeScreen(
         modifier = Modifier
             .fillMaxSize()
             .imePadding()
+            .navigationBarsPadding()
             .background(backplate)
             .padding(24.dp),
         contentAlignment = Alignment.Center
@@ -2403,12 +2620,12 @@ private fun HomeScreen(
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
                 Text(
-                    text = "Survey ready",
+                    text = title,
                     style = MaterialTheme.typography.titleLarge
                 )
 
                 Text(
-                    text = "Tap Start to begin. You can optionally dictate or type a note for this run.",
+                    text = text,
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -2450,7 +2667,8 @@ private fun HomeScreen(
                                     HOME_START_TIMEOUT_MS
                     },
                     speechStatusText = speechStatusText,
-                    speechStatusIsError = speechStatusIsError
+                    speechStatusIsError = speechStatusIsError,
+                    onBack = onBack
                 )
             }
         }
@@ -2488,6 +2706,26 @@ private val KNOWN_CONFIG_LABELS: Map<String, String> = mapOf(
     "survey_config10" to "English",
     "survey_config_sw_10" to "Swahili",
 )
+
+/**
+ * Build a config option for the selection screen, preferring the YAML's own
+ * top-level `title:` field (when present and non-blank) over the
+ * filename-derived label.
+ */
+private fun configOptionFromAsset(
+    assetManager: AssetManager,
+    path: String,
+    fileName: String
+): ConfigOptionUi {
+    val base = configOptionFromFileName(fileName = fileName).copy(id = path)
+
+    val yamlTitle = runCatching {
+        val raw = assetManager.open(path).bufferedReader(Charsets.UTF_8).use { it.readText() }
+        SurveyConfigLoader.fromString(text = raw, fileNameHint = fileName).title
+    }.getOrNull()?.trim()?.takeIf { it.isNotEmpty() }
+
+    return if (yamlTitle != null) base.copy(label = yamlTitle) else base
+}
 
 private fun configOptionFromFileName(fileName: String): ConfigOptionUi {
     val stem = fileName.replace(Regex("""(?i)\.ya?ml$"""), "")
@@ -2790,6 +3028,7 @@ private fun PlaceholderScreen(
         modifier = Modifier
             .fillMaxSize()
             .imePadding()
+            .navigationBarsPadding()
             .background(backplate)
             .padding(24.dp),
         contentAlignment = Alignment.Center

@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <!--
+        Dark counterpart of values/themes.xml — see that file for why
+        android:windowBackground is set here. Matched to the darkest stop
+        of the shared monotone palette (DarkMonotoneColors.introBgStops,
+        see MonotonePalette.kt). Android applies this variant automatically
+        when the system is in Dark mode (Configuration.uiMode).
+    -->
+    <style name="Theme.SurveyNav" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">#FF080808</item>
+    </style>
+</resources>

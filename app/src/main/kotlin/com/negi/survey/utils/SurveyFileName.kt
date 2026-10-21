@@ -322,6 +322,23 @@ private fun timeStamp(
     return fmt.format(Date(nowMillis))
 }
 
+/** Matches the stamp format this file writes: yyyy-MM-dd_HH-mm-ss. */
+private val EXPORT_STAMP_DISPLAY_REGEX = Regex("""^(\d{4}-\d{2}-\d{2})_(\d{2})-(\d{2})-(\d{2})$""")
+
+/**
+ * Reformats a raw `exported_at` stamp (as embedded in survey filenames and JSON
+ * payloads) for display, e.g. "2026-10-15_09-41-04" -> "2026-10-15 09:41:04".
+ *
+ * Falls back to the trimmed raw value when it does not match the expected
+ * pattern, rather than throwing.
+ */
+fun formatSurveyExportStamp(raw: String): String {
+    val trimmed = raw.trim()
+    val match = EXPORT_STAMP_DISPLAY_REGEX.matchEntire(trimmed) ?: return trimmed
+    val (date, hh, mm, ss) = match.destructured
+    return "$date $hh:$mm:$ss"
+}
+
 /** Max length for sanitized filename segments. */
 private const val MAX_SEGMENT_LEN = 80
 
