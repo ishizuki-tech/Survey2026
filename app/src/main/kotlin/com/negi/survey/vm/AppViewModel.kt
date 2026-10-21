@@ -14,7 +14,10 @@
 package com.negi.survey.vm
 
 import android.content.Context
+import android.content.Intent
 import android.net.Uri
+import android.os.Build
+import android.provider.DocumentsContract
 import android.util.Log
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -33,6 +36,7 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
@@ -68,7 +72,17 @@ sealed class DlState {
      * download; calling [AppViewModel.useManuallySelectedModel] with a picked
      * file skips the download entirely.
      */
-    data object NeedsModel : DlState()
+    data class NeedsModel(val expectedFileName: String) : DlState()
+
+    /**
+     * Transient state while [AppViewModel.useManuallySelectedModel] copies
+     * the user's picked file into private storage. Unlike [Downloading],
+     * there's no byte-level progress to show here — the SAF file descriptor
+     * doesn't expose a total up front the way the HTTP download response
+     * does — so the UI just shows an indeterminate "working on it" state
+     * instead of a percentage.
+     */
+    data object ImportingSelectedFile : DlState()
 
     data class Downloading(
         val downloaded: Long,
@@ -184,7 +198,7 @@ class AppViewModel(
                 // a chance to pick a copy saved elsewhere on the device — e.g. by
                 // another install of this app. proceedWithDownload() or
                 // useManuallySelectedModel() resumes from here.
-                _state.value = DlState.NeedsModel
+                _state.value = DlState.NeedsModel(safeName)
             } catch (ce: CancellationException) {
                 if (_state.value !is DlState.Error) {
                     _state.value = DlState.Error("Canceled by user")
@@ -228,6 +242,8 @@ class AppViewModel(
 
         downloadJob = viewModelScope.launch(Dispatchers.IO) {
             try {
+                _state.value = DlState.ImportingSelectedFile
+
                 val safeName = suggestFileName(modelUrl, fileName)
                 val destination = File(app.filesDir, safeName)
                 val tmp = File(app.filesDir, "$safeName.fromPicker.tmp")
@@ -488,9 +504,30 @@ fun DownloadGate(
 
         is DlState.NeedsModel -> {
             ManualModelSelectionDialog(
+                expectedFileName = state.expectedFileName,
                 onFilePicked = onManualModelSelected,
                 onSkip = onSkipManualSelection
             )
+        }
+
+        is DlState.ImportingSelectedFile -> {
+            // The picked file can be a few GB, so copying it into private
+            // storage (see useManuallySelectedModel) takes a visible moment.
+            // Without this, the screen looked stuck for a couple of seconds
+            // between picking the file and the model being ready.
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(downloadGateBackplate())
+                    .padding(24.dp),
+                verticalArrangement = Arrangement.Center
+            ) {
+                Text("Copying the selected file…")
+                Spacer(Modifier.height(12.dp))
+                LinearProgressIndicator(
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
         }
 
         is DlState.Downloading -> {
@@ -569,21 +606,47 @@ private fun downloadGateBackplate(): Brush {
 }
 
 /**
+ * Opens the system document picker already pointed at the device's
+ * Downloads folder, since that's where a manually-saved model file almost
+ * always ends up. [DocumentsContract.EXTRA_INITIAL_URI] is a best-effort
+ * hint (API 26+, which this app's minSdk already requires) — some
+ * device/provider combinations ignore it, in which case the picker just
+ * opens to its normal default location instead.
+ */
+private class OpenDocumentAtDownloads : ActivityResultContracts.OpenDocument() {
+    override fun createIntent(context: Context, input: Array<String>): Intent {
+        val intent = super.createIntent(context, input)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val downloadsUri = Uri.parse(
+                "content://com.android.externalstorage.documents/document/primary:Download"
+            )
+            intent.putExtra(DocumentsContract.EXTRA_INITIAL_URI, downloadsUri)
+        }
+        return intent
+    }
+}
+
+/**
  * Lets the user pick a model file already saved on this device — e.g. by
  * another install of the app — instead of starting the network download.
  *
- * "Select File" opens the system document picker (any location the user's
- * Files app/provider can browse, including another app's exported storage).
- * "Cancel" dismisses this and lets the download proceed normally via
- * [onSkip]; there is no outside-dismiss, so the user makes an explicit choice.
+ * "Select File" opens the system document picker, hinted to open at
+ * Downloads (see [OpenDocumentAtDownloads]), filtered to any file type so
+ * the (often unrecognized) ".litertlm" extension is never hidden. The
+ * picker selects a file with a single tap, not a double-tap — unlike a
+ * desktop file browser, so the dialog spells that out to avoid the most
+ * common point of confusion. "Cancel" dismisses this and lets the download
+ * proceed normally via [onSkip]; there is no outside-dismiss, so the user
+ * makes an explicit choice.
  */
 @Composable
 private fun ManualModelSelectionDialog(
+    expectedFileName: String,
     onFilePicked: (Uri) -> Unit,
     onSkip: () -> Unit
 ) {
     val filePickerLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenDocument()
+        contract = remember { OpenDocumentAtDownloads() }
     ) { uri ->
         if (uri != null) onFilePicked(uri)
     }
@@ -597,8 +660,12 @@ private fun ManualModelSelectionDialog(
             Text(
                 "The on-device AI model isn't on this device yet. If another " +
                     "install of this app already downloaded it, you can select " +
-                    "that file instead of downloading it again. If you can't find " +
-                    "it, cancel and the download will continue."
+                    "that file instead of downloading it again.\n\n" +
+                    "Look for a file named \"$expectedFileName\" — it's usually in " +
+                    "your Downloads folder, which the picker will open to. Tap the " +
+                    "file once to select it; the picker doesn't use double-tap the " +
+                    "way a desktop file browser does.\n\n" +
+                    "If you can't find it, cancel and the download will continue."
             )
         },
         confirmButton = {

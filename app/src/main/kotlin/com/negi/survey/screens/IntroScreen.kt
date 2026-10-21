@@ -58,6 +58,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -87,6 +88,7 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.DividerDefaults
 import androidx.compose.material3.ElevatedCard
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -946,26 +948,22 @@ private fun CtaRowMono(
         horizontalArrangement = Arrangement.Center,
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Button(
+        // Matches RowButtons' Next/Back pattern (MainActivity.kt) so Start
+        // reads as the same kind of action throughout the app: a
+        // FilledTonalButton using the theme's default colors (blue, via
+        // colorScheme.secondaryContainer) instead of the monotone palette,
+        // with the same shape, padding and plain text style.
+        FilledTonalButton(
             onClick = onStart,
             shape = CircleShape,
-            colors = ButtonDefaults.buttonColors(
-                containerColor = mono.buttonContainer,
-                contentColor = mono.buttonContent
-            ),
+            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp),
             modifier = Modifier.testTag("StartButton")
         ) {
+            Text("Start")
+            Spacer(Modifier.width(8.dp))
             Icon(
                 imageVector = Icons.AutoMirrored.Filled.ArrowForward,
-                contentDescription = null
-            )
-            Spacer(Modifier.width(8.dp))
-            Text(
-                text = "Start",
-                style = MaterialTheme.typography.titleSmall.copy(
-                    fontWeight = FontWeight.SemiBold,
-                    letterSpacing = 0.2.sp
-                )
+                contentDescription = "Start"
             )
         }
 
