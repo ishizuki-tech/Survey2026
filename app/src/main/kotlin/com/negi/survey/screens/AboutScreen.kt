@@ -22,6 +22,13 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.getValue
+import androidx.compose.material3.TextButton
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.SpanStyle
@@ -46,7 +53,9 @@ private data class Credit(
     val role: String,
     val license: String,
     val url: String,
-    val note: String? = null
+    val note: String? = null,
+    /** Full licence text bundled in assets/licenses/, shown via "View licence text". */
+    val licenseAsset: String? = null
 )
 
 private val CREDITS = listOf(
@@ -76,20 +85,23 @@ private val CREDITS = listOf(
         name = "whisper.cpp v1.9.3",
         role = "On-device speech recognition engine.",
         license = "MIT",
-        url = "https://github.com/ggml-org/whisper.cpp"
+        url = "https://github.com/ggml-org/whisper.cpp",
+        licenseAsset = "licenses/whisper.cpp-MIT.txt"
     ),
     Credit(
         name = "OpenAI Whisper (small)",
         role = "English speech recognition model (ggml-small-q5_1).",
         license = "MIT",
-        url = "https://huggingface.co/ggerganov/whisper.cpp"
+        url = "https://huggingface.co/ggerganov/whisper.cpp",
+        licenseAsset = "licenses/openai-whisper-MIT.txt"
     ),
     Credit(
         name = "Swahili Whisper model (dmusingu, Common Voice 14)",
         role = "Swahili speech recognition model (ggml-small-sw-cv14-q5_0).",
         license = "Apache 2.0",
         url = "https://huggingface.co/dmusingu/WHISPER-SMALL-SWAHILI-ASR-CV-14",
-        note = "Fine-tuned on Mozilla Common Voice 14 (CC0)."
+        note = "Fine-tuned on Mozilla Common Voice 14 (CC0).",
+        licenseAsset = "licenses/apache-2.0.txt"
     ),
     Credit(
         name = "Gemma 3n E4B",
@@ -97,19 +109,22 @@ private val CREDITS = listOf(
         license = "Gemma Terms of Use",
         url = "https://ai.google.dev/gemma/terms",
         note = "Gemma is provided under and subject to the Gemma Terms of Use found at " +
-            "ai.google.dev/gemma/terms."
+            "ai.google.dev/gemma/terms.",
+        licenseAsset = "licenses/gemma-NOTICE.txt"
     ),
     Credit(
         name = "LiteRT-LM",
         role = "On-device runtime for the language model.",
         license = "Apache 2.0",
-        url = "https://github.com/google-ai-edge/LiteRT-LM"
+        url = "https://github.com/google-ai-edge/LiteRT-LM",
+        licenseAsset = "licenses/apache-2.0.txt"
     ),
     Credit(
         name = "Android Jetpack, Jetpack Compose, Kotlin",
         role = "App framework and UI.",
         license = "Apache 2.0",
-        url = "https://developer.android.com/jetpack"
+        url = "https://developer.android.com/jetpack",
+        licenseAsset = "licenses/apache-2.0.txt"
     ),
 )
 
@@ -119,6 +134,8 @@ private val CREDITS = listOf(
  */
 @Composable
 fun AboutScreen(onClose: () -> Unit) {
+    // Asset path of the licence text currently open, or null.
+    var openLicense by remember { mutableStateOf<String?>(null) }
     Dialog(
         onDismissRequest = onClose,
         properties = DialogProperties(usePlatformDefaultWidth = false)
@@ -165,6 +182,7 @@ fun AboutScreen(onClose: () -> Unit) {
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
+                    ViewLicenseLink { openLicense = "licenses/survey2026-MIT.txt" }
 
                     Spacer(Modifier.height(20.dp))
                     Text("Credits and licences", style = MaterialTheme.typography.titleMedium)
@@ -175,12 +193,17 @@ fun AboutScreen(onClose: () -> Unit) {
                             modifier = Modifier.padding(vertical = 12.dp),
                             color = MaterialTheme.colorScheme.outlineVariant
                         )
-                        CreditItem(credit)
+                        CreditItem(credit, onViewLicense = { asset -> openLicense = asset })
                     }
                     Spacer(Modifier.height(24.dp))
                 }
             }
         }
+    }
+
+    // Shown after the About window so it opens on top of it.
+    openLicense?.let { asset ->
+        LicenseTextDialog(assetPath = asset, onClose = { openLicense = null })
     }
 }
 
@@ -197,7 +220,7 @@ private fun InfoLine(label: String, value: String) {
 }
 
 @Composable
-private fun CreditItem(credit: Credit) {
+private fun CreditItem(credit: Credit, onViewLicense: (String) -> Unit) {
     val linkColor = MaterialTheme.colorScheme.primary
     Column {
         Text(credit.name, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
@@ -225,5 +248,59 @@ private fun CreditItem(credit: Credit) {
             },
             style = MaterialTheme.typography.bodySmall
         )
+        credit.licenseAsset?.let { asset -> ViewLicenseLink { onViewLicense(asset) } }
+    }
+}
+
+@Composable
+private fun ViewLicenseLink(onClick: () -> Unit) {
+    TextButton(onClick = onClick, contentPadding = PaddingValues(0.dp)) {
+        Text("View licence text", style = MaterialTheme.typography.labelLarge)
+    }
+}
+
+/** Full-screen viewer for a licence text bundled in assets/licenses/. */
+@Composable
+private fun LicenseTextDialog(assetPath: String, onClose: () -> Unit) {
+    val context = LocalContext.current
+    val text = remember(assetPath) {
+        runCatching {
+            context.assets.open(assetPath).bufferedReader(Charsets.UTF_8).use { it.readText() }
+        }.getOrElse { "Licence text not found: $assetPath" }
+    }
+    Dialog(
+        onDismissRequest = onClose,
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .statusBarsPadding()
+                    .navigationBarsPadding()
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(start = 20.dp, end = 8.dp, top = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text("Licence", style = MaterialTheme.typography.headlineSmall)
+                    IconButton(onClick = onClose) {
+                        Icon(Icons.Filled.Close, contentDescription = "Close")
+                    }
+                }
+                Text(
+                    text = text,
+                    style = MaterialTheme.typography.bodySmall,
+                    fontFamily = FontFamily.Monospace,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .verticalScroll(rememberScrollState())
+                        .padding(horizontal = 20.dp, vertical = 12.dp)
+                )
+            }
+        }
     }
 }

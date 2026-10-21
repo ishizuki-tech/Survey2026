@@ -1,0 +1,12 @@
+Gemma 3n E4B
+
+Gemma is provided under and subject to the Gemma Terms of Use found at
+ai.google.dev/gemma/terms
+
+Use of Gemma is also subject to the Gemma Prohibited Use Policy:
+ai.google.dev/gemma/prohibited_use_policy
+
+This app does not include the Gemma model file. The model is downloaded
+separately from Google's Hugging Face repository
+(huggingface.co/google/gemma-3n-E4B-it-litert-lm), where it is offered
+under the same terms.
