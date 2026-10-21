@@ -56,6 +56,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /* ───────────────────────────── Download State ───────────────────────────── */
 
@@ -90,7 +91,14 @@ sealed class DlState {
     ) : DlState()
 
     data class Done(
-        val file: File
+        val file: File,
+        /**
+         * True when [file] came from [AppViewModel.useManuallySelectedModel]
+         * rather than a normal download or a reused cached/persisted copy.
+         * Lets the UI offer a different recovery path (re-pick a file,
+         * rather than a plain retry) if initializing this file fails.
+         */
+        val fromManualSelection: Boolean = false
     ) : DlState()
 
     data class Error(
@@ -277,7 +285,7 @@ class AppViewModel(
                     .onFailure { e -> Log.w("AppViewModel", "Failed to persist manually selected model: ${e.message}") }
 
                 Log.i("AppViewModel", "Using manually selected model file: name=$safeName bytes=${destination.length()}")
-                _state.value = DlState.Done(destination)
+                _state.value = DlState.Done(destination, fromManualSelection = true)
             } catch (t: Throwable) {
                 _state.value = DlState.Error(t.message ?: "Couldn't use the selected file.")
             } finally {
@@ -285,6 +293,27 @@ class AppViewModel(
                     downloadJob = null
                 }
             }
+        }
+    }
+
+    /**
+     * Deletes a model file that turned out to be unusable after a manual
+     * selection (see [useManuallySelectedModel]) — both the private copy
+     * and any copy already persisted to the public Downloads store — so
+     * [ensureModelDownloaded] never offers it again as an existing file.
+     *
+     * Intended to be called right before forcing an app restart: once the
+     * native runtime is poisoned (see NativeRuntimePoisonedException in the
+     * slm package), nothing else in this process can recover, so there's no
+     * further UI state to publish here — the fresh process starts clean.
+     */
+    suspend fun discardBadManuallySelectedModel(appContext: Context, file: File) {
+        val app = appContext.applicationContext
+        withContext(Dispatchers.IO) {
+            runCatching { file.delete() }
+                .onFailure { e -> Log.w("AppViewModel", "Failed to delete bad manual model file: ${e.message}") }
+            runCatching { PersistentModelStore.forget(app, file.name) }
+                .onFailure { e -> Log.w("AppViewModel", "Failed to forget persisted bad model file: ${e.message}") }
         }
     }
 
@@ -632,12 +661,9 @@ private class OpenDocumentAtDownloads : ActivityResultContracts.OpenDocument() {
  *
  * "Select File" opens the system document picker, hinted to open at
  * Downloads (see [OpenDocumentAtDownloads]), filtered to any file type so
- * the (often unrecognized) ".litertlm" extension is never hidden. The
- * picker selects a file with a single tap, not a double-tap — unlike a
- * desktop file browser, so the dialog spells that out to avoid the most
- * common point of confusion. "Cancel" dismisses this and lets the download
- * proceed normally via [onSkip]; there is no outside-dismiss, so the user
- * makes an explicit choice.
+ * the (often unrecognized) ".litertlm" extension is never hidden.
+ * "Download New" dismisses this and starts the network download via
+ * [onSkip]; back-press/outside-tap does the same, via the same callback.
  */
 @Composable
 private fun ManualModelSelectionDialog(
@@ -652,20 +678,21 @@ private fun ManualModelSelectionDialog(
     }
 
     AlertDialog(
-        // Back-press/outside-tap behaves the same as the explicit Cancel button:
-        // the download proceeds rather than leaving the user stuck on the dialog.
+        // Back-press/outside-tap behaves the same as the explicit "Download New"
+        // button: the download proceeds rather than leaving the user stuck on
+        // the dialog.
         onDismissRequest = onSkip,
-        title = { Text("Use an existing model file?") },
+        title = { Text("Model File Missing") },
         text = {
             Text(
-                "The on-device AI model isn't on this device yet. If another " +
-                    "install of this app already downloaded it, you can select " +
-                    "that file instead of downloading it again.\n\n" +
-                    "Look for a file named \"$expectedFileName\" — it's usually in " +
-                    "your Downloads folder, which the picker will open to. Tap the " +
-                    "file once to select it; the picker doesn't use double-tap the " +
-                    "way a desktop file browser does.\n\n" +
-                    "If you can't find it, cancel and the download will continue."
+                "We couldn't find the language model. If you downloaded it " +
+                    "previously, you can locate it manually, or we can download " +
+                    "a fresh copy.\n\n" +
+                    "Look for a ~4.92 GB file named \"$expectedFileName\". It will " +
+                    "be in the Download/Survey2026Models directory. Tap the file " +
+                    "to load it.\n\n" +
+                    "If you can't find it, select \"Download New\" to download a " +
+                    "new copy of the file."
             )
         },
         confirmButton = {
@@ -675,7 +702,7 @@ private fun ManualModelSelectionDialog(
         },
         dismissButton = {
             TextButton(onClick = onSkip) {
-                Text("Cancel")
+                Text("Download New")
             }
         }
     )
