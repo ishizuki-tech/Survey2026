@@ -148,6 +148,7 @@ import com.negi.survey.runtime.NoOpHeavyRuntimeHandoff
 import com.negi.survey.slm.LiteRtLM
 import com.negi.survey.slm.LiteRtRepository
 import com.negi.survey.slm.Model
+import com.negi.survey.slm.NATIVE_RUNTIME_POISON_MESSAGE
 import com.negi.survey.slm.Repository
 import com.negi.survey.slm.SLM
 import com.negi.survey.slm.buildModelConfig
@@ -366,6 +367,15 @@ fun InitGate(
     progressText: String = "Initializing…",
     subText: String = "Preparing on-device model and resources",
     onErrorMessage: (Throwable) -> String = { it.message ?: "Initialization failed" },
+    /** Label for the error screen's action button; defaults to the generic "Retry". */
+    retryLabel: (Throwable) -> String = { "Retry" },
+    /**
+     * Called when the error screen's action button is tapped. [defaultRetry] re-runs
+     * [init] in place, which is what every caller gets unless it intercepts here —
+     * e.g. to send the user somewhere else first for an error that a plain retry
+     * can never recover from (see the SLM init call site for an example).
+     */
+    onRetry: (error: Throwable, defaultRetry: () -> Unit) -> Unit = { _, defaultRetry -> defaultRetry() },
     content: @Composable () -> Unit
 ) {
     var isLoading by remember(key) { mutableStateOf(true) }
@@ -489,8 +499,8 @@ fun InitGate(
                             color = MaterialTheme.colorScheme.error
                         )
                         Spacer(Modifier.height(12.dp))
-                        OutlinedButton(onClick = { kick() }) {
-                            Text("Retry")
+                        OutlinedButton(onClick = { onRetry(error!!) { kick() } }) {
+                            Text(retryLabel(error!!))
                         }
                     }
                 }
@@ -499,6 +509,28 @@ fun InitGate(
 
         else -> content()
     }
+}
+
+/**
+ * Force-restarts the app: relaunches its main activity in a fresh task, then kills
+ * this process. Used after a native runtime poisoning (see NATIVE_RUNTIME_POISON_MESSAGE)
+ * that can never recover in the current process, no matter what is retried — only a
+ * brand-new process clears the poisoned state.
+ *
+ * [Intent.makeRestartActivityTask] is the documented API for exactly this: it builds
+ * an intent for the package's launch activity with the flags needed to replace the
+ * current task cleanly. Killing this process afterward (rather than just finishing
+ * the activity) is what actually resets the native/static state the poisoning lives in.
+ */
+private fun restartApp(context: Context) {
+    val launchIntent = context.packageManager.getLaunchIntentForPackage(context.packageName)
+    val component = launchIntent?.component
+    if (component == null) {
+        Log.e(MainActivity.TAG, "restartApp: no launch intent for ${context.packageName}; cannot restart")
+        return
+    }
+    context.startActivity(Intent.makeRestartActivityTask(component))
+    Runtime.getRuntime().exit(0)
 }
 
 /* ──────────────────────── Audio Permission Gate ─────────────────────────── */
@@ -989,24 +1021,85 @@ fun AppNav() {
         }
 
         val heavyRuntimeCoordinator = (appContext as SurveyApp).heavyRuntimeCoordinator
+        val initRetryScope = rememberCoroutineScope()
 
         InitGate(
             key = "slm_init@$sessionKey@${modelFile.absolutePath}",
             progressText = "Initializing Small Language Model…",
             subText = "Setting up accelerated runtime and buffers",
             onErrorMessage = { "Failed to initialize model: ${it.message}" },
+            retryLabel = { error ->
+                // A poisoned native runtime (see NATIVE_RUNTIME_POISON_MESSAGE) can
+                // never recover in this process; a plain retry would just hit the
+                // same error again. If the user picked this file manually, the most
+                // likely cause is the file itself, so offer to pick a different one
+                // instead of a label ("Retry") that would be misleading here.
+                //
+                // Matched by message text, not exception type: the first failure
+                // surfaces this wrapped in a generic IllegalStateException (with no
+                // cause reference back to the original), so type-matching only ever
+                // caught it starting on the second attempt.
+                val fromManualPick = (state as? DlState.Done)?.fromManualSelection == true
+                val isPoisoned = error.message?.contains(NATIVE_RUNTIME_POISON_MESSAGE) == true
+                if (fromManualPick && isPoisoned) {
+                    "Pick a different file"
+                } else {
+                    "Retry"
+                }
+            },
+            onRetry = { error, defaultRetry ->
+                val fromManualPick = (state as? DlState.Done)?.fromManualSelection == true
+                val isPoisoned = error.message?.contains(NATIVE_RUNTIME_POISON_MESSAGE) == true
+                if (fromManualPick && isPoisoned) {
+                    // The bad file was already discarded down in init()'s own catch
+                    // block the moment this error occurred -- not here -- so even a
+                    // user who force-closes the app instead of tapping this button
+                    // still gets it cleaned up. This just does the actual restart.
+                    Log.w(
+                        MainActivity.TAG,
+                        "SLM init poisoned after a manually selected file -> " +
+                            "restarting the app. session=$sessionKey"
+                    )
+                    initRetryScope.launch { restartApp(appContext) }
+                } else {
+                    defaultRetry()
+                }
+            },
             init = {
                 withContext(Dispatchers.Default) {
-                    heavyRuntimeCoordinator.withLiteRt(
-                        runtimeIdentity = modelIdentityForPath(slmModel.taskPath),
-                        releaseLiteRt = { SLM.forceCleanUpAndWait(slmModel) },
-                    ) {
-                        LiteRtLM.initializeIfNeeded(
-                            context = appContext,
-                            model = slmModel,
-                            supportImage = false,
-                            supportAudio = false
-                        )
+                    try {
+                        heavyRuntimeCoordinator.withLiteRt(
+                            runtimeIdentity = modelIdentityForPath(slmModel.taskPath),
+                            releaseLiteRt = { SLM.forceCleanUpAndWait(slmModel) },
+                        ) {
+                            LiteRtLM.initializeIfNeeded(
+                                context = appContext,
+                                model = slmModel,
+                                supportImage = false,
+                                supportAudio = false
+                            )
+                        }
+                    } catch (ce: CancellationException) {
+                        throw ce
+                    } catch (e: Throwable) {
+                        // Matched by message text, not exception type: a poisoned
+                        // native runtime (see NATIVE_RUNTIME_POISON_MESSAGE) surfaces
+                        // here wrapped in a generic IllegalStateException on its first
+                        // failure -- with no cause reference back to the original --
+                        // so type-matching would only catch it starting on retry #2.
+                        //
+                        // Discard the bad file right here, synchronously, before this
+                        // throw ever reaches the UI. Doing it only from the error
+                        // screen's "Pick a different file" button left a gap: a user
+                        // who force-closed the app instead of tapping it (the natural
+                        // reaction to a scary error) relaunched straight back into the
+                        // same bad file, because nothing had removed it yet. This way
+                        // it's gone before the error even has a chance to render.
+                        val isPoisoned = e.message?.contains(NATIVE_RUNTIME_POISON_MESSAGE) == true
+                        if (isPoisoned && (state as? DlState.Done)?.fromManualSelection == true) {
+                            appVm.discardBadManuallySelectedModel(appContext, modelFile)
+                        }
+                        throw e
                     }
                 }
             }

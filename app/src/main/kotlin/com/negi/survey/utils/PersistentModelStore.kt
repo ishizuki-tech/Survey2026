@@ -208,6 +208,33 @@ object PersistentModelStore {
         }
     }
 
+    /**
+     * Removes every persisted entry for [targetFileName] (and MediaStore
+     * collision variants of it) from the public persisted store, including
+     * pending rows.
+     *
+     * Used when a copy turns out to be unusable (e.g. the user picked a
+     * corrupt or incompatible file via the manual picker, and
+     * [AppViewModel.useManuallySelectedModel] already persisted it
+     * alongside the private copy) so [reuseOrReplace] never offers it
+     * again on a future run.
+     *
+     * Best-effort: failures are logged and swallowed.
+     */
+    fun forget(context: Context, targetFileName: String): Boolean {
+        if (!isSupported()) return false
+
+        return runCatching {
+            listEntries(context)
+                .filter { isMediaStoreCollisionVariant(it.displayName, targetFileName) }
+                .forEach { deleteEntry(context, it.uri) }
+            true
+        }.getOrElse { t ->
+            Log.w(TAG, "forget failed for $targetFileName", t)
+            false
+        }
+    }
+
     // ---------------------------------------------------------------------
     // MediaStore helpers
     // ---------------------------------------------------------------------
