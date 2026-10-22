@@ -53,7 +53,7 @@ class AiViewModelSurveyAllPromptsTest : AiViewModelSurveyBase() {
      * Default survey configuration for this suite.
      */
     override fun configAssetName(): String =
-        "survey_config1.yaml"
+        "survey_config10.yaml"
 
     /**
      * Main integration test.
@@ -158,8 +158,13 @@ class AiViewModelSurveyAllPromptsTest : AiViewModelSurveyBase() {
                  * Missing evaluation templates are configuration failures, not
                  * something this end-to-end test should silently hide.
                  */
+                // The shipped configs use two-step prompts (eval_prompt /
+                // followup_prompt); the legacy single "prompt" field is null.
+                // This test exercises the evaluation step, so prefer eval_prompt
+                // and fall back to the legacy prompt for older configs.
                 val template =
-                    promptConfig.prompt
+                    (promptConfig.evalPrompt?.takeIf { it.isNotBlank() }
+                        ?: promptConfig.prompt)
                         ?.trim()
                         .orEmpty()
 
@@ -224,7 +229,7 @@ class AiViewModelSurveyAllPromptsTest : AiViewModelSurveyBase() {
                         tpl = template,
                         q = originalQuestion,
                         a = answerText,
-                    )
+                    ).replace("{{HISTORY}}", "(none)")
 
                 assertTrue(
                     "Filled prompt is blank for " +

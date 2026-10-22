@@ -19,7 +19,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 
 /**
- * Instrumentation tests for the private [GitHubUploadWorker.buildDatedRemotePath] helper.
+ * Instrumentation tests for the private [GitHubUploadWorker.buildDatedRemotePathUtc] helper.
  *
  * Verifies that:
  *  - Empty prefix produces "yyyy-MM-dd/fileName".
@@ -78,7 +78,7 @@ class GitHubUploadWorkerPathTest {
     }
 
     /**
-     * Uses reflection to call the private [GitHubUploadWorker.buildDatedRemotePath]
+     * Uses reflection to call the private [GitHubUploadWorker.buildDatedRemotePathUtc]
      * method on a test worker instance.
      */
     private fun invokeBuildDatedRemotePath(prefix: String, fileName: String): String {
@@ -87,19 +87,19 @@ class GitHubUploadWorkerPathTest {
             .build()
 
         val method = GitHubUploadWorker::class.java.declaredMethods.firstOrNull { m ->
-            m.name == "buildDatedRemotePath" &&
+            m.name == "buildDatedRemotePathUtc" &&
                     m.parameterTypes.size == 2 &&
                     m.parameterTypes[0] == String::class.java &&
                     m.parameterTypes[1] == String::class.java
         } ?: error(
-            "GitHubUploadWorker.buildDatedRemotePath(String, String) not found. " +
+            "GitHubUploadWorker.buildDatedRemotePathUtc(String, String) not found. " +
                     "Check that the method name and signature have not changed."
         )
 
         method.isAccessible = true
         val result = method.invoke(worker, prefix, fileName)
         require(result is String) {
-            "buildDatedRemotePath should return String, but returned ${result?.javaClass?.name}"
+            "buildDatedRemotePathUtc should return String, but returned ${result?.javaClass?.name}"
         }
         return result
     }

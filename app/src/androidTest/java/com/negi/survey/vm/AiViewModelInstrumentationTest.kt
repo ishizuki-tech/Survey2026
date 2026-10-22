@@ -234,7 +234,7 @@ class AiViewModelInstrumentationTest {
             SurveyConfigLoader
                 .fromAssetsStrictValidated(
                     context,
-                    "survey_config1.yaml",
+                    "survey_config10.yaml",
                 )
         } catch (error: Throwable) {
             throw AssertionError(

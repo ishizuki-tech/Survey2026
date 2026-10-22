@@ -363,7 +363,7 @@ open class AiViewModelSurveyBase {
      * Asset name of the survey config used by this test suite.
      */
     protected open fun configAssetName(): String =
-        "survey_config1.yaml"
+        "survey_config10.yaml"
 
     /**
      * Optional flat SLM config asset.

@@ -922,8 +922,8 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
 
         private fun partialFixtures() = listOf(
             SemanticFixture(
-                fixtureId = "Q7_PARTIAL",
-                nodeId = "Q7",
+                fixtureId = "Q07_PARTIAL",
+                nodeId = "Q07",
                 category = FixtureCategory.PARTIAL,
                 answer = "Ndiyo, funza jeshi walikuja shambani kwangu mwaka jana. Ilikuwa mbaya kweli.",
                 expectedDecision = SurveyAiDecision.GENERATE,
@@ -933,8 +933,8 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
                 expectsFollowup = true,
             ),
             SemanticFixture(
-                fixtureId = "Q8_PARTIAL",
-                nodeId = "Q8",
+                fixtureId = "Q08_PARTIAL",
+                nodeId = "Q08",
                 category = FixtureCategory.PARTIAL,
                 answer = "Ningekubali kupoteza kidogo tu, siyo mengi.",
                 expectedDecision = SurveyAiDecision.GENERATE,
@@ -944,8 +944,8 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
                 expectsFollowup = true,
             ),
             SemanticFixture(
-                fixtureId = "Q9_PARTIAL",
-                nodeId = "Q9",
+                fixtureId = "Q09_PARTIAL",
+                nodeId = "Q09",
                 category = FixtureCategory.PARTIAL,
                 answer = "Kama uharibifu ni mkubwa sana, ningebadilisha aina ya mbegu.",
                 expectedDecision = SurveyAiDecision.GENERATE,
@@ -1037,9 +1037,9 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
         )
 
         private fun completeFixtures() = listOf(
-            sourceFixture("Q7", FixtureCategory.COMPLETE, "Ndiyo, funza jeshi walishambulia mahindi yangu msimu uliopita. Walikula majani na masuke, nikapoteza karibu robo ya mavuno.", "No unresolved information; FAW occurrence and damage/loss are supplied.", "FAW occurrence, crop damage, and approximate harvest loss are supplied."),
-            sourceFixture("Q8", FixtureCategory.COMPLETE, "Ningekubali kupoteza hadi asilimia kumi ya mavuno, yaani kama magunia mawili kwa ekari, ili nivune siku 20 mapema.", "No unresolved information; maximum acceptable loss is supplied.", "Ten percent / two bags per acre is supplied."),
-            sourceFixture("Q9", FixtureCategory.COMPLETE, "Kama zaidi ya asilimia thelathini ya mimea yangu itaharibiwa na wadudu au magonjwa, ningebadilisha aina ya mahindi.", "No unresolved information; damage threshold is supplied.", "More than thirty percent plant damage is supplied."),
+            sourceFixture("Q07", FixtureCategory.COMPLETE, "Ndiyo, funza jeshi walishambulia mahindi yangu msimu uliopita. Walikula majani na masuke, nikapoteza karibu robo ya mavuno.", "No unresolved information; FAW occurrence and damage/loss are supplied.", "FAW occurrence, crop damage, and approximate harvest loss are supplied."),
+            sourceFixture("Q08", FixtureCategory.COMPLETE, "Ningekubali kupoteza hadi asilimia kumi ya mavuno, yaani kama magunia mawili kwa ekari, ili nivune siku 20 mapema.", "No unresolved information; maximum acceptable loss is supplied.", "Ten percent / two bags per acre is supplied."),
+            sourceFixture("Q09", FixtureCategory.COMPLETE, "Kama zaidi ya asilimia thelathini ya mimea yangu itaharibiwa na wadudu au magonjwa, ningebadilisha aina ya mahindi.", "No unresolved information; damage threshold is supplied.", "More than thirty percent plant damage is supplied."),
             sourceFixture("Q10", FixtureCategory.COMPLETE, "Ningetaka aina inayokomaa kwa miezi minne, inayostahimili ukame na funza jeshi, na inayotoa angalau magunia ishirini kwa ekari.", "No unresolved information; priority traits and measurable criterion are supplied.", "Maturity, drought and FAW tolerance, and yield target are supplied."),
             sourceFixture("Q11", FixtureCategory.COMPLETE, "Msimu ukiwa mbaya, nikivuna angalau magunia kumi kwa ekari, bado ningeendelea kupanda aina hii.", "No unresolved information; minimum acceptable yield is supplied.", "Ten bags per acre is supplied."),
             sourceFixture("Q12", FixtureCategory.COMPLETE, "Ukame unaleta hasara kubwa zaidi wakati mahindi yanatoa kishada na hariri, kwa sababu masuke hayajai vizuri.", "No unresolved information; growth stage is supplied.", "Tasseling and silking stage is supplied."),
@@ -1050,9 +1050,9 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
         )
 
         private fun unhelpfulFixtures() = listOf(
-            sourceFixture("Q7", FixtureCategory.UNHELPFUL, "Funza jeshi ni wadudu wabaya sana, wakulima wengi huwaongelea.", "Whether the respondent was affected and resulting damage/loss.", "Only a general statement about FAW is supplied."),
-            sourceFixture("Q8", FixtureCategory.UNHELPFUL, "Kuvuna mapema ni jambo zuri, lakini inategemea na mvua.", "Maximum acceptable yield loss for earlier harvest.", "Only a general view of early harvest is supplied."),
-            sourceFixture("Q9", FixtureCategory.UNHELPFUL, "Wadudu na magonjwa ni changamoto kubwa kwa wakulima wote.", "A measurable threshold for changing variety.", "Only a general statement about pests and diseases is supplied."),
+            sourceFixture("Q07", FixtureCategory.UNHELPFUL, "Funza jeshi ni wadudu wabaya sana, wakulima wengi huwaongelea.", "Whether the respondent was affected and resulting damage/loss.", "Only a general statement about FAW is supplied."),
+            sourceFixture("Q08", FixtureCategory.UNHELPFUL, "Kuvuna mapema ni jambo zuri, lakini inategemea na mvua.", "Maximum acceptable yield loss for earlier harvest.", "Only a general view of early harvest is supplied."),
+            sourceFixture("Q09", FixtureCategory.UNHELPFUL, "Wadudu na magonjwa ni changamoto kubwa kwa wakulima wote.", "A measurable threshold for changing variety.", "Only a general statement about pests and diseases is supplied."),
             sourceFixture("Q10", FixtureCategory.UNHELPFUL, "Aina mpya za mahindi zinatoka kila mwaka siku hizi.", "Required characteristics of a replacement variety.", "Only a general statement about new varieties is supplied."),
             sourceFixture("Q11", FixtureCategory.UNHELPFUL, "Misimu mibaya imekuwa mingi siku hizi kwa sababu ya hali ya hewa.", "Lowest acceptable yield in a bad season.", "Only a general statement about bad seasons is supplied."),
             sourceFixture("Q12", FixtureCategory.UNHELPFUL, "Ukame ni tatizo kubwa sana hapa kwetu.", "Maize growth stage with greatest drought loss.", "Only a general statement about drought is supplied."),
