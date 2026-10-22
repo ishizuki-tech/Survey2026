@@ -1,12 +1,12 @@
 {
   "original_branch": "ui/minor-updates",
   "branch_slug": "ui-minor-updates",
-  "commit_sha": "fc379eb3eaab0e24556fc67f0ba1a7308f9e59d1",
-  "short_sha": "fc379eb",
-  "apk_name": "Survey2026-ui-minor-updates-fc379eb.apk",
-  "apk_sha256": "e8083034dc70932b1370de7cb10a2d7147ffaf717274e1b18449aea1ec048634",
-  "apk_download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-ui-minor-updates-fc379eb-run-134/Survey2026-ui-minor-updates-fc379eb.apk",
+  "commit_sha": "471f61948242fbdf547461fe34b64f6aaebad503",
+  "short_sha": "471f619",
+  "apk_name": "Survey2026-ui-minor-updates-471f619.apk",
+  "apk_sha256": "16453fcf4d7a057c242cba8c05c828ae0492290ff5b1721af5b36fa08a7d81c5",
+  "apk_download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-ui-minor-updates-471f619-run-137/Survey2026-ui-minor-updates-471f619.apk",
   "page_url": "https://ishizuki-tech.github.io/Survey2026/ui-minor-updates/",
-  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/39670368883",
-  "generated_utc": "2026-10-21T20:34:55Z"
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/39823014652",
+  "generated_utc": "2026-10-22T17:36:20Z"
 }
