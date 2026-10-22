@@ -65,10 +65,12 @@ class SurveyConfigConditionalNavigationTest {
             ?: error("Unable to locate app assets from $workingDirectory")
         val configNames = listOf("survey_config10.yaml", "survey_config_sw_10.yaml")
 
+        // Q14 was split into a Q14a yes/no gate and a Q14b AI follow-up; the
+        // two-step prompt pair now lives under Q14b.
+        val nodeIds = listOf("Q07", "Q08", "Q09", "Q10", "Q11", "Q12", "Q13", "Q14b", "Q15", "Q16")
         configNames.forEach { name ->
             val config = SurveyConfigLoader.fromFileStrictValidated(File(assetDirectory, name).absolutePath)
-            (7..16).forEach { number ->
-                val nodeId = "Q" + number.toString().padStart(2, '0')
+            nodeIds.forEach { nodeId ->
                 val hasTwoStepPair =
                     !config.resolveEvalPrompt(nodeId).isNullOrBlank() &&
                             !config.resolveFollowupPrompt(nodeId).isNullOrBlank()
@@ -91,11 +93,14 @@ class SurveyConfigConditionalNavigationTest {
             val config = SurveyConfigLoader.fromFileStrictValidated(assetFile(name).absolutePath)
             val nodes = config.graph.nodes.associateBy { it.id }
 
-            /** Node ids 1-9 are zero-padded ("Q01".."Q09"); 10-16 are already two digits. */
-            (1..16).forEach { number ->
-                val id = "Q" + number.toString().padStart(2, '0')
-                assertTrue("$name is missing $id", id in nodes)
-            }
+            /**
+             * Node ids 1-9 are zero-padded ("Q01".."Q09"); 10-16 are already two
+             * digits. Q14 was split into a Q14a yes/no gate and a Q14b AI
+             * follow-up, so it expands to two ids instead of one.
+             */
+            (1..16).map { "Q" + it.toString().padStart(2, '0') }
+                .flatMap { if (it == "Q14") listOf("Q14a", "Q14b") else listOf(it) }
+                .forEach { id -> assertTrue("$name is missing $id", id in nodes) }
             /** Q17 ("End of Interview") now sits between Q16 and Review; Q18 does not exist. */
             assertTrue("$name must not retain Q18", "Q18" !in nodes)
 
@@ -148,33 +153,35 @@ class SurveyConfigConditionalNavigationTest {
 
             val expectedQuestions = if (name.contains("_sw_")) {
                 mapOf(
-                    "Q04" to "Unalima mazao gani?",
-                    "Q05" to "Unafuga wanyama gani?",
-                    "Q07" to "Mahindi yako yamewahi kushambuliwa na funza jeshi (Fall Armyworm)? Ikiwa ndiyo, yalipata hasara gani?",
-                    "Q08" to "Kama ungeweza kuvuna mahindi yako siku 20 mapema, lakini mavuno yangepungua, ungekubali kupoteza kiasi gani cha mavuno ili uvune mapema?",
-                    "Q09" to "Ni kiwango gani cha uharibifu wa mahindi unaosababishwa na wadudu au magonjwa ambacho kingekufanya ubadilishe aina ya mahindi unayopanda?",
-                    "Q10" to "Kama kungekuwa na aina mpya ya mahindi, ingehitaji kuwa na sifa gani ili uamue kuipanda badala ya aina unayopanda sasa?",
-                    "Q11" to "Msimu ukiwa mbaya, ni mavuno ya chini kiasi gani ambayo bado yangekufanya uendelee kupanda aina hii ya mahindi?",
-                    "Q12" to "Ukame huwa unasababisha hasara kubwa zaidi wakati gani katika ukuaji wa mahindi?",
-                    "Q13" to "Unaamua aje kiasi cha mahindi cha kuweka kwa matumizi ya nyumbani, kulisha mifugo, kuuza, au matumizi mengine?",
-                    "Q14" to "Kama unatumia mahindi meupe kulisha mifugo, unawalisha mifugo gani na mara ngapi?",
-                    "Q15" to "Kwa kawaida unapata wapi mbegu za mahindi meupe unazopanda, na kwa nini unapendelea kununua au kupata mbegu huko?",
-                    "Q16" to "Kwa kawaida baada ya kuvuna, unauza mahindi yako wapi, na kwa nini unapendelea kuuza huko au kwa mnunuzi huyo?",
+                    "Q04" to "Unalima mimea gani?",
+                    "Q05" to "Unafuga mifugo au wanyama gani?",
+                    "Q07" to "Je, wadudu wanaoitwa Fall Armyworm wamewahi kushambulia mahindi yako? Kama ndiyo, ulipata hasara gani?",
+                    "Q08" to "Tafadhali sikiza mfano huu: ikiwa ungeweza kuvuna mahindi siku 20 mapema, lakini mavuno yatapungua kidogo, ungekubali kupoteza magunia mangapi ya mavuno?",
+                    "Q09" to "Kama wadudu au magonjwa wanaharibu mahindi yako, ukipoteza magunia mangapi ndipo utaamua kubadilisha mbegu?",
+                    "Q10" to "Kama kuna mbegu mpya ya mahindi, ingekuwa na mambo gani ili uache mbegu unayotumia sasa na utumie hiyo mpya?",
+                    "Q11" to "Kama wewe na wakulima wengine eneo lenu mmevuna mahindi kidogo sana, ukivuna chini ya magunia mangapi ndio utaamua kubadilisha mbegu?",
+                    "Q12" to "Ukame huharibu mahindi yako zaidi wakati gani? Kwa mfano, yakiwa madogo, yakitoa maua, yakianza kuzaa, au wakati gani mwingine?",
+                    "Q13" to "Baada ya kuvuna, unagawanya mahindi yako vipi? Kwa mfano unaamuaje kiasi cha kutumia kwa chakula, mifugo, kuuza, au matumizi mengine?",
+                    "Q14a" to "Je, unatumia mahindi meupe kulisha wanyama?",
+                    "Q14b" to "Ni wanyama gani unawalisha mahindi meupe, na mara ngapi?",
+                    "Q15" to "Kwa kawaida unapata mbegu za mahindi meupe wapi, na kwa nini unapenda kupata mbegu hapo?",
+                    "Q16" to "Kwa kawaida unauza mahindi yako wapi baada ya kuvuna, na kwa nini unachagua kuuza hapo?",
                 )
             } else {
                 mapOf(
                     "Q04" to "Which crops do you grow?",
-                    "Q05" to "Which animals do you keep?",
-                    "Q07" to "Has fall armyworm ever affected your maize? If yes, what damage or losses did it cause?",
-                    "Q08" to "If you could harvest your maize 20 days earlier but this reduced your yield, how much yield would you be willing to lose to harvest earlier?",
-                    "Q09" to "What level of pest or disease damage would make you switch to a different maize variety?",
-                    "Q10" to "If there were a new maize variety, what characteristics would it need to have for you to decide to plant it instead of your current variety?",
-                    "Q11" to "In a bad season, what is the lowest maize yield that would still make you continue planting this variety?",
-                    "Q12" to "At what stage of maize growth does drought cause the greatest losses?",
-                    "Q13" to "How do you decide how much maize to use for household food, livestock feed, sale, or other purposes?",
-                    "Q14" to "If you use white maize to feed livestock, which animals do you feed it to and how often?",
-                    "Q15" to "Where do you usually obtain the white maize seed that you plant, and why do you prefer getting it there?",
-                    "Q16" to "Where do you usually sell your maize after harvest, and why do you prefer selling there or to that buyer?",
+                    "Q05" to "Which livestock do you keep?",
+                    "Q07" to "Has fall armyworm ever attacked your maize? If yes, what loss did you get?",
+                    "Q08" to "Please listen to this example: if you could harvest your maize 20 days early, but your harvest would be smaller, how many bags of harvest would you accept to lose?",
+                    "Q09" to "If pests or diseases damage your maize, how many bags would you need to lose before deciding to change your seed?",
+                    "Q10" to "If there is a new maize seed, what characteristics would make you stop using your current seed and use the new one?",
+                    "Q11" to "If you and other farmers in your area harvested very little maize, below how many bags would you decide to change your seed?",
+                    "Q12" to "When does drought damage your maize the most: when the plants are young, when they are flowering, when they have started producing cobs, or at what other time?",
+                    "Q13" to "After harvest, how do you divide your maize? How do you decide the amount for each use, for example food, animals, selling, or other uses?",
+                    "Q14a" to "Do you use white maize to feed animals?",
+                    "Q14b" to "Which animals do you feed white maize, and how often?",
+                    "Q15" to "Where do you usually get your white maize seed, and why do you like getting it from there?",
+                    "Q16" to "Where do you usually sell your maize after harvesting, and why do you choose to sell there?",
                 )
             }
             expectedQuestions.forEach { (id, question) ->
@@ -189,13 +196,13 @@ class SurveyConfigConditionalNavigationTest {
 
         val expectedEvalTargetByNewId = mapOf(
             "Q07" to "Whether FAW affected the crop",
-            "Q08" to "Maximum yield loss acceptable",
-            "Q09" to "A clear pest/disease damage threshold",
-            "Q10" to "Priority traits a new maize variety",
-            "Q11" to "The lowest yield in a bad season",
-            "Q12" to "The maize growth stage where drought",
+            "Q08" to "Maximum number of bags of harvest the respondent would accept to lose",
+            "Q09" to "The number of bags of maize lost to pests or disease",
+            "Q10" to "Characteristics a new maize seed must have",
+            "Q11" to "The harvest threshold, in bags, below which",
+            "Q12" to "The maize growth stage (e.g. young plants, flowering, cob formation, or another stage)",
             "Q13" to "The factors/criteria used to decide",
-            "Q14" to "Which animals are fed white maize and how often.",
+            "Q14b" to "Which animals are fed white maize and how often.",
             "Q15" to "Where seed is usually obtained and the reason for preferring that source.",
             "Q16" to "Where maize is usually sold after harvest and the reason for choosing that market/buyer.",
         )
@@ -206,10 +213,10 @@ class SurveyConfigConditionalNavigationTest {
 
         assertEquals(
             listOf(
-                RequiredComponent("animals", "If white maize is used for livestock: which animals receive it"),
-                RequiredComponent("feeding_frequency", "If white maize is used for livestock: how often it is fed"),
+                RequiredComponent("animals", "Which animals receive white maize"),
+                RequiredComponent("feeding_frequency", "How often white maize is fed"),
             ),
-            config.graph.nodes.single { it.id == "Q14" }.requiredComponentCatalog,
+            config.graph.nodes.single { it.id == "Q14b" }.requiredComponentCatalog,
         )
         assertEquals(
             listOf(
@@ -236,7 +243,7 @@ class SurveyConfigConditionalNavigationTest {
                 RequiredComponent("animals", "Mifugo inayolishwa mahindi meupe"),
                 RequiredComponent("feeding_frequency", "Mara ngapi mahindi meupe hulishwa"),
             ),
-            config.graph.nodes.single { it.id == "Q14" }.requiredComponentCatalog,
+            config.graph.nodes.single { it.id == "Q14b" }.requiredComponentCatalog,
         )
         assertEquals(
             listOf(

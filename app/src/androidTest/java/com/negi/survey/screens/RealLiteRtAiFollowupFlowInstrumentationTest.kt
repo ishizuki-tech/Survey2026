@@ -999,8 +999,8 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
                 expectsFollowup = true,
             ),
             SemanticFixture(
-                fixtureId = "Q14_PARTIAL",
-                nodeId = "Q14",
+                fixtureId = "Q14b_PARTIAL",
+                nodeId = "Q14b",
                 category = FixtureCategory.PARTIAL,
                 answer = "Ndiyo, nawapa mifugo mahindi wakati mwingine.",
                 expectedDecision = SurveyAiDecision.GENERATE,
@@ -1044,7 +1044,7 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
             sourceFixture("Q11", FixtureCategory.COMPLETE, "Msimu ukiwa mbaya, nikivuna angalau magunia kumi kwa ekari, bado ningeendelea kupanda aina hii.", "No unresolved information; minimum acceptable yield is supplied.", "Ten bags per acre is supplied."),
             sourceFixture("Q12", FixtureCategory.COMPLETE, "Ukame unaleta hasara kubwa zaidi wakati mahindi yanatoa kishada na hariri, kwa sababu masuke hayajai vizuri.", "No unresolved information; growth stage is supplied.", "Tasseling and silking stage is supplied."),
             sourceFixture("Q13", FixtureCategory.COMPLETE, "Kwanza tunaweka chakula cha kutosha familia hadi mavuno yajayo, kisha kidogo kwa mifugo, na kinachobaki tunauza bei ikiwa nzuri.", "No unresolved information; allocation criteria are supplied.", "Household food, livestock allocation, and sale-price criterion are supplied."),
-            sourceFixture("Q14", FixtureCategory.COMPLETE, "Nawalisha ng'ombe wangu wawili na kuku mahindi meupe kila siku wakati wa kiangazi.", "No unresolved information; animals and frequency are supplied.", "Two cows, chickens, and daily dry-season frequency are supplied.", expectedMissingIds = emptyList()),
+            sourceFixture("Q14b", FixtureCategory.COMPLETE, "Nawalisha ng'ombe wangu wawili na kuku mahindi meupe kila siku wakati wa kiangazi.", "No unresolved information; animals and frequency are supplied.", "Two cows, chickens, and daily dry-season frequency are supplied.", expectedMissingIds = emptyList()),
             sourceFixture("Q15", FixtureCategory.COMPLETE, "Kwa kawaida nanunua mbegu zilizothibitishwa kwenye duka la pembejeo la kijijini, kwa sababu ni karibu na mbegu zao huota vizuri.", "No unresolved information; seed source and reason are supplied.", "Certified seed from village agro-dealer, proximity, and germination reason are supplied.", expectedMissingIds = emptyList()),
             sourceFixture("Q16", FixtureCategory.COMPLETE, "Nauza mahindi yangu kwa wafanyabiashara wa soko la Githunguri, kwa sababu wanalipa pesa taslimu siku hiyo hiyo.", "No unresolved information; sale destination and reason are supplied.", "Githunguri market traders and same-day cash reason are supplied.", expectedMissingIds = emptyList()),
         )
@@ -1057,7 +1057,7 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
             sourceFixture("Q11", FixtureCategory.UNHELPFUL, "Misimu mibaya imekuwa mingi siku hizi kwa sababu ya hali ya hewa.", "Lowest acceptable yield in a bad season.", "Only a general statement about bad seasons is supplied."),
             sourceFixture("Q12", FixtureCategory.UNHELPFUL, "Ukame ni tatizo kubwa sana hapa kwetu.", "Maize growth stage with greatest drought loss.", "Only a general statement about drought is supplied."),
             sourceFixture("Q13", FixtureCategory.UNHELPFUL, "Mahindi ni muhimu sana kwa kila familia.", "Criteria for allocating maize.", "Only a general statement about maize is supplied."),
-            sourceFixture("Q14", FixtureCategory.UNHELPFUL, "Mahindi meupe ni chakula kizuri, kwa watu na kwa mifugo.", "Animals fed white maize and feeding frequency.", "No respondent livestock or frequency is supplied.", expectedMissingIds = listOf("animals", "feeding_frequency")),
+            sourceFixture("Q14b", FixtureCategory.UNHELPFUL, "Mahindi meupe ni chakula kizuri, kwa watu na kwa mifugo.", "Animals fed white maize and feeding frequency.", "No respondent livestock or frequency is supplied.", expectedMissingIds = listOf("animals", "feeding_frequency")),
             sourceFixture("Q15", FixtureCategory.UNHELPFUL, "Mbegu nzuri ni muhimu ili upate mavuno mazuri.", "Usual seed source and reason for preferring it.", "No source or preference reason is supplied.", expectedMissingIds = listOf("seed_source", "source_reason")),
             sourceFixture("Q16", FixtureCategory.UNHELPFUL, "Bei ya mahindi hubadilika sana kila msimu.", "Usual sale destination and reason for preferring it.", "No destination or preference reason is supplied.", expectedMissingIds = listOf("sale_destination", "destination_reason")),
         )
