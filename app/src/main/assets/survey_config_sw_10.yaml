@@ -39,6 +39,17 @@ graph:
       title: Kitambulisho cha Mhojiwa
       question: Kitambulisho cha Mhojiwa
       read_aloud: false
+      nextId: Pre5
+
+    - id: Pre5
+      type: SINGLE_CHOICE
+      title: CIMMYT Phone
+      question: Please select your phone
+      options:
+        - Phone 1
+        - Phone 2
+        - Phone 3
+      read_aloud: false
       nextId: Q00
 
     - id: Q00
@@ -107,7 +118,7 @@ graph:
     - id: Q03
       type: NUMBER
       title: "Q03: Umri"
-      question: Una miaka mingapi?
+      question: Una umri wa miaka mingapi?
       special_options:
         - Sipendi kusema
       nextId: Q04
@@ -115,13 +126,13 @@ graph:
     - id: Q04
       type: TEXT
       title: "Q04: Mazao"
-      question: Unalima mazao gani?
+      question: Unalima mimea gani?
       nextId: Q05
 
     - id: Q05
       type: TEXT
       title: "Q05: Wanyama"
-      question: Unafuga wanyama gani?
+      question: Unafuga mifugo au wanyama gani?
       nextId: Q06
 
     - id: Q06
@@ -141,56 +152,69 @@ graph:
       type: AI
       title: Athari ya FAW kwa Mahindi
       question: >-
-        Mahindi yako yamewahi kushambuliwa na funza jeshi (Fall Armyworm)? Ikiwa ndiyo, yalipata hasara gani?
+        Je, wadudu wanaoitwa Fall Armyworm wamewahi kushambulia mahindi yako? Kama ndiyo, ulipata hasara gani?
       nextId: Q08
 
     - id: Q08
       type: AI
       title: Kubadilishana Mavuno kwa Kuvuna Siku 20 Mapema
       question: >-
-        Kama ungeweza kuvuna mahindi yako siku 20 mapema, lakini mavuno yangepungua, ungekubali kupoteza kiasi gani cha mavuno ili uvune mapema?
+        Tafadhali sikiza mfano huu: ikiwa ungeweza kuvuna mahindi siku 20 mapema, lakini mavuno yatapungua kidogo, ungekubali kupoteza magunia mangapi ya mavuno?
       nextId: Q09
 
     - id: Q09
       type: AI
       title: Kizingiti cha Uharibifu cha Kubadilisha Aina ya Mahindi
       question: >-
-        Ni kiwango gani cha uharibifu wa mahindi unaosababishwa na wadudu au magonjwa ambacho kingekufanya ubadilishe aina ya mahindi unayopanda?
+        Kama wadudu au magonjwa wanaharibu mahindi yako, ukipoteza magunia mangapi ndipo utaamua kubadilisha mbegu?
       nextId: Q10
 
     - id: Q10
       type: AI
       title: Sifa Zinazohitajika kwa Aina Mbadala
       question: >-
-        Kama kungekuwa na aina mpya ya mahindi, ingehitaji kuwa na sifa gani ili uamue kuipanda badala ya aina unayopanda sasa?
+        Kama kuna mbegu mpya ya mahindi, ingekuwa na mambo gani ili uache mbegu unayotumia sasa na utumie hiyo mpya?
       nextId: Q11
 
     - id: Q11
       type: AI
       title: Mavuno ya Chini Yanayokubalika Msimu Mbaya
       question: >-
-        Msimu ukiwa mbaya, ni mavuno ya chini kiasi gani ambayo bado yangekufanya uendelee kupanda aina hii ya mahindi?
+        Kama wewe na wakulima wengine eneo lenu mmevuna mahindi kidogo sana, ukivuna chini ya magunia mangapi ndio utaamua kubadilisha mbegu?
       nextId: Q12
 
     - id: Q12
       type: AI
       title: Hatua ya Ukuaji Inayoathiriwa Zaidi na Ukame
       question: >-
-        Ukame huwa unasababisha hasara kubwa zaidi wakati gani katika ukuaji wa mahindi?
+        Ukame huharibu mahindi yako zaidi wakati gani? Kwa mfano, yakiwa madogo, yakitoa maua, yakianza kuzaa, au wakati gani mwingine?
       nextId: Q13
 
     - id: Q13
       type: AI
       title: "Ugawaji wa Mahindi: Chakula, Malisho, Kuuza"
       question: >-
-        Unaamua aje kiasi cha mahindi cha kuweka kwa matumizi ya nyumbani, kulisha mifugo, kuuza, au matumizi mengine?
-      nextId: Q14
+        Baada ya kuvuna, unagawanya mahindi yako vipi? Kwa mfano unaamuaje kiasi cha kutumia kwa chakula, mifugo, kuuza, au matumizi mengine?
+      nextId: Q14a
 
-    - id: Q14
+    - id: Q14a
+      type: SINGLE_CHOICE
+      title: "Q14a: Mahindi Meupe kwa Chakula cha Wanyama"
+      question: Je, unatumia mahindi meupe kulisha wanyama?
+      options:
+        - "Ndiyo"
+        - "Hapana"
+      read_aloud: true
+      nextId: Q15
+      nextIdByAnswer:
+        "Ndiyo": Q14b
+        "Hapana": Q15
+
+    - id: Q14b
       type: AI
       title: Mahindi Meupe kwa Chakula cha Mifugo
       question: >-
-        Kama unatumia mahindi meupe kulisha mifugo, unawalisha mifugo gani na mara ngapi?
+        Ni wanyama gani unawalisha mahindi meupe, na mara ngapi?
       required_component_catalog:
         - id: animals
           text: "Mifugo inayolishwa mahindi meupe"
@@ -202,7 +226,7 @@ graph:
       type: AI
       title: Chanzo cha Mbegu za Mahindi
       question: >-
-        Kwa kawaida unapata wapi mbegu za mahindi meupe unazopanda, na kwa nini unapendelea kununua au kupata mbegu huko?
+        Kwa kawaida unapata mbegu za mahindi meupe wapi, na kwa nini unapenda kupata mbegu hapo?
       required_component_catalog:
         - id: seed_source
           text: "Chanzo cha kawaida cha mbegu za mahindi meupe"
@@ -214,7 +238,7 @@ graph:
       type: AI
       title: Soko la Kuuzia Mahindi
       question: >-
-        Kwa kawaida baada ya kuvuna, unauza mahindi yako wapi, na kwa nini unapendelea kuuza huko au kwa mnunuzi huyo?
+        Kwa kawaida unauza mahindi yako wapi baada ya kuvuna, na kwa nini unachagua kuuza hapo?
       required_component_catalog:
         - id: sale_destination
           text: "Soko au mnunuzi wa kawaida baada ya mavuno"
@@ -301,12 +325,12 @@ prompts:
 
   - nodeId: Q08
     eval_prompt: |-
-      Lengo la jibu: hasara ya juu ya mavuno unayokubali ili kuvuna siku 20 mapema (% au magunia/ekari).
+      Lengo la jibu: idadi ya juu ya magunia ya mavuno ambayo mhojiwa angekubali kupoteza ili kuvuna siku 20 mapema.
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
     followup_prompt: |-
-      Lengo la jibu: hasara ya juu ya mavuno unayokubali ili kuvuna siku 20 mapema (% au magunia/ekari).
+      Lengo la jibu: idadi ya juu ya magunia ya mavuno ambayo mhojiwa angekubali kupoteza ili kuvuna siku 20 mapema.
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
@@ -314,12 +338,12 @@ prompts:
 
   - nodeId: Q09
     eval_prompt: |-
-      Lengo la jibu: kizingiti wazi cha kubadilisha aina ya mahindi (kipimo + kiwango).
+      Lengo la jibu: idadi ya magunia ya mahindi yanayopotea kwa wadudu au magonjwa ambayo ingemfanya mhojiwa aamue kubadilisha mbegu.
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
     followup_prompt: |-
-      Lengo la jibu: kizingiti wazi cha kubadilisha aina ya mahindi (kipimo + kiwango).
+      Lengo la jibu: idadi ya magunia ya mahindi yanayopotea kwa wadudu au magonjwa ambayo ingemfanya mhojiwa aamue kubadilisha mbegu.
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
@@ -327,12 +351,12 @@ prompts:
 
   - nodeId: Q10
     eval_prompt: |-
-      Lengo la jibu: sifa za kipaumbele za aina mpya, ikiwezekana na kigezo kimoja kinachopimika.
+      Lengo la jibu: mambo ambayo mbegu mpya ya mahindi inahitaji kuwa nayo ili mhojiwa aache mbegu anayotumia sasa na atumie mpya, ikiwezekana na kigezo kimoja kinachopimika.
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
     followup_prompt: |-
-      Lengo la jibu: sifa za kipaumbele za aina mpya, ikiwezekana na kigezo kimoja kinachopimika.
+      Lengo la jibu: mambo ambayo mbegu mpya ya mahindi inahitaji kuwa nayo ili mhojiwa aache mbegu anayotumia sasa na atumie mpya, ikiwezekana na kigezo kimoja kinachopimika.
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
@@ -340,12 +364,12 @@ prompts:
 
   - nodeId: Q11
     eval_prompt: |-
-      Lengo la jibu: mavuno ya chini unayokubali katika msimu mbaya (% au magunia/ekari).
+      Lengo la jibu: idadi ya magunia, ambayo chini yake wewe na wakulima wengine eneo lenu mkivuna mahindi kidogo sana, mngeamua kubadilisha mbegu.
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
     followup_prompt: |-
-      Lengo la jibu: mavuno ya chini unayokubali katika msimu mbaya (% au magunia/ekari).
+      Lengo la jibu: idadi ya magunia, ambayo chini yake wewe na wakulima wengine eneo lenu mkivuna mahindi kidogo sana, mngeamua kubadilisha mbegu.
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
@@ -353,12 +377,12 @@ prompts:
 
   - nodeId: Q12
     eval_prompt: |-
-      Lengo la jibu: hatua ya ukuaji wa mahindi inayoathiriwa zaidi na ukame.
+      Lengo la jibu: hatua ya ukuaji wa mahindi (kwa mfano yakiwa madogo, yakitoa maua, yakianza kuzaa, au hatua nyingine) inayoathiriwa zaidi na ukame.
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
     followup_prompt: |-
-      Lengo la jibu: hatua ya ukuaji wa mahindi inayoathiriwa zaidi na ukame.
+      Lengo la jibu: hatua ya ukuaji wa mahindi (kwa mfano yakiwa madogo, yakitoa maua, yakianza kuzaa, au hatua nyingine) inayoathiriwa zaidi na ukame.
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
@@ -377,7 +401,7 @@ prompts:
       Answered followup pairs: {{HISTORY}}
       EVAL_JSON: {{EVAL_JSON}}
 
-  - nodeId: Q14
+  - nodeId: Q14b
     eval_prompt: |-
       Lengo la jibu: mifugo inayolishwa mahindi meupe na mara ngapi.
       Question: {{QUESTION}}

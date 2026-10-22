@@ -39,6 +39,17 @@ graph:
       title: Respondent ID
       question: Respondent ID
       read_aloud: false
+      nextId: Pre5
+
+    - id: Pre5
+      type: SINGLE_CHOICE
+      title: CIMMYT Phone
+      question: Please select your phone
+      options:
+        - Phone 1
+        - Phone 2
+        - Phone 3
+      read_aloud: false
       nextId: Q00
 
     - id: Q00
@@ -60,8 +71,6 @@ graph:
         Thank you very much for taking part in this study.
 
         The study is led by Dr. Mercy Mbugua. If you have any questions or concerns about the study, you can contact her on +254 724 740 197.
-
-        If you have any concerns or questions, you can reach her by mobile: +254 724 740 197.
 
         Do you agree to participate?
       options:
@@ -120,8 +129,8 @@ graph:
 
     - id: Q05
       type: TEXT
-      title: "Q05: Animals"
-      question: Which animals do you keep?
+      title: "Q05: Livestock"
+      question: Which livestock do you keep?
       nextId: Q06
 
     - id: Q06
@@ -141,68 +150,81 @@ graph:
       type: AI
       title: FAW Impact on Maize
       question: >-
-        Has fall armyworm ever affected your maize? If yes, what damage or losses did it cause?
+        Has fall armyworm ever attacked your maize? If yes, what loss did you get?
       nextId: Q08
 
     - id: Q08
       type: AI
       title: Yield Trade-off for 20-Day Earlier Harvest
       question: >-
-        If you could harvest your maize 20 days earlier but this reduced your yield, how much yield would you be willing to lose to harvest earlier?
+        Please listen to this example: if you could harvest your maize 20 days early, but your harvest would be smaller, how many bags of harvest would you accept to lose?
       nextId: Q09
 
     - id: Q09
       type: AI
       title: Damage Threshold to Switch Variety
       question: >-
-        What level of pest or disease damage would make you switch to a different maize variety?
+        If pests or diseases damage your maize, how many bags would you need to lose before deciding to change your seed?
       nextId: Q10
 
     - id: Q10
       type: AI
       title: Traits Needed in Replacement Variety
       question: >-
-        If there were a new maize variety, what characteristics would it need to have for you to decide to plant it instead of your current variety?
+        If there is a new maize seed, what characteristics would make you stop using your current seed and use the new one?
       nextId: Q11
 
     - id: Q11
       type: AI
       title: Minimum Acceptable Harvest in Bad Season
       question: >-
-        In a bad season, what is the lowest maize yield that would still make you continue planting this variety?
+        If you and other farmers in your area harvested very little maize, below how many bags would you decide to change your seed?
       nextId: Q12
 
     - id: Q12
       type: AI
       title: Growth Stage Most Vulnerable to Drought
       question: >-
-        At what stage of maize growth does drought cause the greatest losses?
+        When does drought damage your maize the most: when the plants are young, when they are flowering, when they have started producing cobs, or at what other time?
       nextId: Q13
 
     - id: Q13
       type: AI
       title: "Maize Allocation: Food, Feed, Sale"
       question: >-
-        How do you decide how much maize to use for household food, livestock feed, sale, or other purposes?
-      nextId: Q14
+        After harvest, how do you divide your maize? How do you decide the amount for each use, for example food, animals, selling, or other uses?
+      nextId: Q14a
 
-    - id: Q14
+    - id: Q14a
+      type: SINGLE_CHOICE
+      title: "Q14a: White Maize for Animal Feed"
+      question: Do you use white maize to feed animals?
+      options:
+        - "Yes"
+        - "No"
+      read_aloud: true
+      nextId: Q15
+      nextIdByAnswer:
+        "Yes": Q14b
+        "No": Q15
+
+    - id: Q14b
       type: AI
       title: White Maize for Livestock Feed
       question: >-
-        If you use white maize to feed livestock, which animals do you feed it to and how often?
+        Which animals do you feed white maize, and how often?
       required_component_catalog:
         - id: animals
-          text: "If white maize is used for livestock: which animals receive it"
+          text: "Which animals receive white maize"
         - id: feeding_frequency
-          text: "If white maize is used for livestock: how often it is fed"
+          text: "How often white maize is fed"
       nextId: Q15
 
     - id: Q15
       type: AI
       title: Maize Seed Sourcing
       question: >-
-        Where do you usually obtain the white maize seed that you plant, and why do you prefer getting it there?
+        Where do you usually get your white maize seed, and why do you like getting it from there?
       required_component_catalog:
         - id: seed_source
           text: "Usual source of white maize seed"
@@ -214,7 +236,7 @@ graph:
       type: AI
       title: Maize Selling Market
       question: >-
-        Where do you usually sell your maize after harvest, and why do you prefer selling there or to that buyer?
+        Where do you usually sell your maize after harvesting, and why do you choose to sell there?
       required_component_catalog:
         - id: sale_destination
           text: "Usual market or buyer after harvest"
@@ -300,12 +322,12 @@ prompts:
 
   - nodeId: Q08
     eval_prompt: |-
-      Expected answer target: Maximum yield loss acceptable for harvesting 20 days earlier (% or bags/acre).
+      Expected answer target: Maximum number of bags of harvest the respondent would accept to lose in order to harvest 20 days earlier.
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
     followup_prompt: |-
-      Expected answer target: Maximum yield loss acceptable for harvesting 20 days earlier (% or bags/acre).
+      Expected answer target: Maximum number of bags of harvest the respondent would accept to lose in order to harvest 20 days earlier.
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
@@ -313,12 +335,12 @@ prompts:
 
   - nodeId: Q09
     eval_prompt: |-
-      Expected answer target: A clear pest/disease damage threshold that would trigger switching maize varieties.
+      Expected answer target: The number of bags of maize lost to pests or disease that would make the respondent decide to change their seed.
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
     followup_prompt: |-
-      Expected answer target: A clear pest/disease damage threshold that would trigger switching maize varieties.
+      Expected answer target: The number of bags of maize lost to pests or disease that would make the respondent decide to change their seed.
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
@@ -326,12 +348,12 @@ prompts:
 
   - nodeId: Q10
     eval_prompt: |-
-      Expected answer target: Priority traits a new maize variety must have to replace the current one, ideally with a measurable target.
+      Expected answer target: Characteristics a new maize seed must have for the respondent to stop using their current seed and switch to it, ideally with a measurable target.
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
     followup_prompt: |-
-      Expected answer target: Priority traits a new maize variety must have to replace the current one, ideally with a measurable target.
+      Expected answer target: Characteristics a new maize seed must have for the respondent to stop using their current seed and switch to it, ideally with a measurable target.
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
@@ -339,12 +361,12 @@ prompts:
 
   - nodeId: Q11
     eval_prompt: |-
-      Expected answer target: The lowest yield in a bad season that would still lead to continued planting of the current variety (% or bags/acre).
+      Expected answer target: The harvest threshold, in bags, below which the respondent and other farmers in their area harvesting very little maize would decide to change their seed.
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
     followup_prompt: |-
-      Expected answer target: The lowest yield in a bad season that would still lead to continued planting of the current variety (% or bags/acre).
+      Expected answer target: The harvest threshold, in bags, below which the respondent and other farmers in their area harvesting very little maize would decide to change their seed.
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
@@ -352,12 +374,12 @@ prompts:
 
   - nodeId: Q12
     eval_prompt: |-
-      Expected answer target: The maize growth stage where drought causes the greatest loss or damage.
+      Expected answer target: The maize growth stage (e.g. young plants, flowering, cob formation, or another stage) where drought causes the greatest loss or damage.
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
     followup_prompt: |-
-      Expected answer target: The maize growth stage where drought causes the greatest loss or damage.
+      Expected answer target: The maize growth stage (e.g. young plants, flowering, cob formation, or another stage) where drought causes the greatest loss or damage.
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
@@ -376,7 +398,7 @@ prompts:
       Answered followup pairs: {{HISTORY}}
       EVAL_JSON: {{EVAL_JSON}}
 
-  - nodeId: Q14
+  - nodeId: Q14b
     eval_prompt: |-
       Expected answer target: Which animals are fed white maize and how often.
       Question: {{QUESTION}}
