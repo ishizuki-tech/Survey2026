@@ -1564,8 +1564,8 @@ fun SurveyNavHost(
                     InfoNodeScreen(
                         title = node.title,
                         text = node.question,
-                        onNext = { vmSurvey.advanceToNext() },
-                        onBack = { vmSurvey.backToPrevious() },
+                        onNext = { runCatching { ttsController.stop() }; vmSurvey.advanceToNext() },
+                        onBack = { runCatching { ttsController.stop() }; vmSurvey.backToPrevious() },
                         onReplay = { toggleQuestionSpeaker(ttsController, node.question, node.id) },
                         isSpeaking = ttsSpeaking,
                     )
@@ -1602,8 +1602,8 @@ fun SurveyNavHost(
                         question = node.question,
                         value = answers[node.id].orEmpty(),
                         onValueChange = { vmSurvey.setAnswer(it, node.id) },
-                        onNext = { vmSurvey.advanceToNext() },
-                        onBack = { vmSurvey.backToPrevious() },
+                        onNext = { runCatching { ttsController.stop() }; vmSurvey.advanceToNext() },
+                        onBack = { runCatching { ttsController.stop() }; vmSurvey.backToPrevious() },
                         onReplay = { toggleQuestionSpeaker(ttsController, node.question, node.id) },
                         isSpeaking = ttsSpeaking
                     )
@@ -1628,11 +1628,12 @@ fun SurveyNavHost(
                         otherTextOption = node.otherTextOption,
                         onSubmit = { selection, otherText ->
                             node.composeSingleChoiceAnswer(selection, otherText)?.let { answer ->
+                                runCatching { ttsController.stop() }
                                 vmSurvey.setAnswer(answer, node.id)
                                 vmSurvey.advanceToNext()
                             }
                         },
-                        onBack = { vmSurvey.backToPrevious() },
+                        onBack = { runCatching { ttsController.stop() }; vmSurvey.backToPrevious() },
                         onReplay = { toggleQuestionSpeaker(ttsController, node.question, node.id) },
                         isSpeaking = ttsSpeaking
                     )
@@ -1658,8 +1659,8 @@ fun SurveyNavHost(
                         onValueChange = { vmSurvey.setAnswer(it.filter(Char::isDigit), node.id) },
                         onSpecialSelect = { vmSurvey.setAnswer(it, node.id) },
                         canSubmit = node.isValidNumberAnswer(answer),
-                        onNext = { vmSurvey.advanceToNext() },
-                        onBack = { vmSurvey.backToPrevious() },
+                        onNext = { runCatching { ttsController.stop() }; vmSurvey.advanceToNext() },
+                        onBack = { runCatching { ttsController.stop() }; vmSurvey.backToPrevious() },
                         onReplay = { toggleQuestionSpeaker(ttsController, node.question, node.id) },
                         isSpeaking = ttsSpeaking,
                     )
@@ -1683,11 +1684,12 @@ fun SurveyNavHost(
                         selected = selected,
                         onToggle = { vmSurvey.toggleMultiChoice(it) },
                         onNext = {
+                            runCatching { ttsController.stop() }
                             val ans = selected.toList().sorted().joinToString(", ")
                             vmSurvey.setAnswer(ans, node.id)
                             vmSurvey.advanceToNext()
                         },
-                        onBack = { vmSurvey.backToPrevious() },
+                        onBack = { runCatching { ttsController.stop() }; vmSurvey.backToPrevious() },
                         onReplay = { toggleQuestionSpeaker(ttsController, node.question, node.id) },
                         isSpeaking = ttsSpeaking
                     )
@@ -1721,8 +1723,8 @@ fun SurveyNavHost(
                         nodeId = node.id,
                         vmSurvey = vmSurvey,
                         vmAI = vmAI,
-                        onNext = { vmSurvey.advanceToNext() },
-                        onBack = { vmSurvey.backToPrevious() },
+                        onNext = { runCatching { ttsController.stop() }; vmSurvey.advanceToNext() },
+                        onBack = { runCatching { ttsController.stop() }; vmSurvey.backToPrevious() },
                         speechController = speechController,
                         ttsController = ttsController
                     )
