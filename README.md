@@ -18,7 +18,7 @@ Stable application baseline:
 - Pixel 9a / Android 16 field validation: PASS for the completed upload/recovery scenarios recorded in [ROADMAP.md](ROADMAP.md)
 - The production release pipeline publishes source SHA, release tag, APK SHA-256, signing-certificate SHA-256, exact English/Swahili config assets and hashes, and dynamic "What's New"
 - `whisper.cpp` baseline: v1.9.3
-- LiteRT-LM: 0.16.1
+- LiteRT-LM: 0.18.0
 
 For current completed work and remaining priorities:
 
@@ -155,7 +155,7 @@ Important implementation areas:
 | minSdk | 26 |
 | NDK | 29.0.14206865 |
 | CMake | 3.22.1 |
-| LiteRT-LM | 0.16.1 |
+| LiteRT-LM | 0.18.0 |
 | Native Android ABI | arm64-v8a |
 
 AGP 9 built-in Kotlin is used. Do not add `org.jetbrains.kotlin.android` to the Android modules unless the build design changes.
@@ -265,7 +265,7 @@ Survey2026 uses LiteRT-LM for local model inference.
 Current dependency:
 
 ```text
-com.google.ai.edge.litertlm:litertlm-android:0.16.1
+com.google.ai.edge.litertlm:litertlm-android:0.18.0
 ```
 
 The app-side SLM layer is responsible for:
