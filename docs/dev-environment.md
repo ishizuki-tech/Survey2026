@@ -248,6 +248,24 @@ Key rules every developer must follow:
 
 ---
 
+## Claude Chat Setup (per engineer)
+
+Each developer uses their own claude.ai account. Do NOT share the project owner's
+Claude chat project. Instead:
+
+1. Sign in to https://claude.ai with your own account.
+2. Create a new project named "Survey2026 — Chat" (or any name you prefer).
+3. In the project settings, add the repository:
+   https://github.com/ishizuki-tech/Survey2026
+4. Add project instructions: paste the contents of AGENTS.md as the project instructions,
+   or write: "Read AGENTS.md at the start of every session."
+5. Each morning, send "朝チェック" (morning check) to get the current GitHub state
+   (main HEAD, open PRs, open P1 issues).
+6. Receive implementation prompts from the chat, run them in Claude Code Local,
+   and paste results back for review.
+
+---
+
 ## Sections not filled from available files
 
 - **Claude Code Desktop App usage** — the folder-open workflow is inferred from
