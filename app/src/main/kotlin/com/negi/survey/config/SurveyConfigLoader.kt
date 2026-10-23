@@ -111,6 +111,12 @@ data class SurveyConfig(
      * - Inline two-step is considered "complete" only when BOTH eval_prompt and followup_prompt are present.
      */
     @Serializable
+    data class PhaseSampling(
+        @SerialName("eval_temperature") val evalTemperature: Double? = null,
+        @SerialName("followup_temperature") val followupTemperature: Double? = null,
+    )
+
+    @Serializable
     data class Prompt(
         val nodeId: String,
 
@@ -121,7 +127,10 @@ data class SurveyConfig(
         @SerialName("eval_prompt") val evalPrompt: String? = null,
 
         /** Inline two-step follow-up prompt (2A). */
-        @SerialName("followup_prompt") val followupPrompt: String? = null
+        @SerialName("followup_prompt") val followupPrompt: String? = null,
+
+        /** Optional sampler overrides for an inline two-step prompt. */
+        @SerialName("phase_sampling") val phaseSampling: PhaseSampling? = null,
     ) {
         /** True when this entry has any inline two-step field present (may be incomplete). */
         fun isTwoStepAny(): Boolean = !evalPrompt.isNullOrBlank() || !followupPrompt.isNullOrBlank()
@@ -338,6 +347,13 @@ data class SurveyConfig(
         if (!eval.isNullOrBlank() && !follow.isNullOrBlank()) return follow
 
         return null
+    }
+
+    /** Returns the optional per-phase sampler overrides for an inline prompt. */
+    fun resolvePhaseSampling(nodeId: String): PhaseSampling? {
+        val id = nodeId.trim()
+        if (id.isBlank()) return null
+        return prompts.firstOrNull { it.nodeId.trim() == id }?.phaseSampling
     }
 
     fun composeSystemPromptOneStep(): String {
@@ -750,6 +766,25 @@ data class SurveyConfig(
                     }
                     if (!legacy.evalPrompt.isNullOrBlank() && legacy.followupPrompt.isNullOrBlank()) {
                         issues += "inline two-step prompt for nodeId='$id' has eval_prompt but missing followup_prompt"
+                    }
+                }
+
+                legacy.phaseSampling?.let { sampling ->
+                    if (!legacyHasTwoComplete) {
+                        issues += "phase_sampling for nodeId='$id' requires a complete inline two-step prompt"
+                    }
+                    if (sampling.evalTemperature == null || sampling.followupTemperature == null) {
+                        issues += "phase_sampling for nodeId='$id' requires both eval_temperature and followup_temperature"
+                    }
+                    sampling.evalTemperature?.let { value ->
+                        if (!value.isFinite() || value !in 0.0..2.0) {
+                            issues += "phase_sampling.eval_temperature for nodeId='$id' must be in [0.0,2.0] (got $value)"
+                        }
+                    }
+                    sampling.followupTemperature?.let { value ->
+                        if (!value.isFinite() || value !in 0.0..2.0) {
+                            issues += "phase_sampling.followup_temperature for nodeId='$id' must be in [0.0,2.0] (got $value)"
+                        }
                     }
                 }
             }

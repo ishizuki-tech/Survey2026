@@ -31,6 +31,8 @@ import androidx.navigation3.runtime.NavKey
 import com.negi.survey.config.NodeDTO
 import com.negi.survey.config.RequiredComponent
 import com.negi.survey.config.SurveyConfig
+import com.negi.survey.slm.PromptPhase
+import com.negi.survey.slm.SamplingProfile
 import com.negi.survey.diagnostics.SurveyTrace
 import com.negi.survey.diagnostics.SurveyTraceRegistry
 import com.negi.survey.diagnostics.TraceIdentity
@@ -844,6 +846,17 @@ open class SurveyViewModel(
         }
 
         return output
+    }
+
+    /** Resolves an optional immutable sampler override for an inline two-step prompt. */
+    fun samplingProfileFor(nodeId: String, phase: PromptPhase): SamplingProfile? {
+        val sampling = config.resolvePhaseSampling(nodeId) ?: return null
+        val temperature = when (phase) {
+            PromptPhase.EVAL -> sampling.evalTemperature
+            PromptPhase.FOLLOWUP -> sampling.followupTemperature
+            PromptPhase.ONE_STEP -> null
+        } ?: return null
+        return SamplingProfile(temperature = temperature.toFloat())
     }
 
     fun getFollowupPrompt(

@@ -671,6 +671,7 @@ object SLM {
         supportAudio: Boolean,
         systemMessage: Message? = null,
         tools: List<Any> = emptyList(),
+        samplingProfile: SamplingProfile? = null,
     ) {
         val appContext =
             context.applicationContext ?: context
@@ -687,6 +688,7 @@ object SLM {
             supportAudio = supportAudio,
             systemMessage = systemMessage,
             tools = tools,
+            samplingProfile = samplingProfile,
         )
     }
 
