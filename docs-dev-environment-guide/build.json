@@ -1,0 +1,12 @@
+{
+  "original_branch": "docs/dev-environment-guide",
+  "branch_slug": "docs-dev-environment-guide",
+  "commit_sha": "635869cde6d5b1b72b57b9e85b5b3bcb55766631",
+  "short_sha": "635869c",
+  "apk_name": "Survey2026-docs-dev-environment-guide-635869c.apk",
+  "apk_sha256": "b023872cc410823e7442420ae2ff05ae920595923e1b7af082673a8017e32074",
+  "apk_download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-docs-dev-environment-guide-635869c-run-143/Survey2026-docs-dev-environment-guide-635869c.apk",
+  "page_url": "https://ishizuki-tech.github.io/Survey2026/docs-dev-environment-guide/",
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/39905475316",
+  "generated_utc": "2026-10-23T05:37:54Z"
+}
