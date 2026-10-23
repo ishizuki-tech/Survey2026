@@ -200,7 +200,7 @@ Important files include:
 
 Current dependency baseline:
 
-`com.google.ai.edge.litertlm:litertlm-android:0.16.1`
+`com.google.ai.edge.litertlm:litertlm-android:0.18.0`
 
 When modifying LiteRT-LM integration:
 
