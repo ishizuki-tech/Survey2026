@@ -1,0 +1,12 @@
+{
+  "original_branch": "claude/setup-claude-code",
+  "branch_slug": "claude-setup-claude-code",
+  "commit_sha": "522c136aeec9fe46bba6de77b3e9d4e0e036613a",
+  "short_sha": "522c136",
+  "apk_name": "Survey2026-claude-setup-claude-code-522c136.apk",
+  "apk_sha256": "a528ef4871b1696667c57f3bccc29c5a33729328e0e0a6e8cdf78b827fe569d9",
+  "apk_download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-claude-setup-claude-code-522c136-run-140/Survey2026-claude-setup-claude-code-522c136.apk",
+  "page_url": "https://ishizuki-tech.github.io/Survey2026/claude-setup-claude-code/",
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/39903769785",
+  "generated_utc": "2026-10-23T05:11:52Z"
+}
