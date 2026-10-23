@@ -423,15 +423,6 @@ class UploadRescheduleReceiver : BroadcastReceiver() {
         }
     }
 
-    private fun isRelevantAction(action: String): Boolean =
-        when (action) {
-            Intent.ACTION_BOOT_COMPLETED -> true
-            Intent.ACTION_MY_PACKAGE_REPLACED -> true
-            Intent.ACTION_USER_UNLOCKED -> true
-            ACTION_LOCKED_BOOT_COMPLETED -> true
-            else -> false
-        }
-
     private fun buildGitHubConfigOrNull(): GitHubUploader.GitHubConfig? =
         GitHubUploadTargetPolicy.resolve(
             buildTarget =
@@ -464,8 +455,18 @@ class UploadRescheduleReceiver : BroadcastReceiver() {
         return um?.isUserUnlocked == true
     }
 
-    private companion object {
+    companion object {
         private const val TAG = "UploadRescheduleRcvr"
+
+        /** Returns true for intents that trigger upload rescheduling. */
+        internal fun isRelevantAction(action: String): Boolean =
+            when (action) {
+                Intent.ACTION_BOOT_COMPLETED -> true
+                Intent.ACTION_MY_PACKAGE_REPLACED -> true
+                Intent.ACTION_USER_UNLOCKED -> true
+                ACTION_LOCKED_BOOT_COMPLETED -> true
+                else -> false
+            }
 
         /** Hard timeout to finish receiver work (avoid ANR). */
         private const val RECEIVER_WORK_TIMEOUT_MS = 9_000L
