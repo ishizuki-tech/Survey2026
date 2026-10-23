@@ -1,0 +1,12 @@
+{
+  "original_branch": "fix/upload-rescheduler-internal-test",
+  "branch_slug": "fix-upload-rescheduler-internal-test",
+  "commit_sha": "2aa4e7afcaebb9c69bd6da8803bdae74c3e04eb1",
+  "short_sha": "2aa4e7a",
+  "apk_name": "Survey2026-fix-upload-rescheduler-internal-test-2aa4e7a.apk",
+  "apk_sha256": "9ea7188caebc9132fe386a219553fe344cfd54d4864f9988833e89b35921e985",
+  "apk_download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-fix-upload-rescheduler-internal-test-2aa4e7a-run-141/Survey2026-fix-upload-rescheduler-internal-test-2aa4e7a.apk",
+  "page_url": "https://ishizuki-tech.github.io/Survey2026/fix-upload-rescheduler-internal-test/",
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/39905453614",
+  "generated_utc": "2026-10-23T05:30:35Z"
+}
