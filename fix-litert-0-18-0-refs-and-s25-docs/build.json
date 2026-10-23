@@ -1,0 +1,12 @@
+{
+  "original_branch": "fix/litert-0.18.0-refs-and-s25-docs",
+  "branch_slug": "fix-litert-0-18-0-refs-and-s25-docs",
+  "commit_sha": "dfd9e366e3a971d1c656bf3a9e901cc6797a149b",
+  "short_sha": "dfd9e36",
+  "apk_name": "Survey2026-fix-litert-0-18-0-refs-and-s25-docs-dfd9e36.apk",
+  "apk_sha256": "a72c3cad020678872747f6149752ad84d07be91bd1c766a77b38650dc93e0d2f",
+  "apk_download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-fix-litert-0-18-0-refs-and-s25-docs-dfd9e36-run-145/Survey2026-fix-litert-0-18-0-refs-and-s25-docs-dfd9e36.apk",
+  "page_url": "https://ishizuki-tech.github.io/Survey2026/fix-litert-0-18-0-refs-and-s25-docs/",
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/40035241542",
+  "generated_utc": "2026-10-23T22:48:21Z"
+}
