@@ -1,56 +1,84 @@
 # Galaxy S25 production-package recovery — preconditions
 
-**Status**: Deferred (accepted risk, not waived)
-**Relevant issues**: #103 (closed 2026-10-14), #89 (open)
-**LiteRT-LM baseline**: 0.18.0 (merged via PR #104, commit b20b03f)
+**Status**: Deferred pending fresh, read-only device-state verification
+**Relevant issues**: #103 (closed), #71 (closed historical signed-update evidence), #89 (open)
+**LiteRT-LM baseline**: 0.18.0
 
 ---
 
 ## Background
 
-Issue #103 was closed after upgrading LiteRT-LM from 0.17.1 to 0.18.0. The closing decision
-explicitly accepted the known risk of GPU memory pressure on Galaxy S25 (SM-S731U) but
-deferred — and did not waive — production-package recovery validation on that device.
+Issue #103 completed the LiteRT-LM 0.18.0 upgrade without authorizing a new
+production-package recovery exercise on Galaxy S25 (SM-S731U). Issue #71 records a
+separate, historical release-signed Build #109 to #110 in-place update that preserved a
+pending survey, delivered `MY_PACKAGE_REPLACED`, reconciled the upload, and avoided a
+duplicate resend. That historical result is not proof of this device's current package,
+signature, version, or pending-data state.
 
-The deferral is required because the Galaxy S25 currently has an accidentally installed
-debug-signed `com.negi.survey` 0.18.0 build. Using this device for clean production
-validation without first resolving that package state would produce unreliable results.
+An earlier report described an accidentally installed debug-signed
+`com.negi.survey` build on this S25. Treat that only as historical evidence. Do not
+assume that the package is still installed, that it still has that signing identity, or
+that its data can safely be preserved without a fresh read-only assessment.
+
+## Package roles
+
+- `com.negi.survey` is the production package. Its signing identity and existing app data
+  are recovery-critical.
+- `com.negi.survey.local` is an isolated local-validation package. Its tests do not prove
+  recovery, signing compatibility, or data preservation for `com.negi.survey`.
+- A `localBuild` debug APK is not production-signed.
 
 ---
 
 ## What must happen before clean production validation on S25
 
-1. **Device package restoration (requires explicit approval)**
-   The accidentally installed debug-signed `com.negi.survey` 0.18.0 build must be replaced
-   with a production-signed package via a data-preserving method approved explicitly by NEGI.
-   Do not delete app data, uninstall, or use `-d` (downgrade) without a separate decision.
+1. **Obtain current read-only evidence.** Confirm the installed production package identity
+   and versionCode, its actual installed signing identity using a valid package-signing
+   inspection, pending survey/upload records, and whether data preservation is feasible.
+   Do not infer signing identity from an APK filename, an older report, or a local-package
+   installation.
 
-2. **Pre-replacement assessment of MY_PACKAGE_REPLACED recovery**
-   Before executing the replacement, assess whether any pending survey uploads exist on the
-   device. If pending uploads are present, confirm they will survive the `MY_PACKAGE_REPLACED`
-   broadcast and WorkManager reconciliation before proceeding.
-   - `UploadRescheduleReceiver.isRelevantAction("android.intent.action.MY_PACKAGE_REPLACED")`
-     now has unit test coverage via `UploadRescheduleReceiverIntentClassificationTest`.
-   - The upload recovery path (`SurveyUploadRescheduler` → `SurveyUploadWork.reconcile()`)
-     is covered by JVM unit tests; no direct coupling between LiteRT-LM and the recovery
-     path was found in the codebase.
+2. **Verify the candidate APK separately.** Use the Android build-tools command below for
+   the candidate production APK:
 
-3. **Post-replacement verification**
-   After the replacement:
-   - Verify survey records are intact (no loss of pending uploads).
-   - Verify the installed package is production-signed: check via `aapt2 dump badging` and
-     `adb shell pm list packages -f com.negi.survey`.
-   - Verify package identity using `adb shell pm list packages --show-versioncode`.
+   ```sh
+   apksigner verify --print-certs <production-apk>
+   ```
 
-4. **MY_PACKAGE_REPLACED recovery scenario (validation step)**
-   After the device is in a known-good state, run the signed-update recovery scenario:
-   - Install build N (production-signed `com.negi.survey.local` via `-PlocalBuild=true`).
-   - Complete a survey to produce a pending JSON.
-   - Install build N+1 as an update (`adb install -r -s R5GL2118ZGD <apk>`).
-   - Confirm `MY_PACKAGE_REPLACED` receiver fired and survey upload was re-queued:
-     `adb logcat -d | grep "MY_PACKAGE_REPLACED\|recoverPending\|reconciled"`
-   - Confirm counts: `reconciled=1, duplicates=0, operationalFailures=0`.
-   - Restore network, confirm upload success, confirm no re-submit on restart.
+   Compare the reported certificate SHA-256 with the independently established production
+   signing-certificate SHA-256 recorded in Issue #71. `aapt2 dump badging` and
+   `adb shell pm list packages` are useful for package metadata and paths, but neither
+   verifies an APK signing certificate. Package name and versionCode are separate checks;
+   a candidate APK certificate alone does not establish the installed device package's
+   signing identity.
+
+3. **Confirm update compatibility.** A genuine signed update requires a compatible signing
+   identity, appropriate versionCode progression, and confirmation that survey data can be
+   preserved. If no safe signed replacement is available, or the signing certificates differ,
+   stop and request a separately approved recovery plan. Do not uninstall, downgrade, clear
+   data, or otherwise bypass Android signing protection.
+
+4. **MY_PACKAGE_REPLACED recovery scenario (validation step).** Only after the
+   preconditions above are met and explicit approval is granted:
+   - Use production-signed `com.negi.survey` build N, create a pending survey/upload record,
+     and preserve its identity before the update.
+   - Verify the candidate production APK with `apksigner verify --print-certs` and confirm its
+     compatible signature and higher versionCode.
+   - Install build N+1 with the correct ADB syntax:
+
+     ```sh
+     adb -s R5GL2118ZGD install -r <apk>
+     ```
+
+   - Confirm actual `MY_PACKAGE_REPLACED` delivery, WorkManager reconciliation, survival of
+     pending survey/upload records, eventual upload after network restoration, and no duplicate
+     resend after restart.
+
+PR #113 adds JVM coverage for `UploadRescheduleReceiver.isRelevantAction()`. Those tests
+classify Intent actions only; they do not establish broadcast delivery, real-device
+WorkManager reconciliation, production-signed update recovery, or preservation of pending
+uploads across a package replacement. Issue #71 is the historical signed-update evidence;
+it does not remove the need for the current-device preconditions above.
 
 ---
 
@@ -63,34 +91,19 @@ validation without first resolving that package state would produce unreliable r
 
 ---
 
-## Memory pressure note (from #89)
+## Model-investigation status
 
-E4B GPU runs on Galaxy S25 cause severe LMKD reclamation of unrelated background
-processes. This was observed with both LiteRT-LM 0.17.1 and 0.18.0; no 0.18.0-specific
-material regression was confirmed from available measurements (single noisy process-cold
-pair). Swap PSS increased approximately 11.7 MiB after init and 17.3 MiB after inference
-for 0.18.0 versus 0.17.1.
-
-The 0.18.0 benchmark was safety-stopped after normal teardown. Do not rerun high-pressure
-E4B tests on this S25 without a new safety plan approved by NEGI.
-
-Issue #89 tracks the lower-memory model investigation:
-- **E2B**: NO-GO. Swahili EVAL/FOLLOWUP semantics below E4B baseline (16/30 vs 25/30
-  expected policy decisions). A compact EVAL protocol experiment also failed (0/90 outputs
-  parse-valid).
-- **LFM2.5 1.2B INT4**: GO for continued investigation only; NO-GO for production. GPU
-  execution confirmed (542/542 nodes on LITERT_CL delegate); first English EVAL fixture
-  (EN_Q15_COMPLETE) rejected by the strict parser due to a noncanonical component ID.
-- **Qwen3 1.7B**: Next candidate. No investigation results recorded as of 2026-10-22.
-- **Production model**: Gemma 3n E4B int4 remains the production model until a lower-memory
-  candidate passes the semantic acceptance matrix.
+Issue #89 remains open. Qwen3 1.7B INT4 was investigated on 2026-10-14 and is **NO-GO for
+production adoption**: the `EN_Q15_COMPLETE` EVAL produced a noncanonical component ID, and
+the strict policy correctly rejected it. Further Qwen inference requires separate safety
+approval. Gemma 3n E4B int4 remains the production model. Refer to Issue #89 for the current
+E2B and LFM2.5 investigation findings rather than duplicating candidate details here.
 
 ---
 
 ## References
 
-- Issue #103 (closed): LiteRT-LM 0.18.0 upgrade risk acceptance and S25 recovery deferral
-- Issue #89 (open): Galaxy S25 LiteRT-LM memory pressure / lower-memory model investigation
-- `ROADMAP.md` — Validation Matrix, S25 MY_PACKAGE_REPLACED PASS (build #109 → #110,
-  with earlier LiteRT-LM version)
-- `docs/field-verification-evidence.md` — Upload recovery field evidence baseline
+- Issue #103: LiteRT-LM 0.18.0 upgrade and recovery-precondition context
+- Issue #71: historical release-signed `MY_PACKAGE_REPLACED` recovery validation
+- Issue #89: lower-memory model investigation and Qwen3 NO-GO evidence
+- PR #113: `isRelevantAction()` Intent-classification tests
