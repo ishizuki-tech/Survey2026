@@ -1,0 +1,12 @@
+{
+  "original_branch": "fix/s25-recovery-litert-0.18.0",
+  "branch_slug": "fix-s25-recovery-litert-0-18-0",
+  "commit_sha": "6e866d01c7545fe0cfe06b94e4b11e6aa447396f",
+  "short_sha": "6e866d0",
+  "apk_name": "Survey2026-fix-s25-recovery-litert-0-18-0-6e866d0.apk",
+  "apk_sha256": "4b870d2197b6de13de302e9d604d2296f7f6abb1c19cbf26b6bb217c409b3f27",
+  "apk_download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-fix-s25-recovery-litert-0-18-0-6e866d0-run-139/Survey2026-fix-s25-recovery-litert-0-18-0-6e866d0.apk",
+  "page_url": "https://ishizuki-tech.github.io/Survey2026/fix-s25-recovery-litert-0-18-0/",
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/39896490095",
+  "generated_utc": "2026-10-23T03:50:29Z"
+}
