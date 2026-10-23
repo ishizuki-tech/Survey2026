@@ -1,274 +1,142 @@
 # Survey2026 Developer Environment Setup
 
-This guide describes how to replicate the Claude Code + Claude Chat development
-workflow used in this project.
-
----
+This guide describes a reproducible local setup for Survey2026. It complements
+[AGENTS.md](../AGENTS.md), which is the authoritative source for repository
+development rules. Follow the instructions in that file when they differ from
+this guide.
 
 ## Prerequisites
 
-- **macOS** (development and validation use macOS; confirmed on Darwin 25.x)
-- **Android Studio** with SDK Manager — see [Toolchain versions](#toolchain-versions) below
-- **JDK 17** (`/usr/libexec/java_home -v 17` must resolve)
-- **Claude Code Desktop App** — download from <https://claude.ai/download>
-- **Claude account** with access to the Survey2026 Claude Chat project
+- Android Studio with the Android SDK components required by the checked-out
+  project
+- JDK 17
+- Git, including submodule support
+- A local checkout directory of your choice
 
----
+This guide does not make a particular user directory, desktop application, or
+account entitlement a repository requirement.
 
-## Repository setup
+The current Android, Kotlin, Compose, and LiteRT-LM versions are declared in
+[`gradle/libs.versions.toml`](../gradle/libs.versions.toml). The Android SDK
+levels are declared in [`app/build.gradle.kts`](../app/build.gradle.kts).
+Consult those files and `AGENTS.md` rather than treating a copied version list
+as an independent source of truth. `AGENTS.md` also records the current native
+toolchain baseline.
 
-The repository uses Git worktrees so that multiple tasks (Claude Code sessions,
-Codex workflows) can be in flight simultaneously without interfering with each other.
+## Clone and initialize the repository
 
-### Main checkout
-
-```
-/Users/negi/Gates2026/Surveys0828   [codex-issue-85-production-diagnostic-redaction]
-```
-
-This is the canonical repository root. Claude Code sessions **must not** edit files
-here directly; they work in a dedicated worktree (see below).
-
-### Claude Code worktrees
-
-Claude Code sessions work only inside `~/Gates2026/claude/<name>` on a matching
-`claude/<name>` branch. The initial setup worktree is `setup-claude-code`:
-
-```
-~/Gates2026/claude/setup-claude-code    [claude/setup-claude-code]
-~/Gates2026/claude/issue-103-s25-recovery-test    [claude/103-s25-recovery-test]
-```
-
-To create a new worktree for a task, run from the main checkout:
+Choose a checkout location appropriate for your machine, then clone and
+initialize the tracked submodules:
 
 ```bash
-git worktree add ~/Gates2026/claude/<issue>-<slug> -b claude/<issue>-<slug>
+git clone https://github.com/ishizuki-tech/Survey2026.git Survey2026
+cd Survey2026
+git submodule sync --recursive
+git submodule update --init --recursive
 ```
 
-Open that folder in the Claude Code Desktop App as the session's working directory.
+Do not change the `whisper.cpp` submodule revision as part of ordinary setup or
+unrelated work.
 
-### Codex worktrees
+## Use a task worktree
 
-`/Users/negi/.codex/worktrees/**` and `~/Gates2026/Survey2026-*` are managed by
-Codex. Claude Code must never edit files in those locations.
+Git worktrees are a recommended way to isolate concurrent tasks and preserve
+unrelated local changes. The checkout location and branch name are your local
+choices; Survey2026 does not prescribe a directory layout or an agent-specific
+branch prefix.
 
----
-
-## Claude Code configuration
-
-### Project-local settings file
-
-Location: `<worktree>/.claude/settings.json`
-
-This file controls the permission model and the `bash_guard.py` pre-tool hook for
-all Claude Code sessions opened in this worktree. The hook fails closed: if it
-cannot parse a command, the command is blocked.
-
-**Do not edit, disable, or work around this file.** Propose changes to NEGI instead.
-
-After any approved change, run:
+From a suitable existing checkout, create a task worktree only after verifying
+the intended starting point and that the destination is unused:
 
 ```bash
-python3 -I .claude/hooks/test_bash_guard.py
+git worktree add ../Survey2026-task -b task/example origin/main
+cd ../Survey2026-task
+git status --short --branch
 ```
 
-#### Permissions summary
+Choose the example directory, branch, and starting revision appropriately for
+your task, and verify each before executing the command. For an existing remote
+branch, fetch or otherwise verify its intended revision before creating the
+worktree. Do not switch branches, delete worktrees, or use destructive Git
+commands to make room for a task. Preserve existing worktrees and their
+uncommitted changes.
 
-The project settings split commands into three tiers:
+## Repository rules
 
-| Tier | Behavior | Examples |
-|---|---|---|
-| `allow` | Runs without prompting | `git status`, `git diff`, `git log`, safe `adb` reads, approved Gradle test/assemble tasks |
-| `ask` | Prompts for approval | `git add`, `git commit`, `git fetch`, `git worktree add`, device install commands, GitHub CLI |
-| `deny` | Always blocked | `git push`, `git stash`, `git reset --hard`, `git clean`, Gradle `install`/`clean`, `adb uninstall`, `adb logcat --clear`, `gh pr create`, `gh workflow run`, protected file reads/edits |
+Read [AGENTS.md](../AGENTS.md) before making changes. In particular:
 
-#### Hooks
+- Make the smallest correct change; do not refactor or update dependencies as a
+  side effect of an unrelated task.
+- Preserve unrelated local changes. Do not use `stash`, `reset`, `checkout`,
+  `restore`, or `clean` to dispose of them.
+- Stage explicit paths only. Do not commit, push, merge, tag, create pull
+  requests, or otherwise change remote Git state without explicit authorization.
+- Do not commit or print credentials, keystores, tokens, model artifacts, or
+  local build outputs.
+- Treat device access, production packages, model inference, and release work
+  as separately authorized, safety-sensitive activities.
 
-A single `PreToolUse` hook applies to all shell and file tools:
-
-```json
-{
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Bash|Monitor|PowerShell|mcp__terminal__run_in_terminal|Read|Edit|Write|NotebookEdit|Grep|Glob",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/usr/bin/env python3 -I \"$CLAUDE_PROJECT_DIR/.claude/hooks/bash_guard.py\"",
-            "timeout": 30,
-            "onFailure": "block",
-            "statusMessage": "Survey2026 safety guard"
-          }
-        ]
-      }
-    ]
-  }
-}
-```
-
-#### `disableBypassPermissionsMode`
-
-Not explicitly set in any settings file — not configured as of this writing.
-
-### Global settings file
-
-Location: `~/.claude/settings.json`
-
-Contains only:
-
-```json
-{ "agentPushNotifEnabled": true }
-```
-
-Push notifications for agent completions are enabled globally.
-
----
-
-## Claude Code Desktop App usage
-
-1. Open the Claude Code Desktop App.
-2. Use **File → Open Folder** (or the folder picker in the sidebar) to select the
-   worktree directory: `~/Gates2026/claude/<name>`.
-3. The session will load project instructions from `CLAUDE.md` and `AGENTS.md`
-   automatically.
-4. Sessions opened this way are tied to the worktree folder and persist across
-   restarts until explicitly archived.
-
-**Branch rule**: always verify you are on the correct `claude/<name>` branch before
-doing any work:
+For ordinary local JVM/debug validation without embedded development secrets,
+the current documented command is:
 
 ```bash
-git branch --show-current
+./gradlew :app:testDebugUnitTest --no-daemon \
+  -PskipModelDownload=true \
+  -Pdebug.embedSecrets=false \
+  -Prelease.allowSecrets=false
 ```
 
-If you are on a different branch (e.g. after a `git checkout` for a push), return
-to the session branch before continuing:
+Use the narrowest relevant validation and follow the additional build, device,
+release-signing, and native-build requirements in `AGENTS.md`. Do not infer
+that a local machine has an authorized device, credentials, model assets, or
+permission to download them.
 
-```bash
-git checkout claude/<name>
-```
+## Claude Code, Claude Chat, Codex, and GitHub
 
----
+These tools can support different parts of a development workflow:
 
-## Survey2026 — Chat integration
-
-> **Note**: This section describes the intended workflow as understood from project
-> context. No dedicated documentation file was found for this workflow at the time
-> of writing; details may be incomplete.
-
-The project uses two separate Claude surfaces:
-
-| Surface | Role |
+| Surface | Typical role |
 |---|---|
-| **Claude Code** (Desktop App, Code tab) | Implementation: file edits, Gradle builds, adb commands, git operations |
-| **Claude Chat** (claude.ai, Survey2026 project) | Planning: morning check, task specification authoring, PR management, cross-session coordination |
+| Claude Chat | Investigation, planning, requirements discussion, review, and task preparation |
+| Claude Code | Local source changes, builds, tests, and other permitted development operations |
+| Codex | Another supported local implementation and testing workflow |
+| GitHub | Authoritative remote source for repository, pull request, issue, and CI state |
 
-### Typical flow
+This division describes a project workflow, not a universal product-capability
+claim. Whether a particular Claude Chat or Claude Code session can read files,
+run commands, edit sources, or access GitHub depends on its connected tools,
+permissions, and selected environment.
 
-1. **Morning check** — open the Survey2026 Chat project on claude.ai; review open
-   issues, CI status, and prioritize the day's tasks.
-2. **Task specification** — draft a task spec in Chat (markdown, with explicit
-   steps, non-goals, and branch/commit instructions).
-3. **Execution** — paste the task spec into a Claude Code session; Claude Code
-   implements the changes, runs tests, and reports back.
-4. **Review** — paste the Claude Code output (diff summary, test results) back into
-   Chat for cross-session review or PR description drafting.
-5. **PR management** — Chat assists with PR descriptions, labels, and merge
-   decisions; Claude Code handles the local git operations.
+## Claude-specific local setup
 
----
+This repository currently does **not** track `CLAUDE.md`,
+`.claude/settings.json`, `.claude/hooks/bash_guard.py`, or
+`.claude/hooks/test_bash_guard.py`. Consequently, no Claude permission model,
+hook, global settings file, desktop navigation behavior, session-persistence
+behavior, or automatic instruction-loading behavior is repository-enforced by
+those paths.
 
-## Development rules (from AGENTS.md)
+You may use personal Claude Code or Claude Chat settings when they are available
+to you, but treat them as local preferences. Do not publish personal paths,
+settings, credentials, or permissions as project requirements, and do not use
+local configuration to bypass the safety rules in `AGENTS.md`.
 
-Key rules every developer must follow:
+Creating a personal Claude project is optional and depends on your account,
+available product features, and access permissions. Likewise, connecting a
+repository URL does not itself grant GitHub access or establish a scheduled
+status check. Any GitHub integration requires separate authorization and should
+be verified from the environment in use.
 
-### General
-- Make the **smallest change** that correctly solves the problem.
-- Prefer root-cause fixes over workarounds.
-- Do not change unrelated code while fixing a specific issue.
-- Do not update dependencies (LiteRT-LM, whisper.cpp, AGP, Kotlin, NDK, CMake) as
-  a side effect of unrelated work.
+## Suggested workflow
 
-### Git / worktrees
-- Never use `stash`, `reset`, `checkout`, `restore`, or `clean` to dispose of
-  unrelated work.
-- Prefer `git add <explicit path>` over `git add -A` or `git add .`.
-- Do not commit APKs, keystores, credentials, model artifacts, or local build outputs.
-- **Do not commit, push, open PRs, or merge without explicit instruction from NEGI.**
+1. Use GitHub or an authorized integration to verify the relevant branch, pull
+   request, issue, and CI state.
+2. Use Claude Chat, Claude Code, Codex, or another approved tool to investigate
+   and prepare a scoped task.
+3. Work in an isolated checkout when appropriate, verify the branch and working
+   tree, and apply only the requested changes.
+4. Run the relevant validation, inspect the diff, and report what was changed
+   and what was not verified.
 
-### Builds
-- Always use JDK 17.
-- Always pass: `--no-daemon -PskipModelDownload=true -Pdebug.embedSecrets=false -Prelease.allowSecrets=false`
-- Prefer `--offline`; going online or downloading models requires approval.
-- `-PlocalBuild=true` is **required** for any APK that will be installed on a device.
-- Never run `./gradlew installDebug`, `uninstallAll`, or `clean`.
-
-### Device safety (Galaxy S25 FE, SM-S731U, serial R5GL2118ZGD)
-- Do not use the device without NEGI's explicit approval for the current task.
-- Use only `com.negi.survey.local`. Never install, clear, or force-stop
-  `com.negi.survey` (production package).
-- Before every `adb install -r`: verify package name with `aapt2 dump badging`,
-  record APK SHA-256, confirm device serial, compare versionCode/signing.
-- Never run `adb logcat -c` / `--clear`.
-- Model inference and GPU benchmarks require explicit approval per run.
-
-### Upload / recovery architecture
-- Preserve the single shared reconciliation path (`SurveyUploadWork.reconcile()`).
-- Do not reintroduce a second direct `reenqueuePendingSurveyUploads()` enqueue path.
-- Survey JSON is the mandatory artifact; generic diagnostic upload failures are
-  not evidence of survey recovery failure.
-
-### Secrets
-- Never commit release keystores, keystore passwords, GitHub tokens, or
-  Hugging Face tokens.
-
-### Reporting
-- Report to NEGI in **Japanese**.
-- Keep source code comments in **English**.
-
----
-
-## Toolchain versions
-
-| Component | Version |
-|---|---|
-| AGP | 9.3.2 |
-| Kotlin | 2.4.10 |
-| Compose BOM | 2026.08.00 |
-| Java | 17 |
-| compileSdk | 37 |
-| targetSdk | 36 |
-| minSdk | 26 |
-| NDK | 29.0.14206865 |
-| CMake | 3.22.1 |
-| LiteRT-LM | 0.18.0 |
-| whisper.cpp | v1.9.3 |
-| Native Android ABI | arm64-v8a |
-
----
-
-## Claude Chat Setup (per engineer)
-
-Each developer uses their own claude.ai account. Do NOT share the project owner's
-Claude chat project. Instead:
-
-1. Sign in to https://claude.ai with your own account.
-2. Create a new project named "Survey2026 — Chat" (or any name you prefer).
-3. In the project settings, add the repository:
-   https://github.com/ishizuki-tech/Survey2026
-4. Add project instructions: paste the contents of AGENTS.md as the project instructions,
-   or write: "Read AGENTS.md at the start of every session."
-5. Each morning, send "朝チェック" (morning check) to get the current GitHub state
-   (main HEAD, open PRs, open P1 issues).
-6. Receive implementation prompts from the chat, run them in Claude Code Local,
-   and paste results back for review.
-
----
-
-## Sections not filled from available files
-
-- **Claude Code Desktop App usage** — the folder-open workflow is inferred from
-  general Claude Code behavior; no project-specific documentation was found.
-- **Survey2026 — Chat integration** — workflow described from context inference;
-  no dedicated doc file exists in the repository as of this writing.
+The chosen tool does not replace repository policy: `AGENTS.md`, the current
+checked-out source, and explicitly granted authorization govern the work.
