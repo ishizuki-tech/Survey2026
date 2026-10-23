@@ -1790,6 +1790,7 @@ object LiteRtLM {
         model: Model,
         systemMessage: Message?,
         tools: List<Any>,
+        samplingProfile: SamplingProfile? = null,
     ): ConversationConfig {
         val topK =
             sanitizeTopK(
@@ -1803,7 +1804,7 @@ object LiteRtLM {
 
         val temperature =
             sanitizeTemperature(
-                model.getFloatConfigValue(
+                samplingProfile?.temperature ?: model.getFloatConfigValue(
                     ConfigKey.TEMPERATURE,
                     DEFAULT_TEMPERATURE
                 )
@@ -1848,6 +1849,7 @@ object LiteRtLM {
         onDone: (String) -> Unit,
         systemMessage: Message? = null,
         tools: List<Any> = emptyList(),
+        samplingProfile: SamplingProfile? = null,
     ) {
         val appContext =
             context.applicationContext
@@ -2028,6 +2030,7 @@ object LiteRtLM {
                             model = model,
                             systemMessage = systemMessage,
                             tools = tools,
+                            samplingProfile = samplingProfile,
                         )
 
                     /*
@@ -3087,6 +3090,7 @@ object LiteRtLM {
         supportAudio: Boolean,
         systemMessage: Message? = null,
         tools: List<Any> = emptyList(),
+        samplingProfile: SamplingProfile? = null,
     ) {
         val appContext =
             context.applicationContext
@@ -3118,6 +3122,7 @@ object LiteRtLM {
                 model = model,
                 systemMessage = systemMessage,
                 tools = tools,
+                samplingProfile = samplingProfile,
             )
 
         val ready =
@@ -3191,6 +3196,7 @@ object LiteRtLM {
                 },
                 systemMessage = systemMessage,
                 tools = tools,
+                samplingProfile = samplingProfile,
             )
 
             val error =

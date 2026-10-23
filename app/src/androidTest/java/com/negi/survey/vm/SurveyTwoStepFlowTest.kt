@@ -9,6 +9,7 @@ import com.negi.survey.config.SurveyConfig
 import com.negi.survey.slm.PromptPhase
 import com.negi.survey.slm.Repository
 import com.negi.survey.slm.RepositoryTraceContext
+import com.negi.survey.slm.SamplingProfile
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
@@ -128,6 +129,29 @@ class SurveyTwoStepFlowTest {
                 ai.conversationStateFlow("context").value.turnCompleted,
             )
         }
+    }
+
+    @Test fun q11_phase_sampling_is_forwarded_eval_followup_eval() = runBlocking {
+        val (survey, ai, repo) = fixture(
+            cap = 1,
+            script = listOf(low, Q11_YIELD_QUESTION, high),
+            nodeId = Q11_NODE_ID,
+            question = Q11_QUESTION,
+            mainAnswer = Q11_MAIN_ANSWER,
+            target = Q11_TARGET,
+            phaseSampling = SurveyConfig.PhaseSampling(
+                evalTemperature = 0.0,
+                followupTemperature = 1.0,
+            ),
+        )
+
+        run(survey, ai, Q11_NODE_ID, Q11_QUESTION)
+        survey.answerLastFollowup(Q11_NODE_ID, Q11_YIELD_ANSWER)
+        run(survey, ai, Q11_NODE_ID, Q11_QUESTION)
+
+        assertEquals(listOf(0.0f, 1.0f, 0.0f), repo.samplingProfiles.map { it?.temperature })
+        assertEquals(listOf(PromptPhase.EVAL, PromptPhase.FOLLOWUP, PromptPhase.EVAL), repo.phases)
+        assertEquals(Q11_YIELD_QUESTION, survey.followups.value[Q11_NODE_ID]?.single()?.question)
     }
 
     @Test fun caps_one_and_three_always_evaluate_the_last_answer_before_limit() = runBlocking {
@@ -399,8 +423,9 @@ class SurveyTwoStepFlowTest {
         target: String = "original target",
         requiredComponents: List<String> = emptyList(),
         requiredComponentCatalog: List<RequiredComponent> = emptyList(),
+        phaseSampling: SurveyConfig.PhaseSampling? = null,
     ): Triple<SurveyViewModel, AiViewModel, ScriptedRepository> {
-        val survey = survey(cap, nodeId, question, mainAnswer, target, requiredComponents, requiredComponentCatalog)
+        val survey = survey(cap, nodeId, question, mainAnswer, target, requiredComponents, requiredComponentCatalog, phaseSampling)
         val repo = ScriptedRepository(script)
         val ai = AiViewModel(repo, defaultTimeoutMs = 50, ioDispatcher = Dispatchers.IO)
         ai.ensureConversationContext("context", question, survey.getAnswer(nodeId))
@@ -415,6 +440,7 @@ class SurveyTwoStepFlowTest {
         target: String = "original target",
         requiredComponents: List<String> = emptyList(),
         requiredComponentCatalog: List<RequiredComponent> = emptyList(),
+        phaseSampling: SurveyConfig.PhaseSampling? = null,
     ) = SurveyViewModel(NavBackStack<NavKey>(FlowHome), SurveyConfig(
         aiInteraction = SurveyConfig.AiInteraction(cap),
         graph = SurveyConfig.Graph("Start", listOf(
@@ -431,7 +457,8 @@ class SurveyTwoStepFlowTest {
         )),
         prompts = listOf(SurveyConfig.Prompt(nodeId,
             evalPrompt = "Target: $target\nQuestion: {{QUESTION}}\nOriginal answer: {{ANSWER}}\n{{HISTORY}}",
-            followupPrompt = "Target: $target\nQuestion: {{QUESTION}}\nOriginal answer: {{ANSWER}}\n{{HISTORY}}\nEVAL_JSON: {{EVAL_JSON}}"))
+            followupPrompt = "Target: $target\nQuestion: {{QUESTION}}\nOriginal answer: {{ANSWER}}\n{{HISTORY}}\nEVAL_JSON: {{EVAL_JSON}}",
+            phaseSampling = phaseSampling))
     )).also { it.setAnswer(mainAnswer, nodeId) }
 
     private companion object {
@@ -448,6 +475,7 @@ class SurveyTwoStepFlowTest {
     private class ScriptedRepository(private val script: List<String>) : Repository {
         val phases = mutableListOf<PromptPhase>()
         val prompts = mutableListOf<String>()
+        val samplingProfiles = mutableListOf<SamplingProfile?>()
         override fun buildPrompt(userPrompt: String, phase: PromptPhase): String {
             phases += phase
             return userPrompt
@@ -456,9 +484,16 @@ class SurveyTwoStepFlowTest {
         override suspend fun request(
             prompt: String,
             traceContext: RepositoryTraceContext?,
+        ): Flow<String> = request(prompt, traceContext, samplingProfile = null)
+
+        override suspend fun request(
+            prompt: String,
+            traceContext: RepositoryTraceContext?,
+            samplingProfile: SamplingProfile?,
         ): Flow<String> {
             val result = script[prompts.size]
             prompts += prompt
+            samplingProfiles += samplingProfile
             return flow {
                 when (result) {
                     "TIMEOUT" -> awaitCancellation()

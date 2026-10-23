@@ -26,6 +26,7 @@ import com.negi.survey.slm.PromptPhase
 import com.negi.survey.slm.Repository
 import com.negi.survey.slm.RepositoryTraceContext
 import com.negi.survey.slm.RepositoryTraceEvent
+import com.negi.survey.slm.SamplingProfile
 import java.security.MessageDigest
 import java.util.ArrayDeque
 import java.util.Collections
@@ -517,6 +518,8 @@ class AiViewModel(
         var traceFollowupNeeded: Boolean? = null
         var traceParseSuccess = false
         val evalPrompt = survey.getEvalPrompt(nodeId, rootQuestion, answer)
+        val evalSamplingProfile = survey.samplingProfileFor(nodeId, PromptPhase.EVAL)
+        val followupSamplingProfile = survey.samplingProfileFor(nodeId, PromptPhase.FOLLOWUP)
         survey.traceEvent("AI_EVAL_STARTED", answerTraceId, nodeId, mapOf(
             "prompt" to DiagnosticContentPolicy.rawOrNull(evalPrompt), "promptLength" to evalPrompt.length,
             "modelPhase" to "EVAL"
@@ -526,6 +529,8 @@ class AiViewModel(
         survey.setAiReason(nodeId, SurveyAiReason.FAILURE)
         evaluateConditionalTwoStepAsync(
             firstPrompt = evalPrompt,
+            firstSamplingProfile = evalSamplingProfile,
+            secondSamplingProfile = followupSamplingProfile,
             proceedOnTimeout = false,
             shouldRunSecond = { result ->
                 val admission = SurveyAiPolicy.evaluateAdmission(
@@ -989,6 +994,8 @@ class AiViewModel(
     fun evaluateConditionalTwoStepAsync(
         firstPrompt: String,
         firstPhase: PromptPhase = PromptPhase.EVAL,
+        firstSamplingProfile: SamplingProfile? = null,
+        secondSamplingProfile: SamplingProfile? = null,
         timeoutMs: Long = defaultTimeoutMs,
         proceedOnTimeout: Boolean = true,
         shouldRunSecond: (EvalResult) -> Boolean,
@@ -1017,6 +1024,7 @@ class AiViewModel(
                     timeoutMs = timeoutMs,
                     mode = EvalMode.EVAL_JSON,
                     phase = firstPhase,
+                    samplingProfile = firstSamplingProfile,
                     commitToPrimaryState = true,
                     repositoryTraceContext = repositoryTraceContextForRun?.invoke(runId1, firstPhase)
                 )
@@ -1091,6 +1099,7 @@ class AiViewModel(
                     timeoutMs = timeoutMs,
                     mode = EvalMode.FOLLOWUP_JSON_OR_TEXT,
                     phase = PromptPhase.FOLLOWUP,
+                    samplingProfile = secondSamplingProfile,
                     commitToPrimaryState = false,
                     repositoryTraceContext = repositoryTraceContextForRun?.invoke(runId2, PromptPhase.FOLLOWUP)
                 )
@@ -1179,6 +1188,7 @@ class AiViewModel(
         timeoutMs: Long,
         mode: EvalMode,
         phase: PromptPhase,
+        samplingProfile: SamplingProfile? = null,
         commitToPrimaryState: Boolean,
         repositoryTraceContext: RepositoryTraceContext? = null
     ): EvalResult {
@@ -1308,7 +1318,7 @@ class AiViewModel(
                     inferenceMutex.withLock {
                         requireActiveRun()
 
-                        repo.request(fullPrompt, repositoryTraceContext).collect { part ->
+                        repo.request(fullPrompt, repositoryTraceContext, samplingProfile).collect { part ->
                             requireActiveRun()
 
                             if (part.isNotEmpty()) {

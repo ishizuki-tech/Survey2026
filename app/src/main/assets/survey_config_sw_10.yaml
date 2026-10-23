@@ -363,13 +363,18 @@ prompts:
       EVAL_JSON: {{EVAL_JSON}}
 
   - nodeId: Q11
+    phase_sampling:
+      eval_temperature: 0.0
+      followup_temperature: 1.0
     eval_prompt: |-
       Lengo la jibu: idadi ya magunia, ambayo chini yake wewe na wakulima wengine eneo lenu mkivuna mahindi kidogo sana, mngeamua kubadilisha mbegu.
+      Ikiwa idadi ya magunia haijatajwa katika jibu au historia, missing_points iwe ["idadi ya magunia"] na followup_needed iwe true.
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
     followup_prompt: |-
       Lengo la jibu: idadi ya magunia, ambayo chini yake wewe na wakulima wengine eneo lenu mkivuna mahindi kidogo sana, mngeamua kubadilisha mbegu.
+      Mwelekeze mhojiwa kwa nafsi ya pili; usinakili nafsi ya kwanza ya jibu la awali.
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}

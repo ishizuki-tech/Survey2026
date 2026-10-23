@@ -69,6 +69,11 @@ enum class PromptPhase {
     FOLLOWUP
 }
 
+/** Immutable sampler override for one inference request. */
+data class SamplingProfile(
+    val temperature: Float,
+)
+
 /**
  * Repository that streams inference results from an on-device LLM backend.
  *
@@ -82,6 +87,13 @@ interface Repository {
 
     /** Execute a single streaming inference for the given [prompt]. */
     suspend fun request(prompt: String, traceContext: RepositoryTraceContext? = null): Flow<String>
+
+    /** Execute one request with an optional per-request sampler override. */
+    suspend fun request(
+        prompt: String,
+        traceContext: RepositoryTraceContext?,
+        samplingProfile: SamplingProfile?,
+    ): Flow<String> = request(prompt, traceContext)
 
     /** Build the full model-ready prompt string from a user-level [userPrompt]. */
     fun buildPrompt(userPrompt: String): String
@@ -1179,7 +1191,14 @@ class LiteRtRepository(
     }
 
     @OptIn(ExperimentalCoroutinesApi::class)
-    override suspend fun request(prompt: String, traceContext: RepositoryTraceContext?): Flow<String> {
+    override suspend fun request(prompt: String, traceContext: RepositoryTraceContext?): Flow<String> =
+        request(prompt, traceContext, samplingProfile = null)
+
+    override suspend fun request(
+        prompt: String,
+        traceContext: RepositoryTraceContext?,
+        samplingProfile: SamplingProfile?,
+    ): Flow<String> {
         return callbackFlow {
             val out = this
 
@@ -1762,6 +1781,7 @@ class LiteRtRepository(
                                                         supportAudio = supportAudio,
                                                         systemMessage = systemMessage,
                                                         tools = tools,
+                                                        samplingProfile = samplingProfile,
                                                     )
                                                 }
                                             }
