@@ -112,6 +112,22 @@ internal fun Node.composeSingleChoiceAnswer(selected: String?, otherText: String
     return "$choice: $detail"
 }
 
+/** A saved single-choice answer split back into its option and optional "other" detail. */
+internal data class SingleChoiceSelection(val selected: String?, val otherText: String = "")
+
+/**
+ * Inverse of [composeSingleChoiceAnswer]: recovers the selected option and any "other" detail
+ * from a saved answer, so a revisited question can show what was entered before.
+ */
+internal fun Node.decomposeSingleChoiceAnswer(answer: String?): SingleChoiceSelection {
+    val saved = answer?.trim()?.takeIf { it.isNotEmpty() } ?: return SingleChoiceSelection(null)
+    val other = otherTextOption
+    if (other != null && saved.startsWith("$other:")) {
+        return SingleChoiceSelection(other, saved.removePrefix("$other:").trim())
+    }
+    return SingleChoiceSelection(saved.takeIf { it in options })
+}
+
 /* ───────────────────────────── Nav Keys ───────────────────────────── */
 
 @Serializable object FlowHome : NavKey
@@ -442,6 +458,12 @@ open class SurveyViewModel(
     fun clearSelections() {
         _single.value = null
         _multi.value = emptySet()
+    }
+
+    /** Re-select a single-choice node's saved answer when the node is shown again. */
+    private fun restoreSelectionFor(node: Node) {
+        if (node.type != NodeType.SINGLE_CHOICE) return
+        _single.value = node.decomposeSingleChoiceAnswer(getAnswer(node.id)).selected
     }
 
     /* ───────────────────────────── Follow-ups ───────────────────────────── */
@@ -997,6 +1019,7 @@ open class SurveyViewModel(
         nodeStack.addLast(node.id)
 
         clearSelections()
+        restoreSelectionFor(node)
 
         nav.add(navKeyFor(node))
         updateCanGoBack()
@@ -1135,6 +1158,7 @@ open class SurveyViewModel(
         updateCanGoBack()
 
         clearSelections()
+        restoreSelectionFor(_currentNode.value)
 
         RuntimeLogStore.d(
             TAG,
