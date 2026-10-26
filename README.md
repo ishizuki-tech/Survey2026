@@ -103,11 +103,28 @@ The current upload/recovery design deliberately uses one shared reconciliation p
 
 ---
 
+## AI decision boundary
+
+`survey-decision-engine` is a Kotlin/JVM module containing the deterministic admission policy for structured **EVAL** output and extracted **FOLLOWUP** candidates. It validates the evaluation contract, determines whether a response is achieved, needs a follow-up, has reached its follow-up limit, or fails closed, and accepts only valid, non-duplicate follow-up questions.
+
+The module is independent of Android and LiteRT-LM native inference. It does not execute inference, construct prompts, or extract candidates from model output. The app's existing `SurveyAiPolicy` remains a compatibility facade: it maps the app's established policy API and result types onto `SurveyDecisionEngine` so existing callers retain their contract.
+
+Responsibility is deliberately split as follows:
+
+- **Survey2026 app** owns survey configuration, prompt construction, run/lifecycle ownership, persistence, and presentation of accepted decisions.
+- **SurveyDecisionEngine** owns pure, deterministic evaluation and follow-up admission decisions.
+- **Inference runtime** (currently the LiteRT-LM integration) owns local model execution and supplies raw outputs to the app/decision path.
+
+An AICore layer and an interchangeable inference-backend boundary are planned future architecture work. They are not implemented by this module or claimed as part of the current runtime.
+
+---
+
 ## Repository layout
 
 ```text
 .
 ├── app/                         Android application module
+├── survey-decision-engine/      Kotlin/JVM deterministic AI decision policy
 ├── nativelib/                   whisper.cpp JNI Android library
 ├── whisper.cpp/                 pinned Git submodule
 ├── scripts/                     helper/automation scripts

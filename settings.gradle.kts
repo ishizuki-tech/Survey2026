@@ -25,3 +25,4 @@ dependencyResolutionManagement {
 rootProject.name = "SurveyNav"
 include(":app")
 include(":nativelib")
+include(":survey-decision-engine")

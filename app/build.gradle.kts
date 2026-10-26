@@ -920,6 +920,8 @@ extensions.configure<ApplicationExtension> {
  * ========================================================================== */
 
 dependencies {
+    implementation(project(":survey-decision-engine"))
+
     implementation(
         project(":nativelib")
     )
