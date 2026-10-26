@@ -1743,7 +1743,8 @@ fun SurveyNavHost(
                         onNext = { runCatching { ttsController.stop() }; vmSurvey.advanceToNext() },
                         onBack = { runCatching { ttsController.stop() }; vmSurvey.backToPrevious() },
                         speechController = speechController,
-                        ttsController = ttsController
+                        ttsController = ttsController,
+                        autoReadFollowups = ttsAutoPlay && node.readAloud
                     )
                 }
 

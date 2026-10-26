@@ -45,6 +45,51 @@ class WhisperSpeechControllerLifecycleTest {
     }
 
     @Test
+    fun recording_limit_counts_down_then_stops_and_transcribes_once() = runBlocking {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext.applicationContext
+        val recorder = FakeRecorder()
+        val controller = WhisperSpeechController(
+            appContext = context,
+            recorderFactory = { _, _ -> recorder },
+            modelInitializer = {},
+            transcriber = { _, _ -> Result.success("limited answer") },
+            maxRecordingMs = 2_500L
+        )
+
+        controller.startRecording()
+        waitUntil { recorder.started && controller.recordingRemainingSeconds.value == 3 }
+        waitUntil { controller.recordingRemainingSeconds.value == 1 }
+        assertTrue(controller.isRecording.value)
+
+        waitUntil { !controller.isTranscribing.value && controller.partialText.value == "limited answer" }
+
+        assertFalse(controller.isRecording.value)
+        assertEquals(null, controller.recordingRemainingSeconds.value)
+        assertEquals(1, recorder.stopCalls)
+    }
+
+    @Test
+    fun manual_stop_clears_countdown_before_the_limit() = runBlocking {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext.applicationContext
+        val recorder = FakeRecorder()
+        val controller = WhisperSpeechController(
+            appContext = context,
+            recorderFactory = { _, _ -> recorder },
+            modelInitializer = {},
+            transcriber = { _, _ -> Result.success("manual answer") },
+            maxRecordingMs = 10_000L
+        )
+
+        controller.startRecording()
+        waitUntil { recorder.started && controller.recordingRemainingSeconds.value != null }
+        controller.stopRecording()
+
+        assertEquals(null, controller.recordingRemainingSeconds.value)
+        waitUntil { !controller.isTranscribing.value && controller.partialText.value == "manual answer" }
+        assertEquals(1, recorder.stopCalls)
+    }
+
+    @Test
     fun stop_in_progress_rejects_a_replacement_recording() = runBlocking {
         val context = InstrumentationRegistry.getInstrumentation().targetContext.applicationContext
         val recorder = FakeRecorder(holdStop = true)
