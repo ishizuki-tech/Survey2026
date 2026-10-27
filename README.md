@@ -115,7 +115,15 @@ Responsibility is deliberately split as follows:
 - **SurveyDecisionEngine** owns pure, deterministic evaluation and follow-up admission decisions.
 - **Inference runtime** (currently the LiteRT-LM integration) owns local model execution and supplies raw outputs to the app/decision path.
 
-An AICore layer and an interchangeable inference-backend boundary are planned future architecture work. They are not implemented by this module or claimed as part of the current runtime.
+`:aicore` is a Kotlin/JVM contract module for a backend-neutral, text-only `AiRuntime` API. It defines model/configuration identity, generation identity and events, close results, and lifecycle states; it has no Android or LiteRT-LM dependency. `:survey-decision-engine` remains the separate Kotlin/JVM module for extracted deterministic survey decision logic.
+
+The current LiteRT implementation of that contract, `LiteRtAiRuntime`, is an app-local adapter for architecture characterization and lifecycle evidence. It is **not connected to production AI call sites**. Production SLM inference continues to use the established app-owned `LiteRtRepository` and `LiteRtLM` implementation. Native Engine and Conversation ownership remains there, as do the app-owned inference gate and `HeavyRuntimeCoordinator` handoff. No `:aicore-litert` backend module has been introduced.
+
+### App-local runtime lifecycle
+
+`prepare()` is idempotent only for the same model and configuration; a different identity requires a new runtime. A generation emits `Started`, zero or more `Delta` events, and a logical terminal event. `Completed` means response streaming has logically finished; `NativeTerminated` is a separate event emitted only after the repository's native cleanup observation is confirmed.
+
+The repository owns the adapter generation ID, request ID, and native run ID. Cancellation is latched before native start when necessary, then dispatched only for the published native run ID. Cancelling an external collector does not itself cancel repository/native work or make the runtime reusable. A competing generation is rejected while one remains active. Concurrent `close()` callers share one close flight; if native cleanup cannot be confirmed, the adapter becomes poisoned and rejects further use rather than claiming release.
 
 ---
 
@@ -124,6 +132,7 @@ An AICore layer and an interchangeable inference-backend boundary are planned fu
 ```text
 .
 ├── app/                         Android application module
+├── aicore/                      Kotlin/JVM AI runtime contracts; no native owner
 ├── survey-decision-engine/      Kotlin/JVM deterministic AI decision policy
 ├── nativelib/                   whisper.cpp JNI Android library
 ├── whisper.cpp/                 pinned Git submodule
@@ -153,7 +162,9 @@ Important implementation areas:
 - `app/src/main/kotlin/com/negi/survey/slm/AiRepository.kt`
   - local SLM orchestration
 - `app/src/main/kotlin/com/negi/survey/slm/LiteRtLM.kt`
-  - LiteRT-LM runtime wrapper
+  - app-owned LiteRT-LM runtime wrapper and native Engine/Conversation owner
+- `app/src/main/kotlin/com/negi/survey/slm/LiteRtAiRuntime.kt`
+  - app-local adapter; not wired into production inference
 - `nativelib/src/main/jni/whisper/`
   - JNI bridge and native whisper.cpp build
 
@@ -501,6 +512,14 @@ Current layers include:
 - separate real-model semantic evaluation
 
 A passing JVM test suite does not prove model-language quality, and a successful diagnostic upload is not a substitute for survey-upload acceptance.
+
+### App-local AI runtime evidence
+
+The Step 22–27F refactor reported a 303/303 JVM regression pass and successful Android test-source compilation. Android instrumentation T1–T10 has individual PASS reports. T6, T9, and T10 were executed after the Step 27F single-flight-close correction; T1–T5 and T7–T8 are pre-27F historical results and were not all rerun against the same post-27F APK.
+
+This is adapter/native lifecycle evidence, not evidence of production call-site migration. In particular, T10 injects a synthetic `Unconfirmed` adapter observation only after real delegated cleanup was confirmed; it is not a genuine LiteRT cleanup-failure result.
+
+The suite does not directly establish the exact argument delivered to `SLM.cancel(expectedRunId)`, recovery from a genuine LiteRT cleanup failure, native watchdog/stall recovery, LiteRT/Whisper coordinator handoff, process-global native-memory reclamation, process-death recovery, or unexpected adapter-scope cancellation during cleanup. Validation excluded `-x :app:verifySwahiliAsrModel` because the required local Swahili ASR model artifact was unavailable; that verifier was not claimed to pass.
 
 See [ROADMAP.md](ROADMAP.md) for validated areas and [TODO.md](TODO.md) for pending benchmark/acceptance work.
 
