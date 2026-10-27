@@ -1,0 +1,12 @@
+{
+  "original_branch": "fix/whisper-gemma-gpu-crash",
+  "branch_slug": "fix-whisper-gemma-gpu-crash",
+  "commit_sha": "7b1e58e175336cde136ec45ffb450bbe3eb87479",
+  "short_sha": "7b1e58e",
+  "apk_name": "Survey2026-fix-whisper-gemma-gpu-crash-7b1e58e.apk",
+  "apk_sha256": "905c253fe0f7ec1144ac1fd37e0c31455c2032a0b61cbdd7e20d7283a70df85a",
+  "apk_download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-fix-whisper-gemma-gpu-crash-7b1e58e-run-151/Survey2026-fix-whisper-gemma-gpu-crash-7b1e58e.apk",
+  "page_url": "https://ishizuki-tech.github.io/Survey2026/fix-whisper-gemma-gpu-crash/",
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/40557361376",
+  "generated_utc": "2026-10-27T18:17:44Z"
+}
