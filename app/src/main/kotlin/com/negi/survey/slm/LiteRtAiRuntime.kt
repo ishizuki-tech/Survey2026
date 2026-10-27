@@ -97,6 +97,8 @@ internal class LiteRtRepositoryRuntimeBridge(
 internal class LiteRtAiRuntime(
     private val bridge: LiteRtRuntimeBridge,
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
+    private val afterCancellationHandleCapture: (suspend () -> Unit)? = null,
+    private val afterDriverRetirement: (() -> Unit)? = null,
 ) : AiRuntime {
     private data class Active(
         val request: AiGenerationRequest,
@@ -158,16 +160,19 @@ internal class LiteRtAiRuntime(
 
     override fun cancel(generationId: AiGenerationId) {
         scope.launch {
-            val shouldCancel = mutex.withLock {
+            val runtimeGeneration = mutex.withLock {
                 val current = active
-                if (current == null || current.request.generationId != generationId || current.logicalTerminal) false
+                if (current == null || current.request.generationId != generationId || current.logicalTerminal) null
                 else {
                     current.logicalTerminal = true
                     current.events.trySend(AiGenerationEvent.Cancelled(generationId))
-                    true
+                    current.runtimeGeneration
                 }
             }
-            if (shouldCancel) mutex.withLock { active }?.runtimeGeneration?.cancel()
+            if (runtimeGeneration != null) {
+                afterCancellationHandleCapture?.invoke()
+                runtimeGeneration.cancel()
+            }
         }
     }
 
@@ -307,6 +312,7 @@ internal class LiteRtAiRuntime(
                         if (active === generation) active = null
                         if (state == AiRuntimeState.GENERATING) state = AiRuntimeState.READY
                     }
+                    afterDriverRetirement?.invoke()
                 }
             }
         }

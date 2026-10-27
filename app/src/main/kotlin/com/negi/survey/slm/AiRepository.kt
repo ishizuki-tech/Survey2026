@@ -105,19 +105,28 @@ internal sealed interface LiteRtCleanupObservation {
 internal class LiteRtRepositoryGeneration internal constructor(
     val generationId: com.negi.aicore.AiGenerationId,
     val requestId: Long,
+    private val afterCancellationRequested: (() -> Unit)? = null,
 ) {
     private val cancellationRequested = AtomicBoolean(false)
     private val nativeRunId = AtomicLong(0L)
     private val cancellationDispatcher = AtomicReference<(() -> Unit)?>(null)
+    private val cancellationDispatcherDelivered = AtomicBoolean(false)
 
     fun cancel() {
         if (!cancellationRequested.compareAndSet(false, true)) return
-        cancellationDispatcher.get()?.invoke()
+        afterCancellationRequested?.invoke()
+        dispatchCancellationIfReady()
     }
 
     internal fun installCancellationDispatcher(dispatcher: () -> Unit) {
         cancellationDispatcher.set(dispatcher)
-        if (cancellationRequested.get()) dispatcher()
+        dispatchCancellationIfReady()
+    }
+
+    private fun dispatchCancellationIfReady() {
+        if (!cancellationRequested.get()) return
+        val dispatcher = cancellationDispatcher.get() ?: return
+        if (cancellationDispatcherDelivered.compareAndSet(false, true)) dispatcher()
     }
 
     internal fun publishNativeRunId(runId: Long) {
@@ -127,6 +136,37 @@ internal class LiteRtRepositoryGeneration internal constructor(
     }
 
     internal fun nativeRunIdOrNull(): Long? = nativeRunId.get().takeIf { it > 0L }
+}
+
+/** Per-request latch that dispatches one cancellation after the owning native run ID is known. */
+internal class LiteRtScopedCancellation(
+    private val dispatch: (expectedRunId: Long) -> Unit,
+) {
+    private val cancelIssued = AtomicBoolean(false)
+    private val scopedCancelDispatched = AtomicBoolean(false)
+    private val liteRtRunId = AtomicLong(0L)
+
+    fun issueCancel(): Boolean {
+        if (!cancelIssued.compareAndSet(false, true)) return false
+        dispatchIfReady()
+        return true
+    }
+
+    fun publishRunId(runId: Long): Boolean {
+        val published = liteRtRunId.compareAndSet(0L, runId)
+        if (!published && liteRtRunId.get() != runId) return false
+        dispatchIfReady()
+        return true
+    }
+
+    fun publishedRunId(): Long = liteRtRunId.get()
+
+    private fun dispatchIfReady() {
+        if (!cancelIssued.get()) return
+        val expectedRunId = liteRtRunId.get()
+        if (expectedRunId <= 0L) return
+        if (scopedCancelDispatched.compareAndSet(false, true)) dispatch(expectedRunId)
+    }
 }
 
 /**
@@ -1338,10 +1378,24 @@ class LiteRtRepository(
             val collectorClosed = AtomicBoolean(false)
             val gateActive = AtomicBoolean(false)
             val inferenceStarted = AtomicBoolean(false)
-            val cancelIssued = AtomicBoolean(false)
-            val scopedCancelDispatched = AtomicBoolean(false)
-            val liteRtRunId = AtomicLong(0L)
             val cancelTag = AtomicReference<String?>(null)
+
+            val scopedCancellation = LiteRtScopedCancellation { expectedRunId ->
+                repoScope.launch {
+                    runCatchingSuspend {
+                        runCancelOnSlmThread {
+                            SLM.cancel(
+                                model = model,
+                                expectedRunId = expectedRunId,
+                            )
+                        }
+                    }.onFailure { e ->
+                        val tag = cancelTag.get()
+                        RuntimeLogStore.w(TAG, "[$requestId] cancel failed tag='$tag': ${DiagnosticContentPolicy.errorDescription(e)}", e)
+                        AiTrace.ringW(TAG, "[$requestId] cancel failed tag='$tag' err=${DiagnosticContentPolicy.errorDescription(e)}", e)
+                    }
+                }
+            }
 
             /**
              * Installed after gate acquisition so awaitClose can arm a bounded
@@ -1360,34 +1414,9 @@ class LiteRtRepository(
                 AiTrace.ringW(TAG, "[$requestId] FORCE_REINIT=true reason='$reason'")
             }
 
-            fun dispatchScopedCancelIfReady() {
-                if (!cancelIssued.get()) return
-
-                val expectedRunId = liteRtRunId.get()
-                if (expectedRunId <= 0L) return
-                if (!scopedCancelDispatched.compareAndSet(false, true)) return
-
-                repoScope.launch {
-                    runCatchingSuspend {
-                        runCancelOnSlmThread {
-                            SLM.cancel(
-                                model = model,
-                                expectedRunId = expectedRunId,
-                            )
-                        }
-                    }.onFailure { e ->
-                        val tag = cancelTag.get()
-                        RuntimeLogStore.w(TAG, "[$requestId] cancel failed tag='$tag': ${DiagnosticContentPolicy.errorDescription(e)}", e)
-                        AiTrace.ringW(TAG, "[$requestId] cancel failed tag='$tag' err=${DiagnosticContentPolicy.errorDescription(e)}", e)
-                    }
-                }
-            }
-
             fun issueBackendCancel(tag: String) {
                 cancelTag.compareAndSet(null, tag)
-                if (!cancelIssued.compareAndSet(false, true)) return
-
-                dispatchScopedCancelIfReady()
+                if (!scopedCancellation.issueCancel()) return
 
                 RuntimeLogStore.w(TAG, "[$requestId] cancel requested tag='$tag'")
                 AiTrace.ringW(TAG, "[$requestId] cancel requested tag='$tag'")
@@ -1527,7 +1556,7 @@ class LiteRtRepository(
                                     synchronized(outLock) { fullOut.toString() }
                                 traceContext?.emit(
                                     RepositoryTraceEvent.Finished(
-                                        requestId, outText, reason, cause?.message, liteRtRunId.get()
+                                        requestId, outText, reason, cause?.message, scopedCancellation.publishedRunId()
                                     )
                                 )
 
@@ -2293,19 +2322,15 @@ class LiteRtRepository(
                                         },
                                         onRunStarted = { runId ->
                                             generation?.publishNativeRunId(runId)
-                                            val published =
-                                                liteRtRunId.compareAndSet(0L, runId)
-
-                                            if (!published && liteRtRunId.get() != runId) {
+                                            if (!scopedCancellation.publishRunId(runId)) {
                                                 RuntimeLogStore.e(
                                                     TAG,
                                                     "[$requestId] conflicting LiteRtLM run publication: " +
-                                                            "current=${liteRtRunId.get()} received=$runId",
+                                                            "current=${scopedCancellation.publishedRunId()} received=$runId",
                                                 )
                                                 return@runInference
                                             }
 
-                                            dispatchScopedCancelIfReady()
                                         },
                                         )
                                     }

@@ -20,6 +20,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.yield
+import java.util.Collections
+import java.util.concurrent.ConcurrentHashMap
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -135,6 +137,61 @@ class LiteRtAiRuntimeTest {
         assertEquals(listOf(id), bridge.cancelledGenerationIds)
         bridge.nativeTermination.complete(Unit)
         job.join()
+    }
+
+    @Test fun staleCancellationDispatchTargetsCapturedGenerationAfterSuccessorStarts() = runBlocking {
+        val bridge = PerGenerationFakeBridge()
+        val cancellationCaptured = CompletableDeferred<Unit>()
+        val releaseCancellation = CompletableDeferred<Unit>()
+        val firstDriverRetired = CompletableDeferred<Unit>()
+        val scopeJob = SupervisorJob()
+        val runtime = LiteRtAiRuntime(
+            bridge = bridge,
+            scope = CoroutineScope(scopeJob + Dispatchers.Default),
+            afterCancellationHandleCapture = {
+                cancellationCaptured.complete(Unit)
+                releaseCancellation.await()
+            },
+            afterDriverRetirement = { firstDriverRetired.complete(Unit) },
+        )
+        val first = AiGenerationId.create()
+        val second = AiGenerationId.create()
+        val firstEvents = mutableListOf<AiGenerationEvent>()
+        val secondEvents = mutableListOf<AiGenerationEvent>()
+        var firstJob: kotlinx.coroutines.Job? = null
+        var secondJob: kotlinx.coroutines.Job? = null
+        try {
+            runtime.prepare(model, AiRuntimeConfig())
+            firstJob = launch { runtime.generate(AiGenerationRequest(first, "first")).toList(firstEvents) }
+            withTimeout(1_000) { bridge.started(first).await() }
+
+            runtime.cancel(first)
+            withTimeout(1_000) { cancellationCaptured.await() }
+            bridge.completeLogically(first)
+            bridge.completeNativeTermination(first)
+            withTimeout(1_000) { firstDriverRetired.await() }
+
+            secondJob = launch { runtime.generate(AiGenerationRequest(second, "second")).toList(secondEvents) }
+            withTimeout(1_000) { bridge.started(second).await() }
+            releaseCancellation.complete(Unit)
+            withTimeout(1_000) { bridge.cancelled(first).await() }
+            assertEquals(listOf(first), bridge.cancelledGenerationIds)
+
+            bridge.completeLogically(second)
+            bridge.completeNativeTermination(second)
+            withTimeout(1_000) { firstJob.join(); secondJob.join() }
+
+            assertEquals(listOf("Started", "Cancelled", "NativeTerminated"), firstEvents.map { it::class.simpleName })
+            assertEquals(listOf("Started", "Completed", "NativeTerminated"), secondEvents.map { it::class.simpleName })
+            assertFalse(secondEvents.any { it is AiGenerationEvent.Cancelled || it is AiGenerationEvent.Failed })
+        } finally {
+            releaseCancellation.complete(Unit)
+            bridge.release(first)
+            bridge.release(second)
+            firstJob?.cancelAndJoin()
+            secondJob?.cancelAndJoin()
+            scopeJob.cancel()
+        }
     }
 
     @Test fun concurrentCloseCallersShareOnePendingFlightAndOneBridgeClose() = runBlocking {
@@ -270,5 +327,49 @@ class LiteRtAiRuntimeTest {
                 ?: LiteRtCleanupObservation.Confirmed
         }
         fun completeLogically() { logicalCompletion.complete(Unit) }
+    }
+
+    private class PerGenerationFakeBridge : LiteRtRuntimeBridge {
+        private data class GenerationControl(
+            val started: CompletableDeferred<Unit> = CompletableDeferred(),
+            val logicalCompletion: CompletableDeferred<Unit> = CompletableDeferred(),
+            val nativeTermination: CompletableDeferred<Unit> = CompletableDeferred(),
+            val cancelled: CompletableDeferred<Unit> = CompletableDeferred(),
+        )
+
+        private val controls = ConcurrentHashMap<AiGenerationId, GenerationControl>()
+        val cancelledGenerationIds = Collections.synchronizedList(mutableListOf<AiGenerationId>())
+
+        override suspend fun prepare(model: AiModel, config: AiRuntimeConfig) = LiteRtReadinessObservation.Ready
+
+        override fun startGeneration(request: AiGenerationRequest): LiteRtRuntimeGeneration {
+            val control = controls.computeIfAbsent(request.generationId) { GenerationControl() }
+            control.started.complete(Unit)
+            return object : LiteRtRuntimeGeneration {
+                override val responses: Flow<String> = flow { control.logicalCompletion.await() }
+                override fun cancel() {
+                    cancelledGenerationIds += request.generationId
+                    control.cancelled.complete(Unit)
+                }
+            }
+        }
+
+        override suspend fun awaitNativeTermination(generationId: AiGenerationId): LiteRtCleanupObservation {
+            controls.getValue(generationId).nativeTermination.await()
+            return LiteRtCleanupObservation.Confirmed
+        }
+
+        override suspend fun close() = LiteRtCleanupObservation.Confirmed
+
+        private fun control(id: AiGenerationId) = controls.computeIfAbsent(id) { GenerationControl() }
+
+        fun started(id: AiGenerationId) = control(id).started
+        fun cancelled(id: AiGenerationId) = control(id).cancelled
+        fun completeLogically(id: AiGenerationId) = control(id).logicalCompletion.complete(Unit)
+        fun completeNativeTermination(id: AiGenerationId) = control(id).nativeTermination.complete(Unit)
+        fun release(id: AiGenerationId) {
+            completeLogically(id)
+            completeNativeTermination(id)
+        }
     }
 }
