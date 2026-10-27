@@ -31,7 +31,6 @@ import java.io.FileOutputStream
 import kotlinx.coroutines.runBlocking
 import org.json.JSONArray
 import org.json.JSONObject
-import org.junit.Assert.assertFalse
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Rule
@@ -183,7 +182,7 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
         val transcript = try {
             runBlocking {
                 // Adopt the already-real LiteRT runtime, then use the same production
-                // coordinator transition that releases it before Whisper acquisition.
+                // coordinator transition that acquires Whisper while LiteRT stays resident.
                 coordinator.heavyRuntimeCoordinator.withLiteRt(
                     runtimeIdentity = runtimeIdentity,
                     releaseLiteRt = { SLM.forceCleanUpAndWait(model) },
@@ -218,8 +217,8 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
                 )
             }
         }
-        assertFalse(
-            "Whisper must be released before LiteRT reinitialization completes",
+        assertTrue(
+            "Whisper must stay resident across inference on the same LiteRT runtime",
             WhisperEngine.isInitializedForAsset(ISSUE77_WHISPER_MODEL_ASSET),
         )
 
