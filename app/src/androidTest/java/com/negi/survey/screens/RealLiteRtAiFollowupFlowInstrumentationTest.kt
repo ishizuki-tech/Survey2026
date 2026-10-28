@@ -32,6 +32,7 @@ import kotlinx.coroutines.runBlocking
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
@@ -217,8 +218,8 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
                 )
             }
         }
-        assertTrue(
-            "Whisper must stay resident across inference on the same LiteRT runtime",
+        assertFalse(
+            "Whisper must be released when the answer is submitted to LiteRT",
             WhisperEngine.isInitializedForAsset(ISSUE77_WHISPER_MODEL_ASSET),
         )
 

@@ -58,7 +58,7 @@ class HeavyRuntimeCoordinatorTest {
     }
 
     @Test
-    fun voice_answer_cycle_keeps_both_runtimes_resident() = runTest {
+    fun voice_answer_cycle_keeps_litert_resident_and_releases_whisper_on_submit() = runTest {
         val events = mutableListOf<String>()
         val coordinator = coordinator(
             releaseLiteRt = { events += "release-litert" },
@@ -72,7 +72,11 @@ class HeavyRuntimeCoordinatorTest {
         }
 
         assertEquals(
-            listOf("litert", "whisper", "litert", "whisper", "litert"),
+            listOf(
+                "litert",
+                "whisper", "release-whisper", "litert",
+                "whisper", "release-whisper", "litert",
+            ),
             events,
         )
     }
@@ -149,6 +153,7 @@ class HeavyRuntimeCoordinatorTest {
             listOf(
                 "litert-initial",
                 "whisper-acquired",
+                "release-whisper",
                 "litert-reacquired",
             ),
             events,

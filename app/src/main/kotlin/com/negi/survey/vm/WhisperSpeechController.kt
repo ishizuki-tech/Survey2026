@@ -198,6 +198,30 @@ class WhisperSpeechController(
     }
 
     // ---------------------------------------------------------------------
+    // Model preload
+    // ---------------------------------------------------------------------
+
+    private var preloadJob: Job? = null
+
+    /**
+     * Loads Whisper in the background while a question is being read aloud. The heavy-runtime
+     * coordinator releases it again before the answer is submitted to the language model.
+     */
+    override fun preloadModel() {
+        if (preloadJob?.isActive == true) return
+        preloadJob = viewModelScope.launch(Dispatchers.IO) {
+            try {
+                ensureModelInitializedFromAssetsOnce()
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (t: Throwable) {
+                // startRecording() retries the init and surfaces the error to the user.
+                DiagnosticContentPolicy.logWarning(TAG, "preloadModel failed", t)
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------
     // Recording control
     // ---------------------------------------------------------------------
 
