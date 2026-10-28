@@ -1,0 +1,12 @@
+{
+  "original_branch": "fix/128-upload-409-conflict-retry",
+  "branch_slug": "fix-128-upload-409-conflict-retry",
+  "commit_sha": "e847d73e9912e790d4291f528d11541740a6b7ed",
+  "short_sha": "e847d73",
+  "apk_name": "Survey2026-fix-128-upload-409-conflict-retry-e847d73.apk",
+  "apk_sha256": "69953630f3b0dd2ebfff23c756dbfbc1563e325c2a3646bd0ee86eddd5384eda",
+  "apk_download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-fix-128-upload-409-conflict-retry-e847d73-run-154/Survey2026-fix-128-upload-409-conflict-retry-e847d73.apk",
+  "page_url": "https://ishizuki-tech.github.io/Survey2026/fix-128-upload-409-conflict-retry/",
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/40789913062",
+  "generated_utc": "2026-10-28T23:54:10Z"
+}
