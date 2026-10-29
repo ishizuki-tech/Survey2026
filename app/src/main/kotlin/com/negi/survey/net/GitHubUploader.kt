@@ -84,6 +84,14 @@ object GitHubUploader {
     private const val MAX_BACKOFF_MS = 120_000L
 
     /**
+     * PUT attempts when the commit races another commit to the same branch (409 Conflict).
+     * A finished survey uploads many files in parallel, each as its own commit (issue #128).
+     */
+    private const val MAX_CONFLICT_ATTEMPTS = 5
+    private const val CONFLICT_BASE_DELAY_MS = 400L
+    private const val CONFLICT_MAX_DELAY_MS = 8_000L
+
+    /**
      * Configuration container for GitHub upload operations.
      *
      * When using cfg overloads (dated path mode):
@@ -385,7 +393,8 @@ object GitHubUploader {
      * 4) Parse JSON response.
      *
      * Special:
-     * - If PUT fails with 409 Conflict, re-fetch SHA and retry PUT once.
+     * - If PUT fails with 409 Conflict (the branch head moved because another commit landed
+     *   first), wait a jittered delay, re-fetch SHA and retry, up to [MAX_CONFLICT_ATTEMPTS].
      */
     private suspend fun uploadStream(
         owner: String,
@@ -433,51 +442,44 @@ object GitHubUploader {
         var existingSha = getExistingSha(owner, repoName, branch, encodedPath, token)
         onProgress(10)
 
-        // Phase 2 — PUT with streaming body (may retry once on 409)
-        try {
-            val response = putContents(
-                owner = owner,
-                repoName = repoName,
-                branch = branch,
-                path = path,
-                encodedPath = encodedPath,
-                token = token,
-                rawSize = rawSize,
-                openStream = openStream,
-                message = message,
-                sha = existingSha,
-                onProgress = onProgress,
-                maxRequestBytesHint = maxRequestBytesHint
-            )
+        // Phase 2 — PUT with streaming body (retried on 409 commit races)
+        var attempt = 1
+        var response: HttpResponse? = null
+        while (response == null) {
+            try {
+                response = putContents(
+                    owner = owner,
+                    repoName = repoName,
+                    branch = branch,
+                    path = path,
+                    encodedPath = encodedPath,
+                    token = token,
+                    rawSize = rawSize,
+                    openStream = openStream,
+                    message = message,
+                    sha = existingSha,
+                    onProgress = onProgress,
+                    maxRequestBytesHint = maxRequestBytesHint
+                )
+            } catch (e: HttpFailureException) {
+                if (e.code != 409 || attempt >= MAX_CONFLICT_ATTEMPTS) throw e
 
-            onProgress(95)
-            return@withContext parseUploadResult(response.body)
-
-        } catch (e: HttpFailureException) {
-            if (e.code != 409) throw e
-
-            // 409 Conflict: SHA mismatch or concurrent update; refresh SHA and retry once.
-            Log.w(TAG, "uploadStream: 409 Conflict; refreshing SHA and retrying once.")
-            existingSha = getExistingSha(owner, repoName, branch, encodedPath, token)
-
-            val response2 = putContents(
-                owner = owner,
-                repoName = repoName,
-                branch = branch,
-                path = path,
-                encodedPath = encodedPath,
-                token = token,
-                rawSize = rawSize,
-                openStream = openStream,
-                message = message,
-                sha = existingSha,
-                onProgress = onProgress,
-                maxRequestBytesHint = maxRequestBytesHint
-            )
-
-            onProgress(95)
-            return@withContext parseUploadResult(response2.body)
+                // 409 Conflict: another commit moved the branch head (or the file SHA changed).
+                // Spread parallel uploads apart, then retry against the current state.
+                val delayMs = conflictRetryDelayMs(attempt)
+                Log.w(
+                    TAG,
+                    "uploadStream: 409 Conflict (attempt $attempt/$MAX_CONFLICT_ATTEMPTS); " +
+                            "refreshing SHA and retrying in ${delayMs}ms."
+                )
+                delay(delayMs)
+                existingSha = getExistingSha(owner, repoName, branch, encodedPath, token)
+                attempt++
+            }
         }
+
+        onProgress(95)
+        parseUploadResult(response.body)
     }
 
     // ---------------------------------------------------------------------
@@ -818,6 +820,19 @@ object GitHubUploader {
         }
 
         return computeBackoffMs(attempt)
+    }
+
+    /**
+     * Delay before retrying a PUT after its [attempt]-th 409 Conflict.
+     *
+     * Exponential from [CONFLICT_BASE_DELAY_MS], capped at [CONFLICT_MAX_DELAY_MS], with the
+     * actual delay drawn from the upper half of that window so that uploads which conflicted
+     * at the same moment retry at different times.
+     */
+    internal fun conflictRetryDelayMs(attempt: Int, random: Random = Random): Long {
+        val pow = (attempt - 1).coerceIn(0, 10)
+        val cap = (CONFLICT_BASE_DELAY_MS shl pow).coerceAtMost(CONFLICT_MAX_DELAY_MS)
+        return random.nextLong(from = cap / 2, until = cap + 1)
     }
 
     /**

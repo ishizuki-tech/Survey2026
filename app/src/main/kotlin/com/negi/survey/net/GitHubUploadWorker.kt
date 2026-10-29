@@ -2375,82 +2375,6 @@ class GitHubUploadWorker(
             .trim('_')
             .take(96)
 
-    private fun shouldRetry(t: Throwable): Boolean {
-        val message =
-            t.message.orEmpty()
-
-        if (
-            message.startsWith(
-                "Transient HTTP ",
-                ignoreCase = true
-            )
-        ) {
-            return true
-        }
-
-        if (
-            message.contains(
-                "rate limit",
-                ignoreCase = true
-            ) ||
-            message.contains(
-                "secondary rate",
-                ignoreCase = true
-            ) ||
-            message.contains(
-                "abuse detection",
-                ignoreCase = true
-            )
-        ) {
-            return true
-        }
-
-        val httpCode =
-            Regex("""\((\d{3})\)""")
-                .find(message)
-                ?.groupValues
-                ?.getOrNull(1)
-                ?.toIntOrNull()
-
-        if (httpCode != null) {
-            if (
-                httpCode in 500..599 ||
-                httpCode == 408 ||
-                httpCode == 425 ||
-                httpCode == 429
-            ) {
-                return true
-            }
-
-            if (httpCode in 400..499) {
-                return false
-            }
-        }
-
-        if (
-            message.contains(
-                "too large",
-                ignoreCase = true
-            ) ||
-            message.contains(
-                "bad credentials",
-                ignoreCase = true
-            ) ||
-            message.contains(
-                "requires authentication",
-                ignoreCase = true
-            )
-        ) {
-            return false
-        }
-
-        return t is IOException ||
-                message.contains(
-                    "timeout",
-                    ignoreCase = true
-                )
-    }
-
     companion object {
         const val TAG = "github_upload"
 
@@ -2571,6 +2495,87 @@ class GitHubUploadWorker(
         const val OUT_RING_TOTAL_BYTES = "out.ringTotalBytes"
 
         const val ERROR_MESSAGE = "error"
+
+        /**
+         * Whether a failed upload should be retried by WorkManager instead of failing for good.
+         */
+        internal fun shouldRetry(t: Throwable): Boolean {
+            val message =
+                t.message.orEmpty()
+
+            if (
+                message.startsWith(
+                    "Transient HTTP ",
+                    ignoreCase = true
+                )
+            ) {
+                return true
+            }
+
+            if (
+                message.contains(
+                    "rate limit",
+                    ignoreCase = true
+                ) ||
+                message.contains(
+                    "secondary rate",
+                    ignoreCase = true
+                ) ||
+                message.contains(
+                    "abuse detection",
+                    ignoreCase = true
+                )
+            ) {
+                return true
+            }
+
+            val httpCode =
+                Regex("""\((\d{3})\)""")
+                    .find(message)
+                    ?.groupValues
+                    ?.getOrNull(1)
+                    ?.toIntOrNull()
+
+            if (httpCode != null) {
+                // 409: the commit raced another commit to the same branch (issue #128).
+                if (
+                    httpCode in 500..599 ||
+                    httpCode == 408 ||
+                    httpCode == 409 ||
+                    httpCode == 425 ||
+                    httpCode == 429
+                ) {
+                    return true
+                }
+
+                if (httpCode in 400..499) {
+                    return false
+                }
+            }
+
+            if (
+                message.contains(
+                    "too large",
+                    ignoreCase = true
+                ) ||
+                message.contains(
+                    "bad credentials",
+                    ignoreCase = true
+                ) ||
+                message.contains(
+                    "requires authentication",
+                    ignoreCase = true
+                )
+            ) {
+                return false
+            }
+
+            return t is IOException ||
+                    message.contains(
+                        "timeout",
+                        ignoreCase = true
+                    )
+        }
 
         private fun estimateBase64RequestBytes(rawBytes: Long): Long {
             val raw = rawBytes.coerceAtLeast(1L)
