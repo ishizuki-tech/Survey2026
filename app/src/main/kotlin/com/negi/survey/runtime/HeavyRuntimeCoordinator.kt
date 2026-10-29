@@ -47,12 +47,10 @@ object NoOpHeavyRuntimeHandoff : HeavyRuntimeHandoff {
  * - LiteRT-LM stays resident while Whisper initializes and records. Re-initializing the
  *   LiteRT-LM GPU engine after every dictated answer caused multi-second whole-GPU stalls
  *   and Adreno driver process kills on the Galaxy S25 (issue #125).
- * - Whisper (CPU-only) also stays resident across inferences on an already-owned LiteRT-LM
- *   runtime, which avoids a Whisper re-init on every mic tap. S25 measurements in #125
- *   showed about 2.1 GB MemAvailable at worst with both runtimes resident.
- * - Whisper is released before a LiteRT-LM runtime the coordinator does not already own is
- *   acquired (first acquisition or a different identity), so a coordinated LiteRT-LM GPU
- *   initialization does not run alongside a resident Whisper context.
+ * - Whisper (CPU-only) is loaded for answering a question (the AI screen preloads it while
+ *   the prompt is read aloud) and is released before every LiteRT-LM acquisition, which
+ *   during a survey means when the answer is submitted to the model. LiteRT-LM
+ *   initialization and inference therefore never run alongside a resident Whisper context.
  * - A different LiteRT-LM identity releases the previous LiteRT-LM runtime first.
  */
 class HeavyRuntimeCoordinator(
@@ -69,12 +67,10 @@ class HeavyRuntimeCoordinator(
         acquire: suspend () -> T,
     ): T =
         transitionMutex.withLock {
+            releaseResidentWhisper()
             val sameRuntime = activeLiteRtIdentity == runtimeIdentity
-            if (!sameRuntime) {
-                releaseResidentWhisper()
-                if (activeLiteRtIdentity != null) {
-                    releaseOwnedLiteRt()
-                }
+            if (!sameRuntime && activeLiteRtIdentity != null) {
+                releaseOwnedLiteRt()
             }
 
             try {
