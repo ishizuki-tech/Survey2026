@@ -79,6 +79,7 @@ class WhisperSpeechController(
     private val assetModelPath: String = DEFAULT_ASSET_MODEL,
     languageCode: String = DEFAULT_LANGUAGE,
     private val onVoiceExported: ((ExportedVoice) -> Unit)? = null,
+    private val onVoiceTranscribed: ((TranscribedVoice) -> Unit)? = null,
     private val heavyRuntimeHandoff: HeavyRuntimeHandoff = NoOpHeavyRuntimeHandoff,
     private val recorderFactory: ((Context, (Exception) -> Unit) -> RecorderBackend)? = null,
     private val modelInitializer: (suspend () -> Unit)? = null,
@@ -117,6 +118,7 @@ class WhisperSpeechController(
             assetModelPath: String = DEFAULT_ASSET_MODEL,
             languageCode: String = DEFAULT_LANGUAGE,
             onVoiceExported: ((ExportedVoice) -> Unit)? = null,
+            onVoiceTranscribed: ((TranscribedVoice) -> Unit)? = null,
             heavyRuntimeHandoff: HeavyRuntimeHandoff = NoOpHeavyRuntimeHandoff,
         ): ViewModelProvider.Factory =
             object : ViewModelProvider.Factory {
@@ -130,6 +132,7 @@ class WhisperSpeechController(
                         assetModelPath = assetModelPath,
                         languageCode = languageCode,
                         onVoiceExported = onVoiceExported,
+                        onVoiceTranscribed = onVoiceTranscribed,
                         heavyRuntimeHandoff = heavyRuntimeHandoff,
                     ) as T
                 }
@@ -144,7 +147,17 @@ class WhisperSpeechController(
         val questionId: String?,
         val fileName: String,
         val byteSize: Long,
-        val checksum: String? = null
+        val checksum: String? = null,
+        /** Prompt this recording answered (main question or follow-up), when known. */
+        val prompt: String? = null
+    )
+
+    /** Non-empty transcript produced for one exported recording. */
+    data class TranscribedVoice(
+        val surveyId: String?,
+        val questionId: String?,
+        val fileName: String,
+        val transcript: String
     )
 
     // ---------------------------------------------------------------------
@@ -153,12 +166,14 @@ class WhisperSpeechController(
 
     private var currentSurveyId: String? = null
     private var currentQuestionId: String? = null
+    private var currentPrompt: Pair<String, String>? = null
 
     /** All mutable recording resources belong to exactly one recording session. */
     private class RecordingSession(
         val id: Long,
         val surveyId: String?,
-        val questionId: String?
+        val questionId: String?,
+        val prompt: String?
     ) {
         var recorder: RecorderBackend? = null
         var outputFile: File? = null
@@ -205,6 +220,12 @@ class WhisperSpeechController(
         WhisperTraceRegistry.event(surveyId, questionId, "WHISPER_CONTEXT_UPDATED")
     }
 
+    override fun updatePrompt(questionId: String?, prompt: String?) {
+        val qid = questionId?.trim().orEmpty()
+        val text = prompt?.trim().orEmpty()
+        currentPrompt = if (qid.isNotEmpty() && text.isNotEmpty()) qid to text else null
+    }
+
     // ---------------------------------------------------------------------
     // Model preload
     // ---------------------------------------------------------------------
@@ -244,10 +265,13 @@ class WhisperSpeechController(
             return
         }
 
+        val questionId = currentQuestionId
         val session = RecordingSession(
             id = nextSessionId.incrementAndGet(),
             surveyId = currentSurveyId,
-            questionId = currentQuestionId
+            questionId = questionId,
+            // Only use a prompt recorded for this same question; a stale one is ignored.
+            prompt = currentPrompt?.takeIf { it.first == questionId?.trim() }?.second
         )
         if (!activeSession.compareAndSet(null, session)) {
             _error.value = "Previous recording is still finalizing"
@@ -427,7 +451,8 @@ class WhisperSpeechController(
                                 questionId = session.questionId,
                                 fileName = exported.name,
                                 byteSize = exported.length(),
-                                checksum = checksum
+                                checksum = checksum,
+                                prompt = session.prompt
                             )
                         )
                         WhisperTraceRegistry.event(session.surveyId, session.questionId, "AUDIO_EXPORTED", mapOf("fileName" to exported.name, "byteSize" to exported.length()))
@@ -483,6 +508,16 @@ class WhisperSpeechController(
                                     "success" to true,
                                     "language" to normalizedLanguage,
                                 ))
+                                if (exported != null) {
+                                    onVoiceTranscribed?.invoke(
+                                        TranscribedVoice(
+                                            surveyId = session.surveyId,
+                                            questionId = session.questionId,
+                                            fileName = exported.name,
+                                            transcript = trimmed
+                                        )
+                                    )
+                                }
                             }
                             updatePartialText(trimmed)
                         }

@@ -599,7 +599,11 @@ open class SurveyViewModel(
         val fileName: String,
         val createdAt: Long = System.currentTimeMillis(),
         val byteSize: Long? = null,
-        val checksum: String? = null
+        val checksum: String? = null,
+        /** Prompt this recording answered (main question or follow-up); null when unknown. */
+        val prompt: String? = null,
+        /** Whisper transcript of this recording; null until transcription succeeds. */
+        val transcript: String? = null
     )
 
     private val _recordedAudioRefs = MutableStateFlow<Map<String, List<AudioRef>>>(LinkedHashMap())
@@ -611,7 +615,8 @@ open class SurveyViewModel(
         fileName: String,
         byteSize: Long? = null,
         checksum: String? = null,
-        dedupByFileName: Boolean = true
+        dedupByFileName: Boolean = true,
+        prompt: String? = null
     ) {
         val qid = questionId.trim()
         val sid = surveyUuid.value
@@ -628,7 +633,8 @@ open class SurveyViewModel(
                         questionId = qid,
                         fileName = fileName,
                         byteSize = byteSize,
-                        checksum = checksum
+                        checksum = checksum,
+                        prompt = prompt
                     )
                 )
             }
@@ -644,7 +650,8 @@ open class SurveyViewModel(
         questionId: String,
         fileName: String,
         byteSize: Long? = null,
-        checksum: String? = null
+        checksum: String? = null,
+        prompt: String? = null
     ) {
         val qid = questionId.trim()
         val sid = surveyUuid.value
@@ -657,7 +664,8 @@ open class SurveyViewModel(
                     questionId = qid,
                     fileName = fileName,
                     byteSize = byteSize,
-                    checksum = checksum
+                    checksum = checksum,
+                    prompt = prompt
                 )
             )
             mutable.toImmutableLists()
@@ -725,14 +733,68 @@ open class SurveyViewModel(
         fileName: String,
         byteSize: Long? = null,
         checksum: String? = null,
-        replace: Boolean = false
-    ) {
-        if (replace) {
-            replaceAudioRef(questionId, fileName, byteSize, checksum)
+        replace: Boolean = false,
+        prompt: String? = null
+    ): List<AudioRef> {
+        val discarded = if (replace) {
+            replaceAudioRef(questionId, fileName, byteSize, checksum, prompt)
+            emptyList()
         } else {
-            addAudioRef(questionId, fileName, byteSize, checksum, dedupByFileName = true)
+            removeEarlierTakes(questionId, prompt).also {
+                addAudioRef(questionId, fileName, byteSize, checksum, dedupByFileName = true, prompt = prompt)
+            }
         }
-        RuntimeLogStore.d(TAG, "onVoiceExported -> q=${questionId.trim()}, file=$fileName, replace=$replace")
+        RuntimeLogStore.d(
+            TAG,
+            "onVoiceExported -> q=${questionId.trim()}, file=$fileName, replace=$replace, discarded=${discarded.size}"
+        )
+        return discarded
+    }
+
+    /**
+     * Remove this run's earlier recordings of [questionId] that answered the same [prompt]:
+     * a re-recorded answer keeps only the final take. Recordings without a prompt (such as
+     * Home note dictation, where takes are appended) are never replaced.
+     *
+     * @return The removed references, so the caller can delete their files.
+     */
+    @Synchronized
+    private fun removeEarlierTakes(questionId: String, prompt: String?): List<AudioRef> {
+        val qid = questionId.trim()
+        val key = prompt?.trim()?.takeIf { it.isNotEmpty() } ?: return emptyList()
+        val sid = surveyUuid.value
+        val removed = recordedAudioRefs.value[qid].orEmpty()
+            .filter { it.surveyId == sid && it.prompt?.trim() == key }
+        if (removed.isEmpty()) return emptyList()
+
+        _recordedAudioRefs.update { old ->
+            val mutable = old.mutableLinkedLists<AudioRef>()
+            mutable[qid]?.removeAll { it in removed }
+            if (mutable[qid].isNullOrEmpty()) mutable.remove(qid)
+            mutable.toImmutableLists()
+        }
+        return removed
+    }
+
+    /** Attach a recording's own transcript to its audio reference in the current run. */
+    @Synchronized
+    fun onVoiceTranscribed(questionId: String, fileName: String, transcript: String) {
+        val qid = questionId.trim()
+        val text = transcript.trim()
+        if (qid.isEmpty() || text.isEmpty()) return
+        val sid = surveyUuid.value
+
+        _recordedAudioRefs.update { old ->
+            val list = old[qid] ?: return@update old
+            if (list.none { it.fileName == fileName && it.surveyId == sid }) return@update old
+            val mutable = old.mutableLinkedLists<AudioRef>()
+            mutable[qid] = list.map { ref ->
+                if (ref.fileName == fileName && ref.surveyId == sid) ref.copy(transcript = text) else ref
+            }.toMutableList()
+            mutable.toImmutableLists()
+        }
+
+        RuntimeLogStore.d(TAG, "onVoiceTranscribed -> q=$qid, file=$fileName, length=${text.length}")
     }
 
     /* ───────────────────────────── Prompt Helpers ───────────────────────────── */

@@ -90,6 +90,58 @@ class WhisperSpeechControllerLifecycleTest {
     }
 
     @Test
+    fun recording_reports_its_prompt_on_export_and_its_transcript_afterwards() = runBlocking {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext.applicationContext
+        val recorder = FakeRecorder()
+        val exports = mutableListOf<WhisperSpeechController.ExportedVoice>()
+        val transcripts = mutableListOf<WhisperSpeechController.TranscribedVoice>()
+        val controller = WhisperSpeechController(
+            appContext = context,
+            onVoiceExported = { exports += it },
+            onVoiceTranscribed = { transcripts += it },
+            recorderFactory = { _, _ -> recorder },
+            modelInitializer = {},
+            transcriber = { _, _ -> Result.success(" follow-up answer ") }
+        )
+
+        controller.updateContext("survey-a", "Q7")
+        controller.updatePrompt("Q7", "Follow-up question?")
+        controller.startRecording()
+        waitUntil { recorder.started }
+        controller.stopRecording()
+        waitUntil { !controller.isTranscribing.value && transcripts.isNotEmpty() }
+
+        assertEquals("Follow-up question?", exports.single().prompt)
+        val transcribed = transcripts.single()
+        assertEquals(exports.single().fileName, transcribed.fileName)
+        assertEquals("Q7", transcribed.questionId)
+        assertEquals("follow-up answer", transcribed.transcript)
+    }
+
+    @Test
+    fun prompt_for_another_question_is_not_attached_to_a_recording() = runBlocking {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext.applicationContext
+        val recorder = FakeRecorder()
+        val exports = mutableListOf<WhisperSpeechController.ExportedVoice>()
+        val controller = WhisperSpeechController(
+            appContext = context,
+            onVoiceExported = { exports += it },
+            recorderFactory = { _, _ -> recorder },
+            modelInitializer = {},
+            transcriber = { _, _ -> Result.success("answer") }
+        )
+
+        controller.updatePrompt("Q7", "Stale Q7 prompt?")
+        controller.updateContext("survey-a", "Q8")
+        controller.startRecording()
+        waitUntil { recorder.started }
+        controller.stopRecording()
+        waitUntil { !controller.isTranscribing.value && exports.isNotEmpty() }
+
+        assertEquals(null, exports.single().prompt)
+    }
+
+    @Test
     fun stop_in_progress_rejects_a_replacement_recording() = runBlocking {
         val context = InstrumentationRegistry.getInstrumentation().targetContext.applicationContext
         val recorder = FakeRecorder(holdStop = true)

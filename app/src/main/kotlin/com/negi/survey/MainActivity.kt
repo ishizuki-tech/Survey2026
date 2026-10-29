@@ -153,8 +153,10 @@ import com.negi.survey.slm.Repository
 import com.negi.survey.slm.SLM
 import com.negi.survey.slm.buildModelConfig
 import com.negi.survey.slm.modelIdentityForPath
+import com.negi.survey.ui.theme.ActionBlue
 import com.negi.survey.ui.theme.SurveyNavTheme
 import com.negi.survey.ui.theme.monotoneColors
+import com.negi.survey.utils.ExportUtils
 import com.negi.survey.vm.AiViewModel
 import com.negi.survey.vm.AppViewModel
 import com.negi.survey.vm.DlState
@@ -1379,12 +1381,33 @@ fun SurveyNavHost(
                         "onVoiceExported: q=$resolvedQid, file=${voice.fileName}, bytes=${voice.byteSize}, checksum=${voice.checksum}"
                     )
 
-                    vmSurvey.onVoiceExported(
+                    val discarded = vmSurvey.onVoiceExported(
                         questionId = resolvedQid,
                         fileName = voice.fileName,
                         byteSize = voice.byteSize,
                         checksum = voice.checksum,
-                        replace = false
+                        replace = false,
+                        prompt = voice.prompt
+                    )
+                    // A re-recorded answer keeps only its final take; drop the replaced files.
+                    discarded.forEach { ref ->
+                        val deleted = runCatching {
+                            ExportUtils.deleteExportedVoice(appContext, ref.fileName)
+                        }.getOrDefault(false)
+                        Log.d(
+                            MainActivity.TAG,
+                            "onVoiceExported: discarded earlier take q=$resolvedQid, file=${ref.fileName}, deleted=$deleted"
+                        )
+                    }
+                },
+                onVoiceTranscribed = onVoiceTranscribed@{ voice ->
+                    val resolvedQid =
+                        voice.questionId?.takeIf { it.isNotBlank() } ?: latestNodeIdState.value
+                    if (resolvedQid.isBlank()) return@onVoiceTranscribed
+                    vmSurvey.onVoiceTranscribed(
+                        questionId = resolvedQid,
+                        fileName = voice.fileName,
+                        transcript = voice.transcript
                     )
                 }
             )
@@ -2507,6 +2530,10 @@ private fun HomeFreeTextComposer(
             FilledTonalButton(
                 onClick = onSend,
                 enabled = enabled,
+                colors = ButtonDefaults.filledTonalButtonColors(
+                    containerColor = ActionBlue,
+                    contentColor = Color.White,
+                ),
                 shape = CircleShape,
                 contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp)
             ) {
