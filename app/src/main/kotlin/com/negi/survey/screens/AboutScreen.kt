@@ -172,13 +172,12 @@ fun AboutScreen(onClose: () -> Unit) {
                 ) {
                     Text("Survey Test App", style = MaterialTheme.typography.titleLarge)
                     Spacer(Modifier.height(8.dp))
-                    InfoLine("Version", BuildConfig.DISPLAY_VERSION)
+                    InfoLine("Built", BuildConfig.BUILD_TIMESTAMP)
                     InfoLine("Branch", BuildConfig.GH_BRANCH.ifBlank { "—" })
                     InfoLine("Commit", BuildConfig.GIT_COMMIT_SHA.take(12).ifBlank { "—" })
-                    InfoLine("Built", BuildConfig.BUILD_TIMESTAMP)
                     Spacer(Modifier.height(8.dp))
                     Text(
-                        "App source code: MIT License, © IshizukiTech LLC.",
+                        "App source code: MIT License, © 2026 Ishizuki Tech LLC.",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )

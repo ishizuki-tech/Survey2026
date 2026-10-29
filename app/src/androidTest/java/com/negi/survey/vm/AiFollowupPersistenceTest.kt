@@ -42,6 +42,70 @@ class AiFollowupPersistenceTest {
     }
 
     @Test
+    fun voice_refs_keep_each_recordings_prompt_and_transcript() {
+        lateinit var vm: SurveyViewModel
+
+        composeRule.setContent {
+            val backStack = rememberNavBackStack(FlowHome)
+            vm = remember { SurveyViewModel(backStack, aiConfig()) }
+        }
+
+        composeRule.runOnIdle {
+            vm.onVoiceExported(AI_NODE_ID, "main.wav", prompt = "Main question?")
+            vm.onVoiceExported(AI_NODE_ID, "followup.wav", prompt = "Follow-up question?")
+            vm.onVoiceTranscribed(AI_NODE_ID, "followup.wav", " follow-up answer ")
+            vm.onVoiceTranscribed(AI_NODE_ID, "main.wav", "main answer")
+            vm.onVoiceTranscribed(AI_NODE_ID, "unknown.wav", "ignored")
+
+            val refs = vm.getAudioRefs(AI_NODE_ID)
+            assertEquals(listOf("main.wav", "followup.wav"), refs.map { it.fileName })
+            assertEquals(listOf("Main question?", "Follow-up question?"), refs.map { it.prompt })
+            assertEquals(listOf("main answer", "follow-up answer"), refs.map { it.transcript })
+        }
+    }
+
+    @Test
+    fun rerecording_the_same_prompt_keeps_only_the_final_take() {
+        lateinit var vm: SurveyViewModel
+
+        composeRule.setContent {
+            val backStack = rememberNavBackStack(FlowHome)
+            vm = remember { SurveyViewModel(backStack, aiConfig()) }
+        }
+
+        composeRule.runOnIdle {
+            vm.onVoiceExported(AI_NODE_ID, "main.wav", prompt = "Main question?")
+            vm.onVoiceExported(AI_NODE_ID, "followup-take1.wav", prompt = "Follow-up question?")
+            val discarded = vm.onVoiceExported(AI_NODE_ID, "followup-take2.wav", prompt = "Follow-up question?")
+            vm.onVoiceTranscribed(AI_NODE_ID, "followup-take1.wav", "late transcript of a discarded take")
+
+            assertEquals(listOf("followup-take1.wav"), discarded.map { it.fileName })
+            assertEquals(
+                listOf("main.wav", "followup-take2.wav"),
+                vm.getAudioRefs(AI_NODE_ID).map { it.fileName }
+            )
+        }
+    }
+
+    @Test
+    fun recordings_without_a_prompt_are_appended_not_replaced() {
+        lateinit var vm: SurveyViewModel
+
+        composeRule.setContent {
+            val backStack = rememberNavBackStack(FlowHome)
+            vm = remember { SurveyViewModel(backStack, aiConfig()) }
+        }
+
+        composeRule.runOnIdle {
+            vm.onVoiceExported(AI_NODE_ID, "note-1.wav")
+            val discarded = vm.onVoiceExported(AI_NODE_ID, "note-2.wav")
+
+            assertTrue(discarded.isEmpty())
+            assertEquals(listOf("note-1.wav", "note-2.wav"), vm.getAudioRefs(AI_NODE_ID).map { it.fileName })
+        }
+    }
+
+    @Test
     fun blank_followup_is_rejected_at_the_persistence_boundary() {
         lateinit var vm: SurveyViewModel
 

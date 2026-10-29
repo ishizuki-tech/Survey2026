@@ -186,6 +186,23 @@ object ExportUtils {
     }
 
     /**
+     * Delete an exported voice recording and its meta sidecar from the voice export directory.
+     * Used when a newer take replaces the recording before upload.
+     *
+     * @return true when the WAV no longer exists afterwards.
+     */
+    fun deleteExportedVoice(context: Context, fileName: String): Boolean {
+        val name = File(fileName.trim()).name
+        if (name.isBlank()) return false
+        val voiceDir = getVoiceExportDir(context)
+        val wav = File(voiceDir, name)
+        val meta = File(voiceDir, name.substringBeforeLast('.', name) + META_SUFFIX)
+        if (meta.exists()) runCatching { meta.delete() }
+        if (wav.exists()) runCatching { wav.delete() }
+        return !wav.exists()
+    }
+
+    /**
      * Write a small sidecar JSON file for a voice recording:
      *
      *   voice_<...>.wav  ->  voice_<...>.meta.json

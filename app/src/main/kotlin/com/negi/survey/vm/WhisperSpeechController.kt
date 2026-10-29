@@ -52,6 +52,7 @@ import java.util.Locale
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.abs
+import kotlin.math.ceil
 import kotlin.math.sqrt
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -78,11 +79,13 @@ class WhisperSpeechController(
     private val assetModelPath: String = DEFAULT_ASSET_MODEL,
     languageCode: String = DEFAULT_LANGUAGE,
     private val onVoiceExported: ((ExportedVoice) -> Unit)? = null,
+    private val onVoiceTranscribed: ((TranscribedVoice) -> Unit)? = null,
     private val heavyRuntimeHandoff: HeavyRuntimeHandoff = NoOpHeavyRuntimeHandoff,
     private val recorderFactory: ((Context, (Exception) -> Unit) -> RecorderBackend)? = null,
     private val modelInitializer: (suspend () -> Unit)? = null,
     private val transcriber: (suspend (File, String) -> Result<String>)? = null,
-    private val recorderStopTimeoutMs: Long = RECORDER_STOP_TIMEOUT_MS
+    private val recorderStopTimeoutMs: Long = RECORDER_STOP_TIMEOUT_MS,
+    private val maxRecordingMs: Long = MAX_RECORDING_MS
 ) : ViewModel(), SpeechController {
 
     companion object {
@@ -107,11 +110,15 @@ class WhisperSpeechController(
         /** Best-effort timeout for recorder.close() during recovery. */
         private const val RECORDER_CLOSE_TIMEOUT_MS = 2_500L
 
+        /** Maximum length of one dictated answer; capture stops automatically at this limit. */
+        const val MAX_RECORDING_MS = 30_000L
+
         fun provideFactory(
             appContext: Context,
             assetModelPath: String = DEFAULT_ASSET_MODEL,
             languageCode: String = DEFAULT_LANGUAGE,
             onVoiceExported: ((ExportedVoice) -> Unit)? = null,
+            onVoiceTranscribed: ((TranscribedVoice) -> Unit)? = null,
             heavyRuntimeHandoff: HeavyRuntimeHandoff = NoOpHeavyRuntimeHandoff,
         ): ViewModelProvider.Factory =
             object : ViewModelProvider.Factory {
@@ -125,6 +132,7 @@ class WhisperSpeechController(
                         assetModelPath = assetModelPath,
                         languageCode = languageCode,
                         onVoiceExported = onVoiceExported,
+                        onVoiceTranscribed = onVoiceTranscribed,
                         heavyRuntimeHandoff = heavyRuntimeHandoff,
                     ) as T
                 }
@@ -139,7 +147,17 @@ class WhisperSpeechController(
         val questionId: String?,
         val fileName: String,
         val byteSize: Long,
-        val checksum: String? = null
+        val checksum: String? = null,
+        /** Prompt this recording answered (main question or follow-up), when known. */
+        val prompt: String? = null
+    )
+
+    /** Non-empty transcript produced for one exported recording. */
+    data class TranscribedVoice(
+        val surveyId: String?,
+        val questionId: String?,
+        val fileName: String,
+        val transcript: String
     )
 
     // ---------------------------------------------------------------------
@@ -148,16 +166,19 @@ class WhisperSpeechController(
 
     private var currentSurveyId: String? = null
     private var currentQuestionId: String? = null
+    private var currentPrompt: Pair<String, String>? = null
 
     /** All mutable recording resources belong to exactly one recording session. */
     private class RecordingSession(
         val id: Long,
         val surveyId: String?,
-        val questionId: String?
+        val questionId: String?,
+        val prompt: String?
     ) {
         var recorder: RecorderBackend? = null
         var outputFile: File? = null
         var workerJob: Job? = null
+        var limitJob: Job? = null
         @Volatile var poisoned = false
     }
 
@@ -177,11 +198,13 @@ class WhisperSpeechController(
     private val _isTranscribing = MutableStateFlow(false)
     private val _partialText = MutableStateFlow("")
     private val _error = MutableStateFlow<String?>(null)
+    private val _recordingRemainingSeconds = MutableStateFlow<Int?>(null)
 
     override val isRecording: StateFlow<Boolean> = _isRecording
     override val isTranscribing: StateFlow<Boolean> = _isTranscribing
     override val partialText: StateFlow<String> = _partialText
     override val errorMessage: StateFlow<String?> = _error
+    override val recordingRemainingSeconds: StateFlow<Int?> = _recordingRemainingSeconds
 
     private val languageCodeRaw: String = languageCode
 
@@ -195,6 +218,12 @@ class WhisperSpeechController(
         currentQuestionId = questionId
         Log.d(TAG, "updateContext: surveyId=$surveyId, questionId=$questionId")
         WhisperTraceRegistry.event(surveyId, questionId, "WHISPER_CONTEXT_UPDATED")
+    }
+
+    override fun updatePrompt(questionId: String?, prompt: String?) {
+        val qid = questionId?.trim().orEmpty()
+        val text = prompt?.trim().orEmpty()
+        currentPrompt = if (qid.isNotEmpty() && text.isNotEmpty()) qid to text else null
     }
 
     // ---------------------------------------------------------------------
@@ -236,10 +265,13 @@ class WhisperSpeechController(
             return
         }
 
+        val questionId = currentQuestionId
         val session = RecordingSession(
             id = nextSessionId.incrementAndGet(),
             surveyId = currentSurveyId,
-            questionId = currentQuestionId
+            questionId = questionId,
+            // Only use a prompt recorded for this same question; a stale one is ignored.
+            prompt = currentPrompt?.takeIf { it.first == questionId?.trim() }?.second
         )
         if (!activeSession.compareAndSet(null, session)) {
             _error.value = "Previous recording is still finalizing"
@@ -279,10 +311,16 @@ class WhisperSpeechController(
                     session.recorder?.startRecording(output = wav, rates = RECORDER_RATE_CANDIDATES)
                         ?: error("Recorder session was not initialized")
                     Log.d(TAG, "startRecording: started")
+
+                    // Start the limit only once capture is running, so model init time is not counted.
+                    if (owns(session) && _isRecording.value) {
+                        session.limitJob = viewModelScope.launch { enforceRecordingLimit(session) }
+                    }
                 } catch (ce: CancellationException) {
                     Log.d(TAG, "startRecording: cancelled")
                     if (!owns(session)) return@withLock
                     _isRecording.value = false
+                    _recordingRemainingSeconds.value = null
                     val tmp = session.outputFile
                     session.outputFile = null
                     deleteTempFileQuietly(tmp, reason = "start_cancelled")
@@ -292,6 +330,7 @@ class WhisperSpeechController(
                     if (!owns(session)) return@withLock
                     _error.value = t.message ?: "Speech recognition start failed"
                     _isRecording.value = false
+                    _recordingRemainingSeconds.value = null
 
                     val tmp = session.outputFile
                     session.outputFile = null
@@ -311,7 +350,9 @@ class WhisperSpeechController(
 
         Log.d(TAG, "stopRecording: requested")
         _isRecording.value = false
+        _recordingRemainingSeconds.value = null
 
+        session.limitJob?.cancel()
         session.workerJob?.cancel()
 
         session.workerJob = viewModelScope.launch(Dispatchers.IO) {
@@ -410,7 +451,8 @@ class WhisperSpeechController(
                                 questionId = session.questionId,
                                 fileName = exported.name,
                                 byteSize = exported.length(),
-                                checksum = checksum
+                                checksum = checksum,
+                                prompt = session.prompt
                             )
                         )
                         WhisperTraceRegistry.event(session.surveyId, session.questionId, "AUDIO_EXPORTED", mapOf("fileName" to exported.name, "byteSize" to exported.length()))
@@ -466,6 +508,16 @@ class WhisperSpeechController(
                                     "success" to true,
                                     "language" to normalizedLanguage,
                                 ))
+                                if (exported != null) {
+                                    onVoiceTranscribed?.invoke(
+                                        TranscribedVoice(
+                                            surveyId = session.surveyId,
+                                            questionId = session.questionId,
+                                            fileName = exported.name,
+                                            transcript = trimmed
+                                        )
+                                    )
+                                }
                             }
                             updatePartialText(trimmed)
                         }
@@ -496,6 +548,28 @@ class WhisperSpeechController(
 
     override fun toggleRecording() {
         if (_isRecording.value) stopRecording() else startRecording()
+    }
+
+    /**
+     * Publishes the whole seconds left for [session] and stops capture once
+     * [maxRecordingMs] has elapsed. Exits without stopping if the session was
+     * stopped or replaced in the meantime.
+     */
+    private suspend fun enforceRecordingLimit(session: RecordingSession) {
+        val deadline = SystemClock.elapsedRealtime() + maxRecordingMs
+        while (true) {
+            if (!owns(session) || !_isRecording.value) return
+            val remainingMs = deadline - SystemClock.elapsedRealtime()
+            if (remainingMs <= 0L) break
+            val remainingSec = ceil(remainingMs / 1000.0).toInt()
+            _recordingRemainingSeconds.value = remainingSec
+            // Wake exactly when the displayed second changes.
+            delay(remainingMs - (remainingSec - 1) * 1000L)
+        }
+        if (!owns(session) || !_isRecording.value) return
+        Log.d(TAG, "Recording limit reached (${maxRecordingMs}ms); stopping (qid=${session.questionId})")
+        WhisperTraceRegistry.event(session.surveyId, session.questionId, "RECORDING_LIMIT_REACHED", mapOf("whisperRecordingId" to session.id, "limitMs" to maxRecordingMs))
+        stopRecording()
     }
 
     // ---------------------------------------------------------------------
@@ -643,6 +717,8 @@ class WhisperSpeechController(
 
             _error.value = e.message ?: "Recording error"
             _isRecording.value = false
+            _recordingRemainingSeconds.value = null
+            session.limitJob?.cancel()
             _isTranscribing.value = false
 
             cleanupScope.launch {
@@ -950,6 +1026,7 @@ class WhisperSpeechController(
 
     override fun onCleared() {
         val session = activeSession.getAndSet(null)
+        session?.limitJob?.cancel()
         session?.workerJob?.cancel()
 
         val job = cleanupScope.launch {
