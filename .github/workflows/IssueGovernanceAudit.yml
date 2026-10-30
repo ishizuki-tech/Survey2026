@@ -1,0 +1,73 @@
+name: Issue Governance Audit
+
+on:
+  issues:
+    types:
+      - assigned
+      - unassigned
+      - labeled
+      - unlabeled
+
+# This workflow only writes its own run summary and annotations.
+permissions:
+  contents: read
+  issues: read
+
+jobs:
+  report-keen-way-change:
+    if: >-
+      github.event.sender.login == 'keen-way-software' &&
+      (
+        github.event.action == 'assigned' ||
+        github.event.action == 'unassigned' ||
+        (
+          (github.event.action == 'labeled' || github.event.action == 'unlabeled') &&
+          (
+            github.event.label.name == 'priority:P0' ||
+            github.event.label.name == 'priority:P1' ||
+            github.event.label.name == 'priority:P2' ||
+            github.event.label.name == 'priority:P3'
+          )
+        )
+      )
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report governance-relevant Issue change
+        env:
+          ACTION: ${{ github.event.action }}
+          ACTOR: ${{ github.event.sender.login }}
+          ASSIGNEE: ${{ github.event.assignee.login || '' }}
+          EVENT_TIMESTAMP: ${{ github.event.issue.updated_at || '' }}
+          ISSUE_NUMBER: ${{ github.event.issue.number || '' }}
+          ISSUE_URL: ${{ github.event.issue.html_url || '' }}
+          LABEL: ${{ github.event.label.name || '' }}
+        run: |
+          set -euo pipefail
+
+          subject="$ASSIGNEE"
+          if [[ "$ACTION" == "labeled" || "$ACTION" == "unlabeled" ]]; then
+            subject="$LABEL"
+          fi
+
+          [[ -n "$ISSUE_NUMBER" ]] || ISSUE_NUMBER="unavailable"
+          [[ -n "$ISSUE_URL" ]] || ISSUE_URL="unavailable"
+          [[ -n "$EVENT_TIMESTAMP" ]] || EVENT_TIMESTAMP="unavailable"
+          [[ -n "$subject" ]] || subject="unavailable"
+
+          {
+            echo "## Issue governance audit"
+            echo
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Issue | [#${ISSUE_NUMBER}](${ISSUE_URL}) |"
+            echo "| Actor | ${ACTOR} |"
+            echo "| Event | ${ACTION} |"
+            echo "| Changed value | ${subject} |"
+            echo "| Payload issue updated_at | ${EVENT_TIMESTAMP} |"
+            echo
+            echo "> [!WARNING]"
+            echo "> No automatic correction was performed. This workflow is audit-only and never changes Issue state."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "::error title=Issue governance audit::${ACTOR} performed ${ACTION} on Issue #${ISSUE_NUMBER}; no automatic correction was performed."
+          exit 1
