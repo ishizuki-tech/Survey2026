@@ -32,4 +32,12 @@ class PersistentModelStoreTest {
         assertTrue(PersistentModelStore.isMediaStoreCollisionVariant("model (3)", "model"))
         assertFalse(PersistentModelStore.isMediaStoreCollisionVariant("model (0)", "model"))
     }
+
+    @Test
+    fun preparedModel_persistsOnlyNetworkDownloads() {
+        assertTrue(PersistentModelStore.shouldPersistPreparedModel(fromManualSelection = false))
+        // A picked file already lives in shared storage; persisting it again
+        // writes a full "(N)" duplicate after every reinstall.
+        assertFalse(PersistentModelStore.shouldPersistPreparedModel(fromManualSelection = true))
+    }
 }

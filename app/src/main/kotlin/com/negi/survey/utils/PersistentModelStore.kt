@@ -91,6 +91,20 @@ object PersistentModelStore {
     }
 
     /**
+     * Returns whether a model file that just became ready in private storage
+     * should also be copied into this persisted store via [persistFromPrivate].
+     *
+     * Only a network download produces a copy that exists nowhere else on the
+     * device. A manually picked file already lives in shared storage — usually
+     * this very folder, written by an earlier install. Rows written by an
+     * earlier install are invisible to this one, so [persistFromPrivate] can't
+     * see that copy and MediaStore would write a full renamed duplicate next
+     * to it ("<name> (N).litertlm", ~4.9 GB for Gemma) after every reinstall.
+     */
+    internal fun shouldPersistPreparedModel(fromManualSelection: Boolean): Boolean =
+        !fromManualSelection
+
+    /**
      * Attempts to satisfy [targetFileName] entirely from persisted storage.
      *
      * - If a persisted file with [targetFileName] or a collision variant exists, it is copied
@@ -214,10 +228,9 @@ object PersistentModelStore {
      * pending rows.
      *
      * Used when a copy turns out to be unusable (e.g. the user picked a
-     * corrupt or incompatible file via the manual picker, and
-     * [AppViewModel.useManuallySelectedModel] already persisted it
-     * alongside the private copy) so [reuseOrReplace] never offers it
-     * again on a future run.
+     * corrupt or incompatible file via the manual picker, and an older build
+     * of [AppViewModel.useManuallySelectedModel] persisted it alongside the
+     * private copy) so [reuseOrReplace] never offers it again on a future run.
      *
      * Best-effort: failures are logged and swallowed.
      */

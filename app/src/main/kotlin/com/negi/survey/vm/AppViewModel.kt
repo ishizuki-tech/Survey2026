@@ -233,7 +233,9 @@ class AppViewModel(
     /**
      * Copies a model file the user picked via the system file/document picker
      * (e.g. a copy saved by another install of this app) into private storage
-     * and marks the model ready, skipping the network download entirely.
+     * and marks the model ready, skipping the network download entirely. The
+     * picked file is not copied back into the shared persisted store; see
+     * [PersistentModelStore.shouldPersistPreparedModel].
      *
      * On failure, surfaces a [DlState.Error] so the user can try picking again
      * (via "Retry", which re-enters [ensureModelDownloaded] and will offer the
@@ -281,8 +283,7 @@ class AppViewModel(
 
                 if (!isActive) return@launch
 
-                runCatching { PersistentModelStore.persistFromPrivate(app, safeName, destination) }
-                    .onFailure { e -> Log.w("AppViewModel", "Failed to persist manually selected model: ${e.message}") }
+                persistIfNeeded(app, safeName, destination, fromManualSelection = true)
 
                 Log.i("AppViewModel", "Using manually selected model file: name=$safeName bytes=${destination.length()}")
                 _state.value = DlState.Done(destination, fromManualSelection = true)
@@ -299,7 +300,7 @@ class AppViewModel(
     /**
      * Deletes a model file that turned out to be unusable after a manual
      * selection (see [useManuallySelectedModel]) — both the private copy
-     * and any copy already persisted to the public Downloads store — so
+     * and any copy an older build persisted to the public Downloads store — so
      * [ensureModelDownloaded] never offers it again as an existing file.
      *
      * Intended to be called right before forcing an app restart: once the
@@ -373,8 +374,7 @@ class AppViewModel(
 
                 _state.value = result.fold(
                     onSuccess = { file ->
-                        runCatching { PersistentModelStore.persistFromPrivate(app, safeName, file) }
-                            .onFailure { e -> Log.w("AppViewModel", "Failed to persist model to shared storage: ${e.message}") }
+                        persistIfNeeded(app, safeName, file, fromManualSelection = false)
                         DlState.Done(file)
                     },
                     onFailure = { error -> DlState.Error(error.message ?: "Download failed") }
@@ -392,6 +392,20 @@ class AppViewModel(
                 }
             }
         }
+    }
+
+    /**
+     * Copies a model that just became ready in private storage into the shared
+     * persisted store, unless [PersistentModelStore.shouldPersistPreparedModel]
+     * says the device already has a copy (a manual pick). Best-effort.
+     */
+    private fun persistIfNeeded(app: Context, safeName: String, file: File, fromManualSelection: Boolean) {
+        if (!PersistentModelStore.shouldPersistPreparedModel(fromManualSelection)) {
+            Log.i("AppViewModel", "Not copying manually selected model into shared storage: name=$safeName")
+            return
+        }
+        runCatching { PersistentModelStore.persistFromPrivate(app, safeName, file) }
+            .onFailure { e -> Log.w("AppViewModel", "Failed to persist model to shared storage: ${e.message}") }
     }
 
     /**
