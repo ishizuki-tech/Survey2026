@@ -178,15 +178,14 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
 
         val coordinator = appCtx.applicationContext as? SurveyApp
             ?: throw AssertionError("Expected SurveyApp application context")
-        val runtimeIdentity = "issue77:${model.taskPath}"
         val wav = copyIssue77WhisperFixture(iteration)
         val transcript = try {
             runBlocking {
                 // Adopt the already-real LiteRT runtime, then use the same production
                 // coordinator transition that releases it before Whisper acquisition.
                 coordinator.heavyRuntimeCoordinator.withLiteRt(
-                    runtimeIdentity = runtimeIdentity,
-                    releaseLiteRt = { SLM.forceCleanUpAndWait(model) },
+                    releaseLiteRt = { lease -> SLM.closeGenerationIfCurrent(lease, "issue77") },
+                    generationLease = { checkNotNull(SLM.currentGenerationLease(model)) },
                 ) { Unit }
                 coordinator.heavyRuntimeCoordinator.withWhisper {
                     WhisperEngine.ensureInitializedFromAsset(
@@ -207,8 +206,8 @@ class RealLiteRtAiFollowupFlowInstrumentationTest : AiViewModelSurveyBase() {
 
         runBlocking {
             coordinator.heavyRuntimeCoordinator.withLiteRt(
-                runtimeIdentity = runtimeIdentity,
-                releaseLiteRt = { SLM.forceCleanUpAndWait(model) },
+                releaseLiteRt = { lease -> SLM.closeGenerationIfCurrent(lease, "issue77") },
+                generationLease = { checkNotNull(SLM.currentGenerationLease(model)) },
             ) {
                 SLM.initializeIfNeeded(
                     context = appCtx,

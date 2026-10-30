@@ -460,6 +460,15 @@ class WhisperSpeechController(
                     DiagnosticContentPolicy.logError(TAG, "stopRecording: failed", t)
                     if (owns(session)) _error.value = t.message ?: "Speech recognition failed"
                 } finally {
+                    withContext(NonCancellable) {
+                        runCatching { heavyRuntimeHandoff.releaseWhisper() }
+                            .onFailure { e ->
+                                DiagnosticContentPolicy.logWarning(TAG, "WhisperEngine.release failed", e)
+                                if (owns(session)) {
+                                    _error.value = "Speech recognition cleanup failed; restart required"
+                                }
+                            }
+                    }
                     if (owns(session) && !session.poisoned) {
                         _isTranscribing.value = false
                         activeSession.compareAndSet(session, null)
@@ -506,16 +515,25 @@ class WhisperSpeechController(
 
             var initTiming: InitTiming? = null
             val result = try {
-                Result.success(
+                val handoff = WhisperEngine.WhisperPublicationHandoff()
+                Result.success(try {
                     heavyRuntimeHandoff.withWhisper {
                         WhisperTraceRegistry.event(currentSurveyId, currentQuestionId, "MODEL_INIT_STARTED", mapOf("modelKey" to assetModelPath, "language" to normalizedLanguage))
                         WhisperEngine.ensureInitializedFromAsset(
                             context = appContext,
                             assetPath = assetModelPath,
-                            onTiming = { timing -> initTiming = timing }
+                            onTiming = { timing -> initTiming = timing },
+                            publicationHandoff = handoff,
                         ).getOrThrow()
                     }
-                )
+                } catch (error: Throwable) {
+                    handoff.abandon()?.let { lease ->
+                        withContext(NonCancellable) {
+                            WhisperEngine.releaseGenerationIfCurrent(lease)
+                        }
+                    }
+                    throw error
+                })
             } catch (ce: CancellationException) {
                 throw ce
             } catch (t: Throwable) {
@@ -932,6 +950,8 @@ class WhisperSpeechController(
             withContext(NonCancellable) {
                 runCatching { WhisperEngine.detach() }
                     .onFailure { e -> DiagnosticContentPolicy.logWarning(TAG, "WhisperEngine.detach failed", e) }
+                runCatching { heavyRuntimeHandoff.releaseWhisper() }
+                    .onFailure { e -> DiagnosticContentPolicy.logWarning(TAG, "WhisperEngine.release failed", e) }
 
                 session?.let { active ->
                     runCatching { active.recorder?.close() }

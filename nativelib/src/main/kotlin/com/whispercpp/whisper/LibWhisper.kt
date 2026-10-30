@@ -246,10 +246,12 @@ class WhisperContext private constructor(
                     return@withContext
                 }
 
+                var releaseFailure: Throwable? = null
                 try {
                     WhisperLib.freeContext(nativePtr)
                     Log.d(LOG_TAG, "Released native context (ptr=$nativePtr)")
                 } catch (t: Throwable) {
+                    releaseFailure = t
                     Log.e(
                         LOG_TAG,
                         "Native context release failed (ptr=$nativePtr)",
@@ -258,6 +260,12 @@ class WhisperContext private constructor(
                 } finally {
                     // Never expose a freed or uncertain native pointer again.
                     ptr = 0L
+                }
+                releaseFailure?.let { failure ->
+                    throw IllegalStateException(
+                        "WhisperContext native release completion is uncertain",
+                        failure,
+                    )
                 }
             }
         } finally {

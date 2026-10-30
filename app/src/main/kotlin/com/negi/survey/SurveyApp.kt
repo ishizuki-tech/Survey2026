@@ -229,7 +229,7 @@ class SurveyApp : Application(), Configuration.Provider {
 
     /** Process-wide owner for LiteRT-LM and Whisper native-runtime handoff. */
     val heavyRuntimeCoordinator = HeavyRuntimeCoordinator(
-        releaseWhisper = { WhisperEngine.release() },
+        releaseWhisperAction = { WhisperEngine.release() },
     )
 
     // Guard JNI load to avoid duplicate loads and allow retry on failure.

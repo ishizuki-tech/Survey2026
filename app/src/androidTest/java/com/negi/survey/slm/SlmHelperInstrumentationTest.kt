@@ -362,6 +362,7 @@ class SlmHelperInstrumentationTest {
     private fun startObservedRun(
         prompt: String,
         releaseRunStart: CountDownLatch? = null,
+        onStarted: (Long) -> Unit = {},
     ): ObservedRun {
         val observed = ObservedRun()
 
@@ -380,6 +381,7 @@ class SlmHelperInstrumentationTest {
             },
             onRunStarted = { runId ->
                 observed.runId.set(runId)
+                onStarted(runId)
                 observed.started.countDown()
                 releaseRunStart?.await(
                     GENERATION_TIMEOUT_MS,
@@ -810,7 +812,7 @@ class SlmHelperInstrumentationTest {
         }
 
     @Test
-    fun stale_hard_close_does_not_close_newer_run() =
+    fun stale_hard_close_does_not_close_newer_run(): Unit =
         runBlocking {
             withTimeout(GENERATION_TIMEOUT_MS) {
                 val hardClosePaused = CompletableDeferred<Unit>()
@@ -1180,6 +1182,172 @@ class SlmHelperInstrumentationTest {
                     releaseTerminal.countDown()
                     LiteRtLM.initializationTestHooks = null
                     LiteRtLM.runControlTestHooks = null
+                }
+            }
+        }
+
+    @Test
+    fun stale_generation_cleanup_does_not_cancel_or_close_replacement() =
+        runBlocking {
+            withTimeout(GENERATION_TIMEOUT_MS) {
+                val leaseA = checkNotNull(SLM.currentGenerationLease(model))
+                val closePassedInitialCheck = CompletableDeferred<Unit>()
+                val resumeStaleClose = CompletableDeferred<Unit>()
+                val bRunId = AtomicLong(0L)
+                val bFirstNativeMessage = CountDownLatch(1)
+                val releaseBFirstNativeMessage = CountDownLatch(1)
+                LiteRtLM.runControlTestHooks =
+                    LiteRtLM.RunControlTestHooks(
+                        beforeGenerationCloseCancellationSelection = { observedLease ->
+                            if (observedLease.sameGeneration(leaseA)) {
+                                closePassedInitialCheck.complete(Unit)
+                                resumeStaleClose.await()
+                            }
+                        },
+                        beforeFirstNativeMessage = { runId ->
+                            if (runId == bRunId.get()) {
+                                bFirstNativeMessage.countDown()
+                                check(
+                                    releaseBFirstNativeMessage.await(
+                                        GENERATION_TIMEOUT_MS,
+                                        TimeUnit.MILLISECONDS,
+                                    )
+                                ) { "B first native message was not released." }
+                            }
+                        },
+                    )
+
+                try {
+                    val staleClose =
+                        async {
+                            LiteRtLM.closeGenerationIfCurrent(leaseA, "stale-generation-test")
+                        }
+                    closePassedInitialCheck.await()
+
+                    SLM.forceCleanUpAndWait(model)
+                    initializeModelBlocking(model)
+                    val leaseB = checkNotNull(SLM.currentGenerationLease(model))
+                    assertFalse(leaseA.sameGeneration(leaseB))
+
+                    val run = startObservedRun(
+                        prompt = longPrompt(),
+                        onStarted = { runId -> bRunId.set(runId) },
+                    )
+                    assertTrue(run.started.await(GENERATION_TIMEOUT_MS, TimeUnit.MILLISECONDS))
+                    assertTrue(
+                        "B did not enter the controlled native-active callback",
+                        bFirstNativeMessage.await(GENERATION_TIMEOUT_MS, TimeUnit.MILLISECONDS),
+                    )
+
+                    resumeStaleClose.complete(Unit)
+                    assertEquals(
+                        GenerationCloseResult.NOT_CURRENT,
+                        withTimeout(CANCEL_TIMEOUT_MS) { staleClose.await() },
+                    )
+                    assertEquals("stale A cleanup must not complete B logically", 1L, run.logicalDone.count)
+                    assertEquals("stale A cleanup must not terminate B natively", 1L, run.nativeClean.count)
+                    assertTrue(SLM.currentGenerationLease(model)?.sameGeneration(leaseB) == true)
+
+                    releaseBFirstNativeMessage.countDown()
+                    SLM.cancel(model)
+                    assertObservedRunCompleted("replacement B", run)
+                } finally {
+                    resumeStaleClose.complete(Unit)
+                    releaseBFirstNativeMessage.countDown()
+                    LiteRtLM.runControlTestHooks = null
+                }
+            }
+        }
+
+    @Test
+    fun abandoned_publication_cleanup_does_not_close_warm_adopter() =
+        runBlocking {
+            withTimeout(GENERATION_TIMEOUT_MS) {
+                SLM.forceCleanUpAndWait(model)
+                val publicationReached = CompletableDeferred<Unit>()
+                val releasePublication = CompletableDeferred<Unit>()
+                val cleanupReached = CompletableDeferred<Unit>()
+                val releaseCleanup = CompletableDeferred<Unit>()
+                val cleanupFinished = CompletableDeferred<Unit>()
+                val handoffA = LiteRtPublicationHandoff()
+                val bRunId = AtomicLong(0L)
+                val bFirstNativeMessage = CountDownLatch(1)
+                val releaseBFirstNativeMessage = CountDownLatch(1)
+
+                LiteRtLM.initializationTestHooks =
+                    LiteRtLM.InitializationTestHooks(
+                        beforeEnginePublication = {
+                            publicationReached.complete(Unit)
+                            releasePublication.await()
+                        },
+                        beforeAbandonedPublicationCleanup = {
+                            cleanupReached.complete(Unit)
+                            releaseCleanup.await()
+                        },
+                        afterAbandonedPublicationCleanup = { cleanupFinished.complete(Unit) },
+                    )
+                LiteRtLM.runControlTestHooks =
+                    LiteRtLM.RunControlTestHooks(
+                        beforeFirstNativeMessage = { runId ->
+                            if (runId == bRunId.get()) {
+                                bFirstNativeMessage.countDown()
+                                check(releaseBFirstNativeMessage.await(GENERATION_TIMEOUT_MS, TimeUnit.MILLISECONDS))
+                            }
+                        },
+                    )
+
+                val initializerA = async {
+                    SLM.initializeIfNeeded(
+                        context = appCtx,
+                        model = model,
+                        supportImage = false,
+                        supportAudio = false,
+                        publicationHandoff = handoffA,
+                    )
+                }
+                try {
+                    publicationReached.await()
+                    initializerA.cancel()
+                    assertEquals(null, handoffA.abandon())
+                    releasePublication.complete(Unit)
+                    cleanupReached.await()
+
+                    val leaseG = checkNotNull(SLM.currentGenerationLease(model))
+                    SLM.initializeIfNeeded(
+                        context = appCtx,
+                        model = model,
+                        supportImage = false,
+                        supportAudio = false,
+                        publicationHandoff = LiteRtPublicationHandoff(),
+                    )
+                    assertTrue(
+                        "B must warm-reuse A's published generation",
+                        SLM.currentGenerationLease(model)?.sameGeneration(leaseG) == true,
+                    )
+
+                    val run = startObservedRun(
+                        prompt = longPrompt(),
+                        onStarted = { runId -> bRunId.set(runId) },
+                    )
+                    assertTrue(run.started.await(GENERATION_TIMEOUT_MS, TimeUnit.MILLISECONDS))
+                    assertTrue(bFirstNativeMessage.await(GENERATION_TIMEOUT_MS, TimeUnit.MILLISECONDS))
+
+                    releaseCleanup.complete(Unit)
+                    cleanupFinished.await()
+                    assertEquals(1L, run.logicalDone.count)
+                    assertEquals(1L, run.nativeClean.count)
+                    assertTrue(SLM.currentGenerationLease(model)?.sameGeneration(leaseG) == true)
+
+                    releaseBFirstNativeMessage.countDown()
+                    SLM.cancel(model)
+                    assertObservedRunCompleted("warm adopter B", run)
+                } finally {
+                    releasePublication.complete(Unit)
+                    releaseCleanup.complete(Unit)
+                    releaseBFirstNativeMessage.countDown()
+                    LiteRtLM.initializationTestHooks = null
+                    LiteRtLM.runControlTestHooks = null
+                    initializerA.cancel()
                 }
             }
         }

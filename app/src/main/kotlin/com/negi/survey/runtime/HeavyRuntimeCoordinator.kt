@@ -2,23 +2,37 @@ package com.negi.survey.runtime
 
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
+import com.negi.survey.slm.LiteRtGenerationLease
+import com.negi.survey.slm.sameGeneration
 
 /**
- * Serializes ownership transitions between the app's two memory-heavy native runtimes.
+ * Serializes lifecycle transitions for the app's two memory-heavy native runtimes.
  *
- * A transition retains the mutex through release and the caller-provided native acquisition,
- * so an opposite runtime cannot begin initializing in the gap between those operations.
- * The successful LiteRT acquisition supplies the exact process-wide instance release action
- * used for a later Whisper transition.
+ * LiteRT is allowed to remain resident while a transient Whisper operation runs. The mutex
+ * still serializes runtime replacement and release with native acquisition, but residency is
+ * tracked independently: Whisper must not imply that a healthy LiteRT Engine was destroyed.
  */
 interface HeavyRuntimeHandoff {
     suspend fun <T> withLiteRt(
-        runtimeIdentity: String,
-        releaseLiteRt: suspend () -> Unit,
+        releaseLiteRt: suspend (LiteRtGenerationLease) -> Unit,
+        generationLease: suspend () -> LiteRtGenerationLease,
+        onOwnershipPublished: (LiteRtGenerationLease) -> Unit = {},
         acquire: suspend () -> T,
     ): T
 
     suspend fun <T> withWhisper(acquire: suspend () -> T): T
+
+    /** Releases the transient Whisper context without affecting a resident LiteRT runtime. */
+    suspend fun releaseWhisper()
+
+    /**
+     * Runs a recovery close only if [ownership] is still the published owner.
+     * Returning false means a newer generation superseded the caller; its native
+     * resources must not be touched by the stale recovery path.
+     */
+    suspend fun releaseLiteRt(ownership: LiteRtGenerationLease, release: suspend () -> Unit): Boolean
 
     /**
      * Releases whichever runtime is currently owned (if any), without acquiring
@@ -31,119 +45,115 @@ interface HeavyRuntimeHandoff {
 /** Default for isolated callers that do not participate in app-level runtime handoff. */
 object NoOpHeavyRuntimeHandoff : HeavyRuntimeHandoff {
     override suspend fun <T> withLiteRt(
-        runtimeIdentity: String,
-        releaseLiteRt: suspend () -> Unit,
+        releaseLiteRt: suspend (LiteRtGenerationLease) -> Unit,
+        generationLease: suspend () -> LiteRtGenerationLease,
+        onOwnershipPublished: (LiteRtGenerationLease) -> Unit,
         acquire: suspend () -> T,
     ): T = acquire()
 
     override suspend fun <T> withWhisper(acquire: suspend () -> T): T = acquire()
 
+    override suspend fun releaseWhisper() = Unit
+
+    override suspend fun releaseLiteRt(ownership: LiteRtGenerationLease, release: suspend () -> Unit): Boolean {
+        release()
+        return true
+    }
+
     override suspend fun releaseCurrent() = Unit
 }
 
 class HeavyRuntimeCoordinator(
-    private val releaseWhisper: suspend () -> Unit,
+    private val releaseWhisperAction: suspend () -> Unit,
 ) : HeavyRuntimeHandoff {
-    private enum class Owner {
-        NONE,
-        LITERT,
-        WHISPER,
-    }
-
     private val transitionMutex = Mutex()
-    private var owner = Owner.NONE
-    private var activeLiteRtIdentity: String? = null
-    private var releaseActiveLiteRt: (suspend () -> Unit)? = null
+    private var activeLiteRtOwnership: LiteRtGenerationLease? = null
+    private var releaseActiveLiteRt: (suspend (LiteRtGenerationLease) -> Unit)? = null
+    private var whisperResident = false
 
     override suspend fun <T> withLiteRt(
-        runtimeIdentity: String,
-        releaseLiteRt: suspend () -> Unit,
+        releaseLiteRt: suspend (LiteRtGenerationLease) -> Unit,
+        generationLease: suspend () -> LiteRtGenerationLease,
+        onOwnershipPublished: (LiteRtGenerationLease) -> Unit,
         acquire: suspend () -> T,
     ): T =
         transitionMutex.withLock {
-            val sameRuntime = owner == Owner.LITERT && activeLiteRtIdentity == runtimeIdentity
-            if (!sameRuntime) {
-                when (owner) {
-                    Owner.LITERT -> releaseOwnedLiteRt()
-                    Owner.WHISPER -> releaseWhisper()
-                    Owner.NONE -> Unit
-                }
-                owner = Owner.NONE
-                activeLiteRtIdentity = null
-                releaseActiveLiteRt = null
-            }
-
             try {
-                acquire().also {
-                    owner = Owner.LITERT
-                    activeLiteRtIdentity = runtimeIdentity
+                val acquired = acquire()
+                // Once acquire() returns, the native generation may already have revoked an
+                // abandoned publisher's cleanup authority. Keep lease lookup, replacement,
+                // and publication in one non-cancellable ownership transfer.
+                withContext(NonCancellable) {
+                    val lease = generationLease()
+                    val sameRuntime = activeLiteRtOwnership?.sameGeneration(lease) == true
+                    if (!sameRuntime && activeLiteRtOwnership != null) releaseOwnedLiteRt()
+                    activeLiteRtOwnership = lease
                     releaseActiveLiteRt = releaseLiteRt
+                    onOwnershipPublished(lease)
                 }
+                acquired
             } catch (error: Throwable) {
-                if (!sameRuntime) {
-                    owner = Owner.NONE
-                    activeLiteRtIdentity = null
-                    releaseActiveLiteRt = null
-                }
                 throw error
             }
         }
 
     override suspend fun <T> withWhisper(acquire: suspend () -> T): T =
         transitionMutex.withLock {
-            transitionTo(
-                requested = Owner.WHISPER,
-                releaseOpposite = ::releaseOwnedLiteRt,
-                acquire = acquire,
-            )
+            val acquired = acquire()
+            // Match LiteRT's handoff boundary: do not make native initialization
+            // non-cancellable, but do publish a completed acquisition atomically.
+            withContext(NonCancellable) { whisperResident = true }
+            acquired
+        }
+
+    override suspend fun releaseWhisper() {
+        transitionMutex.withLock {
+            if (!whisperResident) return
+            releaseWhisperAction()
+            whisperResident = false
+        }
+    }
+
+    override suspend fun releaseLiteRt(
+        ownership: LiteRtGenerationLease,
+        release: suspend () -> Unit,
+    ): Boolean =
+        transitionMutex.withLock {
+            if (activeLiteRtOwnership?.sameGeneration(ownership) != true) return false
+            release()
+            activeLiteRtOwnership = null
+            releaseActiveLiteRt = null
+            true
         }
 
     override suspend fun releaseCurrent() {
         transitionMutex.withLock {
-            when (owner) {
-                Owner.LITERT -> releaseOwnedLiteRt()
-                Owner.WHISPER -> releaseWhisper()
-                Owner.NONE -> Unit
+            var failure: Throwable? = null
+            if (whisperResident) {
+                try {
+                    releaseWhisperAction()
+                    whisperResident = false
+                } catch (error: Throwable) {
+                    failure = error
+                }
             }
-            owner = Owner.NONE
+            if (activeLiteRtOwnership != null) {
+                try {
+                    releaseOwnedLiteRt()
+                } catch (error: Throwable) {
+                    failure?.addSuppressed(error) ?: run { failure = error }
+                }
+            }
+            failure?.let { throw it }
         }
     }
 
     private suspend fun releaseOwnedLiteRt() {
-        checkNotNull(activeLiteRtIdentity) {
-            "LiteRT owner is missing its runtime identity."
-        }
+        val lease = checkNotNull(activeLiteRtOwnership) { "LiteRT owner is missing its generation lease." }
         checkNotNull(releaseActiveLiteRt) {
             "LiteRT owner is missing its release action."
-        }.invoke()
-        activeLiteRtIdentity = null
+        }.invoke(lease)
+        activeLiteRtOwnership = null
         releaseActiveLiteRt = null
-    }
-
-    private suspend fun <T> transitionTo(
-        requested: Owner,
-        releaseOpposite: suspend () -> Unit,
-        acquire: suspend () -> T,
-        onAcquired: () -> Unit = {},
-    ): T {
-        val previous = owner
-        if (previous != requested) {
-            if (previous != Owner.NONE) {
-                releaseOpposite()
-            }
-            owner = Owner.NONE
-        }
-
-        return try {
-            acquire().also {
-                owner = requested
-                onAcquired()
-            }
-        } catch (error: Throwable) {
-            if (previous != requested) {
-                owner = Owner.NONE
-            }
-            throw error
-        }
     }
 }

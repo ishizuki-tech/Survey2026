@@ -38,6 +38,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.cancel
@@ -353,6 +354,51 @@ class LiteRtRepository(
     private val systemMessage: Message? = null,
     private val tools: List<Any> = emptyList(),
 ) : Repository {
+    /** This repository's exact published engine claim; never use the model path as a lease. */
+    private val liteRtOwnership = AtomicReference<LiteRtGenerationLease?>(null)
+
+    private suspend fun currentLiteRtLease(): LiteRtGenerationLease =
+        checkNotNull(SLM.currentGenerationLease(model)) {
+            "LiteRT initialization completed without a published native generation."
+        }
+
+    private suspend fun closeLiteRtGeneration(lease: LiteRtGenerationLease) {
+        SLM.closeGenerationIfCurrent(lease, reason = "AiRepository")
+    }
+
+    /**
+     * Covers the interval between native publication and coordinator ownership.
+     * Warm reuse never publishes this handoff, so cancelling a warm waiter cannot
+     * tear down an Engine already retained by another owner.
+     */
+    private suspend fun initializeWithOwnershipHandoff(block: suspend (LiteRtPublicationHandoff) -> Unit) {
+        val handoff = LiteRtPublicationHandoff()
+        try {
+            block(handoff)
+        } catch (error: Throwable) {
+            handoff.abandon()?.let { lease ->
+                withContext(NonCancellable) {
+                    closeLiteRtGeneration(lease)
+                }
+            }
+            throw error
+        }
+    }
+
+    /**
+     * Recovery owns the native cleanup itself, so it must also invalidate the coordinator's
+     * residency record. A failed cleanup is equally unsafe to represent as a live Engine.
+     */
+    private suspend fun forceCleanUpAndInvalidate() {
+        val ownership = liteRtOwnership.get() ?: return
+        if (
+            heavyRuntimeHandoff.releaseLiteRt(ownership) {
+                closeLiteRtGeneration(ownership)
+            }
+        ) {
+            liteRtOwnership.compareAndSet(ownership, null)
+        }
+    }
 
     companion object {
         private const val TAG = "LiteRtRepository"
@@ -748,18 +794,22 @@ class LiteRtRepository(
                     withTimeoutOrNull(INIT_TIMEOUT_MS) {
                         runCatchingSuspend {
                             heavyRuntimeHandoff.withLiteRt(
-                                runtimeIdentity = modelIdentityForPath(model.taskPath),
-                                releaseLiteRt = { SLM.forceCleanUpAndWait(model) },
+                                releaseLiteRt = ::closeLiteRtGeneration,
+                                generationLease = ::currentLiteRtLease,
+                                onOwnershipPublished = { liteRtOwnership.set(it) },
                             ) {
                                 runOnSlmThread {
-                                    SLM.initializeIfNeeded(
-                                        context = ctx,
-                                        model = model,
-                                        supportImage = supportImage,
-                                        supportAudio = supportAudio,
-                                        systemMessage = systemMessage,
-                                        tools = tools,
-                                    )
+                                    initializeWithOwnershipHandoff { handoff ->
+                                        SLM.initializeIfNeeded(
+                                            context = ctx,
+                                            model = model,
+                                            supportImage = supportImage,
+                                            supportAudio = supportAudio,
+                                            systemMessage = systemMessage,
+                                            tools = tools,
+                                            publicationHandoff = handoff,
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -858,8 +908,9 @@ class LiteRtRepository(
                         ) {
                             AI_INFERENCE_GATE.withPermit {
                                 heavyRuntimeHandoff.withLiteRt(
-                                    runtimeIdentity = modelIdentityForPath(model.taskPath),
-                                    releaseLiteRt = { SLM.forceCleanUpAndWait(model) },
+                                    releaseLiteRt = ::closeLiteRtGeneration,
+                                    generationLease = ::currentLiteRtLease,
+                                    onOwnershipPublished = { liteRtOwnership.set(it) },
                                 ) {
                                     val output =
                                         runOnSlmThread {
@@ -955,9 +1006,7 @@ class LiteRtRepository(
                     runCatchingSuspend {
                         AI_INFERENCE_GATE.withPermit {
                             runOnSlmThread {
-                                SLM.forceCleanUpAndWait(
-                                    model
-                                )
+                                forceCleanUpAndInvalidate()
                             }
                         }
                         Unit
@@ -1499,9 +1548,7 @@ class LiteRtRepository(
                                 val forceResult =
                                     runCatchingSuspend {
                                         runOnSlmThread {
-                                            SLM.forceCleanUpAndWait(
-                                                model = model,
-                                            )
+                                            forceCleanUpAndInvalidate()
                                         }
                                     }
 
@@ -1593,9 +1640,7 @@ class LiteRtRepository(
                                          * trying to reuse its Engine.
                                          */
                                         runOnSlmThread {
-                                            SLM.forceCleanUpAndWait(
-                                                model = model,
-                                            )
+                                            forceCleanUpAndInvalidate()
                                         }
 
                                         FORCE_REINIT.set(false)
@@ -1696,9 +1741,7 @@ class LiteRtRepository(
                             val repairResult =
                                 runCatchingSuspend {
                                     runOnSlmThread {
-                                        SLM.forceCleanUpAndWait(
-                                            model = model,
-                                        )
+                                        forceCleanUpAndInvalidate()
                                     }
                                 }
 
@@ -1770,19 +1813,23 @@ class LiteRtRepository(
                                     withTimeoutOrNull(INIT_TIMEOUT_MS) {
                                         runCatchingSuspend {
                                             heavyRuntimeHandoff.withLiteRt(
-                                                runtimeIdentity = modelIdentityForPath(model.taskPath),
-                                                releaseLiteRt = { SLM.forceCleanUpAndWait(model) },
+                                                releaseLiteRt = ::closeLiteRtGeneration,
+                                                generationLease = ::currentLiteRtLease,
+                                                onOwnershipPublished = { liteRtOwnership.set(it) },
                                             ) {
                                                 runOnSlmThread {
-                                                    SLM.initializeIfNeeded(
-                                                        context = ctx,
-                                                        model = model,
-                                                        supportImage = supportImage,
-                                                        supportAudio = supportAudio,
-                                                        systemMessage = systemMessage,
-                                                        tools = tools,
-                                                        samplingProfile = samplingProfile,
-                                                    )
+                                                    initializeWithOwnershipHandoff { handoff ->
+                                                        SLM.initializeIfNeeded(
+                                                            context = ctx,
+                                                            model = model,
+                                                            supportImage = supportImage,
+                                                            supportAudio = supportAudio,
+                                                            systemMessage = systemMessage,
+                                                            tools = tools,
+                                                            samplingProfile = samplingProfile,
+                                                            publicationHandoff = handoff,
+                                                        )
+                                                    }
                                                 }
                                             }
                                         }
@@ -1914,8 +1961,9 @@ class LiteRtRepository(
 
                             try {
                                 heavyRuntimeHandoff.withLiteRt(
-                                    runtimeIdentity = modelIdentityForPath(model.taskPath),
-                                    releaseLiteRt = { SLM.forceCleanUpAndWait(model) },
+                                    releaseLiteRt = ::closeLiteRtGeneration,
+                                    generationLease = ::currentLiteRtLease,
+                                    onOwnershipPublished = { liteRtOwnership.set(it) },
                                 ) {
                                     runOnSlmThread {
                                         SLM.runInference(
