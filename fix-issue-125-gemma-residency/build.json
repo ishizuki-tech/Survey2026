@@ -1,0 +1,12 @@
+{
+  "original_branch": "fix/issue-125-gemma-residency",
+  "branch_slug": "fix-issue-125-gemma-residency",
+  "commit_sha": "734b51ffdbea6e8fe9d307e242f58c36e18b7246",
+  "short_sha": "734b51f",
+  "apk_name": "Survey2026-fix-issue-125-gemma-residency-734b51f.apk",
+  "apk_sha256": "5372e003c33047abfd9ce9cf8dabecca3207b34139550f1d91c67848d3c1ac38",
+  "apk_download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-fix-issue-125-gemma-residency-734b51f-run-163/Survey2026-fix-issue-125-gemma-residency-734b51f.apk",
+  "page_url": "https://ishizuki-tech.github.io/Survey2026/fix-issue-125-gemma-residency/",
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/41121193643",
+  "generated_utc": "2026-10-30T20:19:09Z"
+}
