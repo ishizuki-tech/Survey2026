@@ -672,6 +672,7 @@ object SLM {
         systemMessage: Message? = null,
         tools: List<Any> = emptyList(),
         samplingProfile: SamplingProfile? = null,
+        publicationHandoff: LiteRtPublicationHandoff? = null,
     ) {
         val appContext =
             context.applicationContext ?: context
@@ -689,6 +690,7 @@ object SLM {
             systemMessage = systemMessage,
             tools = tools,
             samplingProfile = samplingProfile,
+            publicationHandoff = publicationHandoff,
         )
     }
 
@@ -798,6 +800,14 @@ object SLM {
             model = model,
         )
     }
+
+    internal suspend fun currentGenerationLease(model: Model): LiteRtGenerationLease? =
+        LiteRtLM.currentGenerationLease(model)
+
+    internal suspend fun closeGenerationIfCurrent(
+        lease: LiteRtGenerationLease,
+        reason: String,
+    ): GenerationCloseResult = LiteRtLM.closeGenerationIfCurrent(lease, reason)
 
     /**
      * Start streaming inference.

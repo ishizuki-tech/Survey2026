@@ -146,6 +146,7 @@ import com.negi.survey.screens.toggleSpeechRecordingWithTtsInterlock
 import com.negi.survey.runtime.HeavyRuntimeHandoff
 import com.negi.survey.runtime.NoOpHeavyRuntimeHandoff
 import com.negi.survey.slm.LiteRtLM
+import com.negi.survey.slm.LiteRtPublicationHandoff
 import com.negi.survey.slm.LiteRtRepository
 import com.negi.survey.slm.Model
 import com.negi.survey.slm.NATIVE_RUNTIME_POISON_MESSAGE
@@ -199,6 +200,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
@@ -1069,15 +1071,33 @@ fun AppNav() {
                 withContext(Dispatchers.Default) {
                     try {
                         heavyRuntimeCoordinator.withLiteRt(
-                            runtimeIdentity = modelIdentityForPath(slmModel.taskPath),
-                            releaseLiteRt = { SLM.forceCleanUpAndWait(slmModel) },
+                            releaseLiteRt = { lease ->
+                                SLM.closeGenerationIfCurrent(lease, reason = "MainActivity")
+                            },
+                            generationLease = {
+                                checkNotNull(SLM.currentGenerationLease(slmModel))
+                            },
                         ) {
-                            LiteRtLM.initializeIfNeeded(
-                                context = appContext,
-                                model = slmModel,
-                                supportImage = false,
-                                supportAudio = false
-                            )
+                            val handoff = LiteRtPublicationHandoff()
+                            try {
+                                LiteRtLM.initializeIfNeeded(
+                                    context = appContext,
+                                    model = slmModel,
+                                    supportImage = false,
+                                    supportAudio = false,
+                                    publicationHandoff = handoff,
+                                )
+                            } catch (error: Throwable) {
+                                handoff.abandon()?.let { lease ->
+                                    withContext(NonCancellable) {
+                                        LiteRtLM.closeGenerationIfCurrent(
+                                            lease,
+                                            reason = "MainActivity-abandoned-handoff",
+                                        )
+                                    }
+                                }
+                                throw error
+                            }
                         }
                     } catch (ce: CancellationException) {
                         throw ce

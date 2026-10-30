@@ -274,7 +274,7 @@ private const val DEBUG_STATE_EVERY_N = 1
  * - systemMessage/tools snapshots are stored to preserve behavior across
  *   capability upgrades (re-init triggered by multimodal needs).
  */
-data class LiteRtLmInstance(
+internal data class LiteRtLmInstance(
     val engine: Engine,
     val runtimeIdentity: Any,
     @Volatile var conversation: Conversation,
@@ -284,7 +284,81 @@ data class LiteRtLmInstance(
     @Volatile var conversationConfigSnapshot: ConversationConfig,
     @Volatile var systemMessageSnapshot: Message?,
     @Volatile var toolsSnapshot: List<Any>,
+    /** Revocable teardown authority retained only by the publishing initializer. */
+    internal val publicationCleanupClaim: PublicationCleanupClaim? = null,
 )
+
+/** Opaque reference to one actually published LiteRT Engine generation. */
+class LiteRtGenerationLease internal constructor(
+    internal val key: String,
+    internal val runtimeIdentity: Any,
+)
+
+/**
+ * Linearizes successor warm adoption against an initializer's abandoned-publication cleanup.
+ * Exactly one path may win: a successor adopts the generation, or the abandoned initializer
+ * claims teardown before any successor has adopted it.
+ */
+internal class PublicationCleanupClaim {
+    private enum class State { AVAILABLE, ADOPTED, CLEANUP_CLAIMED }
+
+    private val state = AtomicReference(State.AVAILABLE)
+
+    fun adopt(): Boolean = state.compareAndSet(State.AVAILABLE, State.ADOPTED)
+
+    fun claimCleanup(): Boolean = state.compareAndSet(State.AVAILABLE, State.CLEANUP_CLAIMED)
+}
+
+/** Atomic bridge between a cancellable initializer and native publication. */
+class LiteRtPublicationHandoff {
+    private sealed interface State {
+        data object Pending : State
+        data object Abandoned : State
+        data class Published(val lease: LiteRtGenerationLease) : State
+    }
+
+    private val state = AtomicReference<State>(State.Pending)
+    private val cleanupClaim = PublicationCleanupClaim()
+
+    internal fun cleanupClaim(): PublicationCleanupClaim = cleanupClaim
+
+    /** Returns false when cancellation won before this generation was published. */
+    fun publish(lease: LiteRtGenerationLease): Boolean =
+        when (state.getAndSet(State.Published(lease))) {
+            State.Abandoned -> false
+            else -> true
+        }
+
+    /**
+     * Returns the exact already-published generation only while this initializer still owns
+     * its cleanup claim. A successor's warm adoption revokes that authority.
+     */
+    internal fun abandon(): LiteRtGenerationLease? {
+        while (true) {
+            when (val current = state.get()) {
+                State.Pending -> if (state.compareAndSet(current, State.Abandoned)) return null
+                State.Abandoned -> return null
+                is State.Published -> if (state.compareAndSet(current, State.Abandoned)) {
+                    return current.lease.takeIf { cleanupClaim.claimCleanup() }
+                }
+            }
+        }
+    }
+
+    /** Claim cleanup after publication observed a prior abandonment. */
+    internal fun claimAbandonedPublicationCleanup(
+        lease: LiteRtGenerationLease,
+    ): LiteRtGenerationLease? = lease.takeIf { cleanupClaim.claimCleanup() }
+}
+
+internal fun LiteRtGenerationLease.sameGeneration(other: LiteRtGenerationLease): Boolean =
+    key == other.key && runtimeIdentity === other.runtimeIdentity
+
+/** Result of a generation-scoped close request. */
+internal enum class GenerationCloseResult {
+    CLOSED,
+    NOT_CURRENT,
+}
 
 /** Thread-confined identity set used to enforce close-at-most-once ownership. */
 internal class ExactNativeCloseTracker {
@@ -587,6 +661,14 @@ object LiteRtLM {
         val nativeDoneHook: AtomicReference<NativeDoneHook?> = AtomicReference(null),
     )
 
+    /** Exact active-run inputs captured for a generation-scoped close request. */
+    private data class GenerationCloseCancellation(
+        val runState: RunState,
+        val runId: Long,
+        val logicalTerminator: ((Long) -> Unit)?,
+        val conversation: Conversation,
+    )
+
     private data class NativeDoneHook(
         val runId: Long,
         val callback: () -> Unit,
@@ -606,6 +688,8 @@ object LiteRtLM {
 
     internal data class RunControlTestHooks(
         val beforeScopedCancelValidation: suspend (Long) -> Unit = {},
+        val beforeGenerationCloseCancellationSelection: suspend (LiteRtGenerationLease) -> Unit = {},
+        val beforeFirstNativeMessage: (Long) -> Unit = {},
         val armHardCloseOnRunStart: (Long) -> Boolean = { false },
         val awaitHardCloseAction: (suspend (Long) -> Unit)? = null,
         val beforeTerminalClaim: (Long) -> Unit = {},
@@ -628,6 +712,9 @@ object LiteRtLM {
     internal data class InitializationTestHooks(
         val beforeWarmTeardownPlan: suspend (String) -> Unit = {},
         val onWarmTeardownSessionLockAcquired: (String) -> Unit = {},
+        val beforeEnginePublication: suspend (String) -> Unit = {},
+        val beforeAbandonedPublicationCleanup: suspend (LiteRtGenerationLease) -> Unit = {},
+        val afterAbandonedPublicationCleanup: (LiteRtGenerationLease) -> Unit = {},
     )
 
     @Volatile
@@ -1850,6 +1937,7 @@ object LiteRtLM {
         systemMessage: Message? = null,
         tools: List<Any> = emptyList(),
         samplingProfile: SamplingProfile? = null,
+        publicationHandoff: LiteRtPublicationHandoff? = null,
     ) {
         val appContext =
             context.applicationContext
@@ -1907,6 +1995,7 @@ object LiteRtLM {
             var unpublishedEngineConversation: Conversation? = null
             var engineConstructionStarted = false
             var publicationCommitted = false
+            var abandonedPublishedLease: LiteRtGenerationLease? = null
             val generationIdentity = Any()
             val scheduledEngineCloses = ExactNativeCloseTracker()
 
@@ -2304,6 +2393,7 @@ object LiteRtLM {
                             }
                             when (decision) {
                                 CleanupPlan.Satisfied -> break
+                                CleanupPlan.NotCurrent -> break
                                 is CleanupPlan.Join -> awaitFlight(decision.flight)
                                 is CleanupPlan.Busy -> throw IllegalStateException(decision.reason)
                                 is CleanupPlan.Started -> {
@@ -2666,6 +2756,8 @@ object LiteRtLM {
                                 "took=${conversationElapsed}ms"
                     )
 
+                    initializationTestHooks?.beforeEnginePublication?.invoke(key)
+
                     withSessionLock(key, reason = "initialize:publish") {
                         stateMutex.withLock {
                             val publish = {
@@ -2679,6 +2771,7 @@ object LiteRtLM {
                                     conversationConfigSnapshot = desiredConversationConfig,
                                     systemMessageSnapshot = systemMessage,
                                     toolsSnapshot = tools,
+                                    publicationCleanupClaim = publicationHandoff?.cleanupClaim(),
                                 )
                             }
                             val commitOwnership = {
@@ -2709,6 +2802,10 @@ object LiteRtLM {
                                 )
                             }
                             check(published) { "LiteRT-LM Engine publication lease was lost." }
+                            val publishedLease = LiteRtGenerationLease(key, generationIdentity)
+                            if (publicationHandoff?.publish(publishedLease) == false) {
+                                abandonedPublishedLease = publishedLease
+                            }
                         }
                     }
 
@@ -2734,7 +2831,6 @@ object LiteRtLM {
                         signal,
                         "",
                     )
-
                     completed =
                         true
                 }
@@ -3067,6 +3163,33 @@ object LiteRtLM {
                     key = key,
                     signal = signal,
                 )
+                abandonedPublishedLease?.let { abandonedLease ->
+                    // The completed signal may admit a warm adopter. Release the init flight
+                    // before scheduling close so an unadopted generation can actually retire.
+                    nativeLifecycleScope.launch {
+                        initializationTestHooks
+                            ?.beforeAbandonedPublicationCleanup
+                            ?.invoke(abandonedLease)
+                        try {
+                            publicationHandoff
+                                ?.claimAbandonedPublicationCleanup(abandonedLease)
+                                ?.let { cleanupLease ->
+                                    runCatching {
+                                        closeGenerationIfCurrent(
+                                            cleanupLease,
+                                            reason = "abandoned-initialization-handoff",
+                                        )
+                                    }.onFailure { error ->
+                                        RuntimeLogStore.w(TAG, "Abandoned initialization cleanup failed: key='$key' err=${error.message}", error)
+                                    }
+                                }
+                        } finally {
+                            initializationTestHooks
+                                ?.afterAbandonedPublicationCleanup
+                                ?.invoke(abandonedLease)
+                        }
+                    }
+                }
             }
         }
     }
@@ -3091,6 +3214,7 @@ object LiteRtLM {
         systemMessage: Message? = null,
         tools: List<Any> = emptyList(),
         samplingProfile: SamplingProfile? = null,
+        publicationHandoff: LiteRtPublicationHandoff? = null,
     ) {
         val appContext =
             context.applicationContext
@@ -3131,7 +3255,7 @@ object LiteRtLM {
                     instances[key]
                         ?: return@withLock false
 
-                engineCanServe(
+                val compatible = engineCanServe(
                     instance = instance,
                     model = model,
                     supportImage = supportImage,
@@ -3139,6 +3263,8 @@ object LiteRtLM {
                 ) &&
                         instance.conversationConfigSnapshot ==
                         desiredConversationConfig
+                if (compatible) instance.publicationCleanupClaim?.adopt()
+                compatible
             }
 
         if (ready) {
@@ -3167,14 +3293,16 @@ object LiteRtLM {
                         instances[key]
                             ?: return@stateLock false
 
-                    engineCanServe(
+                val compatible = engineCanServe(
                         instance = instance,
                         model = model,
                         supportImage = supportImage,
                         supportAudio = supportAudio,
-                    ) &&
+                ) &&
                             instance.conversationConfigSnapshot ==
                             desiredConversationConfig
+                if (compatible) instance.publicationCleanupClaim?.adopt()
+                compatible
                 }
 
             if (readyAfterLock) {
@@ -3197,6 +3325,7 @@ object LiteRtLM {
                 systemMessage = systemMessage,
                 tools = tools,
                 samplingProfile = samplingProfile,
+                publicationHandoff = publicationHandoff,
             )
 
             val error =
@@ -3288,9 +3417,11 @@ object LiteRtLM {
     }
 
     /** Close and remove an instance NOW (best-effort). */
-    private suspend fun closeInstanceNowBestEffort(key: String, reason: String) {
-        cancelScheduledCleanup(key, "closeNow:$reason")
-
+    private suspend fun closeInstanceNowBestEffort(
+        key: String,
+        reason: String,
+        expectedRuntimeIdentity: Any? = null,
+    ): GenerationCloseResult {
         try {
             awaitInitIfInFlight(key, reason = "closeNow:$reason")
         } catch (error: Throwable) {
@@ -3306,6 +3437,15 @@ object LiteRtLM {
             val decision: CleanupPlan = withSessionLock(key, reason = "closeNow:plan:$reason") {
                 stateMutex.withLock {
                     throwIfPoisoned(key)
+                    val instance = instances[key]
+                    // A stale generation must return before observing or changing
+                    // successor run/init state shared by this runtime key.
+                    if (
+                        expectedRuntimeIdentity != null &&
+                        (instance == null || instance.runtimeIdentity !== expectedRuntimeIdentity)
+                    ) {
+                        return@withLock CleanupPlan.NotCurrent
+                    }
                     val rs = getRunState(key)
                     if (rs.active.get()) {
                         return@withLock CleanupPlan.Busy(
@@ -3317,7 +3457,9 @@ object LiteRtLM {
                             "Initialization is in progress for key='$key'.",
                         )
                     }
-                    val instance = instances[key]
+                    // A stale generation must not cancel a successor's deferred
+                    // cleanup before the expected-runtime check above rejects it.
+                    cancelScheduledCleanup(key, "closeNow:$reason")
                     if (instance == null) {
                         fullTeardownAssociations[key]?.let { association ->
                             return@withLock CleanupPlan.Join(association.flight)
@@ -3374,7 +3516,8 @@ object LiteRtLM {
                 }
             }
             when (decision) {
-                CleanupPlan.Satisfied -> return
+                CleanupPlan.Satisfied -> return GenerationCloseResult.CLOSED
+                CleanupPlan.NotCurrent -> return GenerationCloseResult.NOT_CURRENT
                 is CleanupPlan.Join -> {
                     nativeLifecycleTestHooks?.onCleanupJoin?.invoke(key, decision.flight)
                     awaitFlight(decision.flight)
@@ -3411,6 +3554,7 @@ object LiteRtLM {
         data class Join(val flight: NativeLifecycleCoordinator.TeardownFlight) : CleanupPlan
         data class Busy(val reason: String) : CleanupPlan
         data object Satisfied : CleanupPlan
+        data object NotCurrent : CleanupPlan
     }
 
     private sealed interface ReplacementPlanDecision {
@@ -4057,6 +4201,103 @@ object LiteRtLM {
         )
     }
 
+    /** Returns the exact currently published Engine generation, if one exists. */
+    internal suspend fun currentGenerationLease(model: Model): LiteRtGenerationLease? {
+        val key = runtimeKey(model)
+        return stateMutex.withLock {
+            instances[key]?.let { instance ->
+                LiteRtGenerationLease(key, instance.runtimeIdentity)
+            }
+        }
+    }
+
+    /**
+     * Closes only [lease]'s still-current native generation. A later same-path Engine is
+     * deliberately not selected as a fallback.
+     */
+    internal suspend fun closeGenerationIfCurrent(
+        lease: LiteRtGenerationLease,
+        reason: String,
+    ): GenerationCloseResult {
+        awaitInitIfInFlight(lease.key, reason = "closeGenerationIfCurrent:$reason")
+        val isCurrentGeneration = stateMutex.withLock {
+            instances[lease.key]?.runtimeIdentity === lease.runtimeIdentity
+        }
+        if (!isCurrentGeneration) return GenerationCloseResult.NOT_CURRENT
+
+        /*
+         * The initial check above is intentionally outside the session lock so a
+         * stale caller can return cheaply.  It is not authorization to touch the
+         * shared RunState: A may be replaced by B before cancellation selection.
+         * Capture the exact active run and Conversation only while the expected
+         * generation is still published under the normal session -> state lock
+         * order.  The captured run ID then makes delayed logical cancellation and
+         * hard-close work harmless after a successor starts on this key.
+         */
+        runControlTestHooks?.beforeGenerationCloseCancellationSelection?.invoke(lease)
+        val cancellation = withSessionLock(
+            key = lease.key,
+            reason = "closeGenerationIfCurrent:select:$reason",
+        ) {
+            stateMutex.withLock {
+                val instance = instances[lease.key]
+                    ?.takeIf { it.runtimeIdentity === lease.runtimeIdentity }
+                    ?: return@withLock null
+                val rs = getRunState(lease.key)
+                if (!rs.active.get()) return@withLock null
+                GenerationCloseCancellation(
+                    runState = rs,
+                    runId = rs.runId.get(),
+                    logicalTerminator = rs.logicalTerminator.get(),
+                    conversation = instance.conversation,
+                )
+            }
+        }
+        if (cancellation != null) {
+            if (cancellation.logicalTerminator != null) {
+                runCatching { cancellation.logicalTerminator.invoke(cancellation.runId) }
+                    .onFailure { error ->
+                        RuntimeLogStore.w(TAG, "closeGenerationIfCurrent: logical terminator failed: key='${lease.key}' err=${error.message}", error)
+                    }
+            } else {
+                if (
+                    cancellation.runState.runId.get() == cancellation.runId &&
+                    cancellation.runState.active.get()
+                ) {
+                    runCatching { cancellation.conversation.cancelProcess() }
+                        .onFailure { error ->
+                            RuntimeLogStore.w(TAG, "closeGenerationIfCurrent: cancelProcess failed: key='${lease.key}' err=${error.message}", error)
+                        }
+                }
+                if (HARD_CLOSE_ENABLE) {
+                    startHardCloseWatchdog(
+                        key = lease.key,
+                        expectedRunId = cancellation.runId,
+                        expectedConversation = cancellation.conversation,
+                        reason = "closeGenerationIfCurrent:$reason",
+                    )
+                }
+            }
+            val becameIdle = withTimeoutOrNull(FORCE_CLOSE_WAIT_TIMEOUT_MS) {
+                while (
+                    cancellation.runState.runId.get() == cancellation.runId &&
+                    cancellation.runState.active.get()
+                ) {
+                    delay(FORCE_CLOSE_WAIT_POLL_MS)
+                }
+                true
+            } ?: false
+            check(becameIdle) {
+                "closeGenerationIfCurrent timed out while waiting for native termination: key='${lease.key}'"
+            }
+        }
+        return closeInstanceNowBestEffort(
+            key = lease.key,
+            reason = "closeGenerationIfCurrent:$reason",
+            expectedRuntimeIdentity = lease.runtimeIdentity,
+        )
+    }
+
     /**
      * Force immediate teardown (best-effort).
      *
@@ -4699,6 +4940,9 @@ object LiteRtLM {
                 val nativeStarted =
                     AtomicBoolean(false)
 
+                val firstNativeMessage =
+                    AtomicBoolean(false)
+
                 /*
                  * Timestamp captured immediately after sendMessageAsync() returns.
                  * This separates synchronous Kotlin/JNI dispatch cost from the
@@ -5123,6 +5367,10 @@ object LiteRtLM {
                         if (rs.runId.get() != myRunId) return
                         if (rs.terminated.get()) return
                         if (rs.logicalDone.get() || rs.cancelRequested.get()) return
+
+                        if (firstNativeMessage.compareAndSet(false, true)) {
+                            runControlTestHooks?.beforeFirstNativeMessage?.invoke(myRunId)
+                        }
 
                         val now = SystemClock.elapsedRealtime()
                         rs.lastMessageAtMs.set(now)

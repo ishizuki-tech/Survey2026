@@ -21,6 +21,8 @@ import com.whispercpp.whisper.WhisperContext
 import java.io.File
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
+import kotlinx.coroutines.CancellationException
 import kotlin.math.max
 import kotlin.math.sqrt
 import kotlinx.coroutines.Dispatchers
@@ -94,17 +96,50 @@ data class InitTiming(
  */
 object WhisperEngine {
 
+    /** Opaque lease for one actually published WhisperContext generation. */
+    class WhisperGenerationLease internal constructor(
+        internal val key: String,
+        internal val runtimeIdentity: Any,
+    )
+
+    /** Cancellation-safe bridge for a context being created on Dispatchers.IO. */
+    class WhisperPublicationHandoff {
+        private sealed interface State {
+            data object Pending : State
+            data object Abandoned : State
+            data class Published(val lease: WhisperGenerationLease) : State
+        }
+        private val state = AtomicReference<State>(State.Pending)
+        fun publish(lease: WhisperGenerationLease): Boolean =
+            when (state.getAndSet(State.Published(lease))) {
+                State.Abandoned -> false
+                else -> true
+            }
+        fun abandon(): WhisperGenerationLease? {
+            while (true) when (val current = state.get()) {
+                State.Pending -> if (state.compareAndSet(current, State.Abandoned)) return null
+                State.Abandoned -> return null
+                is State.Published -> if (state.compareAndSet(current, State.Abandoned)) return current.lease
+            }
+        }
+    }
+
     /**
      * Keep context + key in a single volatile snapshot to avoid transient inconsistency
      * (ctx != null but key == null, etc.).
      */
     private data class EngineState(
         val ctx: WhisperContext,
-        val key: String
+        val key: String,
+        val runtimeIdentity: Any,
     )
 
     @Volatile
     private var engineState: EngineState? = null
+
+    /** A failed native free cannot be retried because whisper_free is not idempotent. */
+    @Volatile
+    private var releaseUncertain: Throwable? = null
 
     private val engineMutex = Mutex()
 
@@ -113,6 +148,10 @@ object WhisperEngine {
 
     fun currentModelKey(): String? = engineState?.key
 
+    fun currentGenerationLease(): WhisperGenerationLease? = engineState?.let {
+        WhisperGenerationLease(it.key, it.runtimeIdentity)
+    }
+
     fun isInitialized(): Boolean = engineState != null
 
     fun isInitializedForFile(modelFile: File): Boolean =
@@ -120,6 +159,15 @@ object WhisperEngine {
 
     fun isInitializedForAsset(assetPath: String): Boolean =
         engineState?.key == ASSET_KEY_PREFIX + assetPath
+
+    private fun throwIfReleaseUncertain() {
+        releaseUncertain?.let { failure ->
+            throw IllegalStateException(
+                "Whisper native release completion is uncertain; restart the process before reuse.",
+                failure,
+            )
+        }
+    }
 
     /**
      * Estimate a PCM_16BIT MONO WAV file size in bytes.
@@ -169,7 +217,11 @@ object WhisperEngine {
         context: Context,
         modelFile: File,
         onTiming: (InitTiming) -> Unit = {},
+        publicationHandoff: WhisperPublicationHandoff? = null,
     ): Result<Unit> = withContext(Dispatchers.IO) {
+
+        runCatching { throwIfReleaseUncertain() }
+            .onFailure { return@withContext Result.failure(it) }
 
         val requestId = initSeq.incrementAndGet()
         val totalStart = SystemClock.elapsedRealtime()
@@ -310,7 +362,13 @@ object WhisperEngine {
             }
 
             val ctx = createdResult.getOrThrow()
-            engineState = EngineState(ctx = ctx, key = key)
+            val published = EngineState(ctx = ctx, key = key, runtimeIdentity = Any())
+            engineState = published
+            if (publicationHandoff?.publish(WhisperGenerationLease(key, published.runtimeIdentity)) == false) {
+                engineState = null
+                runCatching { ctx.release() }.onFailure { releaseUncertain = it }
+                return@withLock Result.failure(CancellationException("Whisper initialization was abandoned after publication."))
+            }
 
             val totalMs = SystemClock.elapsedRealtime() - totalStart
             val lockHoldMs = SystemClock.elapsedRealtime() - lockAcquiredAt
@@ -347,7 +405,11 @@ object WhisperEngine {
         context: Context,
         assetPath: String,
         onTiming: (InitTiming) -> Unit = {},
+        publicationHandoff: WhisperPublicationHandoff? = null,
     ): Result<Unit> = withContext(Dispatchers.IO) {
+
+        runCatching { throwIfReleaseUncertain() }
+            .onFailure { return@withContext Result.failure(it) }
 
         val requestId = initSeq.incrementAndGet()
         val totalStart = SystemClock.elapsedRealtime()
@@ -512,7 +574,13 @@ object WhisperEngine {
             }
 
             val ctx = createdResult.getOrThrow()
-            engineState = EngineState(ctx = ctx, key = key)
+            val published = EngineState(ctx = ctx, key = key, runtimeIdentity = Any())
+            engineState = published
+            if (publicationHandoff?.publish(WhisperGenerationLease(key, published.runtimeIdentity)) == false) {
+                engineState = null
+                runCatching { ctx.release() }.onFailure { releaseUncertain = it }
+                return@withLock Result.failure(CancellationException("Whisper initialization was abandoned after publication."))
+            }
 
             val totalMs = SystemClock.elapsedRealtime() - totalStart
             val lockHoldMs = SystemClock.elapsedRealtime() - lockAcquiredAt
@@ -828,16 +896,41 @@ object WhisperEngine {
 
     suspend fun release() {
         engineMutex.withLock {
+            throwIfReleaseUncertain()
+
             val st = engineState
             if (st == null) return
 
             engineState = null
 
-            runCatching {
+            try {
                 Log.i(LOG_TAG, "Releasing WhisperContext for ${st.key}")
                 st.ctx.release()
-            }.onFailure { e ->
-                Log.w(LOG_TAG, "Error while releasing WhisperContext", e)
+                releaseUncertain = null
+            } catch (error: Throwable) {
+                releaseUncertain = error
+                throw IllegalStateException(
+                    "WhisperContext release completion is uncertain; restart the process before reuse.",
+                    error,
+                )
+            }
+        }
+    }
+
+    /** Releases only the exact context generation named by [lease]. */
+    suspend fun releaseGenerationIfCurrent(lease: WhisperGenerationLease): Boolean {
+        engineMutex.withLock {
+            throwIfReleaseUncertain()
+            val state = engineState ?: return false
+            if (state.key != lease.key || state.runtimeIdentity !== lease.runtimeIdentity) return false
+            engineState = null
+            try {
+                state.ctx.release()
+                releaseUncertain = null
+                return true
+            } catch (error: Throwable) {
+                releaseUncertain = error
+                throw IllegalStateException("WhisperContext release completion is uncertain; restart the process before reuse.", error)
             }
         }
     }
