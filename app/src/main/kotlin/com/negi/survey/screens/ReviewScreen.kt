@@ -39,7 +39,6 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material3.Button
 import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.HorizontalDivider
@@ -47,11 +46,9 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.style.TextOverflow
@@ -60,7 +57,6 @@ import androidx.compose.ui.unit.sp
 
 import com.negi.survey.vm.SurveyViewModel
 import com.negi.survey.vm.SurveyFinalizationState
-import kotlinx.coroutines.flow.first
 
 /**
  * Review screen that renders a compact, read-only summary of the session.
@@ -147,20 +143,8 @@ fun ReviewScreen(
         allFollowups.toSortedMap()
     }
 
-    /**
-     * Open scrolled to the bottom so Back/Finish are visible without scrolling. Re-runs if the
-     * answers or follow-ups arrive after the first frame, since that changes the list height.
-     */
-    val listState = rememberLazyListState()
-    LaunchedEffect(qaEntries.size, sortedFollowups.size) {
-        // Wait for the first layout; before it the list reports no items.
-        val itemCount = snapshotFlow { listState.layoutInfo.totalItemsCount }.first { it > 0 }
-        listState.animateScrollToItem(itemCount - 1)
-    }
-
     Scaffold(containerColor = Color.Transparent) { pad ->
         LazyColumn(
-            state = listState,
             modifier = Modifier
                 .padding(pad)
                 .fillMaxSize()

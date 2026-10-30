@@ -129,7 +129,6 @@ import androidx.compose.ui.unit.max
 import androidx.compose.ui.unit.min
 import androidx.compose.ui.unit.sp
 import com.negi.survey.BuildConfig
-import com.negi.survey.ui.theme.ActionBlue
 import com.negi.survey.ui.theme.monotoneColors
 import com.negi.survey.vm.UploadStatus
 import com.negi.survey.vm.UploadStatusDetails
@@ -949,15 +948,13 @@ private fun CtaRowMono(
         horizontalArrangement = Arrangement.Center,
         verticalAlignment = Alignment.CenterVertically
     ) {
-        // Matches RowButtons' Next/Back pattern (MainActivity.kt) in shape,
-        // padding and plain text style, filled with the shared ActionBlue so
-        // Start reads as the primary action like Send/Stop/accepted Next.
+        // Matches RowButtons' Next/Back pattern (MainActivity.kt) so Start
+        // reads as the same kind of action throughout the app: a
+        // FilledTonalButton using the theme's default colors (blue, via
+        // colorScheme.secondaryContainer) instead of the monotone palette,
+        // with the same shape, padding and plain text style.
         FilledTonalButton(
             onClick = onStart,
-            colors = ButtonDefaults.filledTonalButtonColors(
-                containerColor = ActionBlue,
-                contentColor = Color.White,
-            ),
             shape = CircleShape,
             contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp),
             modifier = Modifier.testTag("StartButton")
