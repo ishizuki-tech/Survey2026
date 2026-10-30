@@ -42,43 +42,27 @@ class HeavyRuntimeCoordinatorTest {
     }
 
     @Test
-    fun litert_to_whisper_keeps_litert_resident() = runTest {
-        var liteRtReleases = 0
+    fun litert_to_whisper_waits_for_litert_release() = runTest {
+        val releaseStarted = CompletableDeferred<Unit>()
+        val allowRelease = CompletableDeferred<Unit>()
         var whisperAcquired = false
         val coordinator = coordinator(
-            releaseLiteRt = { liteRtReleases++ },
+            releaseLiteRt = {
+                releaseStarted.complete(Unit)
+                allowRelease.await()
+            },
             releaseWhisper = {},
         )
         coordinator.withLiteRt { }
 
-        coordinator.withWhisper { whisperAcquired = true }
+        val transition = async { coordinator.withWhisper { whisperAcquired = true } }
+        releaseStarted.await()
 
+        assertFalse(whisperAcquired)
+        assertFalse(transition.isCompleted)
+        allowRelease.complete(Unit)
+        transition.await()
         assertTrue(whisperAcquired)
-        assertEquals(0, liteRtReleases)
-    }
-
-    @Test
-    fun voice_answer_cycle_keeps_litert_resident_and_releases_whisper_on_submit() = runTest {
-        val events = mutableListOf<String>()
-        val coordinator = coordinator(
-            releaseLiteRt = { events += "release-litert" },
-            releaseWhisper = { events += "release-whisper" },
-        )
-
-        coordinator.withLiteRt { events += "litert" }
-        repeat(2) {
-            coordinator.withWhisper { events += "whisper" }
-            coordinator.withLiteRt { events += "litert" }
-        }
-
-        assertEquals(
-            listOf(
-                "litert",
-                "whisper", "release-whisper", "litert",
-                "whisper", "release-whisper", "litert",
-            ),
-            events,
-        )
     }
 
     @Test
@@ -119,39 +103,38 @@ class HeavyRuntimeCoordinatorTest {
         coordinator.withWhisper { }
         coordinator.withWhisper { }
 
-        assertEquals(0, liteRtReleases)
+        assertEquals(1, liteRtReleases)
         assertEquals(0, whisperReleases)
     }
 
     @Test
     fun concurrent_opposite_acquisitions_are_serialized() = runTest {
-        val whisperAcquireStarted = CompletableDeferred<Unit>()
-        val allowWhisperAcquire = CompletableDeferred<Unit>()
+        val releaseLiteRtStarted = CompletableDeferred<Unit>()
+        val allowLiteRtRelease = CompletableDeferred<Unit>()
         val events = mutableListOf<String>()
         val coordinator = coordinator(
-            releaseLiteRt = { events += "release-litert" },
+            releaseLiteRt = {
+                events += "release-litert"
+                releaseLiteRtStarted.complete(Unit)
+                allowLiteRtRelease.await()
+            },
             releaseWhisper = { events += "release-whisper" },
         )
         coordinator.withLiteRt { events += "litert-initial" }
 
-        val whisper = async {
-            coordinator.withWhisper {
-                whisperAcquireStarted.complete(Unit)
-                allowWhisperAcquire.await()
-                events += "whisper-acquired"
-            }
-        }
-        whisperAcquireStarted.await()
+        val whisper = async { coordinator.withWhisper { events += "whisper-acquired" } }
+        releaseLiteRtStarted.await()
         val liteRt = async { coordinator.withLiteRt { events += "litert-reacquired" } }
 
         assertFalse(liteRt.isCompleted)
-        allowWhisperAcquire.complete(Unit)
+        allowLiteRtRelease.complete(Unit)
         whisper.await()
         liteRt.await()
 
         assertEquals(
             listOf(
                 "litert-initial",
+                "release-litert",
                 "whisper-acquired",
                 "release-whisper",
                 "litert-reacquired",
@@ -163,50 +146,47 @@ class HeavyRuntimeCoordinatorTest {
     @Test
     fun release_failure_does_not_acquire_opposite_runtime_and_retry_is_deterministic() = runTest {
         var failRelease = true
-        var whisperReleases = 0
-        var liteRtAcquisitions = 0
+        var whisperAcquisitions = 0
         val coordinator = coordinator(
-            releaseLiteRt = {},
-            releaseWhisper = {
+            releaseLiteRt = {
                 if (failRelease) error("release failed")
-                whisperReleases++
             },
+            releaseWhisper = {},
         )
-        coordinator.withWhisper { }
+        coordinator.withLiteRt { }
 
-        val failure = runCatching { coordinator.withLiteRt { liteRtAcquisitions++ } }
+        val failure = runCatching { coordinator.withWhisper { whisperAcquisitions++ } }
         assertTrue(failure.isFailure)
-        assertEquals(0, liteRtAcquisitions)
+        assertEquals(0, whisperAcquisitions)
 
         failRelease = false
-        coordinator.withLiteRt { liteRtAcquisitions++ }
-        assertEquals(1, liteRtAcquisitions)
-        assertEquals(1, whisperReleases)
+        coordinator.withWhisper { whisperAcquisitions++ }
+        assertEquals(1, whisperAcquisitions)
     }
 
     @Test
     fun cancellation_during_release_does_not_acquire_opposite_runtime() = runTest {
         val releaseStarted = CompletableDeferred<Unit>()
         val neverRelease = CompletableDeferred<Unit>()
-        var liteRtAcquisitions = 0
+        var whisperAcquisitions = 0
         val coordinator = coordinator(
-            releaseLiteRt = {},
-            releaseWhisper = {
+            releaseLiteRt = {
                 releaseStarted.complete(Unit)
                 neverRelease.await()
             },
+            releaseWhisper = {},
         )
-        coordinator.withWhisper { }
+        coordinator.withLiteRt { }
 
-        val transition = launch { coordinator.withLiteRt { liteRtAcquisitions++ } }
+        val transition = launch { coordinator.withWhisper { whisperAcquisitions++ } }
         releaseStarted.await()
         transition.cancelAndJoin()
 
-        assertEquals(0, liteRtAcquisitions)
+        assertEquals(0, whisperAcquisitions)
 
         neverRelease.complete(Unit)
-        coordinator.withLiteRt { liteRtAcquisitions++ }
-        assertEquals(1, liteRtAcquisitions)
+        coordinator.withWhisper { whisperAcquisitions++ }
+        assertEquals(1, whisperAcquisitions)
     }
 
     @Test
@@ -223,7 +203,7 @@ class HeavyRuntimeCoordinatorTest {
         coordinator.withWhisper { events += "session-b-whisper" }
 
         assertEquals(
-            listOf("session-a-litert", "session-b-whisper"),
+            listOf("session-a-litert", "release-litert", "session-b-whisper"),
             events,
         )
     }
@@ -281,7 +261,7 @@ class HeavyRuntimeCoordinatorTest {
     }
 
     @Test
-    fun different_litert_identity_then_whisper_keeps_new_owner_resident() = runTest {
+    fun different_litert_identity_then_whisper_releases_new_owner_only() = runTest {
         var releaseA = 0
         var releaseB = 0
         val coordinator = coordinator(
@@ -297,7 +277,7 @@ class HeavyRuntimeCoordinatorTest {
         coordinator.withWhisper { }
 
         assertEquals(1, releaseA)
-        assertEquals(0, releaseB)
+        assertEquals(1, releaseB)
     }
 
     @Test
@@ -349,43 +329,6 @@ class HeavyRuntimeCoordinatorTest {
         )
     }
 
-    @Test
-    fun different_litert_identity_releases_resident_whisper_before_acquiring() = runTest {
-        val events = mutableListOf<String>()
-        val coordinator = coordinator(
-            releaseLiteRt = { events += "release-a" },
-            releaseWhisper = { events += "release-whisper" },
-        )
-        coordinator.withLiteRt(runtimeIdentity = "A") { events += "acquire-a" }
-        coordinator.withWhisper { events += "whisper" }
-
-        coordinator.withLiteRt(
-            runtimeIdentity = "B",
-            releaseLiteRt = { events += "release-b" },
-        ) { events += "acquire-b" }
-
-        assertEquals(
-            listOf("acquire-a", "whisper", "release-whisper", "release-a", "acquire-b"),
-            events,
-        )
-    }
-
-    @Test
-    fun release_current_releases_both_resident_runtimes() = runTest {
-        val events = mutableListOf<String>()
-        val coordinator = coordinator(
-            releaseLiteRt = { events += "release-litert" },
-            releaseWhisper = { events += "release-whisper" },
-        )
-        coordinator.withLiteRt { }
-        coordinator.withWhisper { }
-
-        coordinator.releaseCurrent()
-        coordinator.releaseCurrent()
-
-        assertEquals(listOf("release-whisper", "release-litert"), events)
-    }
-
     private fun coordinator(
         releaseLiteRt: suspend () -> Unit,
         releaseWhisper: suspend () -> Unit,
@@ -405,7 +348,5 @@ class HeavyRuntimeCoordinatorTest {
 
         suspend fun <T> withWhisper(acquire: suspend () -> T): T =
             delegate.withWhisper(acquire)
-
-        suspend fun releaseCurrent() = delegate.releaseCurrent()
     }
 }

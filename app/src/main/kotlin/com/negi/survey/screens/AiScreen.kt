@@ -262,14 +262,6 @@ interface SpeechController {
         // no-op
     }
 
-    /**
-     * Loads the speech model ahead of the first mic tap, so recording can start without an
-     * init delay. Best-effort: a failure is left for [startRecording] to retry and report.
-     */
-    fun preloadModel() {
-        // no-op
-    }
-
     /** Start capturing audio and producing partial or final text. */
     fun startRecording()
 
@@ -431,17 +423,6 @@ fun AiScreen(
         )
 
     val chatItems by vmAI.chatHistoryFlow(contextKey).collectAsState(initial = emptyList())
-
-    /**
-     * Load Whisper while the question or follow-up prompt is shown and read aloud, so the
-     * first mic tap does not wait for model init. Submitting the answer releases Whisper
-     * again (see HeavyRuntimeCoordinator), so this re-runs for each new prompt.
-     */
-    val acceptsAnswer = !loading && !submissionPending &&
-            !(isTwoStepNode && (conv.validationFailed || conv.turnCompleted))
-    LaunchedEffect(contextKey, conv.activePromptQuestion, acceptsAnswer, speechController) {
-        if (acceptsAnswer) speechController?.preloadModel()
-    }
 
     val prettyJson = remember {
         Json {
