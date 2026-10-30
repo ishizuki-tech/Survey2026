@@ -1,0 +1,12 @@
+{
+  "original_branch": "revert-127-fix/whisper-gemma-gpu-crash",
+  "branch_slug": "revert-127-fix-whisper-gemma-gpu-crash",
+  "commit_sha": "84146356c9e016ed4bbe32d66b05187345195b92",
+  "short_sha": "8414635",
+  "apk_name": "Survey2026-revert-127-fix-whisper-gemma-gpu-crash-8414635.apk",
+  "apk_sha256": "61cbd695a8b676faaaebd006342195e3bac8f989942e07b335c32842bd6d8d54",
+  "apk_download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-revert-127-fix-whisper-gemma-gpu-crash-8414635-run-162/Survey2026-revert-127-fix-whisper-gemma-gpu-crash-8414635.apk",
+  "page_url": "https://ishizuki-tech.github.io/Survey2026/revert-127-fix-whisper-gemma-gpu-crash/",
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/41091283794",
+  "generated_utc": "2026-10-30T16:41:58Z"
+}
