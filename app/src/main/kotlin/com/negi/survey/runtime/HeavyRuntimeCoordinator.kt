@@ -9,7 +9,7 @@ import kotlinx.coroutines.sync.withLock
  * A transition retains the mutex through release and the caller-provided native acquisition,
  * so an opposite runtime cannot begin initializing in the gap between those operations.
  * The successful LiteRT acquisition supplies the exact process-wide instance release action
- * used for a later identity change or explicit release.
+ * used for a later Whisper transition.
  */
 interface HeavyRuntimeHandoff {
     suspend fun <T> withLiteRt(
@@ -21,7 +21,7 @@ interface HeavyRuntimeHandoff {
     suspend fun <T> withWhisper(acquire: suspend () -> T): T
 
     /**
-     * Releases every heavy runtime that is currently resident, without acquiring
+     * Releases whichever runtime is currently owned (if any), without acquiring
      * a replacement. Use this to explicitly shut down a heavy runtime the user
      * has backed away from, rather than leaving release to the next acquisition.
      */
@@ -41,23 +41,17 @@ object NoOpHeavyRuntimeHandoff : HeavyRuntimeHandoff {
     override suspend fun releaseCurrent() = Unit
 }
 
-/**
- * Process-wide residency policy for LiteRT-LM and Whisper.
- *
- * - LiteRT-LM stays resident while Whisper initializes and records. Re-initializing the
- *   LiteRT-LM GPU engine after every dictated answer caused multi-second whole-GPU stalls
- *   and Adreno driver process kills on the Galaxy S25 (issue #125).
- * - Whisper (CPU-only) is loaded for answering a question (the AI screen preloads it while
- *   the prompt is read aloud) and is released before every LiteRT-LM acquisition, which
- *   during a survey means when the answer is submitted to the model. LiteRT-LM
- *   initialization and inference therefore never run alongside a resident Whisper context.
- * - A different LiteRT-LM identity releases the previous LiteRT-LM runtime first.
- */
 class HeavyRuntimeCoordinator(
     private val releaseWhisper: suspend () -> Unit,
 ) : HeavyRuntimeHandoff {
+    private enum class Owner {
+        NONE,
+        LITERT,
+        WHISPER,
+    }
+
     private val transitionMutex = Mutex()
-    private var whisperResident = false
+    private var owner = Owner.NONE
     private var activeLiteRtIdentity: String? = null
     private var releaseActiveLiteRt: (suspend () -> Unit)? = null
 
@@ -67,19 +61,27 @@ class HeavyRuntimeCoordinator(
         acquire: suspend () -> T,
     ): T =
         transitionMutex.withLock {
-            releaseResidentWhisper()
-            val sameRuntime = activeLiteRtIdentity == runtimeIdentity
-            if (!sameRuntime && activeLiteRtIdentity != null) {
-                releaseOwnedLiteRt()
+            val sameRuntime = owner == Owner.LITERT && activeLiteRtIdentity == runtimeIdentity
+            if (!sameRuntime) {
+                when (owner) {
+                    Owner.LITERT -> releaseOwnedLiteRt()
+                    Owner.WHISPER -> releaseWhisper()
+                    Owner.NONE -> Unit
+                }
+                owner = Owner.NONE
+                activeLiteRtIdentity = null
+                releaseActiveLiteRt = null
             }
 
             try {
                 acquire().also {
+                    owner = Owner.LITERT
                     activeLiteRtIdentity = runtimeIdentity
                     releaseActiveLiteRt = releaseLiteRt
                 }
             } catch (error: Throwable) {
                 if (!sameRuntime) {
+                    owner = Owner.NONE
                     activeLiteRtIdentity = null
                     releaseActiveLiteRt = null
                 }
@@ -89,23 +91,22 @@ class HeavyRuntimeCoordinator(
 
     override suspend fun <T> withWhisper(acquire: suspend () -> T): T =
         transitionMutex.withLock {
-            // LiteRT-LM is intentionally left resident; see the class KDoc.
-            acquire().also { whisperResident = true }
+            transitionTo(
+                requested = Owner.WHISPER,
+                releaseOpposite = ::releaseOwnedLiteRt,
+                acquire = acquire,
+            )
         }
 
     override suspend fun releaseCurrent() {
         transitionMutex.withLock {
-            releaseResidentWhisper()
-            if (activeLiteRtIdentity != null) {
-                releaseOwnedLiteRt()
+            when (owner) {
+                Owner.LITERT -> releaseOwnedLiteRt()
+                Owner.WHISPER -> releaseWhisper()
+                Owner.NONE -> Unit
             }
+            owner = Owner.NONE
         }
-    }
-
-    private suspend fun releaseResidentWhisper() {
-        if (!whisperResident) return
-        releaseWhisper()
-        whisperResident = false
     }
 
     private suspend fun releaseOwnedLiteRt() {
@@ -117,5 +118,32 @@ class HeavyRuntimeCoordinator(
         }.invoke()
         activeLiteRtIdentity = null
         releaseActiveLiteRt = null
+    }
+
+    private suspend fun <T> transitionTo(
+        requested: Owner,
+        releaseOpposite: suspend () -> Unit,
+        acquire: suspend () -> T,
+        onAcquired: () -> Unit = {},
+    ): T {
+        val previous = owner
+        if (previous != requested) {
+            if (previous != Owner.NONE) {
+                releaseOpposite()
+            }
+            owner = Owner.NONE
+        }
+
+        return try {
+            acquire().also {
+                owner = requested
+                onAcquired()
+            }
+        } catch (error: Throwable) {
+            if (previous != requested) {
+                owner = Owner.NONE
+            }
+            throw error
+        }
     }
 }
