@@ -1,0 +1,12 @@
+{
+  "original_branch": "revert-130-ui/minor-updates",
+  "branch_slug": "revert-130-ui-minor-updates",
+  "commit_sha": "561b674107208e69925db22679fa36a8d78fd7d2",
+  "short_sha": "561b674",
+  "apk_name": "Survey2026-revert-130-ui-minor-updates-561b674.apk",
+  "apk_sha256": "89f6e8fb60bdb955cf2ecd9cef286be93834b48e34def15acf76aafc9b0fa861",
+  "apk_download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-revert-130-ui-minor-updates-561b674-run-160/Survey2026-revert-130-ui-minor-updates-561b674.apk",
+  "page_url": "https://ishizuki-tech.github.io/Survey2026/revert-130-ui-minor-updates/",
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/41088448314",
+  "generated_utc": "2026-10-30T16:24:25Z"
+}
