@@ -1,6 +1,12 @@
 package com.negi.survey.vm
 
 import java.util.Locale
+import com.negi.survey.decision.EvaluationExecution
+import com.negi.survey.decision.EvaluationInput
+import com.negi.survey.decision.FollowupAdmissionInput
+import com.negi.survey.decision.RequiredComponentConfiguration
+import com.negi.survey.decision.SurveyDecision
+import com.negi.survey.decision.SurveyDecisionEngine
 import kotlinx.serialization.json.*
 
 /** Additive export values; absence in older surveys means unknown, never achieved. */
@@ -60,84 +66,30 @@ internal object SurveyAiPolicy {
         requiredComponents: List<String> = emptyList(),
         requiredComponentIds: List<String> = emptyList(),
     ): SurveyAiEvaluation {
-        if (timedOut || error != null) return SurveyAiEvaluation(SurveyAiDecision.FAILURE)
-        val obj = parseStrictModelJsonObject(raw)
-            ?: return SurveyAiEvaluation(SurveyAiDecision.FAILURE)
-        val scoreValue = obj["score"] as? JsonPrimitive ?: return SurveyAiEvaluation(SurveyAiDecision.FAILURE)
-        val score = scoreValue.takeUnless { it.isString }?.intOrNull
-            ?.takeIf { it in 1..100 } ?: return SurveyAiEvaluation(SurveyAiDecision.FAILURE)
-        val missing = obj["missing_points"] as? JsonArray ?: return SurveyAiEvaluation(SurveyAiDecision.FAILURE)
-        if (missing.any {
-                val point = it as? JsonPrimitive
-                point == null || !point.isString || point.content.isBlank()
-            }) return SurveyAiEvaluation(SurveyAiDecision.FAILURE)
-        val modelMissingPoints = missing.map { (it as JsonPrimitive).content }
-        val missingPoints = when {
-            requiredComponentIds.isNotEmpty() -> canonicalizeRequiredComponentIds(
-                modelMissingPoints,
-                requiredComponentIds,
-            ) ?: return SurveyAiEvaluation(SurveyAiDecision.FAILURE)
-            requiredComponents.isNotEmpty() -> {
-                if (modelMissingPoints.any { it !in requiredComponents } ||
-                    modelMissingPoints.distinct().size != modelMissingPoints.size
-                ) return SurveyAiEvaluation(SurveyAiDecision.FAILURE)
-                modelMissingPoints
-            }
-            else -> modelMissingPoints
-        }
-        val followupNeeded =
-            if (!obj.containsKey("followup_needed")) {
-                // A low score with valid unresolved points unambiguously requires the next step.
-                if (score in 1..89 && missing.isNotEmpty()) true else return SurveyAiEvaluation(SurveyAiDecision.FAILURE)
-            } else {
-                val followupValue = obj["followup_needed"] as? JsonPrimitive
-                    ?: return SurveyAiEvaluation(SurveyAiDecision.FAILURE)
-                followupValue.takeUnless { it.isString }?.booleanOrNull
-                    ?: return SurveyAiEvaluation(SurveyAiDecision.FAILURE)
-            }
-
-        if (score >= 90) {
-            return if (missing.isEmpty() && !followupNeeded) {
-                SurveyAiEvaluation(SurveyAiDecision.ACHIEVED, missingPoints)
-            } else {
-                SurveyAiEvaluation(SurveyAiDecision.FAILURE)
-            }
-        }
-
-        if (missing.isEmpty() || !followupNeeded) return SurveyAiEvaluation(SurveyAiDecision.FAILURE)
-        return SurveyAiEvaluation(
-            if (remaining > 0) SurveyAiDecision.GENERATE else SurveyAiDecision.LIMIT_REACHED,
-            missingPoints,
+        val result = SurveyDecisionEngine.evaluate(
+            EvaluationInput(
+                execution = EvaluationExecution(raw, timedOut, error),
+                remainingFollowupCapacity = remaining,
+                requiredComponents = RequiredComponentConfiguration(
+                    legacyRequiredComponents = requiredComponents,
+                    requiredComponentIds = requiredComponentIds,
+                ),
+            ),
         )
+        return SurveyAiEvaluation(result.decision.toSurveyAiDecision(), result.admittedMissingPoints)
     }
 
-    fun normalize(question: String): String = question.trim().lowercase(Locale.ROOT)
-        .replace(Regex("\\s+"), " ").trimEnd('?', '？').trim()
+    fun normalize(question: String): String = SurveyDecisionEngine.normalizeQuestion(question)
 
-    private fun canonicalizeRequiredComponentIds(
-        modelIds: List<String>,
-        configuredIds: List<String>,
-    ): List<String>? {
-        val configuredByFormat = configuredIds.groupBy(::normalizeRequiredComponentId)
-        val canonicalIds = modelIds.map { modelId ->
-            configuredByFormat[normalizeRequiredComponentId(modelId)]?.singleOrNull()
-                ?: return null
-        }
-        return canonicalIds.takeIf { it.distinct().size == it.size }
-    }
+    fun acceptQuestion(raw: String, timedOut: Boolean, error: String?, existing: List<String>): String? =
+        SurveyDecisionEngine.admitFollowup(
+            FollowupAdmissionInput(raw, timedOut, error, existing),
+        ).acceptedQuestion
+}
 
-    private fun normalizeRequiredComponentId(id: String): String = id.trim()
-        .lowercase(Locale.ROOT)
-        .replace(Regex("[\\s_-]+"), "_")
-
-    fun acceptQuestion(raw: String, timedOut: Boolean, error: String?, existing: List<String>): String? {
-        if (timedOut || error != null) return null
-        val question = raw.trim()
-        // These survey assets request exactly one plain-text question. Fail closed on other formats.
-        if (question.isEmpty() || question.contains('\n') || question.contains('\r') ||
-            question.startsWith("{") || question.startsWith("[") || question.startsWith("```") ||
-            question.count { it == '?' || it == '？' } != 1 ||
-            question.last() !in listOf('?', '？')) return null
-        return question.takeIf { q -> existing.none { normalize(it) == normalize(q) } }
-    }
+private fun SurveyDecision.toSurveyAiDecision(): SurveyAiDecision = when (this) {
+    SurveyDecision.ACHIEVED -> SurveyAiDecision.ACHIEVED
+    SurveyDecision.GENERATE -> SurveyAiDecision.GENERATE
+    SurveyDecision.LIMIT_REACHED -> SurveyAiDecision.LIMIT_REACHED
+    SurveyDecision.FAILURE -> SurveyAiDecision.FAILURE
 }
