@@ -1,12 +1,12 @@
 {
   "original_branch": "fix/gemma-download-after-local-pick",
   "branch_slug": "fix-gemma-download-after-local-pick",
-  "commit_sha": "59949821fe4cf31da59a94d0b367ddd466ee6d9c",
-  "short_sha": "5994982",
-  "apk_name": "Survey2026-fix-gemma-download-after-local-pick-5994982.apk",
-  "apk_sha256": "e226bf414c04a28336a3a30ba5914fef3af574d044ad3bae0c1e183c5f11ac36",
-  "apk_download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-fix-gemma-download-after-local-pick-5994982-run-158/Survey2026-fix-gemma-download-after-local-pick-5994982.apk",
+  "commit_sha": "474968591c844cc727187e2cf904e056eca0f190",
+  "short_sha": "4749685",
+  "apk_name": "Survey2026-fix-gemma-download-after-local-pick-4749685.apk",
+  "apk_sha256": "de9d2046a2d968b45b3c61c4b8952e54a7107d00b0adc70fba015a66f0eff9ae",
+  "apk_download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-fix-gemma-download-after-local-pick-4749685-run-159/Survey2026-fix-gemma-download-after-local-pick-4749685.apk",
   "page_url": "https://ishizuki-tech.github.io/Survey2026/fix-gemma-download-after-local-pick/",
-  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/41062471638",
-  "generated_utc": "2026-10-30T13:28:11Z"
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/41063200069",
+  "generated_utc": "2026-10-30T13:35:57Z"
 }
