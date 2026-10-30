@@ -169,26 +169,6 @@ class SurveyNavigationResolutionTest {
     }
 
     @Test
-    fun saved_single_choice_answer_restores_selection_and_other_detail() {
-        val node = Node(
-            id = "Choice",
-            type = NodeType.SINGLE_CHOICE,
-            options = listOf("Known", "Other / Nyingine"),
-            otherTextOption = "Other / Nyingine",
-        )
-
-        val saved = node.composeSingleChoiceAnswer("Other / Nyingine", "Ruiru – Gitothua")
-        assertEquals(
-            SingleChoiceSelection("Other / Nyingine", "Ruiru – Gitothua"),
-            node.decomposeSingleChoiceAnswer(saved),
-        )
-        assertEquals(SingleChoiceSelection("Known"), node.decomposeSingleChoiceAnswer("Known"))
-        assertEquals(SingleChoiceSelection(null), node.decomposeSingleChoiceAnswer(""))
-        assertEquals(SingleChoiceSelection(null), node.decomposeSingleChoiceAnswer(null))
-        assertEquals(SingleChoiceSelection(null), node.decomposeSingleChoiceAnswer("Removed option"))
-    }
-
-    @Test
     fun other_details_visibility_requires_a_configured_exact_other_selection() {
         val other = "Other / Nyingine"
 

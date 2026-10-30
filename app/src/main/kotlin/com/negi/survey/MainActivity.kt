@@ -153,10 +153,8 @@ import com.negi.survey.slm.Repository
 import com.negi.survey.slm.SLM
 import com.negi.survey.slm.buildModelConfig
 import com.negi.survey.slm.modelIdentityForPath
-import com.negi.survey.ui.theme.ActionBlue
 import com.negi.survey.ui.theme.SurveyNavTheme
 import com.negi.survey.ui.theme.monotoneColors
-import com.negi.survey.utils.ExportUtils
 import com.negi.survey.vm.AiViewModel
 import com.negi.survey.vm.AppViewModel
 import com.negi.survey.vm.DlState
@@ -176,7 +174,6 @@ import com.negi.survey.vm.NodeType
 import com.negi.survey.vm.QuestionSpeaker
 import com.negi.survey.vm.SurveyViewModel
 import com.negi.survey.vm.composeSingleChoiceAnswer
-import com.negi.survey.vm.decomposeSingleChoiceAnswer
 import com.negi.survey.vm.isValidNumberAnswer
 import com.negi.survey.vm.shouldShowOtherDetails
 import com.negi.survey.vm.SurveySessionStore
@@ -1381,33 +1378,12 @@ fun SurveyNavHost(
                         "onVoiceExported: q=$resolvedQid, file=${voice.fileName}, bytes=${voice.byteSize}, checksum=${voice.checksum}"
                     )
 
-                    val discarded = vmSurvey.onVoiceExported(
+                    vmSurvey.onVoiceExported(
                         questionId = resolvedQid,
                         fileName = voice.fileName,
                         byteSize = voice.byteSize,
                         checksum = voice.checksum,
-                        replace = false,
-                        prompt = voice.prompt
-                    )
-                    // A re-recorded answer keeps only its final take; drop the replaced files.
-                    discarded.forEach { ref ->
-                        val deleted = runCatching {
-                            ExportUtils.deleteExportedVoice(appContext, ref.fileName)
-                        }.getOrDefault(false)
-                        Log.d(
-                            MainActivity.TAG,
-                            "onVoiceExported: discarded earlier take q=$resolvedQid, file=${ref.fileName}, deleted=$deleted"
-                        )
-                    }
-                },
-                onVoiceTranscribed = onVoiceTranscribed@{ voice ->
-                    val resolvedQid =
-                        voice.questionId?.takeIf { it.isNotBlank() } ?: latestNodeIdState.value
-                    if (resolvedQid.isBlank()) return@onVoiceTranscribed
-                    vmSurvey.onVoiceTranscribed(
-                        questionId = resolvedQid,
-                        fileName = voice.fileName,
-                        transcript = voice.transcript
+                        replace = false
                     )
                 }
             )
@@ -1538,21 +1514,7 @@ fun SurveyNavHost(
                                 onResetToSelector()
                             }
                         },
-                        onStart = onStart@{
-                            /*
-                             * Returning to the note mid-survey must not erase it: continue the
-                             * same run. A fresh survey starts only from the selector's Start
-                             * button, which creates a new session.
-                             */
-                            if (vmSurvey.isRunActive.value) {
-                                Log.d(
-                                    MainActivity.TAG,
-                                    "Home -> Continue survey in progress. session=$sessionId"
-                                )
-                                vmSurvey.advanceToNext()
-                                return@onStart
-                            }
-
+                        onStart = {
                             /** Snapshot the home note text before resetting the run. */
                             val homeNote = runFreeTextShadow
 
@@ -1649,7 +1611,6 @@ fun SurveyNavHost(
 
                 entry<FlowSingle> {
                     val node by vmSurvey.currentNode.collectAsStateWithLifecycle()
-                    val answers by vmSurvey.answers.collectAsStateWithLifecycle()
                     val ttsSpeaking by ttsController.isSpeaking.collectAsStateWithLifecycle()
 
                     LaunchedEffect(node.id, node.question, ttsAutoPlay) {
@@ -1665,7 +1626,6 @@ fun SurveyNavHost(
                         selected = vmSurvey.single.collectAsStateWithLifecycle().value,
                         onSelect = { vmSurvey.setSingleChoice(it) },
                         otherTextOption = node.otherTextOption,
-                        initialOtherText = node.decomposeSingleChoiceAnswer(answers[node.id]).otherText,
                         onSubmit = { selection, otherText ->
                             node.composeSingleChoiceAnswer(selection, otherText)?.let { answer ->
                                 runCatching { ttsController.stop() }
@@ -1766,8 +1726,7 @@ fun SurveyNavHost(
                         onNext = { runCatching { ttsController.stop() }; vmSurvey.advanceToNext() },
                         onBack = { runCatching { ttsController.stop() }; vmSurvey.backToPrevious() },
                         speechController = speechController,
-                        ttsController = ttsController,
-                        autoReadFollowups = ttsAutoPlay && node.readAloud
+                        ttsController = ttsController
                     )
                 }
 
@@ -2061,7 +2020,6 @@ private fun SingleChoiceNodeScreen(
     selected: String?,
     onSelect: (String?) -> Unit,
     otherTextOption: String? = null,
-    initialOtherText: String = "",
     onSubmit: (String?, String?) -> Unit,
     onBack: () -> Unit,
     onReplay: () -> Unit = {},
@@ -2069,7 +2027,7 @@ private fun SingleChoiceNodeScreen(
 ) {
     val backplate = appBackplate()
     val scroll = rememberScrollState()
-    var otherText by rememberSaveable(question, otherTextOption) { mutableStateOf(initialOtherText) }
+    var otherText by rememberSaveable(question, otherTextOption) { mutableStateOf("") }
 
     Box(
         modifier = Modifier
@@ -2530,10 +2488,6 @@ private fun HomeFreeTextComposer(
             FilledTonalButton(
                 onClick = onSend,
                 enabled = enabled,
-                colors = ButtonDefaults.filledTonalButtonColors(
-                    containerColor = ActionBlue,
-                    contentColor = Color.White,
-                ),
                 shape = CircleShape,
                 contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp)
             ) {

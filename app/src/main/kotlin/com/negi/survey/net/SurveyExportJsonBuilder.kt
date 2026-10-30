@@ -10,7 +10,6 @@ package com.negi.survey.net
 
 import com.negi.survey.BuildConfig
 import com.negi.survey.vm.SurveyFinalizationSnapshot
-import com.negi.survey.vm.SurveyViewModel
 
 /**
  * The single authoritative serializer for the survey JSON export contract.
@@ -86,9 +85,8 @@ object SurveyExportJsonBuilder {
             append("      \"file\": \"").append(escape(localFileName(ref.fileName))).append("\",\n")
             append("      \"survey_id\": \"").append(escape(snapshot.surveyId)).append("\",\n")
             append("      \"question_id\": \"").append(escape(questionId)).append("\",\n")
-            append("      \"question\": \"").append(escape(recordingPrompt(snapshot, ref))).append("\",\n")
-            append("      \"answer\": \"")
-                .append(escape(ref.transcript ?: snapshot.answers[questionId].orEmpty())).append("\"\n")
+            append("      \"question\": \"").append(escape(snapshot.questions[questionId].orEmpty())).append("\",\n")
+            append("      \"answer\": \"").append(escape(snapshot.answers[questionId].orEmpty())).append("\"\n")
             append("    }")
             if (index != snapshot.audioRefs.lastIndex) append(',')
             append('\n')
@@ -96,10 +94,6 @@ object SurveyExportJsonBuilder {
         append("  ]\n")
         append("}\n")
     }
-
-    /** The prompt a recording answered, falling back to the node question for older references. */
-    private fun recordingPrompt(snapshot: SurveyFinalizationSnapshot, ref: SurveyViewModel.AudioRef): String =
-        ref.prompt?.takeIf { it.isNotBlank() } ?: snapshot.questions[ref.questionId].orEmpty()
 
     private fun StringBuilder.appendStringMap(values: Map<String, String>, indent: String) {
         if (values.isEmpty()) {
