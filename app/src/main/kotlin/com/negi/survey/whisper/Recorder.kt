@@ -19,6 +19,7 @@ import android.content.pm.PackageManager
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.os.SystemClock
 import android.util.Log
 import androidx.annotation.RequiresPermission
 import androidx.core.content.ContextCompat
@@ -51,6 +52,9 @@ interface RecorderBackend : Closeable {
     fun startRecording(output: File, rates: IntArray = intArrayOf(16_000, 48_000, 44_100))
 
     suspend fun stopRecording()
+
+    /** Called after AudioRecord reports that capture has started. */
+    fun setOnCaptureStarted(callback: () -> Unit) = Unit
 }
 
 /**
@@ -78,6 +82,9 @@ class Recorder(
     // -------------------------------------------------------------------------
     // Internal state
     // -------------------------------------------------------------------------
+    private var onCaptureStarted: () -> Unit = {}
+    override fun setOnCaptureStarted(callback: () -> Unit) { onCaptureStarted = callback }
+
     private var writerJob: Job? = null
     private val activeRecorder = AtomicReference<AudioRecord?>(null)
     private var tempPcm: File? = null
@@ -155,6 +162,10 @@ class Recorder(
 
                                 rec.startRecording()
                                 started = true
+                                check(rec.recordingState == AudioRecord.RECORDSTATE_RECORDING) { "AudioRecord did not start" }
+                                Log.i(TAG, "AudioRecord started elapsedMs=${SystemClock.elapsedRealtime()}")
+                                onCaptureStarted()
+                                var firstBuffer = true
                                 Log.i(TAG, "🎙 start ${conf.sampleRate}Hz buf=${conf.bufferSize}")
 
                                 // Use both state AND coroutine cancellation to control the loop.
@@ -165,6 +176,10 @@ class Recorder(
                                         break
                                     }
 
+                                    if (firstBuffer) {
+                                        firstBuffer = false
+                                        Log.i(TAG, "First PCM buffer elapsedMs=${SystemClock.elapsedRealtime()} samples=$n")
+                                    }
                                     var j = 0
                                     for (i in 0 until n) {
                                         val v = shortBuf[i].toInt()
@@ -175,6 +190,9 @@ class Recorder(
                                 }
 
                                 bos.flush()
+                            } catch (e: Exception) {
+                                if (e is kotlinx.coroutines.CancellationException) throw e
+                                if (state.get() == State.Recording) onError(e)
                             } finally {
                                 // Best-effort stop/release (may already be stopped by stopRecording()).
                                 if (started) runCatching { rec.stop() }
@@ -256,6 +274,7 @@ class Recorder(
             activeRecorder.getAndSet(null)?.let { rec ->
                 runCatching { rec.release() }
             }
+            error("AudioRecord writer did not terminate after stop")
         } else {
             Log.d(TAG, "Writer job joined successfully")
         }
@@ -389,14 +408,19 @@ class Recorder(
     // Lifecycle
     // -------------------------------------------------------------------------
     override fun close() {
-        runBlocking {
-            withTimeoutOrNull(CLOSE_TIMEOUT_MS) {
-                if (isActive()) stopRecording()
+        try {
+            val stopped = runBlocking {
+                withTimeoutOrNull(CLOSE_TIMEOUT_MS) {
+                    if (isActive()) stopRecording()
+                    true
+                } ?: false
             }
+            check(stopped) { "Recorder close timed out before stop completed" }
+        } finally {
+            scope.cancel()
+            controlDispatcher.close()
+            controlExecutor.shutdownNow()
         }
-        runCatching { scope.cancel() }
-        runCatching { controlDispatcher.close() }
-        runCatching { controlExecutor.shutdownNow() }
     }
 
     companion object {
