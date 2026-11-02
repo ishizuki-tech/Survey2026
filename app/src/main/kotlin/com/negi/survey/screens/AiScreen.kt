@@ -243,6 +243,9 @@ interface SpeechController {
     /** True while microphone capture is running. */
     val isRecording: StateFlow<Boolean>
 
+    /** True after the recorder reports that the microphone is capturing. */
+    val isCaptureActive: StateFlow<Boolean> get() = isRecording
+
     /** True while the captured audio is being transcribed. */
     val isTranscribing: StateFlow<Boolean>
 
@@ -349,6 +352,8 @@ fun AiScreen(
     // ---------------------------------------------------------------------
 
     val recFlow = remember(speechController) { speechController?.isRecording ?: flowOf(false) }
+    val captureFlow = remember(speechController) { speechController?.isCaptureActive ?: flowOf(false) }
+    val captureActive by captureFlow.collectAsState(initial = false)
     val transFlow = remember(speechController) { speechController?.isTranscribing ?: flowOf(false) }
     val partialFlow = remember(speechController) { speechController?.partialText ?: flowOf("") }
     val errFlow = remember(speechController) { speechController?.errorMessage ?: flowOf<String?>(null) }
@@ -370,7 +375,8 @@ fun AiScreen(
     val speechStatusText: String? = when {
         speechError != null -> speechError
         speechController != null && speechTranscribing -> "Transcribing…"
-        speechController != null && speechRecording -> "Listening…"
+        speechController != null && speechRecording && captureActive -> "Listening…"
+        speechController != null && speechRecording -> "Starting microphone…"
         else -> null
     }
     val speechStatusIsError = speechError != null

@@ -315,12 +315,13 @@ object WhisperEngine {
             var releasePrevMs = 0L
             if (previous != null) {
                 val r0 = SystemClock.elapsedRealtime()
-                runCatching {
-                    Log.i(LOG_TAG, "[$requestId][init:file] Releasing previous WhisperContext for key=$previousKey")
-                    previous.ctx.release()
-                }.onFailure { e ->
-                    Log.w(LOG_TAG, "[$requestId][init:file] Error while releasing previous WhisperContext", e)
-                }
+                releaseWhisperContextForReplacement(
+                    release = {
+                        Log.i(LOG_TAG, "[$requestId][init:file] Releasing previous WhisperContext for key=$previousKey")
+                        previous.ctx.release()
+                    },
+                    markUncertain = { error -> releaseUncertain = error },
+                )
                 releasePrevMs = SystemClock.elapsedRealtime() - r0
                 Log.i(LOG_TAG, "[$requestId][init:file] Released previous context. releasePrevMs=$releasePrevMs")
             }
@@ -527,12 +528,13 @@ object WhisperEngine {
             var releasePrevMs = 0L
             if (previous != null) {
                 val r0 = SystemClock.elapsedRealtime()
-                runCatching {
-                    Log.i(LOG_TAG, "[$requestId][init:asset] Releasing previous WhisperContext for key=$previousKey")
-                    previous.ctx.release()
-                }.onFailure { e ->
-                    Log.w(LOG_TAG, "[$requestId][init:asset] Error while releasing previous WhisperContext", e)
-                }
+                releaseWhisperContextForReplacement(
+                    release = {
+                        Log.i(LOG_TAG, "[$requestId][init:asset] Releasing previous WhisperContext for key=$previousKey")
+                        previous.ctx.release()
+                    },
+                    markUncertain = { error -> releaseUncertain = error },
+                )
                 releasePrevMs = SystemClock.elapsedRealtime() - r0
                 Log.i(LOG_TAG, "[$requestId][init:asset] Released previous context. releasePrevMs=$releasePrevMs")
             }

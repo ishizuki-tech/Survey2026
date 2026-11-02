@@ -56,6 +56,10 @@ import kotlin.math.sqrt
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.async
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
@@ -82,11 +86,19 @@ class WhisperSpeechController(
     private val recorderFactory: ((Context, (Exception) -> Unit) -> RecorderBackend)? = null,
     private val modelInitializer: (suspend () -> Unit)? = null,
     private val transcriber: (suspend (File, String) -> Result<String>)? = null,
-    private val recorderStopTimeoutMs: Long = RECORDER_STOP_TIMEOUT_MS
+    private val recorderStopTimeoutMs: Long = RECORDER_STOP_TIMEOUT_MS,
+    private val recorderCloseTimeoutMs: Long = RECORDER_CLOSE_TIMEOUT_MS,
+    private val whisperDetacher: suspend () -> Unit = { WhisperEngine.detach() },
+    private val recorderSessionMutex: Mutex = globalRecorderSessionMutex,
+    private val whisperSessionGate: WhisperSessionGate = globalWhisperSessionGate
 ) : ViewModel(), SpeechController {
 
     companion object {
         private const val TAG = "WhisperSpeechController"
+
+        // Covers a controller replacement from acquisition through native release.
+        private val globalWhisperSessionGate = WhisperSessionGate()
+        private val globalRecorderSessionMutex = Mutex()
 
         private const val DEFAULT_LANGUAGE = "auto"
         private const val DEFAULT_ASSET_MODEL = "models/ggml-small-q5_1.bin"
@@ -103,9 +115,9 @@ class WhisperSpeechController(
 
         /** Timeout for recorder.stopRecording() (must be > Recorder STOP_JOIN_TIMEOUT_MS). */
         private const val RECORDER_STOP_TIMEOUT_MS = 6_000L
-
-        /** Best-effort timeout for recorder.close() during recovery. */
-        private const val RECORDER_CLOSE_TIMEOUT_MS = 2_500L
+        private const val RECORDER_CLOSE_TIMEOUT_MS = 4_500L
+        private const val RECORDER_CLOSE_PENDING = "Recorder close is still in progress"
+        private const val RECORDER_CLOSE_FAILED = "Recorder cleanup failed; restart the app before recording again"
 
         fun provideFactory(
             appContext: Context,
@@ -158,6 +170,14 @@ class WhisperSpeechController(
         var recorder: RecorderBackend? = null
         var outputFile: File? = null
         var workerJob: Job? = null
+        var startupJob: Job? = null
+        var initJob: Deferred<Unit>? = null
+        var ownsWhisperSession = false
+        @Volatile var ownsRecorderSession = false
+        val whisperCleanup = OnceCleanup()
+        lateinit var recorderClose: SharedClose
+        val closeMonitorStarted = java.util.concurrent.atomic.AtomicBoolean(false)
+        @Volatile var recorderFailed = false
         @Volatile var poisoned = false
     }
 
@@ -174,11 +194,13 @@ class WhisperSpeechController(
     // ---------------------------------------------------------------------
 
     private val _isRecording = MutableStateFlow(false)
+    private val _isCaptureActive = MutableStateFlow(false)
     private val _isTranscribing = MutableStateFlow(false)
     private val _partialText = MutableStateFlow("")
     private val _error = MutableStateFlow<String?>(null)
 
     override val isRecording: StateFlow<Boolean> = _isRecording
+    override val isCaptureActive: StateFlow<Boolean> = _isCaptureActive
     override val isTranscribing: StateFlow<Boolean> = _isTranscribing
     override val partialText: StateFlow<String> = _partialText
     override val errorMessage: StateFlow<String?> = _error
@@ -223,25 +245,39 @@ class WhisperSpeechController(
             return
         }
         session.recorder = newRecorder(session)
+        session.recorderClose = SharedClose(cleanupScope) {
+            session.recorder?.close()
+            if (session.ownsRecorderSession) {
+                session.ownsRecorderSession = false
+                recorderSessionMutex.unlock()
+            }
+        }
 
-        Log.d(TAG, "startRecording: requested")
-        WhisperTraceRegistry.event(session.surveyId, session.questionId, "RECORDING_STARTED", mapOf("whisperRecordingId" to session.id))
+        Log.d(TAG, "microphone requested elapsedMs=${SystemClock.elapsedRealtime()} session=${session.id}")
+        WhisperTraceRegistry.event(session.surveyId, session.questionId, "RECORDING_START_REQUESTED", mapOf("whisperRecordingId" to session.id))
         _error.value = null
         _partialText.value = ""
         _isRecording.value = true
 
-        session.workerJob = viewModelScope.launch(Dispatchers.IO) {
+        session.initJob = viewModelScope.async(Dispatchers.IO, start = CoroutineStart.LAZY) {
+            whisperSessionGate.acquire()
+            session.ownsWhisperSession = true
+            val start = SystemClock.elapsedRealtime()
+            Log.d(TAG, "Whisper init started elapsedMs=$start session=${session.id}")
+            try { ensureModelInitializedFromAssetsOnce(session) } finally {
+                Log.d(TAG, "Whisper init finished elapsedMs=${SystemClock.elapsedRealtime()} session=${session.id}")
+            }
+        }
+        session.startupJob = viewModelScope.launch(Dispatchers.IO, start = CoroutineStart.LAZY) {
             recordingMutex.withLock {
                 try {
                     ensureActive()
+                    check(recorderSessionMutex.tryLock()) { "Previous recorder is still closing; restart required if cleanup failed" }
+                    session.ownsRecorderSession = true
 
                     val old = session.outputFile
                     session.outputFile = null
                     deleteTempFileQuietly(old, reason = "start_cleanup")
-
-                    ensureModelInitializedFromAssetsOnce()
-                    ensureActive()
-                    if (!owns(session)) return@withLock
 
                     val dir = File(appContext.cacheDir, "whisper_rec")
                     if (!dir.exists() && !dir.mkdirs()) {
@@ -251,10 +287,19 @@ class WhisperSpeechController(
                     val wav = File.createTempFile("survey_input_", ".wav", dir)
                     session.outputFile = wav
 
+                    session.recorder?.setOnCaptureStarted {
+                        synchronized(session) {
+                            if (owns(session) && _isRecording.value) {
+                                _isCaptureActive.value = true
+                                WhisperTraceRegistry.event(session.surveyId, session.questionId, "RECORDING_STARTED", mapOf("whisperRecordingId" to session.id))
+                            }
+                        }
+                    }
                     Log.d(TAG, "startRecording: recorder.startRecording -> ${wav.path}")
                     session.recorder?.startRecording(output = wav, rates = RECORDER_RATE_CANDIDATES)
                         ?: error("Recorder session was not initialized")
-                    Log.d(TAG, "startRecording: started")
+                    session.initJob?.start()
+                    Log.d(TAG, "startRecording: recorder requested")
                 } catch (ce: CancellationException) {
                     Log.d(TAG, "startRecording: cancelled")
                     if (!owns(session)) return@withLock
@@ -262,20 +307,24 @@ class WhisperSpeechController(
                     val tmp = session.outputFile
                     session.outputFile = null
                     deleteTempFileQuietly(tmp, reason = "start_cancelled")
-                    activeSession.compareAndSet(session, null)
+                    finishWhisperSession(session)
+                    if (!session.recorderFailed) activeSession.compareAndSet(session, null)
                 } catch (t: Throwable) {
                     DiagnosticContentPolicy.logError(TAG, "startRecording: failed", t)
                     if (!owns(session)) return@withLock
                     _error.value = t.message ?: "Speech recognition start failed"
                     _isRecording.value = false
+                    _isTranscribing.value = false
 
                     val tmp = session.outputFile
                     session.outputFile = null
                     deleteTempFileQuietly(tmp, reason = "start_failed")
-                    activeSession.compareAndSet(session, null)
+                    finishWhisperSession(session)
+                    if (closeRecorderOrMonitor(session)) activeSession.compareAndSet(session, null)
                 }
             }
         }
+        session.startupJob?.start()
     }
 
     override fun stopRecording() {
@@ -285,16 +334,19 @@ class WhisperSpeechController(
             return
         }
 
-        Log.d(TAG, "stopRecording: requested")
-        _isRecording.value = false
+        Log.d(TAG, "recording stop requested elapsedMs=${SystemClock.elapsedRealtime()} session=${session.id}")
+        synchronized(session) {
+            _isRecording.value = false
+            _isCaptureActive.value = false
+            _isTranscribing.value = true
+        }
 
-        session.workerJob?.cancel()
-
-        session.workerJob = viewModelScope.launch(Dispatchers.IO) {
+        session.workerJob = viewModelScope.launch(Dispatchers.IO, start = CoroutineStart.LAZY) {
+            session.startupJob?.join()
             recordingMutex.withLock {
+                if (!owns(session)) return@withLock
                 var localWav: File? = null
                 try {
-                    if (!owns(session)) return@withLock
                     val t0 = SystemClock.elapsedRealtime()
                     Log.d(TAG, "stopRecording: awaiting recorder.stopRecording()")
 
@@ -312,12 +364,10 @@ class WhisperSpeechController(
                             closePoisonedSessionAsync(session)
                         }
 
-                        val wav = session.outputFile
-                        session.outputFile = null
-                        localWav = wav
                         return@withLock
                     } else {
                         Log.d(TAG, "recorder.stopRecording OK in ${dt}ms")
+                        session.recorderClose.request()
                     }
 
                     val wav = session.outputFile
@@ -404,7 +454,9 @@ class WhisperSpeechController(
 
                     if (!owns(session)) return@withLock
                     _isTranscribing.value = true
-                    Log.d(TAG, "stopRecording: transcribing -> ${wav.path}")
+                    session.initJob?.await() ?: error("Whisper initialization was not scheduled")
+                    if (!owns(session)) return@withLock
+                    Log.d(TAG, "transcription started elapsedMs=${SystemClock.elapsedRealtime()} session=${session.id}")
                     WhisperTraceRegistry.event(session.surveyId, session.questionId, "TRANSCRIPTION_STARTED", mapOf("language" to normalizedLanguage))
 
                     val result = transcriber?.invoke(wav, normalizedLanguage)
@@ -461,7 +513,7 @@ class WhisperSpeechController(
                     if (owns(session)) _error.value = t.message ?: "Speech recognition failed"
                 } finally {
                     withContext(NonCancellable) {
-                        runCatching { heavyRuntimeHandoff.releaseWhisper() }
+                        runCatching { finishWhisperSession(session) }
                             .onFailure { e ->
                                 DiagnosticContentPolicy.logWarning(TAG, "WhisperEngine.release failed", e)
                                 if (owns(session)) {
@@ -469,6 +521,7 @@ class WhisperSpeechController(
                                 }
                             }
                     }
+                    if (!session.poisoned) closeRecorderOrMonitor(session)
                     if (owns(session) && !session.poisoned) {
                         _isTranscribing.value = false
                         activeSession.compareAndSet(session, null)
@@ -477,6 +530,7 @@ class WhisperSpeechController(
                 }
             }
         }
+        session.workerJob?.start()
     }
 
     override fun toggleRecording() {
@@ -496,11 +550,23 @@ class WhisperSpeechController(
         _error.value = null
     }
 
+    /** Wait for native initialization to stop before releasing its published context. */
+    private suspend fun finishWhisperSession(session: RecordingSession) = session.whisperCleanup.run {
+        session.initJob?.cancelAndJoin()
+        if (session.ownsWhisperSession) {
+            try {
+                whisperSessionGate.release { heavyRuntimeHandoff.releaseWhisper() }
+            } finally {
+                session.ownsWhisperSession = false
+            }
+        }
+    }
+
     // ---------------------------------------------------------------------
     // Model init
     // ---------------------------------------------------------------------
 
-    private suspend fun ensureModelInitializedFromAssetsOnce() {
+    private suspend fun ensureModelInitializedFromAssetsOnce(session: RecordingSession) {
         modelInitializer?.let {
             it()
             return
@@ -518,7 +584,7 @@ class WhisperSpeechController(
                 val handoff = WhisperEngine.WhisperPublicationHandoff()
                 Result.success(try {
                     heavyRuntimeHandoff.withWhisper {
-                        WhisperTraceRegistry.event(currentSurveyId, currentQuestionId, "MODEL_INIT_STARTED", mapOf("modelKey" to assetModelPath, "language" to normalizedLanguage))
+                        WhisperTraceRegistry.event(session.surveyId, session.questionId, "MODEL_INIT_STARTED", mapOf("modelKey" to assetModelPath, "language" to normalizedLanguage))
                         WhisperEngine.ensureInitializedFromAsset(
                             context = appContext,
                             assetPath = assetModelPath,
@@ -541,7 +607,7 @@ class WhisperSpeechController(
             }
 
             result.onFailure { e ->
-                WhisperTraceRegistry.event(currentSurveyId, currentQuestionId, "MODEL_INIT_FINISHED", mapOf(
+                WhisperTraceRegistry.event(session.surveyId, session.questionId, "MODEL_INIT_FINISHED", mapOf(
                     "success" to false,
                     "modelKey" to assetModelPath,
                     "error" to DiagnosticContentPolicy.rawOrNull(e.message),
@@ -555,7 +621,7 @@ class WhisperSpeechController(
             }
 
             result.onSuccess {
-                initTiming?.let { timing -> WhisperTraceRegistry.event(currentSurveyId, currentQuestionId, "MODEL_INIT_FINISHED", mapOf("success" to true, "modelInitRequestId" to timing.requestId, "modelKey" to timing.key, "totalMs" to timing.totalMs, "lockWaitMs" to timing.lockWaitMs, "modelBytes" to timing.modelBytes)) }
+                initTiming?.let { timing -> WhisperTraceRegistry.event(session.surveyId, session.questionId, "MODEL_INIT_FINISHED", mapOf("success" to true, "modelInitRequestId" to timing.requestId, "modelKey" to timing.key, "totalMs" to timing.totalMs, "lockWaitMs" to timing.lockWaitMs, "modelBytes" to timing.modelBytes)) }
             }
 
             Log.d(TAG, "WhisperEngine initialized: assets/$assetModelPath")
@@ -627,23 +693,25 @@ class WhisperSpeechController(
                 return@onError
             }
 
-            val tmp = session.outputFile
-            session.outputFile = null
-            cleanupScope.launch {
-                withContext(NonCancellable) {
-                    deleteTempFileQuietly(tmp, reason = "recorder_error")
-                }
+            session.recorderFailed = true
+            synchronized(session) {
+                _error.value = e.message ?: "Recording error"
+                _isRecording.value = false
+                _isCaptureActive.value = false
+                _isTranscribing.value = false
             }
-
-            _error.value = e.message ?: "Recording error"
-            _isRecording.value = false
-            _isTranscribing.value = false
 
             cleanupScope.launch {
                 withContext(NonCancellable) {
                     if (owns(session)) {
-                        recoverRecorderAfterHang(session, reason = "recorder_error")
-                        activeSession.compareAndSet(session, null)
+                        session.startupJob?.cancelAndJoin()
+                        session.workerJob?.cancelAndJoin()
+                        recordingMutex.withLock {
+                            if (!owns(session)) return@withLock
+                            session.poisoned = true
+                            closePoisonedSessionAsync(session)
+                            runCatching { finishWhisperSession(session) }
+                        }
                     }
                 }
             }
@@ -651,85 +719,38 @@ class WhisperSpeechController(
         return recorderFactory?.invoke(appContext, onError) ?: Recorder(appContext, onError)
     }
 
-    /**
-     * Best-effort recovery path when stopRecording times out or recorder errors out.
-     */
-    private fun recoverRecorderAfterHang(session: RecordingSession, reason: String) {
-        Log.w(TAG, "Recovering Recorder (reason=$reason, session=${session.id})")
-
-        val old = session.recorder ?: return
-        val closeRes = runBlockingWithThreadTimeout(
-            name = "WSC-recorderClose",
-            timeoutMs = RECORDER_CLOSE_TIMEOUT_MS
-        ) {
-            old.close()
+    /** A close that times out or fails keeps the session reserved until proven closed. */
+    private suspend fun closeRecorderOrMonitor(session: RecordingSession): Boolean = withContext(NonCancellable) {
+        val result = withTimeoutOrNull(recorderCloseTimeoutMs) { session.recorderClose.request().await() }
+        if (result != null && result.isSuccess) return@withContext true
+        session.poisoned = true
+        if (owns(session)) {
+            _error.value = if (result == null) RECORDER_CLOSE_PENDING else RECORDER_CLOSE_FAILED
         }
-
-        when {
-            closeRes == null -> Log.e(TAG, "recorder.close TIMEOUT (reason=$reason)")
-            closeRes.isFailure -> closeRes.exceptionOrNull()?.let {
-                DiagnosticContentPolicy.logWarning(TAG, "recorder.close failed (reason=$reason)", it)
-            }
-            else -> Log.d(TAG, "recorder.close OK (reason=$reason)")
-        }
-
-        Log.w(TAG, "Recorder closed after recovery (reason=$reason)")
+        closePoisonedSessionAsync(session)
+        false
     }
 
-    /**
-     * A stop timeout proves only that the coroutine did not finish. Keep the session active
-     * until close() actually returns, so a new recording cannot overlap unknown native work.
-     */
+    /** Keep ownership until the one shared close actually succeeds. */
     private fun closePoisonedSessionAsync(session: RecordingSession) {
-        Thread(
-            {
-                val closeResult = runCatching { session.recorder?.close() }
-                cleanupScope.launch {
-                    if (!owns(session) || !session.poisoned) return@launch
-                    closeResult.onFailure { e ->
-                        DiagnosticContentPolicy.logError(TAG, "Recorder.close failed after stop timeout", e)
-                        _error.value = e.message ?: "Recorder recovery failed"
-                    }.onSuccess {
-                        Log.w(TAG, "Recorder.close completed after stop timeout; releasing session=${session.id}")
-                        activeSession.compareAndSet(session, null)
-                    }
+        if (!session.closeMonitorStarted.compareAndSet(false, true)) return
+        val close = session.recorderClose.request()
+        cleanupScope.launch {
+            val result = close.await()
+            recordingMutex.withLock {
+                if (!owns(session) || !session.poisoned) return@withLock
+                result.onFailure { e ->
+                    DiagnosticContentPolicy.logError(TAG, "Recorder.close failed", e)
+                    _error.value = RECORDER_CLOSE_FAILED
+                }.onSuccess {
+                    val tmp = session.outputFile
+                    session.outputFile = null
+                    deleteTempFileQuietly(tmp, reason = "recorder_close")
+                    if (_error.value == RECORDER_CLOSE_PENDING) _error.value = null
+                    activeSession.compareAndSet(session, null)
+                    _isTranscribing.value = false
                 }
-            },
-            "WSC-recorderTimeoutClose-${session.id}"
-        ).start()
-    }
-
-    /**
-     * Run a potentially blocking operation on a dedicated Thread and wait up to timeoutMs.
-     *
-     * Returns:
-     * - null if timeout
-     * - Result.success(Unit) if completed without exception
-     * - Result.failure(e) if exception was thrown
-     */
-    private fun runBlockingWithThreadTimeout(
-        name: String,
-        timeoutMs: Long,
-        block: () -> Unit
-    ): Result<Unit>? {
-        val err = AtomicReference<Throwable?>(null)
-        val t = Thread(
-            {
-                try {
-                    block()
-                } catch (e: Throwable) {
-                    err.set(e)
-                }
-            },
-            name
-        )
-        t.start()
-        runCatching { t.join(timeoutMs) }
-        return if (t.isAlive) {
-            null
-        } else {
-            val e = err.get()
-            if (e != null) Result.failure(e) else Result.success(Unit)
+            }
         }
     }
 
@@ -944,19 +965,23 @@ class WhisperSpeechController(
 
     override fun onCleared() {
         val session = activeSession.getAndSet(null)
+        session?.startupJob?.cancel()
         session?.workerJob?.cancel()
 
         val job = cleanupScope.launch {
             withContext(NonCancellable) {
-                runCatching { WhisperEngine.detach() }
+                session?.startupJob?.join()
+                session?.workerJob?.join()
+                val close = session?.recorderClose?.request()
+                session?.let { runCatching { finishWhisperSession(it) }
+                    .onFailure { e -> DiagnosticContentPolicy.logWarning(TAG, "WhisperEngine.release failed", e) } }
+                runCatching { whisperSessionGate.serialized { whisperDetacher() } }
                     .onFailure { e -> DiagnosticContentPolicy.logWarning(TAG, "WhisperEngine.detach failed", e) }
-                runCatching { heavyRuntimeHandoff.releaseWhisper() }
-                    .onFailure { e -> DiagnosticContentPolicy.logWarning(TAG, "WhisperEngine.release failed", e) }
 
                 session?.let { active ->
-                    runCatching { active.recorder?.close() }
-                        .onFailure { e -> DiagnosticContentPolicy.logWarning(TAG, "Recorder.close failed", e) }
-                    deleteTempFileQuietly(active.outputFile, reason = "view_model_cleared")
+                    val closeResult = checkNotNull(close).await()
+                    closeResult.onFailure { e -> DiagnosticContentPolicy.logWarning(TAG, "Recorder.close failed", e) }
+                        .onSuccess { deleteTempFileQuietly(active.outputFile, reason = "view_model_cleared") }
                 }
             }
         }

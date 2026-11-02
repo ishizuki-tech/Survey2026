@@ -2541,6 +2541,7 @@ private fun HomeScreen(
     val freeText by vmSurvey.runFreeText.collectAsStateWithLifecycle()
 
     val isRecording by speechController.isRecording.collectAsStateWithLifecycle()
+    val isCaptureActive by speechController.isCaptureActive.collectAsStateWithLifecycle()
     val isTranscribing by speechController.isTranscribing.collectAsStateWithLifecycle()
     val partialText by speechController.partialText.collectAsStateWithLifecycle()
     val speechError by speechController.errorMessage.collectAsStateWithLifecycle()
@@ -2699,8 +2700,10 @@ private fun HomeScreen(
             val live = partialText.trim()
             if (live.isNotBlank()) {
                 live
-            } else if (isRecording) {
+            } else if (isRecording && isCaptureActive) {
                 "(listening…)"
+            } else if (isRecording) {
+                "Starting microphone…"
             } else {
                 "Transcribing…"
             }
