@@ -1,0 +1,12 @@
+{
+  "original_branch": "fix/whisper-recording-start-latency",
+  "branch_slug": "fix-whisper-recording-start-latency",
+  "commit_sha": "840b154075b11386aaa72ebd498ad7581305f019",
+  "short_sha": "840b154",
+  "apk_name": "Survey2026-fix-whisper-recording-start-latency-840b154.apk",
+  "apk_sha256": "4931ee9f9930d4f61c8a80f23ae379cd6f41ee5651e007496703a22a8bf8977c",
+  "apk_download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-fix-whisper-recording-start-latency-840b154-run-165/Survey2026-fix-whisper-recording-start-latency-840b154.apk",
+  "page_url": "https://ishizuki-tech.github.io/Survey2026/fix-whisper-recording-start-latency/",
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/41515582752",
+  "generated_utc": "2026-11-02T20:08:41Z"
+}
