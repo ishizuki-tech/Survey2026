@@ -96,6 +96,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.drawBehind
@@ -107,6 +108,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.input.ImeAction
@@ -205,6 +207,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -2051,6 +2054,12 @@ internal fun TextNodeScreen(
     }
 }
 
+/** Pause at the top of a long single-choice question before it starts scrolling. */
+private const val SLOW_SCROLL_START_PAUSE_MS = 2_000L
+
+/** Speed of the slow scroll down a long single-choice question, roughly reading pace. */
+private const val SLOW_SCROLL_SPEED_DP_PER_SECOND = 30f
+
 @Composable
 private fun SingleChoiceNodeScreen(
     title: String,
@@ -2068,6 +2077,22 @@ private fun SingleChoiceNodeScreen(
     val backplate = appBackplate()
     val scroll = rememberScrollState()
     var otherText by rememberSaveable(question, otherTextOption) { mutableStateOf(initialOtherText) }
+    val density = LocalDensity.current
+
+    /*
+     * A question taller than the screen (e.g. the Introduction & Consent text) glides slowly
+     * down to its options, at about reading pace, after a short pause at the top. Touching the
+     * screen stops it, since a user scroll takes over from the animation.
+     */
+    LaunchedEffect(question) {
+        // maxValue is Int.MAX_VALUE until the column is first measured.
+        val overflowPx = snapshotFlow { scroll.maxValue }.first { it != Int.MAX_VALUE }
+        if (overflowPx <= 0) return@LaunchedEffect
+        delay(SLOW_SCROLL_START_PAUSE_MS)
+        val pxPerSecond = with(density) { SLOW_SCROLL_SPEED_DP_PER_SECOND.dp.toPx() }
+        val durationMs = (overflowPx / pxPerSecond * 1000f).toInt().coerceAtLeast(1)
+        scroll.animateScrollTo(overflowPx, tween(durationMillis = durationMs, easing = LinearEasing))
+    }
 
     Box(
         modifier = Modifier
