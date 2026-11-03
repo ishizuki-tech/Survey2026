@@ -108,7 +108,6 @@ import androidx.compose.material.icons.automirrored.outlined.NavigateBefore
 import androidx.compose.material.icons.automirrored.outlined.NavigateNext
 import androidx.compose.material.icons.automirrored.outlined.Send
 import androidx.compose.material.icons.filled.Keyboard
-import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.outlined.ContentCopy
@@ -133,7 +132,6 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
-import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
@@ -141,6 +139,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.drawBehind
@@ -157,7 +156,6 @@ import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.ClipEntry
 import androidx.compose.ui.platform.LocalClipboard
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
@@ -188,6 +186,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
@@ -200,7 +199,6 @@ import kotlinx.serialization.json.JsonPrimitive
 
 private const val TAG = "AiScreen"
 private const val TYPING_UPDATE_THROTTLE_MS = 90L
-private const val AUTO_SCROLL_THROTTLE_MS = 40L
 
 internal fun followupCapacityRemaining(entries: List<SurveyViewModel.FollowupEntry>, maxFollowups: Int = 2): Int =
     (maxFollowups - entries.size).coerceAtLeast(0)
@@ -320,7 +318,6 @@ fun AiScreen(
     val focusManager = LocalFocusManager.current
     val scope = rememberCoroutineScope()
     val snack = remember { SnackbarHostState() }
-    val density = LocalDensity.current
 
     // ---------------------------------------------------------------------
     // Survey state
@@ -478,15 +475,6 @@ fun AiScreen(
     val focusRequester = remember { FocusRequester() }
     val scroll = rememberScrollState()
 
-    val bottomThresholdPx = remember(density) { with(density) { 28.dp.roundToPx() } }
-    val isPinnedToBottom by remember {
-        derivedStateOf {
-            val max = scroll.maxValue
-            val cur = scroll.value
-            (max - cur) <= bottomThresholdPx
-        }
-    }
-
     /**
      * Voice is the default way to answer. The text field (and keyboard) only
      * appears after "Type instead", or when no speech controller is available.
@@ -494,7 +482,6 @@ fun AiScreen(
     var typingMode by remember(contextKey) { mutableStateOf(false) }
     val showTextComposer = speechController == null || typingMode
 
-    var lastAutoScrollMs by remember(contextKey) { mutableLongStateOf(0L) }
     var lastTypingUpdateMs by remember(contextKey) { mutableLongStateOf(0L) }
     var lastTypingLen by remember(contextKey) { mutableIntStateOf(0) }
 
@@ -842,27 +829,21 @@ fun AiScreen(
     }
 
     // ---------------------------------------------------------------------
-    // Auto-scroll (pinned-to-bottom only)
+    // Auto-scroll
     // ---------------------------------------------------------------------
 
-    LaunchedEffect(chatItems.size) {
-        if (!isPinnedToBottom) return@LaunchedEffect
-        val now = SystemClock.uptimeMillis()
-        if ((now - lastAutoScrollMs) < AUTO_SCROLL_THROTTLE_MS) return@LaunchedEffect
-        lastAutoScrollMs = now
-
-        delay(16)
-        scroll.animateScrollTo(scroll.maxValue)
-    }
-
-    LaunchedEffect(stream, loading) {
-        if (!loading || !isPinnedToBottom) return@LaunchedEffect
-        val now = SystemClock.uptimeMillis()
-        if ((now - lastAutoScrollMs) < AUTO_SCROLL_THROTTLE_MS) return@LaunchedEffect
-        lastAutoScrollMs = now
-
-        delay(24)
-        scroll.scrollTo(scroll.maxValue)
+    /**
+     * Keep the newest message in view. Whenever the chat content grows (a new bubble, streamed
+     * text, a bubble that got taller), scroll to the bottom so the user never has to.
+     * collectLatest drops an in-flight animation when the content grows again.
+     */
+    LaunchedEffect(contextKey) {
+        var lastMax = 0
+        snapshotFlow { scroll.maxValue }.collectLatest { max ->
+            val grew = max > lastMax
+            lastMax = max
+            if (grew) scroll.animateScrollTo(max)
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -1120,16 +1101,6 @@ fun AiScreen(
                         }
                     }
 
-                    androidx.compose.animation.AnimatedVisibility(
-                        visible = !isPinnedToBottom && chatItems.isNotEmpty(),
-                        modifier = Modifier
-                            .align(Alignment.BottomCenter)
-                            .padding(bottom = 8.dp)
-                    ) {
-                        JumpToBottomPill(
-                            onClick = { scope.launch { scroll.animateScrollTo(scroll.maxValue) } }
-                        )
-                    }
                 }
 
                 Surface(
@@ -1338,43 +1309,6 @@ private fun CompactTopBar(
                     )
                 }
             }
-        }
-    }
-}
-
-@Composable
-private fun JumpToBottomPill(
-    onClick: () -> Unit
-) {
-    val cs = MaterialTheme.colorScheme
-    Surface(
-        color = cs.surfaceVariant.copy(alpha = 0.72f),
-        shape = RoundedCornerShape(999.dp),
-        tonalElevation = 0.dp,
-        shadowElevation = 6.dp,
-        modifier = Modifier
-            .neutralEdge(alpha = 0.14f, corner = 999.dp, stroke = 1.dp)
-            .clickable(
-                indication = null,
-                interactionSource = remember { MutableInteractionSource() }
-            ) { onClick() }
-    ) {
-        androidx.compose.foundation.layout.Row(
-            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(6.dp)
-        ) {
-            Icon(
-                imageVector = Icons.Filled.KeyboardArrowDown,
-                contentDescription = "Jump to bottom",
-                tint = cs.onSurfaceVariant,
-                modifier = Modifier.size(18.dp)
-            )
-            Text(
-                text = "Jump to bottom",
-                style = MaterialTheme.typography.labelMedium,
-                color = cs.onSurfaceVariant
-            )
         }
     }
 }
