@@ -114,6 +114,7 @@ import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material3.DividerDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -171,6 +172,7 @@ import com.negi.survey.diagnostics.DiagnosticContentPolicy
 import com.negi.survey.diagnostics.WhisperTraceRegistry
 import com.negi.survey.slm.FollowupExtractor
 import com.negi.survey.slm.PromptPhase
+import com.negi.survey.ui.theme.ActionBlue
 import com.negi.survey.ui.theme.monotoneColors
 import com.negi.survey.vm.AiViewModel
 import com.negi.survey.vm.QuestionSpeaker
@@ -1156,6 +1158,7 @@ fun AiScreen(
                             }
                         }
 
+                        val turnAccepted = isTwoStepNode && conv.turnCompleted && !conv.validationFailed
                         val composerEnabled = textFieldEnabled && !loading && !submissionPending &&
                                 !(isTwoStepNode && (conv.validationFailed || conv.turnCompleted))
                         val onToggleSpeech: (() -> Unit)? = speechController?.let { sc ->
@@ -1253,6 +1256,14 @@ fun AiScreen(
                                     }
                                     vmAI.resetStates()
                                     onNext()
+                                },
+                                colors = if (turnAccepted) {
+                                    ButtonDefaults.filledTonalButtonColors(
+                                        containerColor = ActionBlue,
+                                        contentColor = Color.White,
+                                    )
+                                } else {
+                                    ButtonDefaults.filledTonalButtonColors()
                                 },
                                 shape = CircleShape,
                                 contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp)
@@ -1785,6 +1796,10 @@ private fun VoiceFirstComposer(
                 FilledTonalButton(
                     onClick = onSend,
                     enabled = enabled,
+                    colors = ButtonDefaults.filledTonalButtonColors(
+                        containerColor = ActionBlue,
+                        contentColor = Color.White,
+                    ),
                     shape = CircleShape,
                     contentPadding = PaddingValues(vertical = 14.dp),
                     modifier = Modifier.weight(1f)

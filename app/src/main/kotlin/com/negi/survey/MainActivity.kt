@@ -154,6 +154,7 @@ import com.negi.survey.slm.Repository
 import com.negi.survey.slm.SLM
 import com.negi.survey.slm.buildModelConfig
 import com.negi.survey.slm.modelIdentityForPath
+import com.negi.survey.ui.theme.ActionBlue
 import com.negi.survey.ui.theme.SurveyNavTheme
 import com.negi.survey.ui.theme.monotoneColors
 import com.negi.survey.vm.AiViewModel
@@ -2527,6 +2528,10 @@ private fun HomeFreeTextComposer(
             FilledTonalButton(
                 onClick = onSend,
                 enabled = enabled,
+                colors = ButtonDefaults.filledTonalButtonColors(
+                    containerColor = ActionBlue,
+                    contentColor = Color.White,
+                ),
                 shape = CircleShape,
                 contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp)
             ) {
