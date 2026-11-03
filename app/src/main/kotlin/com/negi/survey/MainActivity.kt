@@ -1535,7 +1535,21 @@ fun SurveyNavHost(
                                 onResetToSelector()
                             }
                         },
-                        onStart = {
+                        onStart = onStart@{
+                            /*
+                             * Returning to the note mid-survey must not erase it: continue the
+                             * same run. A fresh survey starts only from the selector's Start
+                             * button, which creates a new session.
+                             */
+                            if (vmSurvey.isRunActive.value) {
+                                Log.d(
+                                    MainActivity.TAG,
+                                    "Home -> Continue survey in progress. session=$sessionId"
+                                )
+                                vmSurvey.advanceToNext()
+                                return@onStart
+                            }
+
                             /** Snapshot the home note text before resetting the run. */
                             val homeNote = runFreeTextShadow
 
