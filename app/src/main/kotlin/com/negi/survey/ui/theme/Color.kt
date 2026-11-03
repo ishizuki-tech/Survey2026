@@ -12,6 +12,6 @@ val Pink40 = Color(0xFF7D5260)
 
 /**
  * Blue fill for primary actions: intro and Home-note Start, transcript Send,
- * and the accepted-turn Next button. Used with white content.
+ * recording-timer Stop, and the accepted-turn Next button. Used with white content.
  */
 val ActionBlue = Color(0xFF1E88E5)

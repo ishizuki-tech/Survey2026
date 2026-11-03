@@ -159,11 +159,18 @@ import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import com.negi.survey.BuildConfig
 import com.negi.survey.net.RuntimeLogStore
 import com.negi.survey.diagnostics.DiagnosticContentPolicy
@@ -226,6 +233,12 @@ internal fun canAcceptFollowupCandidate(
     maxFollowups: Int = 2
 ): Boolean =
     followupCapacityRemaining(existing, maxFollowups) > 0 && isDistinctFollowupQuestion(candidate, existing)
+
+/** Formats elapsed recording time as m:ss (e.g. 0:07, 1:23, 12:05). */
+internal fun formatRecordingElapsed(totalSeconds: Int): String {
+    val seconds = totalSeconds.coerceAtLeast(0)
+    return "%d:%02d".format(Locale.ROOT, seconds / 60, seconds % 60)
+}
 
 internal fun canAdvanceAiTurn(
     aiLoading: Boolean,
@@ -365,6 +378,23 @@ fun AiScreen(
     val speechTranscribing by transFlow.collectAsState(initial = false)
     val speechPartial by partialFlow.collectAsState(initial = "")
     val speechError by errFlow.collectAsState(initial = null)
+
+    /**
+     * Seconds the farmer has been talking in the current recording, counted up from when the
+     * microphone actually starts capturing. There is no limit; this only tells the interviewer
+     * how long the answer is running. Each tick is re-aligned to the start time so it does not drift.
+     */
+    var recordingElapsedSeconds by remember { mutableIntStateOf(0) }
+    LaunchedEffect(speechRecording, captureActive) {
+        recordingElapsedSeconds = 0
+        if (!speechRecording || !captureActive) return@LaunchedEffect
+        val startedAt = SystemClock.uptimeMillis()
+        while (true) {
+            val elapsedMs = SystemClock.uptimeMillis() - startedAt
+            recordingElapsedSeconds = (elapsedMs / 1000L).toInt()
+            delay(1000L - elapsedMs % 1000L)
+        }
+    }
 
     // ---------------------------------------------------------------------
     // Text-to-speech state with null-safe fallback (question read-aloud)
@@ -1253,6 +1283,14 @@ fun AiScreen(
         }
     }
 
+    if (speechController != null && speechRecording) {
+        RecordingTimerOverlay(
+            elapsedSeconds = recordingElapsedSeconds,
+            statusText = speechStatusText,
+            onStop = { speechController.stopRecording() }
+        )
+    }
+
     DisposableEffect(contextKey) {
         onDispose {
             runCatching {
@@ -1262,6 +1300,84 @@ fun AiScreen(
             }
             vmAI.resetStates()
             vmAI.removeTypingMessage(contextKey, nid)
+        }
+    }
+}
+
+/* ─────────────────────── Recording timer ───────────────────────────────── */
+
+/**
+ * Full-screen timer shown while a dictated answer is being recorded. It counts up so the
+ * interviewer can see at a glance how long the farmer has been talking; there is no limit.
+ * Stop (or the system back gesture) ends the recording.
+ */
+@Composable
+private fun RecordingTimerOverlay(
+    elapsedSeconds: Int,
+    statusText: String?,
+    onStop: () -> Unit
+) {
+    val cs = MaterialTheme.colorScheme
+    val elapsed = formatRecordingElapsed(elapsedSeconds)
+
+    Dialog(
+        onDismissRequest = onStop,
+        properties = DialogProperties(
+            dismissOnClickOutside = false,
+            usePlatformDefaultWidth = false
+        )
+    ) {
+        Surface(
+            modifier = Modifier.fillMaxSize(),
+            color = cs.surface.copy(alpha = 0.94f)
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center
+            ) {
+                Text(
+                    text = elapsed,
+                    fontSize = 120.sp,
+                    lineHeight = 120.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = cs.primary,
+                    maxLines = 1,
+                    softWrap = false,
+                    modifier = Modifier.semantics {
+                        liveRegion = LiveRegionMode.Polite
+                        contentDescription = "Recording for $elapsed"
+                    }
+                )
+                if (!statusText.isNullOrBlank()) {
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        text = statusText,
+                        style = MaterialTheme.typography.titleMedium,
+                        color = cs.onSurfaceVariant
+                    )
+                }
+                Spacer(Modifier.height(32.dp))
+                FilledTonalButton(
+                    onClick = onStop,
+                    colors = ButtonDefaults.filledTonalButtonColors(
+                        containerColor = ActionBlue,
+                        contentColor = Color.White,
+                    ),
+                    shape = CircleShape,
+                    contentPadding = PaddingValues(horizontal = 32.dp, vertical = 16.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.Stop,
+                        contentDescription = null,
+                        modifier = Modifier.size(32.dp)
+                    )
+                    Spacer(Modifier.width(12.dp))
+                    Text("Stop", style = MaterialTheme.typography.headlineSmall)
+                }
+            }
         }
     }
 }
