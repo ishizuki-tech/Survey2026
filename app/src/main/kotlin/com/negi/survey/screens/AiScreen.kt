@@ -175,6 +175,7 @@ import com.negi.survey.ui.theme.monotoneColors
 import com.negi.survey.vm.AiViewModel
 import com.negi.survey.vm.QuestionSpeaker
 import com.negi.survey.vm.SurveyViewModel
+import com.negi.survey.vm.shouldAutoPlayQuestion
 import com.negi.survey.vm.toggleQuestionSpeaker
 import java.security.MessageDigest
 import java.util.Locale
@@ -307,7 +308,8 @@ fun AiScreen(
     onNext: () -> Unit,
     onBack: () -> Unit,
     speechController: SpeechController? = null,
-    ttsController: QuestionSpeaker? = null
+    ttsController: QuestionSpeaker? = null,
+    autoReadFollowups: Boolean = false
 ) {
     val nid = remember(nodeId) { nodeId.trim() }
     val localContext = LocalContext.current.applicationContext
@@ -429,6 +431,37 @@ fun AiScreen(
                 composerDraft = vmSurvey.getAnswer(nid)
             )
         )
+
+    /*
+     * Read each newly shown follow-up aloud once. Watching the composer state covers both
+     * flows that persist follow-ups (TWO_STEP in AiViewModel, ONE_STEP in this screen).
+     * A follow-up that was already active when the screen opened (e.g. after Back) is not replayed.
+     */
+    var lastAutoReadFollowup by remember(contextKey) {
+        mutableStateOf(
+            vmAI.conversationStateFlow(contextKey).value
+                .takeIf { it.role == AiViewModel.ComposerRole.FOLLOWUP }
+                ?.activePromptQuestion
+                ?.trim()
+        )
+    }
+    LaunchedEffect(contextKey, conv.role, conv.activePromptQuestion) {
+        val followup = conv.activePromptQuestion.trim()
+            .takeIf { conv.role == AiViewModel.ComposerRole.FOLLOWUP && it.isNotBlank() }
+            ?: return@LaunchedEffect
+        if (followup == lastAutoReadFollowup) return@LaunchedEffect
+        lastAutoReadFollowup = followup
+        if (
+            autoReadFollowups && ttsController != null &&
+            shouldAutoPlayQuestion(
+                autoPlayEnabled = true,
+                speechRecording = speechRecording,
+                speechTranscribing = speechTranscribing
+            )
+        ) {
+            runCatching { ttsController.speak(followup, "$nid-followup-${shortHash(followup)}") }
+        }
+    }
 
     val chatItems by vmAI.chatHistoryFlow(contextKey).collectAsState(initial = emptyList())
 
@@ -1023,7 +1056,14 @@ fun AiScreen(
         topBar = {
             CompactTopBar(
                 title = title,
-                onReplay = { ttsController?.let { toggleQuestionSpeaker(it, rootQuestion, nid) } },
+                onReplay = {
+                    ttsController?.let {
+                        val prompt = conv.activePromptQuestion
+                            .takeIf { conv.role == AiViewModel.ComposerRole.FOLLOWUP && it.isNotBlank() }
+                            ?: rootQuestion
+                        toggleQuestionSpeaker(it, prompt, nid)
+                    }
+                },
                 isSpeaking = ttsSpeaking
             )
         },
