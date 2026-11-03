@@ -97,10 +97,6 @@ fun DoneScreen(
     val snackbar = remember { SnackbarHostState() }
     val context = LocalContext.current
 
-    val flatAudioRefsForRun = remember(recordedAudioRefs, surveyUuid) {
-        vm.getAudioRefsForRunFlat(surveyUuid)
-    }
-
     val finalizationSnapshot = remember(
         questions,
         answers,
@@ -185,8 +181,6 @@ fun DoneScreen(
                     // dark background).
                 )
 
-                Spacer(Modifier.height(16.dp))
-                Text("Voice Recordings: ${flatAudioRefsForRun.size}", style = MaterialTheme.typography.bodyMedium)
                 Spacer(Modifier.height(24.dp))
 
                 Row(
