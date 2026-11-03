@@ -1,12 +1,12 @@
 {
   "original_branch": "feature/ui-updates",
   "branch_slug": "feature-ui-updates",
-  "commit_sha": "cbf18e1dd52962a6198664b58bfcfd232bf8da58",
-  "short_sha": "cbf18e1",
-  "apk_name": "Survey2026-feature-ui-updates-cbf18e1.apk",
-  "apk_sha256": "c95a40773edb10e62b4fc6f6c21d81b99af127d44cf77821084b744135c6e0bc",
-  "apk_download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-feature-ui-updates-cbf18e1-run-176/Survey2026-feature-ui-updates-cbf18e1.apk",
+  "commit_sha": "60616ed64a42625f252f340947dc1fbb5978cee7",
+  "short_sha": "60616ed",
+  "apk_name": "Survey2026-feature-ui-updates-60616ed.apk",
+  "apk_sha256": "74a5a3f4f9df9c71523d0e39ad3a38b3bdaf4bbb7bc825f0c6ad86ddd924cbc0",
+  "apk_download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-feature-ui-updates-60616ed-run-177/Survey2026-feature-ui-updates-60616ed.apk",
   "page_url": "https://ishizuki-tech.github.io/Survey2026/feature-ui-updates/",
-  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/41687824121",
-  "generated_utc": "2026-11-03T17:59:02Z"
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/41688948603",
+  "generated_utc": "2026-11-03T18:06:14Z"
 }
