@@ -175,6 +175,7 @@ import com.negi.survey.vm.NodeType
 import com.negi.survey.vm.QuestionSpeaker
 import com.negi.survey.vm.SurveyViewModel
 import com.negi.survey.vm.composeSingleChoiceAnswer
+import com.negi.survey.vm.decomposeSingleChoiceAnswer
 import com.negi.survey.vm.isValidNumberAnswer
 import com.negi.survey.vm.shouldShowOtherDetails
 import com.negi.survey.vm.SurveySessionStore
@@ -1631,6 +1632,7 @@ fun SurveyNavHost(
 
                 entry<FlowSingle> {
                     val node by vmSurvey.currentNode.collectAsStateWithLifecycle()
+                    val answers by vmSurvey.answers.collectAsStateWithLifecycle()
                     val ttsSpeaking by ttsController.isSpeaking.collectAsStateWithLifecycle()
 
                     LaunchedEffect(node.id, node.question, ttsAutoPlay) {
@@ -1646,6 +1648,7 @@ fun SurveyNavHost(
                         selected = vmSurvey.single.collectAsStateWithLifecycle().value,
                         onSelect = { vmSurvey.setSingleChoice(it) },
                         otherTextOption = node.otherTextOption,
+                        initialOtherText = node.decomposeSingleChoiceAnswer(answers[node.id]).otherText,
                         onSubmit = { selection, otherText ->
                             node.composeSingleChoiceAnswer(selection, otherText)?.let { answer ->
                                 runCatching { ttsController.stop() }
@@ -2040,6 +2043,7 @@ private fun SingleChoiceNodeScreen(
     selected: String?,
     onSelect: (String?) -> Unit,
     otherTextOption: String? = null,
+    initialOtherText: String = "",
     onSubmit: (String?, String?) -> Unit,
     onBack: () -> Unit,
     onReplay: () -> Unit = {},
@@ -2047,7 +2051,7 @@ private fun SingleChoiceNodeScreen(
 ) {
     val backplate = appBackplate()
     val scroll = rememberScrollState()
-    var otherText by rememberSaveable(question, otherTextOption) { mutableStateOf("") }
+    var otherText by rememberSaveable(question, otherTextOption) { mutableStateOf(initialOtherText) }
 
     Box(
         modifier = Modifier
