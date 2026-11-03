@@ -1830,7 +1830,12 @@ private fun VoiceFirstComposer(
             Text(
                 text = speechStatusText ?: "Tap to answer",
                 style = MaterialTheme.typography.titleMedium,
-                color = if (speechStatusIsError) cs.error else cs.onSurface
+                color = when {
+                    speechStatusIsError -> cs.error
+                    // Match the disabled mic and "Type instead" once the answer is locked.
+                    !micEnabled -> cs.onSurface.copy(alpha = 0.38f)
+                    else -> cs.onSurface
+                }
             )
         }
 
