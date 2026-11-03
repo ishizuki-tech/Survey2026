@@ -177,7 +177,7 @@ fun AboutScreen(onClose: () -> Unit) {
                     InfoLine("Commit", BuildConfig.GIT_COMMIT_SHA.take(12).ifBlank { "—" })
                     Spacer(Modifier.height(8.dp))
                     Text(
-                        "App source code: MIT License, © IshizukiTech LLC.",
+                        "App source code: MIT License, © 2026 Ishizuki Tech LLC.",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
