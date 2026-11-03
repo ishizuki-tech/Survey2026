@@ -1,0 +1,12 @@
+{
+  "original_branch": "feature/ui-updates",
+  "branch_slug": "feature-ui-updates",
+  "commit_sha": "c83ce148e8e47cca0de6e4b2ee1a82c41c39a36d",
+  "short_sha": "c83ce14",
+  "apk_name": "Survey2026-feature-ui-updates-c83ce14.apk",
+  "apk_sha256": "877cef9d74c748bde5e2dbd5253bba680dd777170e200b8771cd9f29e325e88b",
+  "apk_download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-feature-ui-updates-c83ce14-run-166/Survey2026-feature-ui-updates-c83ce14.apk",
+  "page_url": "https://ishizuki-tech.github.io/Survey2026/feature-ui-updates/",
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/41678063875",
+  "generated_utc": "2026-11-03T16:54:55Z"
+}
