@@ -1662,7 +1662,10 @@ private fun ChatComposer(
                 modifier = Modifier
                     .weight(1f)
                     .focusRequester(focusRequester),
-                placeholder = { Text("Type your answer…") },
+                // With voice available this field only shows after "Type instead", so no prompt.
+                placeholder = if (speechEnabled) null else {
+                    { Text("Type your answer…") }
+                },
                 minLines = 1,
                 maxLines = 5,
                 enabled = enabled,
