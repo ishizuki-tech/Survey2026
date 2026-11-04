@@ -20,7 +20,7 @@
  *   - Dedupe via an atomic local SHA-256 ledger for runtime logs.
  *   - After successful upload (or dedupe-skip), optionally deletes SOURCE .log on device.
  *   - Active (currently written) runtime log is never deleted.
- *   - Ring segments are copied to a stable cache snapshot before upload and are never deleted.
+ *   - Ring segments are copied to a durable snapshot before upload; source segments are never deleted.
  *   - Upload session ids remain stable across WorkManager retries.
  *   - GitHub credentials are resolved at execution time when possible instead of being persisted in WorkManager Data.
  * =====================================================================
@@ -82,6 +82,7 @@ class GitHubUploadWorker(
     appContext: Context,
     params: WorkerParameters
 ) : CoroutineWorker(appContext, params) {
+    private var executionConfig: GitHubUploader.GitHubConfig? = null
 
     override suspend fun getForegroundInfo(): ForegroundInfo {
         val mode = inputData.getString(KEY_MODE)?.lowercase(Locale.US) ?: MODE_FILE
@@ -173,6 +174,19 @@ class GitHubUploadWorker(
                             "No usable owner/repo/token could be resolved."
                 )
             )
+        }
+
+        executionConfig = cfg
+
+        try {
+            val retained = UploadConflictRecoveryStore(applicationContext.filesDir)
+                .get(UploadConflictRecoveryStore.key(inputData, id))
+            if (retained != null && (!inputData.getBoolean(UploadConflictRecoveryStore.RECOVERY, false) || retained.exhausted >= 2)) {
+                return Result.failure(workDataOf(ERROR_MESSAGE to "Upload deferred after conflict exhaustion; staged data retained."))
+            }
+        } catch (error: Exception) {
+            Log.e(TAG, "Cannot inspect upload conflict state; retaining staged data", error)
+            return Result.failure(workDataOf(ERROR_MESSAGE to "Cannot inspect durable conflict state."))
         }
 
         ensureChannel()
@@ -571,7 +585,7 @@ class GitHubUploadWorker(
                                     cfg, remotePathForUi, surveyId, text, "Upload $fileName (deferred)", onProgress
                                 )
                             } else {
-                                GitHubUploader.uploadJson(cfg, fileName, text, "Upload $fileName (deferred)", onProgress)
+                                GitHubUploader.uploadJsonAtPath(cfg, remotePathForUi, text, "Upload $fileName (deferred)", onProgress)
                             }
                         },
                         recordUploaded = {
@@ -621,12 +635,12 @@ class GitHubUploadWorker(
                         SurveyUploadExecutionGuard.Outcome.AUTHORITY_RELEASE_FAILURE -> return Result.retry()
                     }
                 } else {
-                    GitHubUploader.uploadJson(cfg, fileName, text, "Upload $fileName (deferred)", onProgress)
+                    GitHubUploader.uploadJsonAtPath(cfg, remotePathForUi, text, "Upload $fileName (deferred)", onProgress)
                 }
             } else {
-                GitHubUploader.uploadFile(
+                GitHubUploader.uploadFileAtPath(
                     cfg = cfg,
-                    relativePath = fileName,
+                    path = remotePathForUi,
                     file = pendingFile,
                     message = "Upload $fileName (deferred)",
                     onProgress = onProgress
@@ -729,12 +743,13 @@ class GitHubUploadWorker(
         return try {
             onProgress(3)
 
-            val snap = collectLogcatSnapshotGz(
-                context = applicationContext,
-                includeDeviceHeader = includeHeader,
-                includeCrashBuffer = includeCrash,
-                maxUncompressedBytes = maxBytes
-            )
+            val capture = diagnosticCapture("logcat")
+            val staged = capture.capture { directory ->
+                val snap = collectLogcatSnapshotGz(
+                    applicationContext, includeHeader, includeCrash, maxBytes
+                )
+                DiagnosticCaptureStore.write(File(directory, "logcat.log.gz"), snap.gzBytes)
+            }.single()
 
             onProgress(20)
 
@@ -750,13 +765,16 @@ class GitHubUploadWorker(
 
             val mappedProgress = mapProgressRange(start = 20, end = 100, sink = onProgress)
 
-            val result = GitHubUploader.uploadBytesAtPath(
+            val result = GitHubUploader.uploadFileAtPath(
                 cfg = cfg,
                 path = remotePath,
-                bytes = snap.gzBytes,
+                file = staged,
                 message = "Upload logcat snapshot",
                 onProgress = mappedProgress
             )
+
+            val stagedBytes = staged.length()
+            val rawBytes = java.util.zip.GZIPInputStream(staged.inputStream()).use { it.readBytes().size.toLong() }
 
             runCatching {
                 setForegroundAsync(
@@ -775,8 +793,8 @@ class GitHubUploadWorker(
                     OUT_REMOTE_PATH to remotePath,
                     OUT_COMMIT_SHA to (result.commitSha ?: ""),
                     OUT_FILE_URL to (result.fileUrl ?: ""),
-                    OUT_BYTES_RAW to snap.rawBytes.toLong(),
-                    OUT_BYTES_GZ to snap.gzBytes.size.toLong(),
+                    OUT_BYTES_RAW to rawBytes,
+                    OUT_BYTES_GZ to stagedBytes,
                 )
             )
         } catch (ce: CancellationException) {
@@ -818,7 +836,6 @@ class GitHubUploadWorker(
         val addDate = inputData.getBoolean(KEY_RTLOG_ADD_DATE, true)
         val reason = inputData.getString(KEY_RTLOG_REASON)?.takeIf { it.isNotBlank() } ?: "wm"
 
-        val deletePreparedAfter = inputData.getBoolean(KEY_RTLOG_DELETE_ZIP_AFTER, true)
         val dedupeEnabled = inputData.getBoolean(KEY_RTLOG_DEDUPE_ENABLE, true)
 
         // NEW: delete SOURCE logs from device after upload/dedupe-skip
@@ -856,58 +873,36 @@ class GitHubUploadWorker(
         val sessionId = resolvedSessionId("runtime")
         val safeReason = safeFileSegment(reason)
         val appCtx = applicationContext.applicationContext ?: applicationContext
-        val outDir = File(appCtx.cacheDir, "diagnostics_upload").apply { mkdirs() }
 
-        val preparedLogs: List<File> = runCatching {
-            RuntimeLogStore.start(appCtx)
-            RuntimeLogStore.prepareLogsForUploadPlain(
-                reason = safeReason,
-                limitFiles = limitFiles,
-                includeActive = includeActive,
-                rotateSnapshot = rotateSnapshot,
-                writeManifest = writeManifest
-            )
-        }.getOrElse { t ->
-            RuntimeLogStore.w(TAG, "doRuntimeLogsUpload: prepareLogsForUploadPlain failed: ${t.message}", t)
-            emptyList()
-        }
-
-        val manifest: File? = if (writeManifest) findLatestPlainManifest(outDir, safeReason) else null
-
-        val candidates = ArrayList<File>()
-        if (manifest != null && manifest.exists() && manifest.isFile) candidates.add(manifest)
-        candidates.addAll(preparedLogs.filter { it.exists() && it.isFile })
-
-        if (candidates.isEmpty() && !includeLogcat) {
-            RuntimeLogStore.d(TAG, "doRuntimeLogsUpload: no files to upload; no-op success.")
-            return Result.success(
-                workDataOf(
-                    OUT_MODE to MODE_RUNTIME_LOGS,
-                    OUT_REMOTE_PATH to "",
-                    OUT_FILE_NAME to "",
-                    OUT_COMMIT_SHA to "",
-                    OUT_FILE_URL to "",
-                    OUT_PLAIN_FILE_COUNT to 0,
-                    OUT_PLAIN_TOTAL_BYTES to 0L,
-                    OUT_PLAIN_PREVIEW to "",
-                    OUT_PLAIN_SOURCE_DELETED_COUNT to 0
+        val capture = diagnosticCapture("runtime")
+        val sizedFiles = try {
+            capture.capture { directory ->
+                if (!inputData.getBoolean(KEY_RTLOG_DELETE_ZIP_AFTER, true)) File(directory, ".retain").writeText("retain")
+                RuntimeLogStore.start(appCtx)
+                val prepared = RuntimeLogStore.prepareLogsForUploadPlain(
+                    reason = safeReason, limitFiles = limitFiles, includeActive = includeActive,
+                    rotateSnapshot = rotateSnapshot, writeManifest = writeManifest,
+                    outputDirectory = directory
                 )
-            )
-        }
-
-        // Enforce per-file size guard using tail truncation.
-        val sizedFiles = candidates.mapNotNull { f ->
-            val len = runCatching { f.length() }.getOrNull() ?: 0L
-            if (len <= 0L) return@mapNotNull null
-            if (len <= maxPerFileBytes) return@mapNotNull f
-
-            val trimmed = File(f.parentFile ?: outDir, "trimmed_${f.name}")
-            runCatching { copyTailOrFull(src = f, dst = trimmed, maxBytes = maxPerFileBytes) }
-                .getOrElse {
-                    RuntimeLogStore.w(TAG, "tail trim failed; skipping. file=${f.name} err=${it.message}", it)
-                    return@mapNotNull null
+                val candidates = prepared + directory.listFiles().orEmpty().filter { it.extension == "json" }
+                candidates.forEach { file ->
+                    if (file.length() > maxPerFileBytes) {
+                        val trimmed = File(directory, "trimmed_${file.name}")
+                        copyTailOrFull(file, trimmed, maxPerFileBytes)
+                        check(file.delete()) { "Cannot replace oversized diagnostic capture" }
+                    }
                 }
-            trimmed
+                if (includeLogcat) {
+                    val snap = collectLogcatSnapshotGz(
+                        applicationContext, logcatIncludeHeader, logcatIncludeCrash, logcatMaxUncompressed
+                    )
+                    DiagnosticCaptureStore.write(File(directory, "logcat_${sessionId}.log.gz"), snap.gzBytes)
+                }
+            }
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (error: Exception) {
+            return retryOrFailure(error, "Failed to stage runtime capture: ${error.message}")
         }
 
         val ledger: LinkedHashSet<String> = if (dedupeEnabled) loadLedger(appCtx) else LinkedHashSet()
@@ -932,17 +927,12 @@ class GitHubUploadWorker(
         if (deleteSourceAfterUpload && dupPrepared.isNotEmpty()) {
             val srcNames = dupPrepared.mapNotNull { extractSourceLogNameFromPrepared(it.name) }.distinct()
             if (srcNames.isNotEmpty()) {
-                deletedSourceCount += RuntimeLogStore.deleteRolledLogFiles(srcNames, excludeActive = true)
+                deletedSourceCount += RuntimeLogStore.deleteUploadedSnapshots(dupPrepared.associateBy { extractSourceLogNameFromPrepared(it.name).orEmpty() })
             }
         }
 
         if (toUpload.isEmpty() && !includeLogcat) {
             RuntimeLogStore.d(TAG, "doRuntimeLogsUpload: all candidates already uploaded; no-op. deletedSource=$deletedSourceCount")
-            if (deletePreparedAfter) {
-                runCatching { manifest?.delete() }
-                preparedLogs.forEach { runCatching { it.delete() } }
-                sizedFiles.forEach { f -> if (f.name.startsWith("trimmed_")) runCatching { f.delete() } }
-            }
             return Result.success(
                 workDataOf(
                     OUT_MODE to MODE_RUNTIME_LOGS,
@@ -979,7 +969,7 @@ class GitHubUploadWorker(
 
         return try {
             val startPct = 10
-            val endPctLogs = if (includeLogcat) 90 else 100
+            val endPctLogs = 100
             val n = toUpload.size.coerceAtLeast(1)
             var lastResult: GitHubUploader.UploadResult? = null
 
@@ -1016,36 +1006,8 @@ class GitHubUploadWorker(
                 if (deleteSourceAfterUpload) {
                     val srcName = extractSourceLogNameFromPrepared(file.name)
                     if (srcName != null) {
-                        deletedSourceCount += RuntimeLogStore.deleteRolledLogFiles(listOf(srcName), excludeActive = true)
+                        deletedSourceCount += RuntimeLogStore.deleteUploadedSnapshots(mapOf(srcName to file))
                     }
-                }
-            }
-
-            // Optional attached logcat snapshot
-            var logcatResult: GitHubUploader.UploadResult? = null
-            if (includeLogcat) {
-                val snap = runCatching {
-                    collectLogcatSnapshotGz(
-                        context = applicationContext,
-                        includeDeviceHeader = logcatIncludeHeader,
-                        includeCrashBuffer = logcatIncludeCrash,
-                        maxUncompressedBytes = logcatMaxUncompressed
-                    )
-                }.getOrNull()
-
-                if (snap != null && snap.gzBytes.isNotEmpty()) {
-                    val remotePath = "$remoteBaseDir/logcat_${sessionId}.log.gz"
-                    val mapped = mapProgressRange(start = 90, end = 100, sink = onProgress)
-
-                    logcatResult = GitHubUploader.uploadBytesAtPath(
-                        cfg = cfg,
-                        path = remotePath,
-                        bytes = snap.gzBytes,
-                        message = "Upload logcat (attached) ($reason)",
-                        onProgress = mapped
-                    )
-                } else {
-                    onProgress(100)
                 }
             }
 
@@ -1060,19 +1022,13 @@ class GitHubUploadWorker(
                 )
             }
 
-            if (deletePreparedAfter) {
-                runCatching { manifest?.delete() }
-                preparedLogs.forEach { runCatching { it.delete() } }
-                sizedFiles.forEach { f -> if (f.name.startsWith("trimmed_")) runCatching { f.delete() } }
-            }
-
             Result.success(
                 workDataOf(
                     OUT_MODE to MODE_RUNTIME_LOGS,
                     OUT_REMOTE_PATH to remoteBaseDir,
                     OUT_FILE_NAME to sessionDirName,
-                    OUT_COMMIT_SHA to (logcatResult?.commitSha ?: lastResult?.commitSha ?: ""),
-                    OUT_FILE_URL to (logcatResult?.fileUrl ?: lastResult?.fileUrl ?: ""),
+                    OUT_COMMIT_SHA to (lastResult?.commitSha ?: ""),
+                    OUT_FILE_URL to (lastResult?.fileUrl ?: ""),
                     OUT_PLAIN_FILE_COUNT to toUpload.size,
                     OUT_PLAIN_TOTAL_BYTES to totalBytes,
                     OUT_PLAIN_PREVIEW to preview,
@@ -1167,12 +1123,16 @@ class GitHubUploadWorker(
 
         val snapshotDir =
             File(
-                applicationContext.cacheDir,
-                "diagnostics_ring_upload/$sessionId"
+                applicationContext.filesDir,
+                "diagnostic_captures/${captureWorkId()}/ring"
             )
 
         val snapshots =
             runCatching {
+                val previousSnapshot = File(applicationContext.cacheDir, "diagnostics_ring_upload/$sessionId")
+                if (!snapshotDir.exists() && File(previousSnapshot, ".complete").isFile) {
+                    previousSnapshot.copyRecursively(snapshotDir, overwrite = false)
+                }
                 prepareRingSnapshot(
                     ringDir = ringDir,
                     snapshotDir = snapshotDir
@@ -1286,14 +1246,7 @@ class GitHubUploadWorker(
                 )
             }
 
-            /**
-             * Keep the stable snapshot across retries, but remove it only after
-             * the whole upload batch has succeeded.
-             */
-            runCatching {
-                snapshotDir.deleteRecursively()
-            }
-
+            // Startup recovery removes snapshots after WorkManager commits SUCCEEDED.
             Result.success(
                 workDataOf(
                     OUT_MODE to MODE_RING_LOGS,
@@ -1335,7 +1288,7 @@ class GitHubUploadWorker(
     }
 
     /**
-     * Prepare a stable cache snapshot of ring segments.
+     * Prepare a stable durable snapshot of ring segments.
      *
      * WorkManager may retry the same request after the live ring has changed.
      * Reusing a completed snapshot keeps the remote payload stable across
@@ -2297,6 +2250,12 @@ class GitHubUploadWorker(
     // Foreground + helpers
     // ---------------------------------------------------------------------
 
+    private fun captureWorkId() = inputData.getString(UploadConflictRecoveryStore.CAPTURE_ID) ?: id.toString()
+
+    private fun diagnosticCapture(kind: String) = DiagnosticCaptureStore(
+        File(applicationContext.filesDir, "diagnostic_captures/${captureWorkId()}/$kind")
+    )
+
     private fun resolvedSessionId(
         prefix: String
     ): String {
@@ -2310,11 +2269,12 @@ class GitHubUploadWorker(
         }
 
         return safeFileSegmentLong(
-            "${prefix}_work_${id}"
+            "${prefix}_work_${captureWorkId()}"
         )
     }
 
     private fun resolvedSessionDateFolderUtc(): String {
+        inputData.getString(UploadConflictRecoveryStore.DATE)?.let { return it }
         val sessionId =
             inputData.getString(KEY_SESSION_ID)
                 .orEmpty()
@@ -2338,7 +2298,16 @@ class GitHubUploadWorker(
             }
         }
 
-        return utcDateFolder()
+        val dateFile = File(applicationContext.filesDir, "diagnostic_capture_dates/${captureWorkId()}")
+        if (!dateFile.exists()) {
+            dateFile.parentFile?.mkdirs()
+            val temp = File(dateFile.parentFile, dateFile.name + ".tmp")
+            DiagnosticCaptureStore.write(temp, utcDateFolder().toByteArray())
+            check(temp.renameTo(dateFile)) { "Cannot persist upload date" }
+        }
+        return dateFile.readText().also {
+            check(Regex("\\d{4}-\\d{2}-\\d{2}").matches(it)) { "Invalid retained upload date" }
+        }
     }
 
     private fun utcIsoTimestamp(): String =
@@ -2354,21 +2323,30 @@ class GitHubUploadWorker(
         t: Throwable,
         errorMessage: String
     ): Result {
-        val attemptsUsed =
-            runAttemptCount + 1
-
-        return if (
-            shouldRetry(t) &&
-            attemptsUsed < MAX_ATTEMPTS
+        val retryable = shouldRetry(t)
+        if (retryable && runAttemptCount + 1 < MAX_ATTEMPTS) return Result.retry()
+        if (retryable || inputData.getBoolean(UploadConflictRecoveryStore.RECOVERY, false) ||
+            t is GitHubUploader.ArtifactConflictException || t is GitHubUploader.SurveyUploadValidationException
         ) {
-            Result.retry()
-        } else {
-            Result.failure(
-                workDataOf(
-                    ERROR_MESSAGE to errorMessage
+            // Credentials are resolved again by recovery; never duplicate tokens into this record.
+            val retainedBuilder = Data.Builder().putAll(inputData.keyValueMap.filterKeys { it != KEY_TOKEN })
+                .putString(UploadConflictRecoveryStore.CAPTURE_ID, captureWorkId())
+                .putString(UploadConflictRecoveryStore.DATE, resolvedSessionDateFolderUtc())
+            executionConfig?.let { cfg ->
+                retainedBuilder.putString(KEY_OWNER, cfg.owner).putString(KEY_REPO, cfg.repo)
+                    .putString(KEY_BRANCH, cfg.branch).putString(KEY_PATH_PREFIX, cfg.pathPrefix)
+            }
+            val retainedInput = retainedBuilder.build()
+            try {
+                val record = UploadConflictRecoveryStore(applicationContext.filesDir).exhaust(
+                    UploadConflictRecoveryStore.key(inputData, id), retainedInput, permanent = !retryable
                 )
-            )
+                Log.w(TAG, "Upload conflict exhausted: key=${record.key} batches=${record.exhausted}/2; staged data retained")
+            } catch (error: Exception) {
+                Log.e(TAG, "Cannot persist conflict deferral; staged data retained", error)
+            }
         }
+        return Result.failure(workDataOf(ERROR_MESSAGE to errorMessage))
     }
 
     private class CappedByteCollector(
@@ -2492,7 +2470,7 @@ class GitHubUploadWorker(
         SimpleDateFormat("yyyy-MM-dd", Locale.US).apply { timeZone = TimeZone.getTimeZone("UTC") }.format(Date())
 
     private fun buildDatedRemotePathUtc(prefix: String, fileName: String): String {
-        val date = utcDateFolder()
+        val date = resolvedSessionDateFolderUtc()
         return listOf(prefix.trim('/'), date, fileName.trim('/'))
             .filter { it.isNotEmpty() }
             .joinToString("/")
@@ -2522,7 +2500,8 @@ class GitHubUploadWorker(
             .trim('_')
             .take(96)
 
-    private fun shouldRetry(t: Throwable): Boolean {
+    internal fun shouldRetry(t: Throwable): Boolean {
+        if (t is GitHubUploader.ArtifactConflictException || t is GitHubUploader.SurveyUploadValidationException) return false
         val message =
             t.message.orEmpty()
 
@@ -2563,6 +2542,7 @@ class GitHubUploadWorker(
             if (
                 httpCode in 500..599 ||
                 httpCode == 408 ||
+                httpCode == 409 ||
                 httpCode == 425 ||
                 httpCode == 429
             ) {

@@ -103,6 +103,7 @@ internal object SurveyUploadWork {
         DEFER_TRACKER_FAILURE,
         DEFER_LEDGER_FAILURE,
         DEFER_ARTIFACT_FAILURE,
+        DEFER_CONFLICT_EXHAUSTED,
         DEFER_BUILD_FAILURE,
         DEFER_ENQUEUE_FAILURE,
         DEFER_ENQUEUE_TIMEOUT,
@@ -401,9 +402,19 @@ internal object SurveyUploadWork {
             tracker = tracker,
             ledgerContainsSurveyId = { UploadedSurveyStore(appContext).isUploaded(normalizedSurveyId) },
             artifactValidator = ::validateCanonicalArtifact,
-            requestBuilder = { cfg, file, id -> buildSurveyJsonRequest(cfg, file, id, protocol) },
+            requestBuilder = { cfg, file, id ->
+                val request = buildSurveyJsonRequest(cfg, file, id, protocol)
+                if (UploadConflictRecoveryStore(appContext.filesDir).get(UploadConflictRecoveryStore.surveyKey(id)) != null) {
+                    request.workSpec.input = Data.Builder().putAll(request.workSpec.input)
+                        .putBoolean(UploadConflictRecoveryStore.RECOVERY, true).build()
+                }
+                request
+            },
             operations = AndroidWorkManagerOperations(workManager),
-            allowNewEnqueue = allowNewEnqueue
+            allowNewEnqueue = allowNewEnqueue,
+            conflictDeferred = {
+                (UploadConflictRecoveryStore(appContext.filesDir).get(UploadConflictRecoveryStore.surveyKey(normalizedSurveyId))?.exhausted ?: 0) >= 2
+            }
         )
     }
 
@@ -417,7 +428,8 @@ internal object SurveyUploadWork {
         artifactValidator: (File, String) -> SurveyArtifactValidation = ::validateCanonicalArtifact,
         requestBuilder: (GitHubUploader.GitHubConfig, File, String) -> OneTimeWorkRequest = ::buildSurveyJsonRequest,
         operations: WorkManagerOperations,
-        allowNewEnqueue: Boolean = true
+        allowNewEnqueue: Boolean = true,
+        conflictDeferred: () -> Boolean = { false }
     ): SurveyWorkReconcileResult {
         val normalizedSurveyId = normalizeLogicalSurveyId(expectedSurveyId)
         val legacyWorkName = legacyWorkName(canonicalFile)
@@ -439,7 +451,8 @@ internal object SurveyUploadWork {
             artifactValidator,
             requestBuilder,
             operations,
-            allowNewEnqueue
+            allowNewEnqueue,
+            conflictDeferred
         )
     }
 
@@ -454,7 +467,8 @@ internal object SurveyUploadWork {
         artifactValidator: (File, String) -> SurveyArtifactValidation,
         requestBuilder: (GitHubUploader.GitHubConfig, File, String) -> OneTimeWorkRequest,
         operations: WorkManagerOperations,
-        allowNewEnqueue: Boolean
+        allowNewEnqueue: Boolean,
+        conflictDeferred: () -> Boolean = { false }
     ): SurveyWorkReconcileResult = locks.computeIfAbsent(normalizedSurveyId) { ReentrantLock() }.withLock {
         when (val ledger = readLedger(ledgerContainsSurveyId)) {
             is LedgerRead.Failure -> return@withLock resultFor(
@@ -542,6 +556,10 @@ internal object SurveyUploadWork {
         }
         if (decision.action != SurveyWorkAction.ENQUEUE_NEW && decision.action != SurveyWorkAction.RECOVER_NEW) {
             return@withLock resultFor(normalizedSurveyId, logicalWorkName, legacyWorkName, decision)
+        }
+        if (conflictDeferred()) {
+            return@withLock resultFor(normalizedSurveyId, logicalWorkName, legacyWorkName,
+                SurveyWorkDecision(SurveyWorkAction.DEFER_CONFLICT_EXHAUSTED, "Conflict recovery exhausted; canonical artifact retained."))
         }
         if (!allowNewEnqueue) {
             val request = try {

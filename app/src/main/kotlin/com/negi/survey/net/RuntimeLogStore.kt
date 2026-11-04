@@ -333,6 +333,18 @@ object RuntimeLogStore {
 
     fun currentActiveLogFileName(): String? = synchronized(fileLock) { activeFile?.name }
 
+    /** Deletes only rolled source bytes proven to be the uploaded snapshot. */
+    internal fun deleteUploadedSnapshots(snapshots: Map<String, File>): Int = synchronized(fileLock) {
+        val directory = rootDir ?: return@synchronized 0
+        val names = snapshots.filter { (name, snapshot) ->
+            val source = File(directory, name)
+            name.isNotBlank() && source.parentFile == directory && source.isFile &&
+                source.name != activeFile?.name &&
+                DiagnosticCaptureStore.fingerprint(source) == DiagnosticCaptureStore.fingerprint(snapshot)
+        }.keys
+        deleteRolledLogFiles(names, excludeActive = true)
+    }
+
     fun deleteRolledLogFiles(fileNames: Collection<String>, excludeActive: Boolean = true): Int {
         if (fileNames.isEmpty()) return 0
 
@@ -366,7 +378,8 @@ object RuntimeLogStore {
         limitFiles: Int = DEFAULT_MAX_FILES,
         includeActive: Boolean = false,
         rotateSnapshot: Boolean = true,
-        writeManifest: Boolean = false
+        writeManifest: Boolean = false,
+        outputDirectory: File? = null
     ): List<File> = withContext(Dispatchers.IO) {
         val ctx = appContext ?: throw IllegalStateException("RuntimeLogStore not started (context=null).")
         val dir = rootDir ?: throw IllegalStateException("RuntimeLogStore not started (dir=null).")
@@ -390,7 +403,7 @@ object RuntimeLogStore {
 
         val picked = candidates.take(limitFiles.coerceIn(1, 200))
 
-        val outDir = File(ctx.cacheDir, "diagnostics_upload").apply { mkdirs() }
+        val outDir = (outputDirectory ?: File(ctx.cacheDir, "diagnostics_upload")).apply { mkdirs() }
         val stamp = utcStamp()
         val pid = Process.myPid()
 

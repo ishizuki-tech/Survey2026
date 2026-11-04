@@ -62,7 +62,16 @@ internal object SurveyUploadRescheduler {
     fun recoverPendingSurveyUploads(
         context: Context,
         config: GitHubUploader.GitHubConfig
-    ): RecoverySummary = recover(AndroidOperations(context, config))
+    ): RecoverySummary {
+        try {
+            SurveyArtifactUploadScheduler(context).recoverExhaustedConflicts(config)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            android.util.Log.w("SurveyUploadRecovery", "Conflict recovery scan failed; artifacts retained", error)
+        }
+        return recover(AndroidOperations(context, config))
+    }
 
     internal fun recoverForTesting(operations: Operations): RecoverySummary = recover(operations)
 

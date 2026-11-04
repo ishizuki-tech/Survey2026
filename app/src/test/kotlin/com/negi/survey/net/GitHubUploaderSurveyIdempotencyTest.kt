@@ -70,6 +70,40 @@ class GitHubUploaderSurveyIdempotencyTest {
         )
     }
 
+    @Test
+    fun branchConflictsRetryCreateAfterFreshReadback() = runBlocking {
+        var writes = 0
+        var reads = 0
+        val waits = mutableListOf<Int>()
+        val transport = object : GitHubUploader.SurveyContentsTransport {
+            override suspend fun getExisting(): GitHubUploader.SurveyRemoteRecord? { reads++; return null }
+            override suspend fun createOnly(): GitHubUploader.SurveyCreateResult {
+                writes++
+                return if (writes < 4) GitHubUploader.SurveyCreateResult.Reconcile(409)
+                else GitHubUploader.SurveyCreateResult.Created(GitHubUploader.UploadResult("url", "sha"))
+            }
+        }
+        GitHubUploader.reconcileSurveyJsonUpload(identity, payload, transport) { waits.add(it) }
+        assertEquals(4, writes)
+        assertEquals(7, reads)
+        assertEquals(listOf(1, 2, 3), waits)
+    }
+
+    @Test
+    fun branchConflictExhaustionRemainsRetryable() = runBlocking {
+        var writes = 0
+        val transport = object : GitHubUploader.SurveyContentsTransport {
+            override suspend fun getExisting(): GitHubUploader.SurveyRemoteRecord? = null
+            override suspend fun createOnly(): GitHubUploader.SurveyCreateResult {
+                writes++
+                return GitHubUploader.SurveyCreateResult.Reconcile(409)
+            }
+        }
+        val error = runCatching { GitHubUploader.reconcileSurveyJsonUpload(identity, payload, transport) {} }.exceptionOrNull()
+        assertTrue(error is GitHubUploader.ConflictRetriesExhaustedException)
+        assertEquals(5, writes)
+    }
+
     private fun record(content: String) = GitHubUploader.SurveyRemoteRecord(content, "url")
 
     private class FakeTransport(

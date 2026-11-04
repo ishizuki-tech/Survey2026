@@ -126,6 +126,49 @@ internal class SurveyArtifactUploadScheduler(context: Context) {
         }
     }
 
+    /** One recovery request per exhausted artifact, preserving its input route and capture. */
+    fun recoverExhaustedConflicts(config: GitHubUploader.GitHubConfig) {
+        if (DiagnosticUploadInstrumentationGate.isDisabled()) return
+        val store = UploadConflictRecoveryStore(appContext.filesDir)
+        val manager = WorkManager.getInstance(appContext)
+        cleanupConfirmedCaptures(manager, store)
+        store.records().filter { !it.key.startsWith("survey:") }.forEach { record ->
+            if (record.exhausted >= 2 || record.dispatched) return@forEach
+            val input = record.input
+            // Never authorize a retained request with credentials for a different destination.
+            if (input.getString(GitHubUploadWorker.KEY_OWNER) != config.owner ||
+                normalizeRepoName(input.getString(GitHubUploadWorker.KEY_REPO).orEmpty()) != normalizeRepoName(config.repo) ||
+                input.getString(GitHubUploadWorker.KEY_BRANCH) != config.branch ||
+                input.getString(GitHubUploadWorker.KEY_PATH_PREFIX).orEmpty() != config.pathPrefix) return@forEach
+            store.recoverOnce(record,
+                alreadyExists = { manager.getWorkInfoById(it).get(2, TimeUnit.SECONDS) != null },
+                enqueue = { retained ->
+                    val request = OneTimeWorkRequestBuilder<GitHubUploadWorker>()
+                        .setId(retained.recoveryId)
+                        .setInputData(Data.Builder().putAll(input).putString(GitHubUploadWorker.KEY_TOKEN, config.token)
+                            .putBoolean(UploadConflictRecoveryStore.RECOVERY, true).build())
+                        .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
+                        .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
+                        .addTag(GitHubUploadWorker.TAG).build()
+                    manager.enqueueUniqueWork("gh_conflict_${retained.recoveryId}", ExistingWorkPolicy.KEEP, request)
+                        .result.get(2, TimeUnit.SECONDS)
+                }
+            )
+            Log.i(LOG_TAG, "Scheduled final conflict recovery batch: ${record.key}")
+        }
+    }
+
+    private fun cleanupConfirmedCaptures(manager: WorkManager, store: UploadConflictRecoveryStore) {
+        File(appContext.filesDir, "diagnostic_captures").listFiles().orEmpty().forEach { directory ->
+            val originalId = runCatching { java.util.UUID.fromString(directory.name) }.getOrNull() ?: return@forEach
+            val original = manager.getWorkInfoById(originalId).get(2, TimeUnit.SECONDS)
+            val recovery = store.get("capture:$originalId")
+            val confirmed = original?.state == androidx.work.WorkInfo.State.SUCCEEDED ||
+                (recovery != null && manager.getWorkInfoById(recovery.recoveryId).get(2, TimeUnit.SECONDS)?.state == androidx.work.WorkInfo.State.SUCCEEDED)
+            DiagnosticCaptureStore.cleanupConfirmed(directory, confirmed)
+        }
+    }
+
     private fun stageVoiceFilesToSharedPendingForRun(
         context: Context,
         expectedNames: Set<String>,
@@ -213,6 +256,10 @@ internal class SurveyArtifactUploadScheduler(context: Context) {
         localFile: File,
         remoteRelativePath: String
     ) {
+        if (UploadConflictRecoveryStore(context.filesDir).get(UploadConflictRecoveryStore.fileKey(localFile)) != null) {
+            Log.w(LOG_TAG, "Conflict-deferred artifact retained: ${localFile.name}")
+            return
+        }
         val input = Data.Builder()
             .putString(GitHubUploadWorker.KEY_MODE, "file")
             .putString(GitHubUploadWorker.KEY_OWNER, config.owner)

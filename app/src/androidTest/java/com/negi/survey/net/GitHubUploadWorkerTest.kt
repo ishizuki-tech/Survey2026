@@ -50,6 +50,24 @@ import kotlin.text.Charsets
 class GitHubUploadWorkerTest {
 
     @Test
+    fun conflictClassificationAndExhaustionAreBounded() {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val worker = TestListenableWorkerBuilder<GitHubUploadWorker>(context)
+            .setRunAttemptCount(5).build()
+        assertTrue(worker.shouldRetry(GitHubUploader.HttpFailureException(409, "race")))
+        assertTrue(worker.shouldRetry(GitHubUploader.ConflictRetriesExhaustedException()))
+        assertTrue(worker.shouldRetry(java.io.IOException("Transient HTTP 429")))
+        assertTrue(worker.shouldRetry(java.io.IOException("Transient HTTP 500")))
+        assertTrue(!worker.shouldRetry(GitHubUploader.HttpFailureException(400, "bad request")))
+        assertTrue(!worker.shouldRetry(GitHubUploader.ArtifactConflictException()))
+        val method = GitHubUploadWorker::class.java.getDeclaredMethod(
+            "retryOrFailure", Throwable::class.java, String::class.java
+        ).apply { isAccessible = true }
+        val result = method.invoke(worker, GitHubUploader.ConflictRetriesExhaustedException(), "conflict")
+        assertTrue(result is ListenableWorker.Result.Failure)
+    }
+
+    @Test
     fun explicitInstrumentationGate_returnsSuccessWithoutDeletingLocalPayload() = runBlocking {
         assumeTrue(DiagnosticUploadInstrumentationGate.isDisabled())
 

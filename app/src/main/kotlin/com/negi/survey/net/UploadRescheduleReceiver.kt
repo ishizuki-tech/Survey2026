@@ -201,6 +201,7 @@ class UploadRescheduleReceiver : BroadcastReceiver() {
         cfg: GitHubUploader.GitHubConfig,
         file: File
     ) {
+        if (UploadConflictRecoveryStore(context.filesDir).get(UploadConflictRecoveryStore.fileKey(file)) != null) return
         val remoteRelativePath = file.name
         val bytes = file.length().coerceAtLeast(0L)
         val mtime = file.lastModified()

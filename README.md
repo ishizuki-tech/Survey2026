@@ -545,6 +545,85 @@ Relevant components:
 - `SurveyUploadWorkTracker`
 - `UploadRescheduleReceiver`
 
+### Upload deferred after retry exhaustion (Issue #128)
+
+The uploader permits five in-process HTTP 409 create attempts; the Worker permits
+five attempts per batch. Existing startup/recovery scans can schedule one final
+batch after exhaustion. A second exhaustion stops automatic rescheduling; a
+verified permanent content collision is deferred immediately. A restart does
+not reset this budget. Survey JSON still uses Issue #86's shared canonical
+reconciliation, uploaded ledger, and execution authority. A new diagnostic
+capture may be scheduled on startup; it is separate from an older deferred capture.
+
+For operator investigation:
+
+1. Identify the exact installation/package and collect its logs. Look for
+   `Upload conflict exhausted`, `Upload deferred after conflict exhaustion`,
+   `Conflict-deferred artifact retained`, and survey reconciliation's
+   `DEFER_CONFLICT_EXHAUSTED`. WorkManager work has tag `github_upload`; inspect
+   its state and output Data key `error` where developer tooling is available.
+   An initial failure can still have recovery pending; `FAILED` alone does not
+   prove final exhaustion or that the remote write never succeeded.
+2. With authorized access to that installation's private storage, preserve
+   `files/upload_conflict_recovery/*.properties`. Each filename is the SHA-256
+   of its logical `key`: `survey:<normalized-id>`, `file:<absolute-local-path>`,
+   or `capture:<original-worker-UUID>`. `exhausted=1` marks the initial exhausted
+   batch; `exhausted=2` marks final deferral, also used for permanent collisions.
+   For non-survey artifacts, `dispatched=true` means the recovery request was
+   acknowledged/found, not that upload succeeded. `recoveryId` identifies that
+   request. Survey recovery instead uses the existing survey work tracker.
+3. Preserve the retained bytes and metadata together. The record's `input` is
+   Base64-encoded WorkManager Data, **not JSON**. It retains owner, repository,
+   branch, path prefix, file/path or session identity, capture UUID, UTC date,
+   and survey protocol where applicable; the token is excluded and credentials
+   are resolved again. File-mode artifacts are located by `filePath` in this
+   Data, including WAVs under `files/pending_uploads_shared/voice/<survey>/` and
+   survey JSON under `files/pending_uploads/`. Worker-generated diagnostics are
+   under `files/diagnostic_captures/<original-worker-UUID>/{logcat,runtime,ring}/`;
+   keep hidden `.complete`/`.retain` files and `files/diagnostic_capture_dates/`.
+   Preserve relevant survey route/tracker/ledger state when investigating JSON.
+
+On an authorized **debuggable** installation, Android's existing `run-as` access
+can list the directories without changing them, for example:
+
+```bash
+adb -s SERIAL shell run-as PACKAGE ls -la files/upload_conflict_recovery
+adb -s SERIAL shell run-as PACKAGE ls -la files/diagnostic_captures
+```
+
+For preservation, use `adb -s SERIAL exec-out run-as PACKAGE tar -cf -` followed
+by the **existing** relative directories identified above, redirecting the
+archive to a protected host file. Missing directories are normal for unused
+modes; inspect first. Treat captured respondent data and logs as confidential.
+Release installations may reject `run-as`; there is no built-in export for this
+state, so escalate through authorized device support rather than clearing data
+or replacing the installation to gain access.
+
+If only the initial batch is exhausted and the final recovery has not already
+been dispatched, correct connectivity/credentials for the **original destination**,
+then reopen the app to invoke existing recovery.
+The optional-artifact replay requires matching captured routing; survey JSON
+continues through canonical reconciliation. Create-only comparison may accept
+matching remote content after ambiguous success, but rejects unrelated content.
+Inspect the recorded recovery WorkInfo or survey tracker and ledger afterward;
+records remain after success, so their existence alone does not prove a pending
+upload. An already-dispatched optional-artifact request is not recreated.
+
+**There is no supported operator reset or manual resubmit operation after final
+deferral.** Preserve the evidence and escalate for a separately reviewed repair.
+Do not delete/edit exhaustion records, WorkManager state, survey authority,
+routes or uploaded ledgers; rename/move staged files to evade suppression;
+overwrite remote content; or uninstall/clear app data to force another attempt.
+Restart/reboot is not a final-deferral reset.
+
+Deferred captures have no age/size eviction policy. Successful captures are
+removed during later recovery scans only when committed WorkManager success is
+still observable, and explicit `.retain` prevents that cleanup. Missing success
+history also retains bytes. Captures, exhaustion records and date metadata can
+therefore accumulate indefinitely; monitor storage and preserve evidence before
+requesting an authorized cleanup. This procedure documents that limitation and
+does not add a recovery UI, reset command, or retention policy.
+
 ---
 
 ## License

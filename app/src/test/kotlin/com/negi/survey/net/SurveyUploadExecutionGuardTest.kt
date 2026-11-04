@@ -68,6 +68,7 @@ class SurveyUploadExecutionGuardTest {
         val start = CountDownLatch(1)
         val remoteEntered = CountDownLatch(1)
         val releaseRemote = CountDownLatch(1)
+        val competingClaimFinished = CountDownLatch(1)
         val writes = AtomicInteger()
         val ledger = AtomicInteger()
         val outcomes = mutableListOf<SurveyUploadExecutionGuard.Outcome>()
@@ -81,13 +82,23 @@ class SurveyUploadExecutionGuardTest {
                     }, { ledger.incrementAndGet() })
             }
             synchronized(outcomes) { outcomes += outcome }
+            competingClaimFinished.countDown()
         }
         val legacy = worker(SurveyUploadExecutionAuthority.Protocol.LEGACY)
         val canonical = worker(SurveyUploadExecutionAuthority.Protocol.CANONICAL)
         legacy.start(); canonical.start()
         assertTrue(ready.await(1, TimeUnit.SECONDS)); start.countDown()
-        assertTrue(remoteEntered.await(1, TimeUnit.SECONDS)); releaseRemote.countDown()
-        legacy.join(); canonical.join()
+        val entered: Boolean
+        val competitorFinished: Boolean
+        try {
+            entered = remoteEntered.await(1, TimeUnit.SECONDS)
+            competitorFinished = entered && competingClaimFinished.await(1, TimeUnit.SECONDS)
+        } finally {
+            releaseRemote.countDown()
+            legacy.join(); canonical.join()
+        }
+        assertTrue(entered)
+        assertTrue(competitorFinished)
 
         assertEquals(1, writes.get())
         assertEquals(1, ledger.get())
