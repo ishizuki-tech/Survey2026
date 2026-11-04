@@ -287,6 +287,28 @@ class SurveyUploadWorkTest {
     }
 
     @Test
+    fun reconcile_exhaustedConflictDefersWithoutReplacingButLedgerStillWins() {
+        val tracker = tracker()
+        val staleId = UUID.randomUUID()
+        tracker.prepare("survey", staleId, SurveyUploadWorkTracker.IdentityKind.LOGICAL)
+        tracker.markEnqueuedIfMatches("survey", staleId)
+        val operations = FakeOperations(states = mutableMapOf(staleId to workInfo(staleId, WorkInfo.State.FAILED)))
+        val deferred = SurveyUploadWork.reconcileForTesting(
+            config(), "survey", validFile(), tracker, { false }, operations = operations,
+            conflictDeferred = { true }
+        )
+        assertEquals(SurveyUploadWork.SurveyWorkAction.DEFER_CONFLICT_EXHAUSTED, deferred.decision.action)
+        assertFalse(deferred.enqueued)
+        assertTrue(operations.enqueuedPolicies.isEmpty())
+        assertEquals(staleId, tracker.get("survey")!!.workRequestId)
+        val uploaded = SurveyUploadWork.reconcileForTesting(
+            config(), "survey", validFile(), tracker, { true }, operations = operations,
+            conflictDeferred = { true }
+        )
+        assertEquals(SurveyUploadWork.SurveyWorkAction.SKIP_UPLOADED, uploaded.decision.action)
+    }
+
+    @Test
     fun reconcile_legacyOrphanDefersWithoutEnqueueingReplacement() {
         val operations = FakeOperations()
         val result = SurveyUploadWork.reconcileForTesting(

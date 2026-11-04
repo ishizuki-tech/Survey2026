@@ -24,6 +24,7 @@ import java.io.OutputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
+import java.security.MessageDigest
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -79,6 +80,7 @@ object GitHubUploader {
     private const val REQUEST_OVERHEAD_BYTES = 16_384L
 
     /** Retry defaults. */
+    private const val MAX_CONFLICT_ATTEMPTS = 5
     private const val DEFAULT_MAX_ATTEMPTS = 3
     private const val BASE_BACKOFF_MS = 800L
     private const val MAX_BACKOFF_MS = 120_000L
@@ -124,6 +126,8 @@ object GitHubUploader {
 
     /** The remote target was not proven to be the staged survey and must not be overwritten. */
     internal class SurveyUploadValidationException(message: String) : IOException(message)
+
+    internal class ConflictRetriesExhaustedException : IOException("GitHub branch conflict retries exhausted (409).")
 
     // ---------------------------------------------------------------------
     // Public APIs — JSON/Text Upload
@@ -258,7 +262,8 @@ object GitHubUploader {
     internal suspend fun reconcileSurveyJsonUpload(
         identity: SurveyUploadIdempotency.LocalSurveyIdentity,
         content: String,
-        transport: SurveyContentsTransport
+        transport: SurveyContentsTransport,
+        waitForConflict: suspend (Int) -> Unit = { delay(conflictDelayMs(it)) }
     ): UploadResult {
         fun matching(existing: SurveyRemoteRecord): UploadResult {
             if (SurveyUploadIdempotency.classifyExisting(identity, content, existing.content) !=
@@ -270,17 +275,24 @@ object GitHubUploader {
         }
 
         transport.getExisting()?.let { return matching(it) }
-        return when (val created = transport.createOnly()) {
-            is SurveyCreateResult.Created -> created.upload
-            is SurveyCreateResult.Reconcile -> {
-                val existing = transport.getExisting()
-                if (existing != null) return matching(existing)
-                if (created.statusCode == 422) {
-                    throw SurveyUploadValidationException("Canonical survey create was rejected (422) and no matching target exists.")
+        for (attempt in 1..MAX_CONFLICT_ATTEMPTS) {
+            when (val created = transport.createOnly()) {
+                is SurveyCreateResult.Created -> return created.upload
+                is SurveyCreateResult.Reconcile -> {
+                    transport.getExisting()?.let { return matching(it) }
+                    if (created.statusCode == 422) {
+                        throw SurveyUploadValidationException("Canonical survey create was rejected (422) and no matching target exists.")
+                    }
+                    if (created.statusCode != 409) {
+                        throw SurveyUploadAmbiguousException("Canonical survey create outcome is ambiguous.")
+                    }
+                    if (attempt == MAX_CONFLICT_ATTEMPTS) throw ConflictRetriesExhaustedException()
+                    waitForConflict(attempt)
+                    transport.getExisting()?.let { return matching(it) }
                 }
-                throw SurveyUploadAmbiguousException("Canonical survey create outcome is ambiguous.")
             }
         }
+        throw SurveyUploadAmbiguousException("Canonical survey conflict retries exhausted.")
     }
 
     // ---------------------------------------------------------------------
@@ -484,7 +496,7 @@ object GitHubUploader {
      * 4) Parse JSON response.
      *
      * Special:
-     * - If PUT fails with 409 Conflict, re-fetch SHA and retry PUT once.
+     * - On 409, back off and read the target before another create-only PUT.
      */
     private suspend fun uploadStream(
         owner: String,
@@ -528,55 +540,65 @@ object GitHubUploader {
 
         onProgress(0)
 
-        // Phase 1 — Lookup existing SHA (retry-capable, 404 allowed)
-        var existingSha = getExistingSha(owner, repoName, branch, encodedPath, token)
-        onProgress(10)
-
-        // Phase 2 — PUT with streaming body (may retry once on 409)
-        try {
-            val response = putContents(
-                owner = owner,
-                repoName = repoName,
-                branch = branch,
-                path = path,
-                encodedPath = encodedPath,
-                token = token,
-                rawSize = rawSize,
-                openStream = openStream,
-                message = message,
-                sha = existingSha,
-                onProgress = onProgress,
-                maxRequestBytesHint = maxRequestBytesHint
-            )
-
-            onProgress(95)
-            return@withContext parseUploadResult(response.body)
-
-        } catch (e: HttpFailureException) {
-            if (e.code != 409) throw e
-
-            // 409 Conflict: SHA mismatch or concurrent update; refresh SHA and retry once.
-            Log.w(TAG, "uploadStream: 409 Conflict; refreshing SHA and retrying once.")
-            existingSha = getExistingSha(owner, repoName, branch, encodedPath, token)
-
-            val response2 = putContents(
-                owner = owner,
-                repoName = repoName,
-                branch = branch,
-                path = path,
-                encodedPath = encodedPath,
-                token = token,
-                rawSize = rawSize,
-                openStream = openStream,
-                message = message,
-                sha = existingSha,
-                onProgress = onProgress,
-                maxRequestBytesHint = maxRequestBytesHint
-            )
-
-            onProgress(95)
-            return@withContext parseUploadResult(response2.body)
+        val digest = MessageDigest.getInstance("SHA-1")
+        digest.update("blob $rawSize\u0000".toByteArray(Charsets.UTF_8))
+        openStream().use { input ->
+            val buffer = ByteArray(8192)
+            while (true) {
+                val count = input.read(buffer)
+                if (count < 0) break
+                digest.update(buffer, 0, count)
+            }
         }
+        val localSha = digest.digest().joinToString("") { "%02x".format(it.toInt() and 0xff) }
+        val result = createArtifactWithConflictRetry(
+            localSha = localSha,
+            getExistingSha = { getExistingSha(owner, repoName, branch, encodedPath, token) },
+            create = {
+                val response = putContents(
+                    owner, repoName, branch, path, encodedPath, token, rawSize,
+                    openStream, message, null, onProgress, maxRequestBytesHint
+                )
+                parseUploadResult(response.body)
+            }
+        )
+        onProgress(95)
+        result
+    }
+
+    /** Create-only artifact upload. A matching Git blob proves an earlier attempt succeeded. */
+    internal suspend fun createArtifactWithConflictRetry(
+        localSha: String,
+        getExistingSha: suspend () -> String?,
+        create: suspend () -> UploadResult,
+        waitForConflict: suspend (Int) -> Unit = { delay(conflictDelayMs(it)) }
+    ): UploadResult {
+        fun checkRemote(sha: String?): UploadResult? {
+            if (sha == null) return null
+            if (sha != localSha) throw ArtifactConflictException()
+            return UploadResult(null, null)
+        }
+        checkRemote(getExistingSha())?.let { return it }
+        for (attempt in 1..MAX_CONFLICT_ATTEMPTS) {
+            try {
+                return create()
+            } catch (failure: HttpFailureException) {
+                if (failure.code != 409 && failure.code != 422) throw failure
+                checkRemote(getExistingSha())?.let { return it }
+                if (failure.code == 422) throw failure
+                if (attempt == MAX_CONFLICT_ATTEMPTS) throw ConflictRetriesExhaustedException()
+                waitForConflict(attempt)
+                checkRemote(getExistingSha())?.let { return it }
+            }
+        }
+        throw IOException("Artifact conflict retries exhausted")
+    }
+
+    internal class ArtifactConflictException : IOException("Remote artifact contains different content.")
+
+    internal fun conflictDelayMs(attempt: Int, random: Random = Random): Long {
+        val cap = (400L shl (attempt - 1).coerceIn(0, 4)).coerceAtMost(6400L)
+        return random.nextLong(cap / 2, cap + 1)
     }
 
     // ---------------------------------------------------------------------
@@ -706,7 +728,7 @@ object GitHubUploader {
         val rateLimitResetEpochSeconds: Long?
     ) : IOException()
 
-    private class HttpFailureException(val code: Int, val body: String) :
+    internal class HttpFailureException(val code: Int, val body: String) :
         IOException("GitHub request failed ($code): ${body.take(256)}")
 
     /**
@@ -800,6 +822,8 @@ object GitHubUploader {
                 )
                 delay(delayMs)
 
+            } catch (e: HttpFailureException) {
+                throw e
             } catch (e: IOException) {
                 lastError = e
                 if (attempt >= maxAttempts) throw e
@@ -967,9 +991,12 @@ object GitHubUploader {
         if (resp.code == 404) return null
         if (resp.code !in 200..299) return null
 
-        return runCatching {
-            JSONObject(resp.body).optString("sha").takeIf { it.isNotBlank() }
-        }.getOrNull()
+        return try {
+            JSONObject(resp.body).optString("sha").takeIf { it.matches(Regex("[0-9a-f]{40}")) }
+                ?: throw IOException("Existing artifact has no valid blob SHA.")
+        } catch (error: JSONException) {
+            throw IOException("Malformed existing artifact response.", error)
+        }
     }
 
     /** Reads the complete UTF-8 payload needed to validate an immutable survey target. */
