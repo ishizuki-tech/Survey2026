@@ -1,12 +1,12 @@
 {
   "original_branch": "codex/ui-interaction",
   "branch_slug": "codex-ui-interaction",
-  "commit_sha": "528752bfa5aa82385804cfc587e51e0072188fd9",
-  "short_sha": "528752b",
-  "apk_name": "Survey2026-codex-ui-interaction-528752b.apk",
-  "apk_sha256": "61d3d8b97e849565f8b7262947ff5e3a2e00402345d4eb02c8c191d89662aeda",
-  "apk_download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-codex-ui-interaction-528752b-run-185/Survey2026-codex-ui-interaction-528752b.apk",
+  "commit_sha": "6f457d93c79487d034e57f8a0215777253cfca90",
+  "short_sha": "6f457d9",
+  "apk_name": "Survey2026-codex-ui-interaction-6f457d9.apk",
+  "apk_sha256": "cf66e9b895f9d9cdba3ce800a3b17421722c5f14102f5742d4d17955c9741768",
+  "apk_download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-codex-ui-interaction-6f457d9-run-186/Survey2026-codex-ui-interaction-6f457d9.apk",
   "page_url": "https://ishizuki-tech.github.io/Survey2026/codex-ui-interaction/",
-  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/41902071046",
-  "generated_utc": "2026-11-04T20:06:02Z"
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/41904878327",
+  "generated_utc": "2026-11-04T20:23:07Z"
 }
