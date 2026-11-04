@@ -1,0 +1,12 @@
+{
+  "original_branch": "codex/issue-86-upload-idempotency",
+  "branch_slug": "codex-issue-86-upload-idempotency",
+  "commit_sha": "9c79eeca9f36392c8ae7b2c1437ab065cc431a51",
+  "short_sha": "9c79eec",
+  "apk_name": "Survey2026-codex-issue-86-upload-idempotency-9c79eec.apk",
+  "apk_sha256": "d47ff88ce1e3766cd3bede78a63b73ca181d55a6ef7d9570c49f77394a98f81d",
+  "apk_download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-codex-issue-86-upload-idempotency-9c79eec-run-180/Survey2026-codex-issue-86-upload-idempotency-9c79eec.apk",
+  "page_url": "https://ishizuki-tech.github.io/Survey2026/codex-issue-86-upload-idempotency/",
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/41746128068",
+  "generated_utc": "2026-11-04T00:27:19Z"
+}
