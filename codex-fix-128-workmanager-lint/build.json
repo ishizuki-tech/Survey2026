@@ -1,0 +1,12 @@
+{
+  "original_branch": "codex/fix-128-workmanager-lint",
+  "branch_slug": "codex-fix-128-workmanager-lint",
+  "commit_sha": "e5be1ae0052e708b7fb57965490d8e6d3d283237",
+  "short_sha": "e5be1ae",
+  "apk_name": "Survey2026-codex-fix-128-workmanager-lint-e5be1ae.apk",
+  "apk_sha256": "133086589119383b3f115e583c3fb4eedf7f91f1c790b620f727541d5584d814",
+  "apk_download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-codex-fix-128-workmanager-lint-e5be1ae-run-183/Survey2026-codex-fix-128-workmanager-lint-e5be1ae.apk",
+  "page_url": "https://ishizuki-tech.github.io/Survey2026/codex-fix-128-workmanager-lint/",
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/41773111892",
+  "generated_utc": "2026-11-04T04:30:40Z"
+}
