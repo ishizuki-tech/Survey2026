@@ -211,7 +211,8 @@ internal object SurveyUploadWork {
         config: GitHubUploader.GitHubConfig,
         canonicalFile: File,
         surveyId: String,
-        protocol: SurveyUploadProtocol = SurveyUploadProtocol.CANONICAL_IMMUTABLE_V1
+        protocol: SurveyUploadProtocol = SurveyUploadProtocol.CANONICAL_IMMUTABLE_V1,
+        isConflictRecovery: Boolean = false
     ): OneTimeWorkRequest {
         val remotePath = when (protocol) {
             SurveyUploadProtocol.LEGACY_DATED_V0 -> remoteRelativePath(canonicalFile.name)
@@ -228,6 +229,9 @@ internal object SurveyUploadWork {
             .putString(GitHubUploadWorker.KEY_FILE_NAME, remotePath)
             .putLong(GitHubUploadWorker.KEY_FILE_MAX_BYTES_HINT, config.maxRawBytesHint.toLong())
             .putInt(GitHubUploadWorker.KEY_FILE_MAX_REQUEST_BYTES_HINT, config.maxRequestBytesHint)
+        if (isConflictRecovery) {
+            data.putBoolean(UploadConflictRecoveryStore.RECOVERY, true)
+        }
         addSurveyJsonMetadata(data, surveyId)
         // Ordinary builds have no active Issue #86 registration, so this adds no Worker input.
         Issue86ProcessDeathHarness.activeSessionForWorkRequest()?.let { sessionId ->
@@ -253,7 +257,8 @@ internal object SurveyUploadWork {
     fun buildSurveyJsonRequest(
         config: GitHubUploader.GitHubConfig,
         candidate: PendingSurveyUploads.PendingSurveyCandidate,
-        protocol: SurveyUploadProtocol = SurveyUploadProtocol.CANONICAL_IMMUTABLE_V1
+        protocol: SurveyUploadProtocol = SurveyUploadProtocol.CANONICAL_IMMUTABLE_V1,
+        isConflictRecovery: Boolean = false
     ): OneTimeWorkRequest {
         val parsedSurveyId = requireNotNull(PendingSurveyUploads.surveyIdFromFile(candidate.canonicalFile)) {
             "Canonical pending file is not valid survey JSON."
@@ -261,7 +266,7 @@ internal object SurveyUploadWork {
         require(normalizeLogicalSurveyId(parsedSurveyId) == normalizeLogicalSurveyId(candidate.normalizedSurveyId)) {
             "Canonical pending file survey ID changed."
         }
-        return buildSurveyJsonRequest(config, candidate.canonicalFile, parsedSurveyId, protocol)
+        return buildSurveyJsonRequest(config, candidate.canonicalFile, parsedSurveyId, protocol, isConflictRecovery)
     }
 
     /** Pure tracked-state policy used by concrete reconciliation and JVM tests. */
@@ -403,12 +408,9 @@ internal object SurveyUploadWork {
             ledgerContainsSurveyId = { UploadedSurveyStore(appContext).isUploaded(normalizedSurveyId) },
             artifactValidator = ::validateCanonicalArtifact,
             requestBuilder = { cfg, file, id ->
-                val request = buildSurveyJsonRequest(cfg, file, id, protocol)
-                if (UploadConflictRecoveryStore(appContext.filesDir).get(UploadConflictRecoveryStore.surveyKey(id)) != null) {
-                    request.workSpec.input = Data.Builder().putAll(request.workSpec.input)
-                        .putBoolean(UploadConflictRecoveryStore.RECOVERY, true).build()
-                }
-                request
+                val isConflictRecovery = UploadConflictRecoveryStore(appContext.filesDir)
+                    .get(UploadConflictRecoveryStore.surveyKey(id)) != null
+                buildSurveyJsonRequest(cfg, file, id, protocol, isConflictRecovery)
             },
             operations = AndroidWorkManagerOperations(workManager),
             allowNewEnqueue = allowNewEnqueue,
