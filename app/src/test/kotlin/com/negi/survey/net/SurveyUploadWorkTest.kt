@@ -128,6 +128,9 @@ class SurveyUploadWorkTest {
             " Survey-Id "
         )
         val data = request.workSpec.input
+        assertFalse(data.keyValueMap.containsKey(UploadConflictRecoveryStore.RECOVERY))
+        assertFalse(data.getBoolean(UploadConflictRecoveryStore.RECOVERY, false))
+        assertEquals(GitHubUploadWorker::class.java.name, request.workSpec.workerClassName)
 
         assertEquals("file", data.getString(GitHubUploadWorker.KEY_MODE))
         assertEquals("owner", data.getString(GitHubUploadWorker.KEY_OWNER))
@@ -154,6 +157,43 @@ class SurveyUploadWorkTest {
         assertTrue(request.workSpec.expedited)
         assertTrue(request.tags.contains(GitHubUploadWorker.TAG))
         assertTrue(request.tags.contains("${GitHubUploadWorker.TAG}:file:" + SurveyUploadWork.safeWorkNameSegment(SurveyUploadWork.canonicalRemotePath("Survey-Id"))))
+    }
+
+    @Test
+    fun buildSurveyJsonRequest_recoveryPreservesAllInputAndSchedulingConfiguration() {
+        val file = validFile()
+        SurveyUploadWork.SurveyUploadProtocol.entries.forEach { protocol ->
+            val normal = SurveyUploadWork.buildSurveyJsonRequest(config(), file, "survey", protocol)
+            val recovery = SurveyUploadWork.buildSurveyJsonRequest(
+                config(), file, "survey", protocol, isConflictRecovery = true
+            )
+            assertTrue(recovery.workSpec.input.getBoolean(UploadConflictRecoveryStore.RECOVERY, false))
+            assertEquals(
+                normal.workSpec.input.keyValueMap,
+                recovery.workSpec.input.keyValueMap.filterKeys { it != UploadConflictRecoveryStore.RECOVERY }
+            )
+            assertEquals(GitHubUploadWorker::class.java.name, recovery.workSpec.workerClassName)
+            assertEquals(normal.workSpec.constraints, recovery.workSpec.constraints)
+            assertEquals(normal.workSpec.backoffPolicy, recovery.workSpec.backoffPolicy)
+            assertEquals(normal.workSpec.backoffDelayDuration, recovery.workSpec.backoffDelayDuration)
+            assertEquals(normal.workSpec.expedited, recovery.workSpec.expedited)
+            assertEquals(normal.workSpec.outOfQuotaPolicy, recovery.workSpec.outOfQuotaPolicy)
+            assertEquals(normal.workSpec.initialDelay, recovery.workSpec.initialDelay)
+            assertEquals(normal.tags, recovery.tags)
+            assertEquals(recovery.id.toString(), recovery.workSpec.id)
+        }
+    }
+
+    @Test
+    fun buildSurveyJsonRequest_recoveryCandidateKeepsCanonicalArtifact() {
+        val canonical = validFile()
+        val candidate = PendingSurveyUploads.PendingSurveyCandidate(
+            normalizedSurveyId = "survey", canonicalFile = canonical,
+            duplicateFiles = listOf(validFile("duplicate.json"))
+        )
+        val request = SurveyUploadWork.buildSurveyJsonRequest(config(), candidate, isConflictRecovery = true)
+        assertTrue(request.workSpec.input.getBoolean(UploadConflictRecoveryStore.RECOVERY, false))
+        assertEquals(canonical.absolutePath, request.workSpec.input.getString(GitHubUploadWorker.KEY_FILE_PATH))
     }
 
     @Test
@@ -293,19 +333,28 @@ class SurveyUploadWorkTest {
         tracker.prepare("survey", staleId, SurveyUploadWorkTracker.IdentityKind.LOGICAL)
         tracker.markEnqueuedIfMatches("survey", staleId)
         val operations = FakeOperations(states = mutableMapOf(staleId to workInfo(staleId, WorkInfo.State.FAILED)))
+        val canonical = validFile()
+        val original = canonical.readText()
+        val trackedBefore = tracker.get("survey")
         val deferred = SurveyUploadWork.reconcileForTesting(
-            config(), "survey", validFile(), tracker, { false }, operations = operations,
+            config(), "survey", canonical, tracker, { false }, operations = operations,
             conflictDeferred = { true }
         )
         assertEquals(SurveyUploadWork.SurveyWorkAction.DEFER_CONFLICT_EXHAUSTED, deferred.decision.action)
         assertFalse(deferred.enqueued)
         assertTrue(operations.enqueuedPolicies.isEmpty())
         assertEquals(staleId, tracker.get("survey")!!.workRequestId)
+        assertEquals(trackedBefore, tracker.get("survey"))
+        assertEquals(original, canonical.readText())
         val uploaded = SurveyUploadWork.reconcileForTesting(
             config(), "survey", validFile(), tracker, { true }, operations = operations,
             conflictDeferred = { true }
         )
         assertEquals(SurveyUploadWork.SurveyWorkAction.SKIP_UPLOADED, uploaded.decision.action)
+        assertFalse(uploaded.enqueued)
+        assertTrue(operations.enqueuedPolicies.isEmpty())
+        assertNull(tracker.get("survey"))
+        assertEquals(original, canonical.readText())
     }
 
     @Test
