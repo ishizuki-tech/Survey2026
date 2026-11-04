@@ -128,26 +128,6 @@ class UploadedSurveyStore internal constructor(
         }
     }
 
-    /**
-     * Clears every recorded uploaded survey ID and its export time.
-     *
-     * This only resets local bookkeeping (what this device believes it has
-     * uploaded) — it does not affect anything already uploaded remotely, and
-     * there is nothing left on-device to re-upload for a cleared entry, since
-     * its staged file was already deleted on successful upload.
-     */
-    fun clear() {
-        synchronized(LOCK) {
-            check(
-                prefs.edit()
-                    .remove(KEY_SURVEY_IDS)
-                    .remove(KEY_EXPORTED_AT_JSON)
-                    .remove(KEY_PAYLOAD_FINGERPRINT_JSON)
-                    .commit()
-            ) { "Failed to clear uploaded survey ledger." }
-        }
-    }
-
     /** Returns the number of unique survey UUIDs successfully recorded. */
     fun uploadedCount(): Int = synchronized(LOCK) {
         prefs.getStringSet(KEY_SURVEY_IDS, emptySet()).orEmpty().size

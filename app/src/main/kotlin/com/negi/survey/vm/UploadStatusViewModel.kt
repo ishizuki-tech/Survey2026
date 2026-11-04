@@ -18,6 +18,7 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.asFlow
 import androidx.lifecycle.viewModelScope
 import androidx.work.WorkManager
+import com.negi.survey.net.CompletedSurveyVisibilityStore
 import com.negi.survey.net.GitHubUploadWorker
 import com.negi.survey.net.LegacySurveyRecoveryObservation
 import com.negi.survey.net.LegacySurveyRecoveryStore
@@ -98,12 +99,15 @@ data class UploadStatusDetails(
     val completed: List<UploadStatusEntry>,
     /** Read-only local snapshots; this list is intentionally independent of Clear List. */
     val deferredLegacyRecovery: List<DeferredLegacyRecoveryEntry> = emptyList(),
+    /** Opaque IDs for the exact completed snapshot; passed back to Clear List, never rendered. */
+    val completedSurveyIds: Set<String> = emptySet(),
 )
 
 /** Activity-scoped owner of upload-status reads and refresh triggers. */
 class UploadStatusViewModel(app: Application) : AndroidViewModel(app) {
     private val appContext = app.applicationContext
     private val uploadedSurveyStore = UploadedSurveyStore(appContext)
+    private val completedVisibilityStore = CompletedSurveyVisibilityStore(appContext)
     private val legacyRecoveryStore = LegacySurveyRecoveryStore(appContext)
     private val deviceTag = DeviceUploadTagProvider.from(appContext).value
     private val refreshMutex = Mutex()
@@ -140,12 +144,11 @@ class UploadStatusViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /**
-     * Clears the completed-uploads ledger (local bookkeeping only; see
-     * [UploadedSurveyStore.clear]) and refreshes the summary counts.
-     */
-    suspend fun clearCompletedSurveys() = withContext(Dispatchers.IO) {
-        uploadedSurveyStore.clear()
+    /** Persists display-only hiding for the dialog snapshot; canonical delivery evidence is read-only. */
+    suspend fun clearCompletedSurveys(displayedIds: Set<String>) = withContext(Dispatchers.IO) {
+        refreshMutex.withLock {
+            completedVisibilityStore.hideCompleted(displayedIds, uploadedSurveyStore.uploadedSurveyIds())
+        }
         refreshNow()
     }
 
@@ -165,7 +168,8 @@ class UploadStatusViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 .sortedWith(newestFirstComparator)
 
-            val completed = uploadedSurveyStore.uploadedSurveyRecords()
+            val visibleCompleted = completedVisibilityStore.visibleRecords(uploadedSurveyStore.uploadedSurveyRecords())
+            val completed = visibleCompleted
                 .map { record ->
                     UploadStatusEntry(
                         idPrefix = uuidFirstSegment(record.surveyId),
@@ -206,6 +210,7 @@ class UploadStatusViewModel(app: Application) : AndroidViewModel(app) {
                 pending = pending,
                 completed = completed,
                 deferredLegacyRecovery = deferredLegacyRecovery,
+                completedSurveyIds = visibleCompleted.mapTo(mutableSetOf()) { it.surveyId },
             )
         }
     }

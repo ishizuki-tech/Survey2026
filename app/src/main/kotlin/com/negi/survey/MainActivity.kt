@@ -1309,7 +1309,7 @@ fun SurveyNavHost(
     heavyRuntimeHandoff: HeavyRuntimeHandoff = NoOpHeavyRuntimeHandoff,
     uploadStatus: UploadStatus = UploadStatus(),
     onResolveUploadStatusDetails: suspend () -> UploadStatusDetails,
-    onClearCompletedSurveys: suspend () -> Unit
+    onClearCompletedSurveys: suspend (Set<String>) -> Unit
 ) {
     val localContext = LocalContext.current
     val appContext = localContext.applicationContext

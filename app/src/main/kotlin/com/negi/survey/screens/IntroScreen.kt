@@ -188,7 +188,7 @@ fun IntroScreen(
     onRestart: (() -> Unit)? = null,
     onResolveConfigDetails: suspend (configId: String) -> ConfigDetails,
     onResolveUploadStatusDetails: suspend () -> UploadStatusDetails,
-    onClearCompletedSurveys: suspend () -> Unit,
+    onClearCompletedSurveys: suspend (Set<String>) -> Unit,
 ) {
     require(options.isNotEmpty()) { "IntroScreen requires at least one ConfigOptionUi." }
 
@@ -240,7 +240,7 @@ private fun IntroCardMono(
     onRestart: (() -> Unit)?,
     onResolveConfigDetails: suspend (configId: String) -> ConfigDetails,
     onResolveUploadStatusDetails: suspend () -> UploadStatusDetails,
-    onClearCompletedSurveys: suspend () -> Unit,
+    onClearCompletedSurveys: suspend (Set<String>) -> Unit,
 ) {
     val cs = MaterialTheme.colorScheme
     val corner = 20.dp
@@ -486,7 +486,7 @@ private fun IntroCardMono(
 internal fun UploadStatusSummary(
     uploadStatus: UploadStatus,
     onResolveUploadStatusDetails: suspend () -> UploadStatusDetails,
-    onClearCompletedSurveys: suspend () -> Unit,
+    onClearCompletedSurveys: suspend (Set<String>) -> Unit,
     modifier: Modifier = Modifier,
     titleColor: Color = monotoneColors().textMuted,
     countColor: Color = monotoneColors().textSecondary,
@@ -569,7 +569,7 @@ private sealed class UploadStatusDetailsState {
 private fun UploadStatusDetailsDialog(
     onDismiss: () -> Unit,
     onResolve: suspend () -> UploadStatusDetails,
-    onClearCompleted: suspend () -> Unit,
+    onClearCompleted: suspend (Set<String>) -> Unit,
 ) {
     val resolve by rememberUpdatedState(newValue = onResolve)
     val clearCompleted by rememberUpdatedState(newValue = onClearCompleted)
@@ -577,6 +577,9 @@ private fun UploadStatusDetailsDialog(
     var state by remember {
         mutableStateOf<UploadStatusDetailsState>(UploadStatusDetailsState.Loading)
     }
+
+    var clearing by remember { mutableStateOf(false) }
+    var clearError by remember { mutableStateOf<String?>(null) }
 
     suspend fun reload() {
         state = UploadStatusDetailsState.Loading
@@ -634,6 +637,10 @@ private fun UploadStatusDetailsDialog(
                             showColumnHeaders = true
                         )
 
+                        clearError?.let { message ->
+                            Text(message, color = MaterialTheme.colorScheme.error)
+                        }
+
                         if (s.details.deferredLegacyRecovery.isNotEmpty()) {
                             Spacer(Modifier.padding(top = 14.dp))
                             DeferredLegacyRecoverySection(
@@ -657,11 +664,25 @@ private fun UploadStatusDetailsDialog(
             ) {
                 TextButton(
                     onClick = {
+                        val displayedIds = (state as? UploadStatusDetailsState.Ready)
+                            ?.details?.completedSurveyIds ?: return@TextButton
+                        clearing = true
+                        clearError = null
                         scope.launch {
-                            clearCompleted()
-                            reload()
+                            try {
+                                clearCompleted(displayedIds)
+                                reload()
+                            } catch (ce: CancellationException) {
+                                throw ce
+                            } catch (error: Exception) {
+                                Log.e(TAG, "Failed to save completed-list visibility.", error)
+                                clearError = "Could not clear completed list. Please try again."
+                            } finally {
+                                clearing = false
+                            }
                         }
                     },
+                    enabled = state is UploadStatusDetailsState.Ready && !clearing,
                     contentPadding = ButtonDefaults.TextButtonContentPadding,
                     modifier = Modifier.testTag("ClearCompletedUploadsButton")
                 ) {
