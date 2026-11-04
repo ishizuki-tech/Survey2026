@@ -113,6 +113,8 @@ import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material3.DividerDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
+import com.negi.survey.ui.theme.ActionBlue
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -1161,6 +1163,7 @@ fun AiScreen(
                             }
 
                             FilledTonalButton(
+                                colors = ButtonDefaults.filledTonalButtonColors(containerColor = ActionBlue, contentColor = Color.Black),
                                 enabled = canAdvanceAiTurn(
                                     aiLoading = loading,
                                     mainSubmissionPending = submissionPending,

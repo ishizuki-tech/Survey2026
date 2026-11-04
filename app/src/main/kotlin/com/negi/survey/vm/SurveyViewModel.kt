@@ -112,6 +112,18 @@ internal fun Node.composeSingleChoiceAnswer(selected: String?, otherText: String
     return "$choice: $detail"
 }
 
+/** A saved choice and its optional detail, using the existing answer format. */
+internal data class SingleChoiceSelection(val selected: String?, val otherText: String = "")
+
+internal fun Node.decomposeSingleChoiceAnswer(answer: String?): SingleChoiceSelection {
+    val saved = answer?.trim()?.takeIf { it.isNotEmpty() } ?: return SingleChoiceSelection(null)
+    val other = otherTextOption?.takeIf { it in options }
+    if (other != null && saved.startsWith("$other:")) {
+        return SingleChoiceSelection(other, saved.removePrefix("$other:").trim())
+    }
+    return SingleChoiceSelection(saved.takeIf { it in options })
+}
+
 /* ───────────────────────────── Nav Keys ───────────────────────────── */
 
 @Serializable object FlowHome : NavKey
@@ -997,6 +1009,7 @@ open class SurveyViewModel(
         nodeStack.addLast(node.id)
 
         clearSelections()
+        if (node.type == NodeType.SINGLE_CHOICE) _single.value = node.decomposeSingleChoiceAnswer(getAnswer(node.id)).selected
 
         nav.add(navKeyFor(node))
         updateCanGoBack()
@@ -1135,6 +1148,9 @@ open class SurveyViewModel(
         updateCanGoBack()
 
         clearSelections()
+        if (_currentNode.value.type == NodeType.SINGLE_CHOICE) {
+            _single.value = _currentNode.value.decomposeSingleChoiceAnswer(getAnswer(prevId)).selected
+        }
 
         RuntimeLogStore.d(
             TAG,
