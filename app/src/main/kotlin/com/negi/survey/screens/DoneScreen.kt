@@ -77,7 +77,7 @@ fun DoneScreen(
     vm: SurveyViewModel,
     uploadStatus: UploadStatus,
     onResolveUploadStatusDetails: suspend () -> UploadStatusDetails,
-    onClearCompletedSurveys: suspend () -> Unit,
+    onClearCompletedSurveys: suspend (Set<String>) -> Unit,
     onRestart: () -> Unit,
     autoSaveToDevice: Boolean = false
 ) {
