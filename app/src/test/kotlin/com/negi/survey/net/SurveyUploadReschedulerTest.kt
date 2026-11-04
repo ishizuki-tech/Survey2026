@@ -86,6 +86,19 @@ class SurveyUploadReschedulerTest {
     }
 
     @Test
+    fun recover_legacyOrphanRecordsAnActionableDiagnostic() {
+        val file = survey("legacy.json", "legacy")
+        val operations = FakeOperations(discovery()).apply {
+            resultFor[file] = result(SurveyUploadWork.SurveyWorkAction.DEFER_LEGACY_ORPHAN)
+        }
+
+        val summary = SurveyUploadRescheduler.recoverForTesting(operations)
+
+        assertEquals(listOf(file), operations.legacyOrphans)
+        assertEquals(SurveyUploadRescheduler.RecoveryClassification.DEFERRED, summary.candidates.single().classification)
+    }
+
+    @Test
     fun recover_classifiesEveryCurrentSurveyWorkAction() {
         val actions = mapOf(
             ENQUEUE_NEW to SUBMITTED,
@@ -124,6 +137,20 @@ class SurveyUploadReschedulerTest {
 
         assertEquals(candidates.map { it.canonicalFile }, operations.reconciled)
         assertEquals(actions.values.toList(), summary.candidates.map { it.classification })
+    }
+
+    @Test
+    fun recover_uploadedArtifactCleanupFailureRemainsDeferred() {
+        val file = survey("uploaded.json", "uploaded")
+        val operations = FakeOperations(discovery()).apply {
+            resultFor[file] = result(SurveyUploadWork.SurveyWorkAction.SKIP_UPLOADED)
+            cleanupOutcome = SurveyUploadedArtifactCleanup.Outcome.RETRY_CLEANUP
+        }
+
+        val summary = SurveyUploadRescheduler.recoverForTesting(operations)
+
+        assertEquals(SurveyUploadRescheduler.RecoveryClassification.DEFERRED, summary.candidates.single().classification)
+        assertEquals("Recorded survey artifact retained: RETRY_CLEANUP", summary.candidates.single().operationalFailureMessage)
     }
 
     @Test
@@ -209,21 +236,39 @@ class SurveyUploadReschedulerTest {
     private class FakeOperations(
         private val pendingDiscovery: PendingSurveyUploads.PendingSurveyDiscovery
     ) : SurveyUploadRescheduler.Operations {
+        var cleanupOutcome = SurveyUploadedArtifactCleanup.Outcome.CLEANED
         val reconciled = mutableListOf<File>()
         val resultFor = mutableMapOf<File, SurveyUploadWork.SurveyWorkReconcileResult>()
         val failureFor = mutableMapOf<File, Exception>()
         val errorFor = mutableMapOf<File, Error>()
+        val legacyOrphans = mutableListOf<File>()
 
         override fun discover(): PendingSurveyUploads.PendingSurveyDiscovery = pendingDiscovery
 
+        override fun protocolFor(surveyId: String): SurveyUploadWork.SurveyUploadProtocol? =
+            SurveyUploadWork.SurveyUploadProtocol.CANONICAL_IMMUTABLE_V1
+
         override fun reconcile(
-            candidate: PendingSurveyUploads.PendingSurveyCandidate
+            candidate: PendingSurveyUploads.PendingSurveyCandidate,
+            protocol: SurveyUploadWork.SurveyUploadProtocol?,
+            allowNewEnqueue: Boolean
         ): SurveyUploadWork.SurveyWorkReconcileResult {
             reconciled += candidate.canonicalFile
             errorFor[candidate.canonicalFile]?.let { throw it }
             failureFor[candidate.canonicalFile]?.let { throw it }
             return requireNotNull(resultFor[candidate.canonicalFile])
         }
+
+        override fun recordLegacyOrphan(candidate: PendingSurveyUploads.PendingSurveyCandidate, reason: String) {
+            legacyOrphans += candidate.canonicalFile
+        }
+
+        override fun clearLegacyOrphan(surveyId: String) = Unit
+
+        override fun cleanupRecordedArtifact(
+            candidate: PendingSurveyUploads.PendingSurveyCandidate,
+            protocol: SurveyUploadWork.SurveyUploadProtocol?
+        ): SurveyUploadedArtifactCleanup.Outcome = cleanupOutcome
     }
 
     private companion object {

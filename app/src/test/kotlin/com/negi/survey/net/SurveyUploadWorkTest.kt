@@ -136,17 +136,24 @@ class SurveyUploadWorkTest {
         assertEquals("branch", data.getString(GitHubUploadWorker.KEY_BRANCH))
         assertEquals("prefix", data.getString(GitHubUploadWorker.KEY_PATH_PREFIX))
         assertEquals(file.absolutePath, data.getString(GitHubUploadWorker.KEY_FILE_PATH))
-        assertEquals("exports/canonical.json", data.getString(GitHubUploadWorker.KEY_FILE_NAME))
+        assertEquals(
+            SurveyUploadWork.canonicalRemotePath("Survey-Id"),
+            data.getString(GitHubUploadWorker.KEY_FILE_NAME)
+        )
         assertEquals(123L, data.getLong(GitHubUploadWorker.KEY_FILE_MAX_BYTES_HINT, -1L))
         assertEquals(456, data.getInt(GitHubUploadWorker.KEY_FILE_MAX_REQUEST_BYTES_HINT, -1))
         assertEquals(GitHubUploadWorker.UPLOAD_KIND_SURVEY_JSON, data.getString(GitHubUploadWorker.KEY_UPLOAD_KIND))
         assertEquals("Survey-Id", data.getString(GitHubUploadWorker.KEY_SURVEY_ID))
+        assertEquals(
+            GitHubUploadWorker.SURVEY_UPLOAD_PROTOCOL_CANONICAL_IMMUTABLE_V1,
+            data.getString(GitHubUploadWorker.KEY_SURVEY_UPLOAD_PROTOCOL)
+        )
         assertEquals(NetworkType.CONNECTED, request.workSpec.constraints.requiredNetworkType)
         assertEquals(30_000L, request.workSpec.backoffDelayDuration)
         assertEquals(androidx.work.BackoffPolicy.EXPONENTIAL, request.workSpec.backoffPolicy)
         assertTrue(request.workSpec.expedited)
         assertTrue(request.tags.contains(GitHubUploadWorker.TAG))
-        assertTrue(request.tags.contains("${GitHubUploadWorker.TAG}:file:exports_canonical.json"))
+        assertTrue(request.tags.contains("${GitHubUploadWorker.TAG}:file:" + SurveyUploadWork.safeWorkNameSegment(SurveyUploadWork.canonicalRemotePath("Survey-Id"))))
     }
 
     @Test
@@ -162,8 +169,19 @@ class SurveyUploadWorkTest {
         val request = SurveyUploadWork.buildSurveyJsonRequest(config(), candidate)
 
         assertEquals(canonical.absolutePath, request.workSpec.input.getString(GitHubUploadWorker.KEY_FILE_PATH))
-        assertEquals("exports/a.json", request.workSpec.input.getString(GitHubUploadWorker.KEY_FILE_NAME))
+        assertEquals(SurveyUploadWork.canonicalRemotePath("Same"), request.workSpec.input.getString(GitHubUploadWorker.KEY_FILE_NAME))
         assertEquals("Same", request.workSpec.input.getString(GitHubUploadWorker.KEY_SURVEY_ID))
+    }
+
+    @Test
+    fun buildLegacySurveyRequest_keepsDatedWorkerMetadataUnmarked() {
+        val file = write("legacy.json", """{"survey_id":"legacy"}""")
+        val request = SurveyUploadWork.buildSurveyJsonRequest(
+            config(), file, "legacy", SurveyUploadWork.SurveyUploadProtocol.LEGACY_DATED_V0
+        )
+
+        assertEquals("exports/legacy.json", request.workSpec.input.getString(GitHubUploadWorker.KEY_FILE_NAME))
+        assertNull(request.workSpec.input.getString(GitHubUploadWorker.KEY_SURVEY_UPLOAD_PROTOCOL))
     }
 
     @Test
@@ -266,6 +284,23 @@ class SurveyUploadWorkTest {
         assertEquals(ExistingWorkPolicy.REPLACE, operations.enqueuedPolicies.single())
         assertEquals(SurveyUploadWorkTracker.Phase.ENQUEUED, tracker.get("survey")!!.phase)
         assertTrue(tracker.get("survey")!!.workRequestId != staleId)
+    }
+
+    @Test
+    fun reconcile_legacyOrphanDefersWithoutEnqueueingReplacement() {
+        val operations = FakeOperations()
+        val result = SurveyUploadWork.reconcileForTesting(
+            config = config(),
+            expectedSurveyId = "survey",
+            canonicalFile = validFile(),
+            tracker = tracker(),
+            ledgerContainsSurveyId = { false },
+            operations = operations,
+            allowNewEnqueue = false
+        )
+
+        assertEquals(SurveyUploadWork.SurveyWorkAction.DEFER_LEGACY_ORPHAN, result.decision.action)
+        assertTrue(operations.enqueuedPolicies.isEmpty())
     }
 
     @Test
@@ -377,7 +412,7 @@ class SurveyUploadWorkTest {
         assertEquals(SurveyUploadWorkTracker.Phase.PREPARED, tracker.get("survey")!!.phase)
         assertEquals(1, tracker.prepareIds.size)
         assertEquals(1, operations.enqueuedPolicies.size)
-        assertEquals(0, operations.legacyInspectionCalls)
+        assertEquals(1, operations.legacyInspectionCalls)
     }
 
     @Test

@@ -45,7 +45,18 @@ internal object SurveyUploadRescheduler {
     /** Narrow seam keeps grouped-recovery tests independent from Android WorkManager. */
     internal interface Operations {
         fun discover(): PendingSurveyUploads.PendingSurveyDiscovery
-        fun reconcile(candidate: PendingSurveyUploads.PendingSurveyCandidate): SurveyUploadWork.SurveyWorkReconcileResult
+        fun protocolFor(surveyId: String): SurveyUploadWork.SurveyUploadProtocol?
+        fun reconcile(
+            candidate: PendingSurveyUploads.PendingSurveyCandidate,
+            protocol: SurveyUploadWork.SurveyUploadProtocol?,
+            allowNewEnqueue: Boolean
+        ): SurveyUploadWork.SurveyWorkReconcileResult
+        fun recordLegacyOrphan(candidate: PendingSurveyUploads.PendingSurveyCandidate, reason: String)
+        fun clearLegacyOrphan(surveyId: String)
+        fun cleanupRecordedArtifact(
+            candidate: PendingSurveyUploads.PendingSurveyCandidate,
+            protocol: SurveyUploadWork.SurveyUploadProtocol?
+        ): SurveyUploadedArtifactCleanup.Outcome = SurveyUploadedArtifactCleanup.Outcome.CLEANED
     }
 
     fun recoverPendingSurveyUploads(
@@ -59,13 +70,43 @@ internal object SurveyUploadRescheduler {
         val discovery = operations.discover()
         val candidates = discovery.candidates.map { candidate ->
             try {
-                val reconciliation = operations.reconcile(candidate)
-                CandidateRecovery(
-                    normalizedSurveyId = candidate.normalizedSurveyId,
-                    canonicalFile = candidate.canonicalFile,
-                    classification = classify(reconciliation.decision.action),
-                    reconciliation = reconciliation
+                val protocol = operations.protocolFor(candidate.normalizedSurveyId)
+                val reconciliation = operations.reconcile(
+                    candidate = candidate,
+                    protocol = protocol,
+                    allowNewEnqueue = protocol != null
                 )
+                if (reconciliation.decision.action == SurveyUploadWork.SurveyWorkAction.DEFER_LEGACY_ORPHAN) {
+                    operations.recordLegacyOrphan(candidate, reconciliation.decision.reason)
+                    CandidateRecovery(
+                        candidate.normalizedSurveyId, candidate.canonicalFile,
+                        classify(reconciliation.decision.action), reconciliation
+                    )
+                } else if (
+                    reconciliation.decision.action == SurveyUploadWork.SurveyWorkAction.SKIP_UPLOADED ||
+                    reconciliation.decision.action == SurveyUploadWork.SurveyWorkAction.SKIP_UPLOADED_TRACKER_CLEANUP_FAILED
+                ) {
+                    when (val cleanup = operations.cleanupRecordedArtifact(candidate, protocol)) {
+                        SurveyUploadedArtifactCleanup.Outcome.CLEANED,
+                        SurveyUploadedArtifactCleanup.Outcome.ALREADY_MISSING -> {
+                            operations.clearLegacyOrphan(candidate.normalizedSurveyId)
+                            CandidateRecovery(
+                                candidate.normalizedSurveyId, candidate.canonicalFile,
+                                classify(reconciliation.decision.action), reconciliation
+                            )
+                        }
+                        else -> CandidateRecovery(
+                            candidate.normalizedSurveyId, candidate.canonicalFile,
+                            RecoveryClassification.DEFERRED, reconciliation,
+                            "Recorded survey artifact retained: $cleanup"
+                        )
+                    }
+                } else {
+                    CandidateRecovery(
+                        candidate.normalizedSurveyId, candidate.canonicalFile,
+                        classify(reconciliation.decision.action), reconciliation
+                    )
+                }
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (exception: Exception) {
@@ -107,6 +148,8 @@ internal object SurveyUploadRescheduler {
 
         SurveyUploadWork.SurveyWorkAction.INVALID_ARTIFACT -> RecoveryClassification.INVALID
 
+        SurveyUploadWork.SurveyWorkAction.CAPTURED_FOR_ISOLATED_TEST -> RecoveryClassification.DEFERRED
+
         else -> RecoveryClassification.DEFERRED
     }
 
@@ -119,9 +162,57 @@ internal object SurveyUploadRescheduler {
         override fun discover(): PendingSurveyUploads.PendingSurveyDiscovery =
             PendingSurveyUploads.discoverPendingSurveys(appContext)
 
+        override fun protocolFor(surveyId: String): SurveyUploadWork.SurveyUploadProtocol? =
+            SurveyUploadRouteStore(appContext).protocolFor(surveyId)
+
         override fun reconcile(
-            candidate: PendingSurveyUploads.PendingSurveyCandidate
+            candidate: PendingSurveyUploads.PendingSurveyCandidate,
+            protocol: SurveyUploadWork.SurveyUploadProtocol?,
+            allowNewEnqueue: Boolean
         ): SurveyUploadWork.SurveyWorkReconcileResult =
-            SurveyUploadWork.reconcile(appContext, config, candidate)
+            SurveyUploadWork.reconcile(
+                context = appContext,
+                config = config,
+                candidate = candidate,
+                protocol = protocol ?: SurveyUploadWork.SurveyUploadProtocol.LEGACY_DATED_V0,
+                allowNewEnqueue = allowNewEnqueue && !Issue86ProcessDeathHarness.suppressesRecoveryEnqueue()
+            )
+
+        override fun recordLegacyOrphan(
+            candidate: PendingSurveyUploads.PendingSurveyCandidate,
+            reason: String
+        ) {
+            check(
+                LegacySurveyRecoveryStore(appContext).record(
+                    candidate.normalizedSurveyId,
+                    candidate.canonicalFile.name,
+                    reason
+                )
+            ) { "Could not persist legacy survey recovery record." }
+        }
+
+        override fun clearLegacyOrphan(surveyId: String) {
+            LegacySurveyRecoveryStore(appContext).clear(surveyId)
+        }
+
+        override fun cleanupRecordedArtifact(
+            candidate: PendingSurveyUploads.PendingSurveyCandidate,
+            protocol: SurveyUploadWork.SurveyUploadProtocol?
+        ): SurveyUploadedArtifactCleanup.Outcome {
+            val outcomes = (listOf(candidate.canonicalFile) + candidate.duplicateFiles).map { file ->
+                SurveyUploadedArtifactCleanup.cleanup(appContext, candidate.normalizedSurveyId, file)
+            }
+            val failure = outcomes.firstOrNull {
+                it != SurveyUploadedArtifactCleanup.Outcome.CLEANED &&
+                    it != SurveyUploadedArtifactCleanup.Outcome.ALREADY_MISSING
+            }
+            if (failure != null) return failure
+            if (protocol == SurveyUploadWork.SurveyUploadProtocol.CANONICAL_IMMUTABLE_V1) {
+                if (!SurveyUploadRouteStore(appContext).clearCanonical(candidate.normalizedSurveyId)) {
+                    return SurveyUploadedArtifactCleanup.Outcome.RETRY_CLEANUP
+                }
+            }
+            return SurveyUploadedArtifactCleanup.Outcome.CLEANED
+        }
     }
 }

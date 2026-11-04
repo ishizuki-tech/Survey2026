@@ -59,7 +59,7 @@ class SurveyUploadFinalizerTest {
         assertEquals(0, operations.pendingLookupCalls.get())
         assertEquals(0, operations.stageCalls.get())
         assertEquals(0, operations.reconcileCalls.get())
-        assertEquals(0, operations.deleteCalls.get())
+        assertEquals(0, operations.cleanupCalls.get())
         assertTrue(operations.events.isEmpty())
     }
 
@@ -76,7 +76,7 @@ class SurveyUploadFinalizerTest {
         assertEquals(1, operations.reconcileCalls.get())
         assertEquals(File(directory, "survey-uuid.json"), operations.reconciledFile)
         assertEquals("survey-uuid", operations.reconciledSurveyId)
-        assertEquals(0, operations.deleteCalls.get())
+        assertEquals(0, operations.cleanupCalls.get())
         assertEquals(listOf("lookup", "stage", "reconcile", "voice", "log", "trace"), operations.events)
     }
 
@@ -196,67 +196,130 @@ class SurveyUploadFinalizerTest {
             SurveyUploadWork.SurveyWorkAction.SKIP_UPLOADED,
             SurveyUploadWork.SurveyWorkAction.SKIP_UPLOADED_TRACKER_CLEANUP_FAILED
         ).forEach { action ->
-            val operations = FakeOperations(directory).apply { reconciliationResult = reconciliation(action) }
+            val operations = FakeOperations(directory).apply {
+                reconciliationResult = reconciliation(action)
+                cleanupOutcome = SurveyUploadedArtifactCleanup.Outcome.CLEANED
+            }
 
             val result = finalizer(operations).finalize(snapshot(), config(), tag(), STAMP)
 
             assertEquals(SurveyFinalizationResult.AlreadyUploaded, result)
             assertEquals(1, operations.reconcileCalls.get())
-            assertEquals(1, operations.deleteCalls.get())
-            assertFalse(operations.deletedFile!!.exists())
+            assertEquals(1, operations.cleanupCalls.get())
+            assertFalse(operations.cleanedFile!!.exists())
             assertFalse(operations.events.contains("voice"))
             assertFalse(operations.events.contains("log"))
         }
     }
 
     @Test
-    fun finalize_lateUploadedDeletesSelectedReusedPendingFile() = runBlocking {
-        val existing = File(directory, "existing.json").apply { writeText("{\"survey_id\":\"survey-uuid\"}") }
+    fun finalize_lateUploadedCleansSelectedReusedPendingFileOnlyAfterVerifiedCleanup() = runBlocking {
+        val existing = payload("existing.json", "answer-a", "2026-10-30")
         val operations = FakeOperations(directory).apply {
             pendingFile = existing
             reconciliationResult = reconciliation(SurveyUploadWork.SurveyWorkAction.SKIP_UPLOADED)
+            cleanupOperations = FingerprintCleanupOperations(fingerprint(existing))
         }
 
         val result = finalizer(operations).finalize(snapshot(), config(), tag(), STAMP)
 
         assertEquals(SurveyFinalizationResult.AlreadyUploaded, result)
         assertEquals(0, operations.stageCalls.get())
-        assertEquals(existing, operations.deletedFile)
+        assertEquals(existing, operations.cleanedFile)
         assertFalse(existing.exists())
         assertFalse(operations.events.contains("voice"))
         assertFalse(operations.events.contains("log"))
     }
 
     @Test
-    fun finalize_lateUploadedCleanupFailureStillReturnsAlreadyUploaded() = runBlocking {
+    fun finalize_lateUploadedDifferentPayloadWithSameIdIsRetainedBySharedCleanup() = runBlocking {
+        val delivered = payload("delivered.json", "answer-a", "2026-10-30")
+        val staged = payload("staged.json", "answer-b", "2026-10-30")
         val operations = FakeOperations(directory).apply {
+            pendingFile = staged
             reconciliationResult = reconciliation(SurveyUploadWork.SurveyWorkAction.SKIP_UPLOADED)
-            deleteResult = false
+            cleanupOperations = FingerprintCleanupOperations(fingerprint(delivered))
         }
 
         val result = finalizer(operations).finalize(snapshot(), config(), tag(), STAMP)
 
-        assertEquals(SurveyFinalizationResult.AlreadyUploaded, result)
-        assertEquals(1, operations.deleteCalls.get())
-        assertTrue(operations.deletedFile!!.exists())
+        assertEquals(SurveyFinalizationResult.StagedPending(staged, reused = true), result)
+        assertEquals(1, operations.cleanupCalls.get())
+        assertTrue(staged.exists())
+        assertEquals(1, operations.reconcileCalls.get())
+        assertFalse(operations.events.contains("voice"))
+    }
+
+    @Test
+    fun finalize_lateUploadedByteDifferencesAndFingerprintlessLedgerAreRetained() = runBlocking {
+        val delivered = payload("delivered.json", "answer", "2026-10-30")
+        listOf(
+            payload("different-exported-at.json", "answer", "2026-10-31") to fingerprint(delivered),
+            payload("historical.json", "answer", "2026-10-30") to null,
+            File(directory, "invalid.json").apply { writeText("not json") } to fingerprint(delivered)
+        ).forEach { (staged, ledgerFingerprint) ->
+            val operations = FakeOperations(directory).apply {
+                pendingFile = staged
+                reconciliationResult = reconciliation(SurveyUploadWork.SurveyWorkAction.SKIP_UPLOADED)
+                cleanupOperations = FingerprintCleanupOperations(ledgerFingerprint)
+            }
+
+            assertEquals(
+                SurveyFinalizationResult.StagedPending(staged, reused = true),
+                finalizer(operations).finalize(snapshot(), config(), tag(), STAMP)
+            )
+            assertTrue(staged.exists())
+        }
+    }
+
+    @Test
+    fun finalize_lateUploadedUnverifiedCleanupRetainsArtifact() = runBlocking {
+        val operations = FakeOperations(directory).apply {
+            reconciliationResult = reconciliation(SurveyUploadWork.SurveyWorkAction.SKIP_UPLOADED)
+            cleanupOutcome = SurveyUploadedArtifactCleanup.Outcome.DEFER_UNVERIFIED
+        }
+
+        val result = finalizer(operations).finalize(snapshot(), config(), tag(), STAMP)
+
+        assertEquals(SurveyFinalizationResult.StagedPending(File(directory, "survey-uuid.json"), reused = true), result)
+        assertEquals(1, operations.cleanupCalls.get())
+        assertTrue(operations.cleanedFile!!.exists())
         assertFalse(operations.events.contains("voice"))
         assertFalse(operations.events.contains("log"))
     }
 
     @Test
-    fun finalize_lateUploadedCleanupExceptionStillReturnsAlreadyUploaded() = runBlocking {
+    fun finalize_lateUploadedRetryableCleanupRetainsArtifact() = runBlocking {
         val operations = FakeOperations(directory).apply {
             reconciliationResult = reconciliation(SurveyUploadWork.SurveyWorkAction.SKIP_UPLOADED_TRACKER_CLEANUP_FAILED)
-            deleteFailure = IllegalStateException("delete")
+            cleanupOutcome = SurveyUploadedArtifactCleanup.Outcome.RETRY_CLEANUP
         }
 
         val result = finalizer(operations).finalize(snapshot(), config(), tag(), STAMP)
 
-        assertEquals(SurveyFinalizationResult.AlreadyUploaded, result)
-        assertEquals(1, operations.deleteCalls.get())
-        assertTrue(operations.deletedFile!!.exists())
+        assertEquals(SurveyFinalizationResult.StagedPending(File(directory, "survey-uuid.json"), reused = true), result)
+        assertEquals(1, operations.cleanupCalls.get())
+        assertTrue(operations.cleanedFile!!.exists())
         assertFalse(operations.events.contains("voice"))
         assertFalse(operations.events.contains("log"))
+    }
+
+    @Test
+    fun finalize_lateUploadedActiveWorkDefersWithoutCancellationOrReplacement() = runBlocking {
+        val staged = payload("active.json", "answer", "2026-10-30")
+        val operations = FakeOperations(directory).apply {
+            pendingFile = staged
+            reconciliationResult = reconciliation(SurveyUploadWork.SurveyWorkAction.SKIP_UPLOADED)
+            cleanupOperations = FingerprintCleanupOperations(fingerprint(staged), active = true)
+        }
+
+        assertEquals(
+            SurveyFinalizationResult.StagedPending(staged, reused = true),
+            finalizer(operations).finalize(snapshot(), config(), tag(), STAMP)
+        )
+        assertTrue(staged.exists())
+        assertEquals(1, operations.cleanupCalls.get())
+        assertFalse(operations.events.contains("voice"))
     }
 
     @Test
@@ -281,7 +344,7 @@ class SurveyUploadFinalizerTest {
             val result = finalizer(operations).finalize(snapshot(), config(), tag(), STAMP)
 
             assertTrue("$action should fail", result is SurveyFinalizationResult.Failure)
-            assertEquals(0, operations.deleteCalls.get())
+            assertEquals(0, operations.cleanupCalls.get())
             assertFalse(operations.events.contains("voice"))
             assertFalse(operations.events.contains("log"))
         }
@@ -376,13 +439,19 @@ class SurveyUploadFinalizerTest {
 
     private fun tag() = DeviceUploadTag("Device_CODE")
 
+    private fun payload(name: String, answer: String, exportedAt: String) = File(directory, name).apply {
+        writeText("{\"survey_id\":\"survey-uuid\",\"answer\":\"$answer\",\"exported_at\":\"$exportedAt\"}")
+    }
+
+    private fun fingerprint(file: File) = SurveyUploadIdempotency.payloadFingerprint(file.readBytes())
+
     private class FakeOperations(private val directory: File) : SurveyFinalizationOperations {
         var uploaded = false
         var pendingFile: File? = null
         var reconciliationResult = reconciliation(SurveyUploadWork.SurveyWorkAction.ENQUEUE_NEW, enqueued = true)
         var stageFailure: Exception? = null
-        var deleteFailure: Exception? = null
-        var deleteResult = true
+        var cleanupOutcome = SurveyUploadedArtifactCleanup.Outcome.CLEANED
+        var cleanupOperations: SurveyUploadedArtifactCleanup.Operations? = null
         var voiceFailure: Exception? = null
         var logFailure: Exception? = null
         var traceFailure: Exception? = null
@@ -393,13 +462,17 @@ class SurveyUploadFinalizerTest {
         val pendingLookupCalls = AtomicInteger()
         val stageCalls = AtomicInteger()
         val reconcileCalls = AtomicInteger()
-        val deleteCalls = AtomicInteger()
+        val cleanupCalls = AtomicInteger()
         var pendingLookupSurveyId: String? = null
         var reconciledFile: File? = null
         var reconciledSurveyId: String? = null
-        var deletedFile: File? = null
+        var cleanedFile: File? = null
 
         override fun isUploaded(surveyId: String): Boolean = uploaded
+
+        override fun reserveCanonicalSurveyRoute(surveyId: String): Boolean = true
+
+        override fun hasCanonicalSurveyRoute(surveyId: String): Boolean = true
 
         override fun findPendingSurveyFile(surveyId: String): File? {
             events += "lookup"
@@ -439,12 +512,18 @@ class SurveyUploadFinalizerTest {
             return reconciliationResult
         }
 
-        override fun deletePendingSurveyFile(file: File): Boolean {
-            events += "delete"
-            deleteCalls.incrementAndGet()
-            deletedFile = file
-            deleteFailure?.let { throw it }
-            return deleteResult && file.delete()
+        override fun cleanupUploadedSurveyArtifact(
+            surveyId: String,
+            file: File
+        ): SurveyUploadedArtifactCleanup.Outcome {
+            events += "cleanup"
+            cleanupCalls.incrementAndGet()
+            cleanedFile = file
+            cleanupOperations?.let {
+                return SurveyUploadedArtifactCleanup.cleanup(surveyId, file, it)
+            }
+            if (cleanupOutcome == SurveyUploadedArtifactCleanup.Outcome.CLEANED) file.delete()
+            return cleanupOutcome
         }
 
         override suspend fun scheduleVoiceArtifacts(
@@ -472,6 +551,22 @@ class SurveyUploadFinalizerTest {
             events += "trace"
             traceFailure?.let { throw it }
         }
+    }
+
+    private class FingerprintCleanupOperations(
+        private val ledgerFingerprint: String?,
+        private val active: Boolean = false,
+        private val deleteSucceeds: Boolean = true,
+    ) : SurveyUploadedArtifactCleanup.Operations {
+        override fun ledgerPayloadFingerprint(surveyId: String) = ledgerFingerprint
+        override fun isOwnedPendingFile(file: File) = true
+        override fun hasOtherActiveWork(surveyId: String, file: File) = active
+        override fun payloadFingerprint(file: File, surveyId: String): String? {
+            val content = file.readText()
+            return SurveyUploadIdempotency.validateLocalPayload(surveyId, content)
+                ?.let { SurveyUploadIdempotency.payloadFingerprint(file.readBytes()) }
+        }
+        override fun delete(file: File) = deleteSucceeds && file.delete()
     }
 
     private companion object {

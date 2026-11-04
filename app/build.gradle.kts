@@ -503,13 +503,24 @@ extensions.configure<ApplicationExtension> {
         )
     val localBuild =
         providers.gradleProperty("localBuild").orNull.equals("true", ignoreCase = true)
+    // Dedicated, package-isolated target for Issue #86 Android instrumentation only. It is
+    // intentionally independent from localBuild so it cannot replace either existing package.
+    val issue86Instrumentation =
+        providers.gradleProperty("issue86Instrumentation").orNull.equals("true", ignoreCase = true)
+    val issue86ApplicationId = "com.negi.survey.issue86.it"
+    val issue86TestApplicationId = "com.negi.survey.issue86.it.test"
+    val isolatedBuild = localBuild || issue86Instrumentation
     // This is deliberately independent from build type, CI, upload routing, signing, and secrets.
     // Full diagnostics remain the default unless a real Production APK explicitly opts in.
     val diagnosticsProduction = requiredBooleanProperty("diagnostics.production")
     val applicationIdForBuild =
-        if (localBuild) "com.negi.survey.local" else appId
+        when {
+            issue86Instrumentation -> issue86ApplicationId
+            localBuild -> "com.negi.survey.local"
+            else -> appId
+        }
     val appLabelResource =
-        if (localBuild) "@string/app_name_local" else "@string/app_name"
+        if (isolatedBuild) "@string/app_name_local" else "@string/app_name"
 
     /* ------------------------------------------------------------------------
      * GitHub configuration
@@ -567,6 +578,13 @@ extensions.configure<ApplicationExtension> {
         environmentNames =
             listOf("GH_TOKEN"),
     )
+    // Never embed, route to, or accept a GitHub destination in the Issue #86 test target.
+    // This is applied after property/environment resolution so neither can override isolation.
+    val effectiveGhOwner = if (issue86Instrumentation) "" else ghOwner
+    val effectiveGhRepo = if (issue86Instrumentation) "" else ghRepo
+    val effectiveGhBranch = if (issue86Instrumentation) "" else ghBranch
+    val effectiveGhPathPrefix = if (issue86Instrumentation) "" else ghPathPrefix
+    val effectiveGhToken = if (issue86Instrumentation) "" else ghToken
 
     /* ------------------------------------------------------------------------
      * Hugging Face configuration
@@ -649,6 +667,9 @@ extensions.configure<ApplicationExtension> {
 
     defaultConfig {
         applicationId = applicationIdForBuild
+        if (issue86Instrumentation) {
+            testApplicationId = issue86TestApplicationId
+        }
         manifestPlaceholders["appLabel"] = appLabelResource
         minSdk = 26
         targetSdk = 36
@@ -686,6 +707,15 @@ extensions.configure<ApplicationExtension> {
             "boolean",
             "DIAGNOSTICS_PRODUCTION",
             diagnosticsProduction.toString(),
+        )
+
+        // This is intentionally true only for the dedicated Issue #86 isolated APK.  It gates
+        // process-death test seams in production sources; neither production nor local builds
+        // can enable them through runtime arguments or preferences.
+        buildConfigField(
+            "boolean",
+            "ISSUE86_PROCESS_DEATH_HARNESS",
+            issue86Instrumentation.toString(),
         )
 
         testInstrumentationRunner =
@@ -733,39 +763,39 @@ extensions.configure<ApplicationExtension> {
             buildConfigField(
                 "String",
                 "GH_OWNER",
-                quote(ghOwner),
+                quote(effectiveGhOwner),
             )
 
             buildConfigField(
                 "String",
                 "GH_REPO",
-                quote(ghRepo),
+                quote(effectiveGhRepo),
             )
 
             buildConfigField(
                 "String",
                 "GH_BRANCH",
-                quote(ghBranch),
+                quote(effectiveGhBranch),
             )
 
             buildConfigField(
                 "String",
                 "GH_PATH_PREFIX",
-                quote(ghPathPrefix),
+                quote(effectiveGhPathPrefix),
             )
 
             buildConfigField(
                 "String",
                 "GH_UPLOAD_MODE",
-                quote(if (localBuild) "local" else "production"),
+                quote(if (isolatedBuild) "local" else "production"),
             )
 
             buildConfigField(
                 "String",
                 "GH_TOKEN",
                 quote(
-                    if (embedDebugSecrets) {
-                        ghToken
+                    if (embedDebugSecrets && !issue86Instrumentation) {
+                        effectiveGhToken
                     } else {
                         ""
                     }
@@ -815,31 +845,31 @@ extensions.configure<ApplicationExtension> {
             buildConfigField(
                 "String",
                 "GH_OWNER",
-                quote(ghOwner),
+                quote(effectiveGhOwner),
             )
 
             buildConfigField(
                 "String",
                 "GH_REPO",
-                quote(ghRepo),
+                quote(effectiveGhRepo),
             )
 
             buildConfigField(
                 "String",
                 "GH_BRANCH",
-                quote(ghBranch),
+                quote(effectiveGhBranch),
             )
 
             buildConfigField(
                 "String",
                 "GH_PATH_PREFIX",
-                quote(ghPathPrefix),
+                quote(effectiveGhPathPrefix),
             )
 
             buildConfigField(
                 "String",
                 "GH_UPLOAD_MODE",
-                quote(if (localBuild) "local" else "production"),
+                quote(if (isolatedBuild) "local" else "production"),
             )
 
             // Allow the GitHub token only for explicitly enabled internal releases.
@@ -847,8 +877,8 @@ extensions.configure<ApplicationExtension> {
                 "String",
                 "GH_TOKEN",
                 quote(
-                    if (allowReleaseSecrets) {
-                        ghToken
+                    if (allowReleaseSecrets && !issue86Instrumentation) {
+                        effectiveGhToken
                     } else {
                         ""
                     }

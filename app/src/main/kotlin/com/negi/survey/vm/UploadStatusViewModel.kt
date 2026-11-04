@@ -19,7 +19,10 @@ import androidx.lifecycle.asFlow
 import androidx.lifecycle.viewModelScope
 import androidx.work.WorkManager
 import com.negi.survey.net.GitHubUploadWorker
+import com.negi.survey.net.LegacySurveyRecoveryObservation
+import com.negi.survey.net.LegacySurveyRecoveryStore
 import com.negi.survey.net.PendingSurveyUploads
+import com.negi.survey.net.SurveyUploadExecutionAuthority
 import com.negi.survey.net.UploadedSurveyStore
 import com.negi.survey.utils.DeviceUploadTagProvider
 import com.negi.survey.utils.formatSurveyExportStamp
@@ -69,16 +72,39 @@ data class UploadStatusEntry(
             ?: "Unknown time"
 }
 
+/** Non-sensitive, read-only legacy-recovery data suitable for the existing local status dialog. */
+data class DeferredLegacyRecoveryEntry(
+    val surveyId: String,
+    val fileName: String,
+    val reason: String,
+    val localStatus: LegacyRecoveryLocalStatus,
+    val operatorReviewRequired: Boolean,
+    /** Null when no execution pin exists or it could not be read. */
+    val executionAuthority: String? = null,
+)
+
+enum class LegacyRecoveryLocalStatus {
+    ALREADY_UPLOADED,
+    ACTIVE_WORK,
+    MANUAL_REVIEW_REQUIRED,
+    MISSING_ARTIFACT,
+    INVALID_ARTIFACT,
+    UNKNOWN_LOCAL_STATE,
+}
+
 /** Pending and completed entries shown when the upload status area is tapped, newest first. */
 data class UploadStatusDetails(
     val pending: List<UploadStatusEntry>,
-    val completed: List<UploadStatusEntry>
+    val completed: List<UploadStatusEntry>,
+    /** Read-only local snapshots; this list is intentionally independent of Clear List. */
+    val deferredLegacyRecovery: List<DeferredLegacyRecoveryEntry> = emptyList(),
 )
 
 /** Activity-scoped owner of upload-status reads and refresh triggers. */
 class UploadStatusViewModel(app: Application) : AndroidViewModel(app) {
     private val appContext = app.applicationContext
     private val uploadedSurveyStore = UploadedSurveyStore(appContext)
+    private val legacyRecoveryStore = LegacySurveyRecoveryStore(appContext)
     private val deviceTag = DeviceUploadTagProvider.from(appContext).value
     private val refreshMutex = Mutex()
     private val _status = MutableStateFlow(UploadStatus(deviceTag = deviceTag))
@@ -149,9 +175,54 @@ class UploadStatusViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 .sortedWith(newestFirstComparator)
 
-            UploadStatusDetails(pending = pending, completed = completed)
+            val legacyRecords = legacyRecoveryStore.records()
+            val deferredLegacyRecovery = legacyRecords.map { record ->
+                LegacySurveyRecoveryObservation.observe(appContext, record).toUiEntry()
+            }.toMutableList()
+            // A valid or corrupt authority pin is independently discoverable from pending survey
+            // artifacts, even when it was never a markerless legacy-orphan record.
+            val orphanIds = legacyRecords.mapTo(mutableSetOf()) { it.normalizedSurveyId }
+            PendingSurveyUploads.discoverPendingSurveys(appContext).candidates
+                .filterNot { it.normalizedSurveyId in orphanIds }
+                .forEach { candidate ->
+                    val owner = SurveyUploadExecutionAuthority(appContext).ownerFor(candidate.normalizedSurveyId)
+                    if (owner != SurveyUploadExecutionAuthority.Owner.NONE) {
+                        val reason = when (owner) {
+                            is SurveyUploadExecutionAuthority.Owner.VALID -> when (owner.protocol) {
+                                SurveyUploadExecutionAuthority.Protocol.LEGACY -> "BLOCKED_BY_LEGACY_AUTHORITY"
+                                SurveyUploadExecutionAuthority.Protocol.CANONICAL -> "BLOCKED_BY_CANONICAL_AUTHORITY"
+                            }
+                            SurveyUploadExecutionAuthority.Owner.CORRUPT_OR_UNKNOWN ->
+                                "CORRUPT_OR_UNKNOWN_AUTHORITY"
+                            SurveyUploadExecutionAuthority.Owner.NONE -> error("filtered above")
+                        }
+                        val record = LegacySurveyRecoveryStore.Record(
+                            candidate.normalizedSurveyId, candidate.canonicalFile.name, reason
+                        )
+                        deferredLegacyRecovery += LegacySurveyRecoveryObservation.observe(appContext, record).toUiEntry()
+                    }
+                }
+            UploadStatusDetails(
+                pending = pending,
+                completed = completed,
+                deferredLegacyRecovery = deferredLegacyRecovery,
+            )
         }
     }
+
+    private fun LegacySurveyRecoveryObservation.Snapshot.toUiEntry(): DeferredLegacyRecoveryEntry =
+        DeferredLegacyRecoveryEntry(
+            surveyId = record.normalizedSurveyId,
+            fileName = record.fileName,
+            reason = record.reason,
+            localStatus = LegacyRecoveryLocalStatus.valueOf(status.name),
+            operatorReviewRequired = operatorReviewRequired,
+            executionAuthority = when (val owner = executionAuthority) {
+                is SurveyUploadExecutionAuthority.Owner.VALID -> owner.protocol.name
+                SurveyUploadExecutionAuthority.Owner.CORRUPT_OR_UNKNOWN -> "CORRUPT_OR_UNKNOWN"
+                else -> null
+            },
+        )
 
     companion object {
         /** Entries with no recoverable timestamp (legacy IDs) sort last. */
