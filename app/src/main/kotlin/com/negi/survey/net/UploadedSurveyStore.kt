@@ -66,7 +66,7 @@ class UploadedSurveyStore internal constructor(
                 if (exportedAtById[normalized] != trimmedExportedAt) {
                     val updated = exportedAtById.toMutableMap()
                     updated[normalized] = trimmedExportedAt
-                    editor.putString(KEY_EXPORTED_AT_JSON, encodeExportedAtMap(updated))
+                    editor.putString(KEY_EXPORTED_AT_JSON, encodeMap(updated))
                     changed = true
                 }
             }
@@ -77,10 +77,55 @@ class UploadedSurveyStore internal constructor(
         }
     }
 
+    /**
+     * Atomically records a remotely confirmed survey payload and the SHA-256 of the exact UTF-8
+     * bytes sent to (or read back from) GitHub.  Historical ID-only entries are deliberately not
+     * upgraded here: doing so could manufacture proof from a later local file.
+     */
+    fun markConfirmedUploaded(surveyId: String, exportedAt: String?, payloadFingerprint: String) {
+        val normalized = requireNotNull(normalize(surveyId)) { "Survey ID is blank." }
+        require(SurveyUploadIdempotency.isPayloadFingerprint(payloadFingerprint)) {
+            "Payload fingerprint must be a SHA-256 hex digest."
+        }
+        val trimmedExportedAt = exportedAt?.trim()?.takeIf { it.isNotBlank() }
+
+        synchronized(LOCK) {
+            val ids = prefs.getStringSet(KEY_SURVEY_IDS, emptySet()).orEmpty().toMutableSet()
+            val fingerprints = readPayloadFingerprintMapLocked()
+            val priorFingerprint = fingerprints[normalized]
+            check(!ids.contains(normalized) || priorFingerprint == payloadFingerprint) {
+                "Existing uploaded survey record has no matching payload fingerprint."
+            }
+
+            val exportedAtById = readExportedAtMapLocked().toMutableMap()
+            if (trimmedExportedAt != null) exportedAtById[normalized] = trimmedExportedAt
+            ids += normalized
+            val updatedFingerprints = fingerprints.toMutableMap().apply {
+                put(normalized, payloadFingerprint)
+            }
+            check(
+                prefs.edit()
+                    .putStringSet(KEY_SURVEY_IDS, ids)
+                    .putString(KEY_EXPORTED_AT_JSON, encodeMap(exportedAtById))
+                    .putString(KEY_PAYLOAD_FINGERPRINT_JSON, encodeMap(updatedFingerprints))
+                    .commit()
+            ) { "Failed to persist confirmed uploaded survey ledger." }
+        }
+    }
+
     /** Returns the recorded `exported_at` stamp for [surveyId], or null if none is known. */
     fun exportedAtFor(surveyId: String): String? {
         val normalized = normalize(surveyId) ?: return null
         return synchronized(LOCK) { readExportedAtMapLocked()[normalized] }
+    }
+
+    /** Returns a valid recorded SHA-256 only; missing and malformed historical values are unusable. */
+    fun payloadFingerprintFor(surveyId: String): String? {
+        val normalized = normalize(surveyId) ?: return null
+        return synchronized(LOCK) {
+            if (!prefs.getStringSet(KEY_SURVEY_IDS, emptySet()).orEmpty().contains(normalized)) return@synchronized null
+            readPayloadFingerprintMapLocked()[normalized]
+        }
     }
 
     /**
@@ -97,6 +142,7 @@ class UploadedSurveyStore internal constructor(
                 prefs.edit()
                     .remove(KEY_SURVEY_IDS)
                     .remove(KEY_EXPORTED_AT_JSON)
+                    .remove(KEY_PAYLOAD_FINGERPRINT_JSON)
                     .commit()
             ) { "Failed to clear uploaded survey ledger." }
         }
@@ -113,13 +159,18 @@ class UploadedSurveyStore internal constructor(
     }
 
     /** One successfully uploaded survey, paired with its known export time (if any). */
-    data class UploadedSurveyRecord(val surveyId: String, val exportedAt: String?)
+    data class UploadedSurveyRecord(
+        val surveyId: String,
+        val exportedAt: String?,
+        val payloadFingerprint: String? = null
+    )
 
     /** Read-only snapshot of every uploaded survey, each paired with its export time if known. */
     fun uploadedSurveyRecords(): List<UploadedSurveyRecord> = synchronized(LOCK) {
         val ids = prefs.getStringSet(KEY_SURVEY_IDS, emptySet()).orEmpty()
         val exportedAtById = readExportedAtMapLocked()
-        ids.map { id -> UploadedSurveyRecord(surveyId = id, exportedAt = exportedAtById[id]) }
+        val fingerprints = readPayloadFingerprintMapLocked()
+        ids.map { id -> UploadedSurveyRecord(id, exportedAtById[id], fingerprints[id]) }
     }
 
     /** Returns true only when [surveyId] was previously recorded successfully. */
@@ -137,7 +188,17 @@ class UploadedSurveyStore internal constructor(
 
     /** Must be called while holding [LOCK]. */
     private fun readExportedAtMapLocked(): Map<String, String> {
-        val raw = prefs.getString(KEY_EXPORTED_AT_JSON, null) ?: return emptyMap()
+        return readStringMapLocked(KEY_EXPORTED_AT_JSON)
+    }
+
+    /** Must be called while holding [LOCK]. */
+    private fun readPayloadFingerprintMapLocked(): Map<String, String> =
+        readStringMapLocked(KEY_PAYLOAD_FINGERPRINT_JSON)
+            .filterValues(SurveyUploadIdempotency::isPayloadFingerprint)
+
+    /** Must be called while holding [LOCK]. */
+    private fun readStringMapLocked(key: String): Map<String, String> {
+        val raw = prefs.getString(key, null) ?: return emptyMap()
         return runCatching {
             val root = Json.parseToJsonElement(raw) as? JsonObject ?: return@runCatching emptyMap()
             root.entries
@@ -150,13 +211,14 @@ class UploadedSurveyStore internal constructor(
         }.getOrDefault(emptyMap())
     }
 
-    private fun encodeExportedAtMap(map: Map<String, String>): String =
+    private fun encodeMap(map: Map<String, String>): String =
         buildJsonObject { map.forEach { (k, v) -> put(k, v) } }.toString()
 
     private companion object {
         private const val PREF_NAME = "uploaded_survey_ledger_v1"
         private const val KEY_SURVEY_IDS = "survey_ids"
         private const val KEY_EXPORTED_AT_JSON = "exported_at_by_id"
+        private const val KEY_PAYLOAD_FINGERPRINT_JSON = "payload_fingerprint_by_id"
         private val LOCK = Any()
     }
 }

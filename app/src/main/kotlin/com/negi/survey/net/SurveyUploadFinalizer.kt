@@ -31,13 +31,18 @@ sealed interface SurveyFinalizationResult {
 internal interface SurveyFinalizationOperations {
     fun isUploaded(surveyId: String): Boolean
     fun findPendingSurveyFile(surveyId: String): File?
+    fun reserveCanonicalSurveyRoute(surveyId: String): Boolean
+    fun hasCanonicalSurveyRoute(surveyId: String): Boolean
     fun stageSurveyJson(snapshot: SurveyFinalizationSnapshot, tag: DeviceUploadTag, stamp: String): File
     fun reconcileSurveyJson(
         config: GitHubUploader.GitHubConfig,
         file: File,
         surveyId: String
     ): SurveyUploadWork.SurveyWorkReconcileResult
-    fun deletePendingSurveyFile(file: File): Boolean
+    fun cleanupUploadedSurveyArtifact(
+        surveyId: String,
+        file: File
+    ): SurveyUploadedArtifactCleanup.Outcome
     suspend fun scheduleVoiceArtifacts(
         config: GitHubUploader.GitHubConfig,
         surveyId: String,
@@ -77,24 +82,33 @@ class SurveyUploadFinalizer private constructor(
                 if (operations.isUploaded(surveyId)) {
                     return@withLock SurveyFinalizationResult.AlreadyUploaded
                 }
+                val existing = operations.findPendingSurveyFile(surveyId)
+                if (existing != null && !operations.hasCanonicalSurveyRoute(surveyId)) {
+                    // An upgraded process must not relabel a historical staged artifact.
+                    return@withLock SurveyFinalizationResult.StagedPending(existing, reused = true)
+                }
+                if (existing == null && !operations.reserveCanonicalSurveyRoute(surveyId)) {
+                    return@withLock SurveyFinalizationResult.Failure("Could not reserve survey upload route.")
+                }
                 if (config == null) {
-                    val existing = operations.findPendingSurveyFile(surveyId)
                     val pending = existing ?: operations.stageSurveyJson(snapshot, deviceTag, exportedAtStamp)
                     return@withLock SurveyFinalizationResult.StagedPending(pending, reused = existing != null)
                 }
-                val existing = operations.findPendingSurveyFile(surveyId)
                 val pending = existing ?: operations.stageSurveyJson(snapshot, deviceTag, exportedAtStamp)
                 val reconciliation = operations.reconcileSurveyJson(config, pending, surveyId)
                 when (reconciliation.decision.action) {
                     SurveyUploadWork.SurveyWorkAction.SKIP_UPLOADED,
                     SurveyUploadWork.SurveyWorkAction.SKIP_UPLOADED_TRACKER_CLEANUP_FAILED -> {
-                        try {
-                            operations.deletePendingSurveyFile(pending)
-                        } catch (cancelled: CancellationException) {
-                            throw cancelled
-                        } catch (_: Exception) {
+                        when (operations.cleanupUploadedSurveyArtifact(surveyId, pending)) {
+                            SurveyUploadedArtifactCleanup.Outcome.CLEANED,
+                            SurveyUploadedArtifactCleanup.Outcome.ALREADY_MISSING ->
+                                return@withLock SurveyFinalizationResult.AlreadyUploaded
+
+                            SurveyUploadedArtifactCleanup.Outcome.DEFER_UNVERIFIED,
+                            SurveyUploadedArtifactCleanup.Outcome.DEFER_ACTIVE_WORK,
+                            SurveyUploadedArtifactCleanup.Outcome.RETRY_CLEANUP ->
+                                return@withLock SurveyFinalizationResult.StagedPending(pending, reused = true)
                         }
-                        return@withLock SurveyFinalizationResult.AlreadyUploaded
                     }
 
                     SurveyUploadWork.SurveyWorkAction.ENQUEUE_NEW,
@@ -159,6 +173,13 @@ private class AndroidSurveyFinalizationOperations(context: Context) : SurveyFina
     override fun findPendingSurveyFile(surveyId: String): File? =
         PendingSurveyUploads.findPendingSurveyFile(appContext, surveyId)
 
+    override fun reserveCanonicalSurveyRoute(surveyId: String): Boolean =
+        SurveyUploadRouteStore(appContext).reserveCanonical(surveyId)
+
+    override fun hasCanonicalSurveyRoute(surveyId: String): Boolean =
+        SurveyUploadRouteStore(appContext).protocolFor(surveyId) ==
+            SurveyUploadWork.SurveyUploadProtocol.CANONICAL_IMMUTABLE_V1
+
     override fun stageSurveyJson(
         snapshot: SurveyFinalizationSnapshot,
         tag: DeviceUploadTag,
@@ -185,7 +206,11 @@ private class AndroidSurveyFinalizationOperations(context: Context) : SurveyFina
         canonicalFile = file
     )
 
-    override fun deletePendingSurveyFile(file: File): Boolean = file.delete()
+    override fun cleanupUploadedSurveyArtifact(
+        surveyId: String,
+        file: File
+    ): SurveyUploadedArtifactCleanup.Outcome =
+        SurveyUploadedArtifactCleanup.cleanup(appContext, surveyId, file)
 
     override suspend fun scheduleVoiceArtifacts(
         config: GitHubUploader.GitHubConfig,

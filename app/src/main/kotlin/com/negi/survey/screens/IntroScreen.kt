@@ -129,6 +129,8 @@ import androidx.compose.ui.unit.max
 import androidx.compose.ui.unit.min
 import androidx.compose.ui.unit.sp
 import com.negi.survey.BuildConfig
+import com.negi.survey.vm.DeferredLegacyRecoveryEntry
+import com.negi.survey.vm.LegacyRecoveryLocalStatus
 import com.negi.survey.ui.theme.monotoneColors
 import com.negi.survey.vm.UploadStatus
 import com.negi.survey.vm.UploadStatusDetails
@@ -631,6 +633,14 @@ private fun UploadStatusDetailsDialog(
                             entries = s.details.completed,
                             showColumnHeaders = true
                         )
+
+                        if (s.details.deferredLegacyRecovery.isNotEmpty()) {
+                            Spacer(Modifier.padding(top = 14.dp))
+                            DeferredLegacyRecoverySection(
+                                entries = s.details.deferredLegacyRecovery,
+                                onRefresh = { scope.launch { reload() } },
+                            )
+                        }
                     }
                 }
             }
@@ -661,6 +671,64 @@ private fun UploadStatusDetailsDialog(
             }
         }
     )
+}
+
+/** Read-only, local-only metadata for legacy artifacts whose historical destination is unknown. */
+@Composable
+private fun DeferredLegacyRecoverySection(
+    entries: List<DeferredLegacyRecoveryEntry>,
+    onRefresh: () -> Unit,
+) {
+    Text(
+        text = "Deferred upload recovery (${entries.size})",
+        style = MaterialTheme.typography.labelLarge.copy(letterSpacing = 0.2.sp),
+    )
+    Spacer(Modifier.padding(top = 6.dp))
+    entries.forEach { snapshot ->
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(vertical = 6.dp)
+                .testTag("DeferredLegacyRecoveryRecord"),
+        ) {
+            Text("Survey ID: ${snapshot.surveyId}", style = MaterialTheme.typography.bodySmall)
+            Text("Staged file: ${snapshot.fileName}", style = MaterialTheme.typography.bodySmall)
+            Text("Deferred: ${snapshot.reason}", style = MaterialTheme.typography.bodySmall)
+            snapshot.executionAuthority?.let { owner ->
+                Text("Execution authority: $owner", style = MaterialTheme.typography.bodySmall)
+            }
+            Text(
+                text = "Local status: ${snapshot.localStatus.displayLabel()}",
+                style = MaterialTheme.typography.bodySmall,
+            )
+            Text(
+                text = if (snapshot.operatorReviewRequired) {
+                    "Operator review required: historical destination is not known."
+                } else {
+                    "Operator review required: no"
+                },
+                style = MaterialTheme.typography.bodySmall,
+            )
+            TextButton(
+                onClick = onRefresh,
+                contentPadding = ButtonDefaults.TextButtonContentPadding,
+                modifier = Modifier.testTag("RefreshLegacyRecoveryStatusButton"),
+            ) {
+                Icon(Icons.Default.Refresh, contentDescription = null)
+                Spacer(Modifier.width(4.dp))
+                Text("Refresh local status")
+            }
+        }
+    }
+}
+
+private fun LegacyRecoveryLocalStatus.displayLabel(): String = when (this) {
+    LegacyRecoveryLocalStatus.ALREADY_UPLOADED -> "Already uploaded locally"
+    LegacyRecoveryLocalStatus.ACTIVE_WORK -> "Active WorkManager job"
+    LegacyRecoveryLocalStatus.MANUAL_REVIEW_REQUIRED -> "Manual review required"
+    LegacyRecoveryLocalStatus.MISSING_ARTIFACT -> "Missing staged artifact"
+    LegacyRecoveryLocalStatus.INVALID_ARTIFACT -> "Invalid staged JSON"
+    LegacyRecoveryLocalStatus.UNKNOWN_LOCAL_STATE -> "Unknown local state"
 }
 
 @Composable

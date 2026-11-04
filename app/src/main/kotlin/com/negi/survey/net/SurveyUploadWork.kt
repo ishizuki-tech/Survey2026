@@ -45,6 +45,12 @@ internal object SurveyUploadWork {
     private const val STATE_LOOKUP_TIMEOUT_MS = 350L
     private const val ENQUEUE_CONFIRMATION_TIMEOUT_MS = 350L
 
+    /** The remote-destination semantics persisted with newly-created survey work. */
+    enum class SurveyUploadProtocol {
+        LEGACY_DATED_V0,
+        CANONICAL_IMMUTABLE_V1
+    }
+
     /** Minimal WorkManager seam used by reconciliation and JVM tests. */
     internal interface WorkManagerOperations {
         fun getWorkInfoById(id: UUID): WorkInfo?
@@ -100,6 +106,9 @@ internal object SurveyUploadWork {
         DEFER_BUILD_FAILURE,
         DEFER_ENQUEUE_FAILURE,
         DEFER_ENQUEUE_TIMEOUT,
+        DEFER_LEGACY_ORPHAN,
+        DEFER_MIXED_ACTIVE_WORK,
+        CAPTURED_FOR_ISOLATED_TEST,
         ENQUEUED_TRACKER_UNCONFIRMED,
         SKIP_UPLOADED_TRACKER_CLEANUP_FAILED,
         INVALID_ARTIFACT,
@@ -128,6 +137,10 @@ internal object SurveyUploadWork {
 
     fun remoteRelativePath(fileName: String): String =
         "$REMOTE_EXPORT_DIR/${fileName.trim().trimStart('/')}"
+
+    /** Stable, immutable target for one normalized logical survey identity. */
+    fun canonicalRemotePath(surveyId: String): String =
+        "$REMOTE_EXPORT_DIR/surveys/${sha256Hex(requireNotNull(normalizeLogicalSurveyId(surveyId)))}.json"
 
     fun safeWorkNameSegment(value: String): String =
         value.trim()
@@ -196,9 +209,13 @@ internal object SurveyUploadWork {
     fun buildSurveyJsonRequest(
         config: GitHubUploader.GitHubConfig,
         canonicalFile: File,
-        surveyId: String
+        surveyId: String,
+        protocol: SurveyUploadProtocol = SurveyUploadProtocol.CANONICAL_IMMUTABLE_V1
     ): OneTimeWorkRequest {
-        val remotePath = remoteRelativePath(canonicalFile.name)
+        val remotePath = when (protocol) {
+            SurveyUploadProtocol.LEGACY_DATED_V0 -> remoteRelativePath(canonicalFile.name)
+            SurveyUploadProtocol.CANONICAL_IMMUTABLE_V1 -> canonicalRemotePath(surveyId)
+        }
         val data = Data.Builder()
             .putString(GitHubUploadWorker.KEY_MODE, "file")
             .putString(GitHubUploadWorker.KEY_OWNER, config.owner)
@@ -211,6 +228,16 @@ internal object SurveyUploadWork {
             .putLong(GitHubUploadWorker.KEY_FILE_MAX_BYTES_HINT, config.maxRawBytesHint.toLong())
             .putInt(GitHubUploadWorker.KEY_FILE_MAX_REQUEST_BYTES_HINT, config.maxRequestBytesHint)
         addSurveyJsonMetadata(data, surveyId)
+        // Ordinary builds have no active Issue #86 registration, so this adds no Worker input.
+        Issue86ProcessDeathHarness.activeSessionForWorkRequest()?.let { sessionId ->
+            data.putString(Issue86ProcessDeathHarness.KEY_SESSION_ID, sessionId)
+        }
+        if (protocol == SurveyUploadProtocol.CANONICAL_IMMUTABLE_V1) {
+            data.putString(
+                GitHubUploadWorker.KEY_SURVEY_UPLOAD_PROTOCOL,
+                GitHubUploadWorker.SURVEY_UPLOAD_PROTOCOL_CANONICAL_IMMUTABLE_V1
+            )
+        }
         return OneTimeWorkRequestBuilder<GitHubUploadWorker>()
             .setInputData(data.build())
             .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
@@ -224,7 +251,8 @@ internal object SurveyUploadWork {
     /** Candidate overload deliberately builds from [PendingSurveyUploads.PendingSurveyCandidate.canonicalFile] only. */
     fun buildSurveyJsonRequest(
         config: GitHubUploader.GitHubConfig,
-        candidate: PendingSurveyUploads.PendingSurveyCandidate
+        candidate: PendingSurveyUploads.PendingSurveyCandidate,
+        protocol: SurveyUploadProtocol = SurveyUploadProtocol.CANONICAL_IMMUTABLE_V1
     ): OneTimeWorkRequest {
         val parsedSurveyId = requireNotNull(PendingSurveyUploads.surveyIdFromFile(candidate.canonicalFile)) {
             "Canonical pending file is not valid survey JSON."
@@ -232,7 +260,7 @@ internal object SurveyUploadWork {
         require(normalizeLogicalSurveyId(parsedSurveyId) == normalizeLogicalSurveyId(candidate.normalizedSurveyId)) {
             "Canonical pending file survey ID changed."
         }
-        return buildSurveyJsonRequest(config, candidate.canonicalFile, parsedSurveyId)
+        return buildSurveyJsonRequest(config, candidate.canonicalFile, parsedSurveyId, protocol)
     }
 
     /** Pure tracked-state policy used by concrete reconciliation and JVM tests. */
@@ -310,12 +338,16 @@ internal object SurveyUploadWork {
     fun reconcile(
         context: Context,
         config: GitHubUploader.GitHubConfig,
-        candidate: PendingSurveyUploads.PendingSurveyCandidate
+        candidate: PendingSurveyUploads.PendingSurveyCandidate,
+        protocol: SurveyUploadProtocol = SurveyUploadProtocol.CANONICAL_IMMUTABLE_V1,
+        allowNewEnqueue: Boolean = true
     ): SurveyWorkReconcileResult = reconcile(
         context = context,
         config = config,
         expectedSurveyId = candidate.normalizedSurveyId,
-        canonicalFile = candidate.canonicalFile
+        canonicalFile = candidate.canonicalFile,
+        protocol = protocol,
+        allowNewEnqueue = allowNewEnqueue
     )
 
     /** Finalizer-oriented overload for one already-selected staged survey artifact. */
@@ -323,7 +355,9 @@ internal object SurveyUploadWork {
         context: Context,
         config: GitHubUploader.GitHubConfig,
         expectedSurveyId: String,
-        canonicalFile: File
+        canonicalFile: File,
+        protocol: SurveyUploadProtocol = SurveyUploadProtocol.CANONICAL_IMMUTABLE_V1,
+        allowNewEnqueue: Boolean = true
     ): SurveyWorkReconcileResult {
         val normalizedSurveyId = normalizeLogicalSurveyId(expectedSurveyId)
         val logicalWorkName = normalizedSurveyId?.let(::logicalWorkName)
@@ -367,8 +401,9 @@ internal object SurveyUploadWork {
             tracker = tracker,
             ledgerContainsSurveyId = { UploadedSurveyStore(appContext).isUploaded(normalizedSurveyId) },
             artifactValidator = ::validateCanonicalArtifact,
-            requestBuilder = ::buildSurveyJsonRequest,
-            operations = AndroidWorkManagerOperations(workManager)
+            requestBuilder = { cfg, file, id -> buildSurveyJsonRequest(cfg, file, id, protocol) },
+            operations = AndroidWorkManagerOperations(workManager),
+            allowNewEnqueue = allowNewEnqueue
         )
     }
 
@@ -381,7 +416,8 @@ internal object SurveyUploadWork {
         ledgerContainsSurveyId: () -> Boolean,
         artifactValidator: (File, String) -> SurveyArtifactValidation = ::validateCanonicalArtifact,
         requestBuilder: (GitHubUploader.GitHubConfig, File, String) -> OneTimeWorkRequest = ::buildSurveyJsonRequest,
-        operations: WorkManagerOperations
+        operations: WorkManagerOperations,
+        allowNewEnqueue: Boolean = true
     ): SurveyWorkReconcileResult {
         val normalizedSurveyId = normalizeLogicalSurveyId(expectedSurveyId)
         val legacyWorkName = legacyWorkName(canonicalFile)
@@ -402,7 +438,8 @@ internal object SurveyUploadWork {
             ledgerContainsSurveyId,
             artifactValidator,
             requestBuilder,
-            operations
+            operations,
+            allowNewEnqueue
         )
     }
 
@@ -416,7 +453,8 @@ internal object SurveyUploadWork {
         ledgerContainsSurveyId: () -> Boolean,
         artifactValidator: (File, String) -> SurveyArtifactValidation,
         requestBuilder: (GitHubUploader.GitHubConfig, File, String) -> OneTimeWorkRequest,
-        operations: WorkManagerOperations
+        operations: WorkManagerOperations,
+        allowNewEnqueue: Boolean
     ): SurveyWorkReconcileResult = locks.computeIfAbsent(normalizedSurveyId) { ReentrantLock() }.withLock {
         when (val ledger = readLedger(ledgerContainsSurveyId)) {
             is LedgerRead.Failure -> return@withLock resultFor(
@@ -440,10 +478,35 @@ internal object SurveyUploadWork {
         val trackedInspection = trackedWork?.let { tracked ->
             inspectTrackedWork(operations, tracked.workRequestId)
         }
-        val legacyInspection = if (trackedWork == null && trackedInspection == null) {
+        val trackedIsActive = trackedInspection?.workInfo?.state?.let(::isActive) == true
+        val legacyInspection = if (
+            trackedWork == null ||
+            (trackedWork.identityKind != SurveyUploadWorkTracker.IdentityKind.LEGACY && trackedIsActive)
+        ) {
             inspectLegacy(operations, legacyWorkName)
-        } else {
-            LegacyWorkInspection()
+        } else LegacyWorkInspection()
+        val logicalInspection = if (trackedWork?.identityKind == SurveyUploadWorkTracker.IdentityKind.LEGACY) {
+            inspectLegacy(operations, logicalWorkName)
+        } else LegacyWorkInspection()
+        if (legacyInspection.inspectionFailed || logicalInspection.inspectionFailed) {
+            return@withLock resultFor(
+                normalizedSurveyId, logicalWorkName, legacyWorkName,
+                SurveyWorkDecision(SurveyWorkAction.DEFER_UNKNOWN_STATE, "Work identity could not be inspected.")
+            )
+        }
+        val competingActive = when (trackedWork?.identityKind) {
+            SurveyUploadWorkTracker.IdentityKind.LOGICAL -> legacyInspection.activeWorkIds.isNotEmpty()
+            SurveyUploadWorkTracker.IdentityKind.LEGACY -> logicalInspection.activeWorkIds.any { it != trackedWork.workRequestId }
+            null -> false
+        }
+        if (trackedIsActive && competingActive) {
+            return@withLock resultFor(
+                normalizedSurveyId, logicalWorkName, legacyWorkName,
+                SurveyWorkDecision(
+                    SurveyWorkAction.DEFER_MIXED_ACTIVE_WORK,
+                    "Legacy and canonical survey work are both active; no replacement was enqueued."
+                )
+            )
         }
         val validation = try {
             artifactValidator(canonicalFile, normalizedSurveyId)
@@ -479,6 +542,34 @@ internal object SurveyUploadWork {
         }
         if (decision.action != SurveyWorkAction.ENQUEUE_NEW && decision.action != SurveyWorkAction.RECOVER_NEW) {
             return@withLock resultFor(normalizedSurveyId, logicalWorkName, legacyWorkName, decision)
+        }
+        if (!allowNewEnqueue) {
+            val request = try {
+                requestBuilder(config, canonicalFile, normalizedSurveyId)
+            } catch (_: Exception) {
+                return@withLock resultFor(
+                    normalizedSurveyId, logicalWorkName, legacyWorkName,
+                    SurveyWorkDecision(SurveyWorkAction.DEFER_BUILD_FAILURE, "Upload work request could not be built.")
+                )
+            }
+            if (Issue86ProcessDeathHarness.suppressesRecoveryEnqueue()) {
+                Issue86ProcessDeathHarness.captureRecoveryRequest(
+                    request, logicalWorkName, normalizedSurveyId, canonicalFile
+                )
+                return@withLock resultFor(
+                    normalizedSurveyId, logicalWorkName, legacyWorkName,
+                    SurveyWorkDecision(SurveyWorkAction.CAPTURED_FOR_ISOLATED_TEST, "Recovery request captured without enqueue.")
+                )
+            }
+            return@withLock resultFor(
+                normalizedSurveyId,
+                logicalWorkName,
+                legacyWorkName,
+                SurveyWorkDecision(
+                    SurveyWorkAction.DEFER_LEGACY_ORPHAN,
+                    "Legacy pending survey has no durable route reservation or active work."
+                )
+            )
         }
 
         // A second ledger guard closes the artifact-validation/build window before submission.

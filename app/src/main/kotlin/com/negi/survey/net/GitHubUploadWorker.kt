@@ -109,12 +109,34 @@ class GitHubUploadWorker(
                 ?.lowercase(Locale.US)
                 ?: MODE_FILE
 
+        val issue86ProcessDeathSession = inputData.getString(Issue86ProcessDeathHarness.KEY_SESSION_ID)
         if (DiagnosticUploadInstrumentationGate.isDisabled()) {
-            Log.i(
-                TAG,
-                "doWork: external diagnostic upload skipped by instrumentation argument; mode=$mode",
-            )
-            return Result.success()
+            val permittedHarness = try {
+                Issue86ProcessDeathHarness.permitsWorkerThroughInstrumentationGate(issue86ProcessDeathSession)
+            } catch (invalidHarness: IllegalArgumentException) {
+                return Result.failure(workDataOf(ERROR_MESSAGE to "Invalid Issue #86 process-death session."))
+            } catch (invalidHarness: IllegalStateException) {
+                return Result.failure(workDataOf(ERROR_MESSAGE to "Invalid Issue #86 process-death harness state."))
+            }
+            if (!permittedHarness) {
+                when (DiagnosticUploadInstrumentationGate.classifyWorker(
+                    inputData.getString(KEY_UPLOAD_KIND), inputData.getString(KEY_SURVEY_ID)
+                )) {
+                    DiagnosticUploadInstrumentationGate.WorkerDisposition.SKIP_DIAGNOSTIC -> {
+                        Log.i(TAG, "doWork: external diagnostic upload skipped by instrumentation argument; mode=$mode")
+                        return Result.success()
+                    }
+                    DiagnosticUploadInstrumentationGate.WorkerDisposition.DEFER_SURVEY -> {
+                        // Survey WorkManager requests use exponential backoff. Retrying keeps the
+                        // request observable as pending without upload, ledger, authority, or cleanup effects.
+                        Log.i(TAG, "doWork: survey upload deferred by instrumentation diagnostic gate")
+                        return Result.retry()
+                    }
+                    DiagnosticUploadInstrumentationGate.WorkerDisposition.REJECT_MALFORMED_SURVEY -> {
+                        return Result.failure(workDataOf(ERROR_MESSAGE to "Malformed survey JSON Worker input."))
+                    }
+                }
+            }
         }
 
         val maxFileBytesHint =
@@ -448,6 +470,8 @@ class GitHubUploadWorker(
         val fileName = inputData.getString(KEY_FILE_NAME) ?: File(filePath).name
         val uploadKind = inputData.getString(KEY_UPLOAD_KIND).orEmpty()
         val surveyId = inputData.getString(KEY_SURVEY_ID).orEmpty()
+        val surveyUploadProtocol = inputData.getString(KEY_SURVEY_UPLOAD_PROTOCOL).orEmpty()
+        val issue86ProcessDeathSession = inputData.getString(Issue86ProcessDeathHarness.KEY_SESSION_ID)
 
         if (filePath.isBlank()) return Result.failure(workDataOf(ERROR_MESSAGE to "Missing file path."))
 
@@ -473,7 +497,7 @@ class GitHubUploadWorker(
             return Result.failure(workDataOf(ERROR_MESSAGE to msg))
         }
 
-        val remotePathForUi = buildDatedRemotePathUtc(cfg.pathPrefix, fileName)
+        var remotePathForUi = buildDatedRemotePathUtc(cfg.pathPrefix, fileName)
 
         return try {
             val extension = pendingFile.extension.lowercase(Locale.US)
@@ -481,6 +505,9 @@ class GitHubUploadWorker(
 
             /** Only set for a survey JSON payload — read before the file is deleted below. */
             var exportedAtFromJson: String? = null
+            var surveyProtocol: SurveyUploadExecutionAuthority.Protocol? = null
+            var surveyExecutionWasGuarded = false
+            var surveyPayloadFingerprint: String? = null
 
             val result = if (isText) {
                 val text = runCatching { pendingFile.readText(Charsets.UTF_8) }.getOrElse {
@@ -489,15 +516,113 @@ class GitHubUploadWorker(
 
                 if (uploadKind == UPLOAD_KIND_SURVEY_JSON) {
                     exportedAtFromJson = PendingSurveyUploads.exportedAtFromJsonText(text)
+                    // This is the immutable UTF-8 snapshot supplied to the remote transport below.
+                    surveyPayloadFingerprint = SurveyUploadIdempotency.payloadFingerprint(text)
                 }
 
-                GitHubUploader.uploadJson(
-                    cfg = cfg,
-                    relativePath = fileName,
-                    content = text,
-                    message = "Upload $fileName (deferred)",
-                    onProgress = onProgress
-                )
+                surveyProtocol = if (
+                    uploadKind == UPLOAD_KIND_SURVEY_JSON && surveyId.isNotBlank()
+                ) {
+                    if (surveyUploadProtocol == SURVEY_UPLOAD_PROTOCOL_CANONICAL_IMMUTABLE_V1) {
+                        SurveyUploadExecutionAuthority.Protocol.CANONICAL
+                    } else {
+                        SurveyUploadExecutionAuthority.Protocol.LEGACY
+                    }
+                } else {
+                    null
+                }
+                if (
+                    surveyProtocol == SurveyUploadExecutionAuthority.Protocol.CANONICAL &&
+                    SurveyUploadIdempotency.validateLocalPayload(surveyId, text) == null
+                ) {
+                    return Result.failure(
+                        workDataOf(ERROR_MESSAGE to "Staged survey JSON does not match its logical survey ID.")
+                    )
+                }
+                val issue86Harness = if (issue86ProcessDeathSession.isNullOrBlank()) {
+                    null
+                } else if (surveyProtocol == SurveyUploadExecutionAuthority.Protocol.CANONICAL) {
+                    // A session-bearing request may never continue to the HTTP transport unless
+                    // the isolated test process explicitly registered its durable fake backend.
+                    Issue86ProcessDeathHarness.registrationForWorker(issue86ProcessDeathSession)
+                } else {
+                    return Result.failure(
+                        workDataOf(ERROR_MESSAGE to "Issue #86 process-death session requires canonical survey JSON.")
+                    )
+                }
+                if (surveyProtocol != null) {
+                    var guardedResult: GitHubUploader.UploadResult? = null
+                    val outcome = SurveyUploadExecutionGuard.execute(
+                        surveyId = surveyId,
+                        protocol = surveyProtocol,
+                        authority = SurveyUploadExecutionAuthority(applicationContext),
+                        ledgerContains = { UploadedSurveyStore(applicationContext).isUploaded(surveyId) },
+                        remoteWrite = {
+                            guardedResult = if (
+                                surveyUploadProtocol == SURVEY_UPLOAD_PROTOCOL_CANONICAL_IMMUTABLE_V1
+                            ) {
+                                val canonicalPath = SurveyUploadWork.canonicalRemotePath(surveyId)
+                                remotePathForUi = listOf(cfg.pathPrefix.trim('/'), canonicalPath)
+                                    .filter { it.isNotBlank() }
+                                    .joinToString("/")
+                                issue86Harness?.uploadCanonical(
+                                    cfg, remotePathForUi, surveyId, text, "Upload $fileName (deferred)", onProgress
+                                ) ?: GitHubUploader.uploadSurveyJsonIdempotentlyAtPath(
+                                    cfg, remotePathForUi, surveyId, text, "Upload $fileName (deferred)", onProgress
+                                )
+                            } else {
+                                GitHubUploader.uploadJson(cfg, fileName, text, "Upload $fileName (deferred)", onProgress)
+                            }
+                        },
+                        recordUploaded = {
+                            UploadedSurveyStore(applicationContext).markConfirmedUploaded(
+                                surveyId, exportedAtFromJson, requireNotNull(surveyPayloadFingerprint)
+                            )
+                        },
+                        afterRemoteWrite = {
+                            issue86Harness?.awaitBoundary(
+                                Issue86ProcessDeathHarness.Boundary.REMOTE_CONFIRMED_BEFORE_LEDGER
+                            )
+                        },
+                        afterRecordedUpload = {
+                            issue86Harness?.awaitBoundary(
+                                Issue86ProcessDeathHarness.Boundary.LEDGER_COMMITTED_BEFORE_CLEANUP
+                            )
+                        },
+                    )
+                    surveyExecutionWasGuarded = true
+                    when (outcome) {
+                        SurveyUploadExecutionGuard.Outcome.UPLOADED -> requireNotNull(guardedResult)
+                        SurveyUploadExecutionGuard.Outcome.ALREADY_RECORDED -> {
+                            when (SurveyUploadedArtifactCleanup.cleanup(applicationContext, surveyId, pendingFile, id)) {
+                                SurveyUploadedArtifactCleanup.Outcome.CLEANED,
+                                SurveyUploadedArtifactCleanup.Outcome.ALREADY_MISSING -> {
+                                    if (surveyUploadProtocol == SURVEY_UPLOAD_PROTOCOL_CANONICAL_IMMUTABLE_V1) {
+                                        runCatching { SurveyUploadRouteStore(applicationContext).clearCanonical(surveyId) }
+                                    }
+                                    return Result.success(
+                                        workDataOf(OUT_MODE to MODE_FILE, OUT_FILE_NAME to fileName, OUT_REMOTE_PATH to remotePathForUi)
+                                    )
+                                }
+                                SurveyUploadedArtifactCleanup.Outcome.RETRY_CLEANUP -> return Result.retry()
+                                SurveyUploadedArtifactCleanup.Outcome.DEFER_ACTIVE_WORK,
+                                SurveyUploadedArtifactCleanup.Outcome.DEFER_UNVERIFIED -> return Result.failure(
+                                    workDataOf(ERROR_MESSAGE to "Recorded survey artifact was retained because safe local cleanup could not be verified.")
+                                )
+                            }
+                        }
+                        is SurveyUploadExecutionGuard.Outcome.BLOCKED_BY_OTHER_PROTOCOL -> return Result.failure(
+                            workDataOf(ERROR_MESSAGE to "Survey upload is retained because ${outcome.owner.name.lowercase(Locale.US)} protocol owns the unresolved remote-write authority.")
+                        )
+                        SurveyUploadExecutionGuard.Outcome.CORRUPT_OR_UNKNOWN_AUTHORITY -> return Result.failure(
+                            workDataOf(ERROR_MESSAGE to "Survey upload is retained because remote-write authority is corrupt or unknown.")
+                        )
+                        SurveyUploadExecutionGuard.Outcome.AUTHORITY_PERSISTENCE_FAILURE,
+                        SurveyUploadExecutionGuard.Outcome.AUTHORITY_RELEASE_FAILURE -> return Result.retry()
+                    }
+                } else {
+                    GitHubUploader.uploadJson(cfg, fileName, text, "Upload $fileName (deferred)", onProgress)
+                }
             } else {
                 GitHubUploader.uploadFile(
                     cfg = cfg,
@@ -511,9 +636,31 @@ class GitHubUploadWorker(
             if (
                 isText &&
                 uploadKind == UPLOAD_KIND_SURVEY_JSON &&
-                surveyId.isNotBlank()
+                surveyId.isNotBlank() &&
+                !surveyExecutionWasGuarded
             ) {
-                UploadedSurveyStore(applicationContext).markUploaded(surveyId, exportedAtFromJson)
+                UploadedSurveyStore(applicationContext).markConfirmedUploaded(
+                    surveyId, exportedAtFromJson, requireNotNull(surveyPayloadFingerprint)
+                )
+                if (surveyUploadProtocol == SURVEY_UPLOAD_PROTOCOL_CANONICAL_IMMUTABLE_V1) {
+                    runCatching { SurveyUploadRouteStore(applicationContext).clearCanonical(surveyId) }
+                }
+            }
+
+            if (surveyExecutionWasGuarded) {
+                when (SurveyUploadedArtifactCleanup.cleanup(applicationContext, surveyId, pendingFile, id)) {
+                    SurveyUploadedArtifactCleanup.Outcome.CLEANED,
+                    SurveyUploadedArtifactCleanup.Outcome.ALREADY_MISSING -> {
+                        if (surveyUploadProtocol == SURVEY_UPLOAD_PROTOCOL_CANONICAL_IMMUTABLE_V1) {
+                            runCatching { SurveyUploadRouteStore(applicationContext).clearCanonical(surveyId) }
+                        }
+                    }
+                    SurveyUploadedArtifactCleanup.Outcome.RETRY_CLEANUP -> return Result.retry()
+                    SurveyUploadedArtifactCleanup.Outcome.DEFER_ACTIVE_WORK,
+                    SurveyUploadedArtifactCleanup.Outcome.DEFER_UNVERIFIED -> return Result.failure(
+                        workDataOf(ERROR_MESSAGE to "Confirmed survey artifact was retained because safe local cleanup could not be verified.")
+                    )
+                }
             }
 
             runCatching {
@@ -527,7 +674,7 @@ class GitHubUploadWorker(
                 )
             }
 
-            runCatching { pendingFile.delete() }
+            if (!surveyExecutionWasGuarded) runCatching { pendingFile.delete() }
 
             Result.success(
                 workDataOf(
@@ -2499,9 +2646,11 @@ class GitHubUploadWorker(
         const val KEY_MODE = "mode"
         const val KEY_UPLOAD_KIND = "uploadKind"
         const val KEY_SURVEY_ID = "surveyId"
+        const val KEY_SURVEY_UPLOAD_PROTOCOL = "surveyUploadProtocol"
 
         /** Explicit marker for survey JSON only; generic file uploads are never counted. */
         const val UPLOAD_KIND_SURVEY_JSON = "survey_json"
+        const val SURVEY_UPLOAD_PROTOCOL_CANONICAL_IMMUTABLE_V1 = "canonical_immutable_v1"
 
         /** Stable across WorkManager retries for one logical upload session. */
         const val KEY_SESSION_ID = "sessionId"

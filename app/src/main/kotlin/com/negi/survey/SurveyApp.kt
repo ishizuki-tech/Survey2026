@@ -326,9 +326,6 @@ class SurveyApp : Application(), Configuration.Provider {
         val appCtx = applicationContext ?: this
         val disableDiagnosticUpload = DiagnosticUploadInstrumentationGate.isDisabled()
 
-        if (disableDiagnosticUpload) {
-            cancelDiagnosticUploadWorkForInstrumentation(appCtx)
-        }
 
         // Retry JNI loading here if the early attachBaseContext attempt failed.
         // The AtomicBoolean is reset on failure, so this is a real second chance.
@@ -396,18 +393,6 @@ class SurveyApp : Application(), Configuration.Provider {
             .build()
     }
 
-    /**
-     * Test-only isolation for pre-existing diagnostic work. This deliberately targets the
-     * upload worker's shared tag, not all application WorkManager work or local artifacts.
-     */
-    private fun cancelDiagnosticUploadWorkForInstrumentation(context: Context) {
-        runCatching {
-            WorkManager.getInstance(context).cancelAllWorkByTag(GitHubUploadWorker.TAG).result.get()
-            RuntimeLogStore.w(TAG, "Diagnostic upload work cancelled by instrumentation argument.")
-        }.onFailure { t ->
-            RuntimeLogStore.w(TAG, "Diagnostic upload work cancellation failed: ${t.message}", t)
-        }
-    }
 
     /**
      * Defer startup enqueues to reduce cold-start contention (CPU/IO) with LiteRT initialization.
