@@ -8,30 +8,30 @@
   <script id="release-metadata" type="application/json">{
   "repository": "ishizuki-tech/Survey2026",
   "stable_tag": "",
-  "source_commit_sha": "c83ce148e8e47cca0de6e4b2ee1a82c41c39a36d",
-  "release_tag": "build-143-c83ce14",
+  "source_commit_sha": "2e8a4e1813e59f0e2bd15cc00b90b7e8ec13b5c7",
+  "release_tag": "build-144-2e8a4e1",
   "branch": "main",
-  "release_url": "https://github.com/ishizuki-tech/Survey2026/releases/tag/build-143-c83ce14",
-  "download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/build-143-c83ce14/Survey2026-c83ce14-release.apk",
+  "release_url": "https://github.com/ishizuki-tech/Survey2026/releases/tag/build-144-2e8a4e1",
+  "download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/build-144-2e8a4e1/Survey2026-2e8a4e1-release.apk",
   "config_files": {
     "english": {
-      "view_url": "https://github.com/ishizuki-tech/Survey2026/blob/c83ce148e8e47cca0de6e4b2ee1a82c41c39a36d/app/src/main/assets/survey_config10.yaml",
-      "download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/build-143-c83ce14/survey_config10.yaml",
+      "view_url": "https://github.com/ishizuki-tech/Survey2026/blob/2e8a4e1813e59f0e2bd15cc00b90b7e8ec13b5c7/app/src/main/assets/survey_config10.yaml",
+      "download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/build-144-2e8a4e1/survey_config10.yaml",
       "sha256": "2fe06c03a7794a3a3ee5f2c65b31587a624b7285ede7ae7376d5f1876a980287"
     },
     "swahili": {
-      "view_url": "https://github.com/ishizuki-tech/Survey2026/blob/c83ce148e8e47cca0de6e4b2ee1a82c41c39a36d/app/src/main/assets/survey_config_sw_10.yaml",
-      "download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/build-143-c83ce14/survey_config_sw_10.yaml",
+      "view_url": "https://github.com/ishizuki-tech/Survey2026/blob/2e8a4e1813e59f0e2bd15cc00b90b7e8ec13b5c7/app/src/main/assets/survey_config_sw_10.yaml",
+      "download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/build-144-2e8a4e1/survey_config_sw_10.yaml",
       "sha256": "0daafc936e9258fc5424bd8ae687d1ff91d68cb3e576cafa9b5eb0b850b9cf7f"
     }
   },
-  "apk_name": "Survey2026-c83ce14-release.apk",
-  "apk_sha256": "6b98d4e20a13c1125372238b0e03d24b556ea6989b7b899b786668a05af57b66",
+  "apk_name": "Survey2026-2e8a4e1-release.apk",
+  "apk_sha256": "7bd471c484baaacb9db68a74994edcaf4a13c52b6551780480324b5f63c0822d",
   "signing_cert_sha256": "d6edef47ec6734a46122ab7fddb5e4f17d19d4d51ae3eaddfb32f309ee5036ea",
-  "short_sha": "c83ce14",
-  "run_id": "41518060684",
-  "run_number": "143",
-  "generated_utc": "2026-11-02T20:31:10Z",
+  "short_sha": "2e8a4e1",
+  "run_id": "41747640040",
+  "run_number": "144",
+  "generated_utc": "2026-11-04T00:43:21Z",
   "deployment_status": "Field validated",
   "verified_device": {
     "model": "Samsung SM-S731U",
@@ -80,72 +80,68 @@
         <h2>Build provenance</h2>
         
         <p>
-        <strong>Source:</strong> <code>c83ce148e8e47cca0de6e4b2ee1a82c41c39a36d</code></p>
+        <strong>Source:</strong> <code>2e8a4e1813e59f0e2bd15cc00b90b7e8ec13b5c7</code></p>
         <p><strong>Deployment status:</strong> <code>Field validated</code></p>
         <p><strong>Verified device:</strong> <code>Samsung SM-S731U, Android 16 (API 36)</code></p>
       </section>
-      <section class="config-files"><h2>What's New</h2><h3>fix(whisper): start microphone capture before model initialization and reduce recording startup latency</h3><pre class="whats-new-body">## Summary
+      <section class="config-files"><h2>What's New</h2><h3>Fix #86: Prevent duplicate survey uploads after process death</h3><pre class="whats-new-body">## Summary
 
-Start microphone capture before Whisper model initialization completes, reducing recording startup latency and allowing audio capture to overlap native model initialization.
-
-## Changes
-
-- Start Recorder independently of Whisper initialization.
-- Separate microphone startup from model initialization and transcription.
-- Display microphone readiness based on actual AudioRecord state.
-- Add timestamp logging for microphone startup and first PCM capture.
-- Serialize Whisper lifecycle cleanup and prevent unsafe reuse after uncertain native release.
-- Protect recorder close ownership across delayed completion and failures.
-- Add lifecycle and native-release safety regression tests.
+- Establish stable canonical survey upload identity and paths across retries and process restarts.
+- Prevent duplicate logical uploads through durable execution authority and remote readback.
+- Preserve pending surveys on ambiguous or conflicting remote outcomes.
+- Improve recovery, ledger reconciliation, cleanup safety, and legacy orphan visibility.
+- Add unit, instrumentation, and process-death regression coverage.
 
 ## Validation
 
-- JVM unit tests: 270 passed, 0 failures.
-- Android instrumentation: 16 focused lifecycle tests passed on Galaxy S25 FE (SM-S731U).
-- Android test compilation and debug assembly passed.
-- Real microphone startup: 94–194 ms after request.
-- First PCM buffer: 248–361 ms after request.
-- Whisper initialization overlapped real audio capture.
-- Controlled Q07 recording preserved the beginning of the spoken fixture.
-- `git diff --check` passed.
+- **Galaxy S25 FE (Android 17/API 37):** `DEVICE_PROCESS_DEATH_PASSED`
+- Verified process death after remote creation and before ledger persistence.
+- Verified recovery with one remote create, one lookup, zero conflicts, successful ledger persistence, and matching-artifact cleanup.
+- Host Runner mock regression suite passed.
+- Android instrumentation APK built successfully.
+- Production-readiness review found no confirmed blocking implementation defect.
 
-## Limitations
+## Remaining Verification
 
-- Actual native-free failure was not deliberately induced.
-- Microphone startup timing was measured in two real-device runs.
-- A full Q07–Q16 consecutive-answer test was not performed and is not required for this focused change.
+- Run the relevant JVM regression tests and normal debug build.
+- Verify GitHub Contents API create/readback behavior against an isolated test repository.
+- Real WorkManager recovery and the second process-death boundary have not been independently validated on-device.
 
-## Scope
+## Scope and Follow-up
 
-This PR does not change Gemma inference logic, survey prompts, scoring, upload behavior, or export format.</pre></section>
-      <a class="download" href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-143-c83ce14/Survey2026-c83ce14-release.apk">Download APK</a>
+- Issue #86 covers canonical upload identity, idempotency, recovery, and safe cleanup.
+- Broader HTTP 409 retry behavior remains tracked in #128.
+- Do not merge until required checks and review are complete.
+
+Refs #86</pre></section>
+      <a class="download" href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-144-2e8a4e1/Survey2026-2e8a4e1-release.apk">Download APK</a>
       <p class="note">Direct GitHub Release asset. No ZIP extraction is required.</p>
       <section class="config-files">
         <h2>Config files included in this APK</h2>
         <p class="note">These config files were extracted from the exact APK build shown on this page.</p>
-        <p><strong>English — survey_config10.yaml</strong><br><a href="https://github.com/ishizuki-tech/Survey2026/blob/c83ce148e8e47cca0de6e4b2ee1a82c41c39a36d/app/src/main/assets/survey_config10.yaml">View in browser</a> · <a href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-143-c83ce14/survey_config10.yaml">Download</a><br><code>SHA-256: 2fe06c03a7794a3a3ee5f2c65b31587a624b7285ede7ae7376d5f1876a980287</code></p>
-        <p><strong>Swahili — survey_config_sw_10.yaml</strong><br><a href="https://github.com/ishizuki-tech/Survey2026/blob/c83ce148e8e47cca0de6e4b2ee1a82c41c39a36d/app/src/main/assets/survey_config_sw_10.yaml">View in browser</a> · <a href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-143-c83ce14/survey_config_sw_10.yaml">Download</a><br><code>SHA-256: 0daafc936e9258fc5424bd8ae687d1ff91d68cb3e576cafa9b5eb0b850b9cf7f</code></p>
+        <p><strong>English — survey_config10.yaml</strong><br><a href="https://github.com/ishizuki-tech/Survey2026/blob/2e8a4e1813e59f0e2bd15cc00b90b7e8ec13b5c7/app/src/main/assets/survey_config10.yaml">View in browser</a> · <a href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-144-2e8a4e1/survey_config10.yaml">Download</a><br><code>SHA-256: 2fe06c03a7794a3a3ee5f2c65b31587a624b7285ede7ae7376d5f1876a980287</code></p>
+        <p><strong>Swahili — survey_config_sw_10.yaml</strong><br><a href="https://github.com/ishizuki-tech/Survey2026/blob/2e8a4e1813e59f0e2bd15cc00b90b7e8ec13b5c7/app/src/main/assets/survey_config_sw_10.yaml">View in browser</a> · <a href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-144-2e8a4e1/survey_config_sw_10.yaml">Download</a><br><code>SHA-256: 0daafc936e9258fc5424bd8ae687d1ff91d68cb3e576cafa9b5eb0b850b9cf7f</code></p>
       </section>
       <div class="qr-panel">
-        <div class="qr-box"><img src="qr.png" alt="QR code that downloads the Survey2026 APK for build-143-c83ce14" width="300" height="300"></div>
-        <div><h2>Scan with Android</h2><p class="subtitle">This QR code downloads the APK for this build (build-143-c83ce14).</p><code>https://github.com/ishizuki-tech/Survey2026/releases/download/build-143-c83ce14/Survey2026-c83ce14-release.apk</code></div>
+        <div class="qr-box"><img src="qr.png" alt="QR code that downloads the Survey2026 APK for build-144-2e8a4e1" width="300" height="300"></div>
+        <div><h2>Scan with Android</h2><p class="subtitle">This QR code downloads the APK for this build (build-144-2e8a4e1).</p><code>https://github.com/ishizuki-tech/Survey2026/releases/download/build-144-2e8a4e1/Survey2026-2e8a4e1-release.apk</code></div>
       </div>
       <div class="grid">
-        <div class="item"><span class="label">Release tag</span><code>build-143-c83ce14</code></div>
+        <div class="item"><span class="label">Release tag</span><code>build-144-2e8a4e1</code></div>
         <div class="item"><span class="label">Branch</span><code>main</code></div>
-        <div class="item"><span class="label">Commit SHA</span><code>c83ce14</code></div>
-        <div class="item"><span class="label">APK filename</span><code>Survey2026-c83ce14-release.apk</code></div>
-        <div class="item"><span class="label">Workflow run number</span><code>143</code></div>
-        <div class="item"><span class="label">APK SHA-256</span><code>6b98d4e20a13c1125372238b0e03d24b556ea6989b7b899b786668a05af57b66</code></div>
+        <div class="item"><span class="label">Commit SHA</span><code>2e8a4e1</code></div>
+        <div class="item"><span class="label">APK filename</span><code>Survey2026-2e8a4e1-release.apk</code></div>
+        <div class="item"><span class="label">Workflow run number</span><code>144</code></div>
+        <div class="item"><span class="label">APK SHA-256</span><code>7bd471c484baaacb9db68a74994edcaf4a13c52b6551780480324b5f63c0822d</code></div>
         <div class="item"><span class="label">Signing certificate SHA-256</span><code>d6edef47ec6734a46122ab7fddb5e4f17d19d4d51ae3eaddfb32f309ee5036ea</code></div>
-        <div class="item"><span class="label">Generated timestamp</span><code>2026-11-02T20:31:10Z</code></div>
+        <div class="item"><span class="label">Generated timestamp</span><code>2026-11-04T00:43:21Z</code></div>
       </div>
       <div class="links">
-        <a href="https://github.com/ishizuki-tech/Survey2026/releases/tag/build-143-c83ce14">GitHub Release</a>
-        <a href="https://github.com/ishizuki-tech/Survey2026/actions/runs/41518060684">GitHub Actions run</a>
+        <a href="https://github.com/ishizuki-tech/Survey2026/releases/tag/build-144-2e8a4e1">GitHub Release</a>
+        <a href="https://github.com/ishizuki-tech/Survey2026/actions/runs/41747640040">GitHub Actions run</a>
         <a href="https://github.com/ishizuki-tech/Survey2026">Repository</a>
       </div>
-      <footer>Survey2026 release metadata generated 2026-11-02T20:31:10Z.</footer>
+      <footer>Survey2026 release metadata generated 2026-11-04T00:43:21Z.</footer>
     </section>
   </main>
 </body>
