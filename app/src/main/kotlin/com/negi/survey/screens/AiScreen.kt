@@ -107,6 +107,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.NavigateBefore
 import androidx.compose.material.icons.automirrored.outlined.NavigateNext
 import androidx.compose.material.icons.automirrored.outlined.Send
+import androidx.compose.material.icons.filled.Keyboard
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Stop
@@ -128,6 +129,7 @@ import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -160,11 +162,16 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import com.negi.survey.BuildConfig
 import com.negi.survey.net.RuntimeLogStore
 import com.negi.survey.diagnostics.DiagnosticContentPolicy
@@ -175,6 +182,7 @@ import com.negi.survey.ui.theme.monotoneColors
 import com.negi.survey.vm.AiViewModel
 import com.negi.survey.vm.QuestionSpeaker
 import com.negi.survey.vm.SurveyViewModel
+import com.negi.survey.vm.shouldAutoPlayQuestion
 import com.negi.survey.vm.toggleQuestionSpeaker
 import java.security.MessageDigest
 import java.util.Locale
@@ -225,6 +233,29 @@ internal fun canAcceptFollowupCandidate(
     maxFollowups: Int = 2
 ): Boolean =
     followupCapacityRemaining(existing, maxFollowups) > 0 && isDistinctFollowupQuestion(candidate, existing)
+
+/** Formats elapsed recording time as m:ss (e.g. 0:07, 1:23, 12:05). */
+internal fun formatRecordingElapsed(totalSeconds: Int): String {
+    val seconds = totalSeconds.coerceAtLeast(0)
+    return "%d:%02d".format(Locale.ROOT, seconds / 60, seconds % 60)
+}
+
+/** Runs one capture interval; cancellation stops updates when capture ends. */
+internal suspend fun runRecordingTimer(
+    recording: Boolean,
+    captureActive: Boolean,
+    elapsedRealtime: () -> Long,
+    publish: (Int) -> Unit,
+) {
+    publish(0)
+    if (!recording || !captureActive) return
+    val startedAt = elapsedRealtime()
+    while (true) {
+        val elapsedMs = elapsedRealtime() - startedAt
+        publish((elapsedMs / 1000L).coerceAtMost(Int.MAX_VALUE.toLong()).toInt())
+        delay(1000L - elapsedMs % 1000L)
+    }
+}
 
 internal fun canAdvanceAiTurn(
     aiLoading: Boolean,
@@ -307,7 +338,8 @@ fun AiScreen(
     onNext: () -> Unit,
     onBack: () -> Unit,
     speechController: SpeechController? = null,
-    ttsController: QuestionSpeaker? = null
+    ttsController: QuestionSpeaker? = null,
+    autoReadFollowups: Boolean = false
 ) {
     val nid = remember(nodeId) { nodeId.trim() }
     val localContext = LocalContext.current.applicationContext
@@ -364,6 +396,13 @@ fun AiScreen(
     val speechTranscribing by transFlow.collectAsState(initial = false)
     val speechPartial by partialFlow.collectAsState(initial = "")
     val speechError by errFlow.collectAsState(initial = null)
+
+    var recordingElapsedSeconds by remember { mutableIntStateOf(0) }
+    LaunchedEffect(speechRecording, captureActive) {
+        runRecordingTimer(speechRecording, captureActive, SystemClock::elapsedRealtime) {
+            recordingElapsedSeconds = it
+        }
+    }
 
     // ---------------------------------------------------------------------
     // Text-to-speech state with null-safe fallback (question read-aloud)
@@ -430,6 +469,41 @@ fun AiScreen(
             )
         )
 
+    // An already active follow-up belongs to a previous presentation (for example, Back).
+    var lastAutoReadFollowup by remember(contextKey) {
+        val active = vmAI.conversationStateFlow(contextKey).value
+            .takeIf { it.role == AiViewModel.ComposerRole.FOLLOWUP }
+            ?.activePromptQuestion?.trim()
+        val pending = if (isTwoStepNode) {
+            vmSurvey.followups.value[nid].orEmpty().lastOrNull { it.answer == null }
+                ?.question?.trim()
+        } else null
+        mutableStateOf(pending ?: active)
+    }
+    LaunchedEffect(contextKey, conv.role, conv.activePromptQuestion) {
+        val followup = conv.activePromptQuestion.trim()
+            .takeIf { conv.role == AiViewModel.ComposerRole.FOLLOWUP && it.isNotEmpty() }
+            ?: return@LaunchedEffect
+        val current = vmAI.conversationStateFlow(contextKey).value
+        if (vmSurvey.currentNode.value.id.trim() != nid ||
+            vmSurvey.sessionId.value != surveySessionId ||
+            current.role != AiViewModel.ComposerRole.FOLLOWUP ||
+            current.activePromptQuestion.trim() != followup) return@LaunchedEffect
+        if (followup == lastAutoReadFollowup) return@LaunchedEffect
+        lastAutoReadFollowup = followup
+        if (shouldAutoPlayQuestion(autoReadFollowups,
+                speechController?.isRecording?.value == true,
+                speechController?.isTranscribing?.value == true)) {
+            try {
+                ttsController?.speak(followup, "$nid-followup-${shortHash(followup)}")
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                Log.w(TAG, "Unable to read follow-up", error)
+            }
+        }
+    }
+
     val chatItems by vmAI.chatHistoryFlow(contextKey).collectAsState(initial = emptyList())
 
     val prettyJson = remember {
@@ -440,6 +514,8 @@ fun AiScreen(
         }
     }
 
+    var typingMode by remember(contextKey) { mutableStateOf(false) }
+    val showTextComposer = speechController == null || typingMode
     val focusRequester = remember { FocusRequester() }
     val scroll = rememberScrollState()
 
@@ -462,8 +538,11 @@ fun AiScreen(
      * Compose render state avoids recomposition solely for persistence side effects.
      */
 
-    LaunchedEffect(contextKey) {
+    LaunchedEffect(contextKey, showTextComposer) {
+        if (!showTextComposer || !textFieldEnabled) return@LaunchedEffect
         delay(30)
+        if (speechController?.isRecording?.value == true ||
+            speechController?.isTranscribing?.value == true) return@LaunchedEffect
         focusRequester.requestFocus()
         keyboard?.show()
     }
@@ -673,11 +752,6 @@ fun AiScreen(
                                 )
                             }
 
-                            scope.launch {
-                                delay(40)
-                                focusRequester.requestFocus()
-                                keyboard?.show()
-                            }
                         }
                     } else if (!repairEligibleInitial) {
                         if (fuNorm != null) {
@@ -1013,7 +1087,12 @@ fun AiScreen(
         topBar = {
             CompactTopBar(
                 title = title,
-                onReplay = { ttsController?.let { toggleQuestionSpeaker(it, rootQuestion, nid) } },
+                onReplay = { ttsController?.let {
+                    val prompt = conv.activePromptQuestion.takeIf {
+                        conv.role == AiViewModel.ComposerRole.FOLLOWUP && it.isNotBlank()
+                    } ?: rootQuestion
+                    toggleQuestionSpeaker(it, prompt, nid)
+                } },
                 isSpeaking = ttsSpeaking
             )
         },
@@ -1106,33 +1185,60 @@ fun AiScreen(
                             }
                         }
 
-                        ChatComposer(
-                            value = conv.composerDraft,
-                            onValueChange = { t ->
-                                vmAI.updateComposerDraft(contextKey, t)
-                                if (conv.role == AiViewModel.ComposerRole.MAIN) {
-                                    vmSurvey.setAnswer(t, nid)
+                        val composerEnabled = textFieldEnabled && !loading && !submissionPending &&
+                            !(isTwoStepNode && (conv.validationFailed || conv.turnCompleted))
+                        val onToggleSpeech: (() -> Unit)? = speechController?.let { sc ->
+                            {
+                                if (!sc.isRecording.value) {
+                                    keyboard?.hide()
+                                    focusManager.clearFocus(force = true)
+                                    val traceId = vmSurvey.beginAnswerTransaction(nid, "voice")
+                                    WhisperTraceRegistry.beginVoiceTransaction(localContext, surveyUuid, nid, traceId)
                                 }
-                            },
-                            onSend = ::submit,
-                            enabled = textFieldEnabled && !loading && !submissionPending &&
-                                    !(isTwoStepNode && (conv.validationFailed || conv.turnCompleted)),
-                            focusRequester = focusRequester,
-                            speechEnabled = speechController != null,
-                            speechRecording = speechRecording,
-                            speechTranscribing = speechTranscribing,
-                            speechStatusText = speechStatusText,
-                            speechStatusIsError = speechStatusIsError,
-                            onToggleSpeech = speechController?.let { sc ->
-                                {
-                                    if (!sc.isRecording.value) {
-                                        val traceId = vmSurvey.beginAnswerTransaction(nid, "voice")
-                                        WhisperTraceRegistry.beginVoiceTransaction(localContext, surveyUuid, nid, traceId)
-                                    }
-                                    toggleSpeechRecordingWithTtsInterlock(sc, ttsController)
-                                }
+                                toggleSpeechRecordingWithTtsInterlock(sc, ttsController)
                             }
-                        )
+                        }
+                        val onSendAnswer: () -> Unit = {
+                            if (composerEnabled && conv.composerDraft.isNotBlank()) {
+                                submit()
+                                typingMode = false
+                            }
+                        }
+                        if (showTextComposer) {
+                            ChatComposer(
+                                value = conv.composerDraft,
+                                onValueChange = { t ->
+                                    vmAI.updateComposerDraft(contextKey, t)
+                                    if (conv.role == AiViewModel.ComposerRole.MAIN) vmSurvey.setAnswer(t, nid)
+                                },
+                                onSend = onSendAnswer,
+                                enabled = composerEnabled,
+                                focusRequester = focusRequester,
+                                speechEnabled = speechController != null,
+                                speechRecording = speechRecording,
+                                speechTranscribing = speechTranscribing,
+                                speechStatusText = speechStatusText,
+                                speechStatusIsError = speechStatusIsError,
+                                onToggleSpeech = onToggleSpeech,
+                                onVoiceInstead = if (speechController != null) {{
+                                    keyboard?.hide()
+                                    focusManager.clearFocus(force = true)
+                                    typingMode = false
+                                }} else null
+                            )
+                        } else if (onToggleSpeech != null) {
+                            VoiceFirstComposer(
+                                value = conv.composerDraft,
+                                enabled = composerEnabled,
+                                speechRecording = speechRecording,
+                                speechTranscribing = speechTranscribing,
+                                speechStatusText = speechStatusText,
+                                speechStatusIsError = speechStatusIsError,
+                                onToggleSpeech = onToggleSpeech,
+                                onSend = onSendAnswer,
+                                onTypeInstead = { typingMode = true }
+                            )
+                        }
 
                         HorizontalDivider(
                             thickness = DividerDefaults.Thickness,
@@ -1200,6 +1306,16 @@ fun AiScreen(
         }
     }
 
+    if (speechController != null && speechRecording) {
+        var stopRequested by remember(speechController) { mutableStateOf(false) }
+        RecordingTimerOverlay(recordingElapsedSeconds, speechStatusText, stopRequested) {
+            if (!stopRequested && speechController.isRecording.value) {
+                stopRequested = true
+                speechController.stopRecording()
+            }
+        }
+    }
+
     DisposableEffect(contextKey) {
         onDispose {
             runCatching {
@@ -1209,6 +1325,85 @@ fun AiScreen(
             }
             vmAI.resetStates()
             vmAI.removeTypingMessage(contextKey, nid)
+        }
+    }
+}
+
+/* ─────────────────────── Recording timer ───────────────────────────────── */
+
+/**
+ * Full-screen timer shown while a dictated answer is being recorded. It counts up so the
+ * interviewer can see at a glance how long the farmer has been talking; there is no limit.
+ * Stop (or the system back gesture) ends the recording.
+ */
+@Composable
+private fun RecordingTimerOverlay(
+    elapsedSeconds: Int,
+    statusText: String?,
+    stopRequested: Boolean,
+    onStop: () -> Unit
+) {
+    val cs = MaterialTheme.colorScheme
+    val elapsed = formatRecordingElapsed(elapsedSeconds)
+
+    Dialog(
+        onDismissRequest = onStop,
+        properties = DialogProperties(
+            dismissOnClickOutside = false,
+            usePlatformDefaultWidth = false
+        )
+    ) {
+        Surface(
+            modifier = Modifier.fillMaxSize(),
+            color = cs.surface.copy(alpha = 0.94f)
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center
+            ) {
+                Text(
+                    text = elapsed,
+                    fontSize = 120.sp,
+                    lineHeight = 120.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = cs.primary,
+                    maxLines = 1,
+                    softWrap = false,
+                    modifier = Modifier.semantics {
+                        contentDescription = "Recording for $elapsed"
+                    }
+                )
+                if (!statusText.isNullOrBlank()) {
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        text = statusText,
+                        style = MaterialTheme.typography.titleMedium,
+                        color = cs.onSurfaceVariant
+                    )
+                }
+                Spacer(Modifier.height(32.dp))
+                FilledTonalButton(
+                    onClick = onStop,
+                    enabled = !stopRequested,
+                    colors = ButtonDefaults.filledTonalButtonColors(
+                        containerColor = ActionBlue,
+                        contentColor = Color.Black,
+                    ),
+                    shape = CircleShape,
+                    contentPadding = PaddingValues(horizontal = 32.dp, vertical = 16.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.Stop,
+                        contentDescription = null,
+                        modifier = Modifier.size(32.dp)
+                    )
+                    Spacer(Modifier.width(12.dp))
+                    Text("Stop", style = MaterialTheme.typography.headlineSmall)
+                }
+            }
         }
     }
 }
@@ -1548,7 +1743,8 @@ private fun ChatComposer(
     speechTranscribing: Boolean = false,
     speechStatusText: String? = null,
     speechStatusIsError: Boolean = false,
-    onToggleSpeech: (() -> Unit)? = null
+    onToggleSpeech: (() -> Unit)? = null,
+    onVoiceInstead: (() -> Unit)? = null
 ) {
     val cs = MaterialTheme.colorScheme
 
@@ -1638,6 +1834,9 @@ private fun ChatComposer(
             }
         }
 
+        if (onVoiceInstead != null) {
+            TextButton(onClick = onVoiceInstead, enabled = enabled) { Text("Use voice instead") }
+        }
         if (speechStatusText != null) {
             androidx.compose.foundation.layout.Spacer(Modifier.height(4.dp))
             Text(
@@ -1646,6 +1845,126 @@ private fun ChatComposer(
                 color = if (speechStatusIsError) cs.error else cs.onSurfaceVariant,
                 modifier = Modifier.padding(start = 4.dp, top = 2.dp)
             )
+        }
+    }
+}
+
+/**
+ * Voice-first answer area: a large mic button while there is no answer yet,
+ * then the transcript with Send and Record again. Typing is a secondary
+ * action ("Type instead"); tapping the transcript also opens it for editing.
+ */
+@Composable
+internal fun VoiceFirstComposer(
+    value: String,
+    enabled: Boolean,
+    speechRecording: Boolean,
+    speechTranscribing: Boolean,
+    speechStatusText: String?,
+    speechStatusIsError: Boolean,
+    onToggleSpeech: () -> Unit,
+    onSend: () -> Unit,
+    onTypeInstead: () -> Unit
+) {
+    val cs = MaterialTheme.colorScheme
+    val micEnabled = (enabled || speechRecording) && !speechTranscribing
+    val hasAnswer = value.isNotBlank() && !speechRecording && !speechTranscribing
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp, vertical = 12.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        if (hasAnswer) {
+            Surface(
+                onClick = onTypeInstead,
+                enabled = enabled,
+                shape = RoundedCornerShape(16.dp),
+                color = cs.surfaceVariant.copy(alpha = 0.6f),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 160.dp)
+            ) {
+                Text(
+                    text = value,
+                    style = MaterialTheme.typography.bodyLarge,
+                    modifier = Modifier
+                        .verticalScroll(rememberScrollState())
+                        .padding(horizontal = 14.dp, vertical = 12.dp)
+                )
+            }
+            if (speechStatusIsError && !speechStatusText.isNullOrBlank()) {
+                Text(speechStatusText, color = cs.error, style = MaterialTheme.typography.labelSmall)
+            }
+            Spacer(Modifier.height(10.dp))
+            androidx.compose.foundation.layout.Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                OutlinedButton(
+                    onClick = onToggleSpeech,
+                    enabled = micEnabled,
+                    shape = CircleShape,
+                    contentPadding = PaddingValues(vertical = 14.dp),
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Icon(Icons.Filled.Mic, contentDescription = null)
+                    Spacer(Modifier.width(8.dp))
+                    Text("Record again")
+                }
+                FilledTonalButton(
+                    onClick = onSend,
+                    enabled = enabled,
+                    colors = ButtonDefaults.filledTonalButtonColors(
+                        containerColor = ActionBlue,
+                        contentColor = Color.Black,
+                    ),
+                    shape = CircleShape,
+                    contentPadding = PaddingValues(vertical = 14.dp),
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Text("Send")
+                    Spacer(Modifier.width(8.dp))
+                    Icon(Icons.AutoMirrored.Outlined.Send, contentDescription = null)
+                }
+            }
+        } else {
+            Surface(
+                onClick = onToggleSpeech,
+                enabled = micEnabled,
+                shape = CircleShape,
+                color = if (micEnabled) cs.primary else cs.onSurface.copy(alpha = 0.12f),
+                contentColor = if (micEnabled) cs.onPrimary else cs.onSurface.copy(alpha = 0.38f),
+                modifier = Modifier.size(96.dp)
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Icon(
+                        imageVector = if (speechRecording) Icons.Filled.Stop else Icons.Filled.Mic,
+                        contentDescription = if (speechRecording) "Stop recording" else "Record answer",
+                        modifier = Modifier.size(48.dp)
+                    )
+                }
+            }
+            Spacer(Modifier.height(8.dp))
+            Text(
+                text = speechStatusText ?: "Tap to answer",
+                style = MaterialTheme.typography.titleMedium,
+                color = when {
+                    speechStatusIsError -> cs.error
+                    // Match the disabled mic and "Type instead" once the answer is locked.
+                    !micEnabled -> cs.onSurface.copy(alpha = 0.38f)
+                    else -> cs.onSurface
+                }
+            )
+        }
+
+        if (!speechRecording && !speechTranscribing) {
+            TextButton(onClick = onTypeInstead, enabled = enabled) {
+                Icon(Icons.Filled.Keyboard, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(6.dp))
+                Text(if (hasAnswer) "Edit by typing" else "Type instead")
+            }
         }
     }
 }
