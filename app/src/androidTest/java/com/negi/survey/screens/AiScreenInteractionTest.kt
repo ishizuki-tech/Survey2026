@@ -4,7 +4,11 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsNotEnabled
+import androidx.compose.ui.test.hasAnyAncestor
+import androidx.compose.ui.test.hasText
+import androidx.compose.ui.test.isDialog
 import androidx.compose.ui.test.hasSetTextAction
 import androidx.compose.ui.test.junit4.v2.createComposeRule
 import androidx.compose.ui.test.onNodeWithContentDescription
@@ -145,11 +149,11 @@ class AiScreenInteractionTest {
     @Test fun stopAndBackAreGuardedUntilControllerReportsTransition() {
         host()
         rule.onNodeWithContentDescription("Record answer").performClick()
-        rule.onNodeWithText("Starting microphone…").assertExists()
+        rule.onNode(hasText("Starting microphone…") and hasAnyAncestor(isDialog())).assertIsDisplayed()
         rule.onNodeWithText("Send").assertDoesNotExist()
         rule.onNodeWithText("0:00").assertExists()
         rule.runOnIdle { speech.capture.value = true }
-        rule.onNodeWithText("Listening…").assertExists()
+        rule.onNode(hasText("Listening…") and hasAnyAncestor(isDialog())).assertIsDisplayed()
         rule.onNodeWithText("Stop").performClick()
         rule.onNodeWithText("Stop").assertIsNotEnabled()
         InstrumentationRegistry.getInstrumentation().sendKeyDownUpSync(KeyEvent.KEYCODE_BACK)
