@@ -84,6 +84,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import com.negi.survey.ui.theme.ActionBlue
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.DividerDefaults
@@ -1037,13 +1038,9 @@ private fun CtaRowMono(
         horizontalArrangement = Arrangement.Center,
         verticalAlignment = Alignment.CenterVertically
     ) {
-        // Matches RowButtons' Next/Back pattern (MainActivity.kt) so Start
-        // reads as the same kind of action throughout the app: a
-        // FilledTonalButton using the theme's default colors (blue, via
-        // colorScheme.secondaryContainer) instead of the monotone palette,
-        // with the same shape, padding and plain text style.
         FilledTonalButton(
             onClick = onStart,
+            colors = ButtonDefaults.filledTonalButtonColors(containerColor = ActionBlue, contentColor = Color.Black),
             shape = CircleShape,
             contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp),
             modifier = Modifier.testTag("StartButton")

@@ -174,6 +174,8 @@ import com.negi.survey.vm.NoOpQuestionSpeaker
 import com.negi.survey.vm.NodeType
 import com.negi.survey.vm.QuestionSpeaker
 import com.negi.survey.vm.SurveyViewModel
+import com.negi.survey.ui.theme.ActionBlue
+import com.negi.survey.vm.decomposeSingleChoiceAnswer
 import com.negi.survey.vm.composeSingleChoiceAnswer
 import com.negi.survey.vm.isValidNumberAnswer
 import com.negi.survey.vm.shouldShowOtherDetails
@@ -1630,6 +1632,7 @@ fun SurveyNavHost(
                 }
 
                 entry<FlowSingle> {
+                    val answers by vmSurvey.answers.collectAsStateWithLifecycle()
                     val node by vmSurvey.currentNode.collectAsStateWithLifecycle()
                     val ttsSpeaking by ttsController.isSpeaking.collectAsStateWithLifecycle()
 
@@ -1646,6 +1649,7 @@ fun SurveyNavHost(
                         selected = vmSurvey.single.collectAsStateWithLifecycle().value,
                         onSelect = { vmSurvey.setSingleChoice(it) },
                         otherTextOption = node.otherTextOption,
+                        initialOtherText = node.decomposeSingleChoiceAnswer(answers[node.id]).otherText,
                         onSubmit = { selection, otherText ->
                             node.composeSingleChoiceAnswer(selection, otherText)?.let { answer ->
                                 runCatching { ttsController.stop() }
@@ -2033,13 +2037,14 @@ internal fun TextNodeScreen(
 }
 
 @Composable
-private fun SingleChoiceNodeScreen(
+internal fun SingleChoiceNodeScreen(
     title: String,
     question: String,
     options: List<String>,
     selected: String?,
     onSelect: (String?) -> Unit,
     otherTextOption: String? = null,
+    initialOtherText: String = "",
     onSubmit: (String?, String?) -> Unit,
     onBack: () -> Unit,
     onReplay: () -> Unit = {},
@@ -2047,7 +2052,7 @@ private fun SingleChoiceNodeScreen(
 ) {
     val backplate = appBackplate()
     val scroll = rememberScrollState()
-    var otherText by rememberSaveable(question, otherTextOption) { mutableStateOf("") }
+    var otherText by rememberSaveable(question, otherTextOption) { mutableStateOf(initialOtherText) }
 
     Box(
         modifier = Modifier
@@ -2370,6 +2375,7 @@ private fun RowButtons(
         FilledTonalButton(
             onClick = onPrimary,
             enabled = primaryEnabled,
+            colors = ButtonDefaults.filledTonalButtonColors(containerColor = ActionBlue, contentColor = Color.Black),
             shape = CircleShape,
             contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp)
         ) {
@@ -2508,6 +2514,7 @@ private fun HomeFreeTextComposer(
             FilledTonalButton(
                 onClick = onSend,
                 enabled = enabled,
+                colors = ButtonDefaults.filledTonalButtonColors(containerColor = ActionBlue, contentColor = Color.Black),
                 shape = CircleShape,
                 contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp)
             ) {

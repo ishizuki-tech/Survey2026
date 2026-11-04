@@ -169,6 +169,19 @@ class SurveyNavigationResolutionTest {
     }
 
     @Test
+    fun saved_choices_restore_known_other_and_reject_obsolete_values() {
+        val node = Node(id = "Choice", type = NodeType.SINGLE_CHOICE,
+            options = listOf("Known", "Other / Nyingine"), otherTextOption = "Other / Nyingine")
+        assertEquals(SingleChoiceSelection("Known"), node.decomposeSingleChoiceAnswer("Known"))
+        assertEquals(SingleChoiceSelection("Other / Nyingine", "Ruiru – Gitothua"),
+            node.decomposeSingleChoiceAnswer(node.composeSingleChoiceAnswer("Other / Nyingine", "Ruiru – Gitothua")))
+        assertEquals(SingleChoiceSelection(null), node.decomposeSingleChoiceAnswer(null))
+        assertEquals(SingleChoiceSelection(null), node.decomposeSingleChoiceAnswer(""))
+        assertEquals(SingleChoiceSelection(null), node.decomposeSingleChoiceAnswer("Removed option"))
+        assertEquals(SingleChoiceSelection(null), node.copy(options = listOf("Known")).decomposeSingleChoiceAnswer("Other / Nyingine: old"))
+    }
+
+    @Test
     fun other_details_visibility_requires_a_configured_exact_other_selection() {
         val other = "Other / Nyingine"
 
