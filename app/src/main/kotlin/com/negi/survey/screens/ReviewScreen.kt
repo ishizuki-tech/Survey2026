@@ -37,9 +37,12 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
@@ -51,9 +54,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 
 import com.negi.survey.vm.SurveyViewModel
 import com.negi.survey.vm.SurveyFinalizationState
@@ -87,19 +88,9 @@ fun ReviewScreen(
 ) {
     val cs = MaterialTheme.colorScheme
 
-    // Compact typography presets (tight but readable for dense lists).
-    val titleTight = MaterialTheme.typography.titleSmall.copy(
-        fontSize = 12.sp,
-        lineHeight = 14.sp
-    )
-    val labelTight = MaterialTheme.typography.labelSmall.copy(
-        fontSize = 10.sp,
-        lineHeight = 12.sp
-    )
-    val bodyTight = MaterialTheme.typography.bodySmall.copy(
-        fontSize = 11.sp,
-        lineHeight = 14.sp
-    )
+    val sectionTitle = MaterialTheme.typography.titleMedium
+    val answerLabel = MaterialTheme.typography.labelMedium
+    val answerBody = MaterialTheme.typography.bodyMedium
 
     // Collect VM state with explicit empty defaults for safety.
     val allQuestions by vm.questions.collectAsState(initial = emptyMap())
@@ -155,7 +146,7 @@ fun ReviewScreen(
             item {
                 Text(
                     text = "Review",
-                    style = titleTight,
+                    style = sectionTitle,
                     color = cs.onSurface
                 )
             }
@@ -166,7 +157,7 @@ fun ReviewScreen(
                     Column(Modifier.padding(12.dp)) {
                         Text(
                             text = "All Original Questions and Answers",
-                            style = titleTight,
+                            style = sectionTitle,
                             color = cs.onSurface
                         )
                         Spacer(Modifier.height(6.dp))
@@ -174,7 +165,7 @@ fun ReviewScreen(
                         if (qaEntries.isEmpty()) {
                             Text(
                                 text = "No records yet.",
-                                style = bodyTight,
+                                style = answerBody,
                                 color = cs.onSurfaceVariant
                             )
                         } else {
@@ -185,8 +176,8 @@ fun ReviewScreen(
 
                                 QaRow(
                                     entry = entry,
-                                    labelStyle = labelTight,
-                                    bodyStyle = bodyTight
+                                    labelStyle = answerLabel,
+                                    bodyStyle = answerBody
                                 )
                             }
                         }
@@ -200,7 +191,7 @@ fun ReviewScreen(
                     Column(Modifier.padding(12.dp)) {
                         Text(
                             text = "Follow-up History",
-                            style = titleTight,
+                            style = sectionTitle,
                             color = cs.onSurface
                         )
                         Spacer(Modifier.height(6.dp))
@@ -208,7 +199,7 @@ fun ReviewScreen(
                         if (sortedFollowups.isEmpty()) {
                             Text(
                                 text = "No follow-up questions.",
-                                style = bodyTight,
+                                style = answerBody,
                                 color = cs.onSurfaceVariant
                             )
                         } else {
@@ -219,14 +210,14 @@ fun ReviewScreen(
 
                                 Text(
                                     text = "Node: $nodeId",
-                                    style = labelTight,
+                                    style = answerLabel,
                                     color = cs.onSurfaceVariant
                                 )
 
                                 if (list.isEmpty()) {
                                     Text(
                                         text = "– No follow-ups recorded.",
-                                        style = bodyTight,
+                                        style = answerBody,
                                         color = cs.onSurfaceVariant
                                     )
                                 } else {
@@ -234,14 +225,14 @@ fun ReviewScreen(
                                         Spacer(Modifier.height(4.dp))
                                         Text(
                                             text = "${i + 1}. Q: ${entry.question}",
-                                            style = bodyTight,
+                                            style = answerBody,
                                             color = cs.onSurface
                                         )
                                         Text(
                                             text = "   A: ${entry.answer ?: "– No Answer."}",
-                                            style = bodyTight,
+                                            style = answerBody,
                                             color = if (entry.answer.isNullOrBlank()) {
-                                                cs.onSurface.copy(alpha = 0.6f)
+                                                cs.onSurfaceVariant
                                             } else {
                                                 cs.onSurface
                                             }
@@ -264,9 +255,11 @@ fun ReviewScreen(
                         .fillMaxWidth()
                         .padding(top = 4.dp, bottom = 8.dp)
                 ) {
-                    Button(
+                    OutlinedButton(
                         onClick = onBack,
                         enabled = !finishing,
+                        shape = MaterialTheme.shapes.medium,
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = cs.onSurface),
                         modifier = Modifier.weight(1f)
                     ) {
                         Text("Back")
@@ -274,14 +267,15 @@ fun ReviewScreen(
                     Button(
                         onClick = onFinish,
                         enabled = !finishing,
-                        modifier = Modifier.weight(1f)
+                        shape = MaterialTheme.shapes.medium,
+                        modifier = Modifier.weight(1f).heightIn(min = 56.dp)
                     ) {
                         Text(if (finishing) "Finishing..." else "Finish")
                     }
                 }
                 if (!error.isNullOrBlank()) {
                     Spacer(Modifier.height(8.dp))
-                    Text(text = error, style = bodyTight, color = cs.error)
+                    Text(text = error, style = answerBody, color = cs.error)
                 }
             }
         }
@@ -321,7 +315,7 @@ private fun QaRow(
             text = qText,
             style = bodyStyle,
             color = if (entry.question.isBlank()) {
-                cs.onSurface.copy(alpha = 0.6f)
+                cs.onSurfaceVariant
             } else {
                 cs.onSurface
             }
@@ -332,11 +326,9 @@ private fun QaRow(
         val aText = if (entry.answer.isBlank()) "– No Answer." else entry.answer
         Text(
             text = "A: $aText",
-            maxLines = 6,
-            overflow = TextOverflow.Ellipsis,
             style = bodyStyle,
             color = if (entry.answer.isBlank()) {
-                cs.onSurface.copy(alpha = 0.6f)
+                cs.onSurfaceVariant
             } else {
                 cs.onSurface
             }

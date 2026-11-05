@@ -5,7 +5,11 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.semantics.SemanticsActions
+import androidx.compose.ui.semantics.SemanticsProperties
+import androidx.compose.ui.test.SemanticsMatcher
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.hasAnyAncestor
 import androidx.compose.ui.test.hasText
@@ -15,6 +19,7 @@ import androidx.compose.ui.test.junit4.v2.createComposeRule
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performSemanticsAction
 import androidx.compose.ui.test.performTextInput
 import androidx.navigation3.runtime.rememberNavBackStack
 import androidx.test.platform.app.InstrumentationRegistry
@@ -112,15 +117,40 @@ class AiScreenInteractionTest {
 
     @Test fun sendOnceDisablesComposerDuringInferenceAndReturnsToVoice() {
         host()
+        rule.onNodeWithText("Next").assertIsEnabled()
         rule.onNodeWithText("Type instead").performClick()
+        val send = rule.onNodeWithContentDescription("Send")
+        send.assertIsNotEnabled()
         rule.onNode(hasSetTextAction()).performTextInput("answer")
-        rule.onNodeWithContentDescription("Send").performClick()
+        send.assertIsEnabled().performClick()
         rule.waitUntil(5_000) { repo.requests > 0 }
+        rule.onNodeWithText("Next").assertIsNotEnabled()
         rule.onNodeWithContentDescription("Record answer").assertIsNotEnabled()
         rule.runOnIdle {
             assertEquals(1, repo.requests)
             assertEquals("answer", survey.getAnswer("Q8"))
         }
+    }
+
+    @Test fun conversationCanReturnToBottomAfterReadingEarlierMessages() {
+        host(withSpeech = false)
+        rule.runOnIdle {
+            repeat(12) { index ->
+                ai.appendUserMessage(contextKey, "Answer ${index + 1}. " + "Earlier survey context. ".repeat(10))
+            }
+        }
+        val conversation = rule.onNode(SemanticsMatcher.keyIsDefined(SemanticsProperties.VerticalScrollAxisRange))
+        val range = conversation.fetchSemanticsNode().config[SemanticsProperties.VerticalScrollAxisRange]
+        assertTrue(range.maxValue() > 0f)
+        conversation.performSemanticsAction(SemanticsActions.ScrollBy) { it(0f, -range.maxValue()) }
+        val jump = rule.onNodeWithText("Jump to bottom")
+        jump.assertIsDisplayed()
+
+        rule.runOnIdle { ai.appendUserMessage(contextKey, "Latest answer") }
+        jump.assertIsDisplayed()
+        jump.performClick()
+        rule.onNodeWithText("Latest answer").assertIsDisplayed()
+        assertEquals(range.maxValue(), range.value(), 0f)
     }
 
     @Test fun completedSubmissionPreservesAnswersAndReturnsToVoiceForFollowup() {
