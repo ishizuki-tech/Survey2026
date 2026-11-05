@@ -475,6 +475,13 @@ class AiViewModel(
         }
     }
 
+    /** Restore the saved pending prompt without clearing the conversation's draft. */
+    internal fun restoreFollowupMode(contextKey: String, question: String) {
+        conversationStore[contextKey]?.update { cur ->
+            cur.copy(role = ComposerRole.FOLLOWUP, activePromptQuestion = question)
+        }
+    }
+
     /** Mark a main-answer or follow-up validation turn as in progress before inference begins. */
     fun beginValidationTurn(contextKey: String) {
         conversationStore[contextKey]?.update { cur ->
@@ -689,6 +696,7 @@ class AiViewModel(
      */
     fun ensureRootQuestionMessage(contextKey: String, nodeId: String, rootQuestion: String) {
         val id = "qroot-$nodeId"
+        if (chatStore[contextKey]?.value?.any { it.id == id && it.text == rootQuestion } == true) return
         upsertChatItem(
             contextKey = contextKey,
             item = ChatItem(
