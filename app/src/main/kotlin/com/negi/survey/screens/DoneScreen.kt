@@ -34,6 +34,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -177,12 +178,6 @@ fun DoneScreen(
                     uploadStatus = uploadStatus,
                     onResolveUploadStatusDetails = onResolveUploadStatusDetails,
                     onClearCompletedSurveys = onClearCompletedSurveys
-                    // titleColor/countColor/actionColor intentionally left at
-                    // UploadStatusSummary's own defaults (monotoneColors()),
-                    // so this follows Light/Dark like the rest of the app.
-                    // Previously hardcoded to Color.Black, which made this
-                    // section invisible in Dark mode (black text on a themed
-                    // dark background).
                 )
 
                 Spacer(Modifier.height(16.dp))
@@ -194,6 +189,8 @@ fun DoneScreen(
                     horizontalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
                     Button(
+                        modifier = Modifier.heightIn(min = 56.dp),
+                        shape = MaterialTheme.shapes.medium,
                         onClick = {
                             onRestart()
                         }
