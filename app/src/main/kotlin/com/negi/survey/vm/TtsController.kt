@@ -162,7 +162,7 @@ internal suspend fun checkTtsOfflineVoice(
  *   initializing, and plays automatically once ready (covers the common
  *   "auto-play as soon as the question appears" race).
  */
-class TtsController(
+class TtsController internal constructor(
     private val appContext: Context,
     private val languageCode: String = DEFAULT_LANGUAGE,
     /** Null = don't set; the TTS engine's own speech-rate setting applies. */
@@ -170,7 +170,8 @@ class TtsController(
     /** Null = don't set; the TTS engine's own pitch setting applies. */
     private val pitch: Float? = null,
     private val enginePackage: String? = null,
-    private val requireEngine: Boolean = false
+    private val requireEngine: Boolean = false,
+    createEngine: (Context, TextToSpeech.OnInitListener, String?) -> TextToSpeech = ::TextToSpeech
 ) : ViewModel(), QuestionSpeaker {
 
     companion object {
@@ -222,7 +223,7 @@ class TtsController(
         val installed = requested != null && isEngineInstalled(requested)
         engine = if (installed) {
             Log.d(TAG, "Binding to TTS engine app: $requested")
-            TextToSpeech(appContext, { status -> onEngineInit(status) }, requested)
+            createEngine(appContext, ::dispatchEngineInit, requested)
         } else if (requested != null && requireEngine) {
             // Forced engine missing: never read questions with a different voice.
             Log.e(TAG, "Required TTS engine '$requested' is not installed; read-aloud disabled")
@@ -233,11 +234,16 @@ class TtsController(
             if (requested != null) {
                 Log.w(TAG, "TTS engine '$requested' not installed; using device default engine")
             }
-            TextToSpeech(appContext) { status -> onEngineInit(status) }
+            createEngine(appContext, ::dispatchEngineInit, null)
         }
     }
 
     private fun isEngineInstalled(pkg: String): Boolean = isTtsEngineInstalled(appContext, pkg)
+
+    private fun dispatchEngineInit(status: Int) {
+        // Serialize the pending request with UI playback and lifecycle stop on the main thread.
+        viewModelScope.launch(Dispatchers.Main) { onEngineInit(status) }
+    }
 
     private fun onEngineInit(status: Int) {
         if (status != TextToSpeech.SUCCESS) {
