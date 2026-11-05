@@ -15,6 +15,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -221,7 +222,7 @@ private fun InfoLine(label: String, value: String) {
 
 @Composable
 private fun CreditItem(credit: Credit, onViewLicense: (String) -> Unit) {
-    val linkColor = MaterialTheme.colorScheme.primary
+    val linkColor = MaterialTheme.colorScheme.onSurface
     Column {
         Text(credit.name, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
         Text(credit.role, style = MaterialTheme.typography.bodyMedium)
@@ -254,7 +255,13 @@ private fun CreditItem(credit: Credit, onViewLicense: (String) -> Unit) {
 
 @Composable
 private fun ViewLicenseLink(onClick: () -> Unit) {
-    TextButton(onClick = onClick, contentPadding = PaddingValues(0.dp)) {
+    TextButton(
+        onClick = onClick,
+        contentPadding = PaddingValues(0.dp),
+        colors = ButtonDefaults.textButtonColors(
+            contentColor = MaterialTheme.colorScheme.onSurface
+        )
+    ) {
         Text("View licence text", style = MaterialTheme.typography.labelLarge)
     }
 }
