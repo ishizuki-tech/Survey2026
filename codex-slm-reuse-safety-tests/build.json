@@ -1,0 +1,12 @@
+{
+  "original_branch": "codex/slm-reuse-safety-tests",
+  "branch_slug": "codex-slm-reuse-safety-tests",
+  "commit_sha": "7896b5e12bf3c9df1a78a6b6840d989fb4db744a",
+  "short_sha": "7896b5e",
+  "apk_name": "Survey2026-codex-slm-reuse-safety-tests-7896b5e.apk",
+  "apk_sha256": "91beddf97d1058c96d3e2e5d04f7f79f7d584bb09673dd44a5376e5a7fd21eda",
+  "apk_download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-codex-slm-reuse-safety-tests-7896b5e-run-187/Survey2026-codex-slm-reuse-safety-tests-7896b5e.apk",
+  "page_url": "https://ishizuki-tech.github.io/Survey2026/codex-slm-reuse-safety-tests/",
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/41984743325",
+  "generated_utc": "2026-11-05T07:11:32Z"
+}
