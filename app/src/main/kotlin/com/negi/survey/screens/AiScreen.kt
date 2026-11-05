@@ -87,6 +87,7 @@ import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
@@ -114,9 +115,8 @@ import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material3.DividerDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
-import com.negi.survey.ui.theme.ActionBlue
 import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.Button
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -162,12 +162,10 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.compose.ui.semantics.contentDescription
@@ -178,7 +176,8 @@ import com.negi.survey.diagnostics.DiagnosticContentPolicy
 import com.negi.survey.diagnostics.WhisperTraceRegistry
 import com.negi.survey.slm.FollowupExtractor
 import com.negi.survey.slm.PromptPhase
-import com.negi.survey.ui.theme.monotoneColors
+import com.negi.survey.ui.theme.neutralEdge
+import com.negi.survey.ui.theme.outdoorGradientStops
 import com.negi.survey.vm.AiViewModel
 import com.negi.survey.vm.QuestionSpeaker
 import com.negi.survey.vm.SurveyViewModel
@@ -1095,7 +1094,7 @@ fun AiScreen(
     // Visuals
     // ---------------------------------------------------------------------
 
-    val bgBrush = animatedMonotoneBackplate()
+    val bgBrush = animatedOutdoorBackplate()
     val title =
         if (conv.role == AiViewModel.ComposerRole.FOLLOWUP) "Follow-up • $nid" else "Question • $nid"
 
@@ -1161,7 +1160,7 @@ fun AiScreen(
                                 if (m.json != null) {
                                     JsonBubbleMono(pretty = m.json, snack = snack)
                                 } else {
-                                    BubbleMono(
+                                    ChatBubble(
                                         text = m.text.orEmpty(),
                                         isAi = isAi,
                                         isTyping = m.isTyping
@@ -1203,6 +1202,7 @@ fun AiScreen(
                             }
                             if (conv.validationFailed) {
                                 OutlinedButton(
+                                    colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.onSurface),
                                     enabled = !loading && !submissionPending && !speechRecording && !speechTranscribing,
                                     onClick = { runTwoStep(retry = true) }
                                 ) { Text("Retry saved answers") }
@@ -1269,19 +1269,20 @@ fun AiScreen(
                             color = DividerDefaults.color
                         )
 
-                        androidx.compose.foundation.layout.Row(
+                        FlowRow(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .padding(horizontal = 12.dp, vertical = 12.dp),
                             horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
-                            FilledTonalButton(
+                            OutlinedButton(
+                                colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.onSurface),
                                 onClick = {
                                     vmAI.resetStates()
                                     onBack()
                                 },
-                                shape = CircleShape,
+                                shape = MaterialTheme.shapes.medium,
                                 contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp)
                             ) {
                                 Icon(
@@ -1292,8 +1293,8 @@ fun AiScreen(
                                 Text("Back")
                             }
 
-                            FilledTonalButton(
-                                colors = ButtonDefaults.filledTonalButtonColors(containerColor = ActionBlue, contentColor = Color.Black),
+                            Button(
+                                modifier = Modifier.heightIn(min = 56.dp),
                                 enabled = canAdvanceAiTurn(
                                     aiLoading = loading,
                                     mainSubmissionPending = submissionPending,
@@ -1308,12 +1309,12 @@ fun AiScreen(
                                             speechTranscribing = speechTranscribing,
                                         )
                                     ) {
-                                        return@FilledTonalButton
+                                        return@Button
                                     }
                                     vmAI.resetStates()
                                     onNext()
                                 },
-                                shape = CircleShape,
+                                shape = MaterialTheme.shapes.medium,
                                 contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp)
                             ) {
                                 Text("Next")
@@ -1384,16 +1385,15 @@ private fun RecordingTimerOverlay(
             Column(
                 modifier = Modifier
                     .fillMaxSize()
+                    .verticalScroll(rememberScrollState())
                     .padding(24.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.Center
             ) {
                 Text(
                     text = elapsed,
-                    fontSize = 120.sp,
-                    lineHeight = 120.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = cs.primary,
+                    style = MaterialTheme.typography.displayMedium,
+                    color = cs.onSurface,
                     maxLines = 1,
                     softWrap = false,
                     modifier = Modifier.semantics {
@@ -1409,14 +1409,14 @@ private fun RecordingTimerOverlay(
                     )
                 }
                 Spacer(Modifier.height(32.dp))
-                FilledTonalButton(
+                Button(
                     onClick = onStop,
                     enabled = !stopRequested,
-                    colors = ButtonDefaults.filledTonalButtonColors(
-                        containerColor = ActionBlue,
-                        contentColor = Color.Black,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = cs.error,
+                        contentColor = cs.onError
                     ),
-                    shape = CircleShape,
+                    shape = MaterialTheme.shapes.medium,
                     contentPadding = PaddingValues(horizontal = 32.dp, vertical = 16.dp)
                 ) {
                     Icon(
@@ -1437,16 +1437,14 @@ private fun RecordingTimerOverlay(
 @Composable
 private fun CompactTopBar(
     title: String,
-    height: Dp = 32.dp,
     onReplay: (() -> Unit)? = null,
     isSpeaking: Boolean = false
 ) {
     val cs = MaterialTheme.colorScheme
-    val mono = monotoneColors()
     val topBrush = Brush.horizontalGradient(
         listOf(
             cs.surface.copy(alpha = 0.96f),
-            mono.buttonContainer.copy(alpha = 0.75f)
+            cs.surfaceContainerHigh.copy(alpha = 0.75f)
         )
     )
     Surface(color = Color.Transparent, tonalElevation = 0.dp) {
@@ -1455,19 +1453,18 @@ private fun CompactTopBar(
                 .fillMaxWidth()
                 .background(topBrush)
                 .windowInsetsPadding(WindowInsets.statusBars)
-                .height(height)
+                .heightIn(min = 48.dp)
                 .padding(horizontal = 12.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Text(
                 text = title,
                 style = MaterialTheme.typography.titleSmall,
-                maxLines = 1,
                 color = cs.onSurface,
                 modifier = Modifier.weight(1f)
             )
             if (onReplay != null) {
-                IconButton(onClick = onReplay, modifier = Modifier.size(height)) {
+                IconButton(onClick = onReplay) {
                     Text(
                         text = if (isSpeaking) "\u23F9" else "\uD83D\uDD0A",
                         color = cs.onSurface,
@@ -1497,7 +1494,7 @@ private fun JumpToBottomPill(
             ) { onClick() }
     ) {
         androidx.compose.foundation.layout.Row(
-            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+            modifier = Modifier.heightIn(min = 48.dp).padding(horizontal = 12.dp, vertical = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(6.dp)
         ) {
@@ -1519,13 +1516,13 @@ private fun JumpToBottomPill(
 /* ───────────────────────────── Chat bubbles ─────────────────────────────── */
 
 @Composable
-private fun BubbleMono(
+private fun ChatBubble(
     text: String,
     isAi: Boolean,
     isTyping: Boolean,
     maxWidth: Dp = 520.dp
 ) {
-    val mono = monotoneColors()
+    val cs = MaterialTheme.colorScheme
 
     val corner = 12.dp
     val padH = 10.dp
@@ -1533,30 +1530,9 @@ private fun BubbleMono(
     val tailW = 7f
     val tailH = 6f
 
-    // Both bubble roles now follow the active Light/Dark scheme: the AI
-    // bubble uses the same neutral "card" tone as the rest of the app
-    // (mono.cardBg), and the user bubble is shifted a step toward
-    // textPrimary so the two stay visually distinct in either theme.
-    // Previously these were pinned to a fixed near-black (AI) / near-white
-    // (user) regardless of the system theme, which is why the AI bubble
-    // kept showing white text on a black background even after the rest
-    // of the screen started following Light mode.
-    //
-    // Deliberately NOT blended toward MaterialTheme.colorScheme.surface
-    // (as an earlier pass here did): with dynamicColor enabled (see
-    // SurveyNavTheme), that surface tone comes from the device's Material
-    // You wallpaper palette and can land on a noticeably darker/grayer tone
-    // than expected, which is what made the Light-mode AI bubble read as
-    // "too dark a gray" even though mono.cardBg itself is pure white there.
-    // Every other Mono-prefixed component in this app stays off
-    // colorScheme.surface for the same reason -- this just brings bubbles
-    // in line with that.
-    val base = if (isAi) mono.cardBg else lerp(mono.cardBg, mono.textPrimary, 0.16f)
-    val stops = listOf(
-        base,
-        lerp(base, mono.textPrimary, 0.05f),
-        lerp(base, mono.textPrimary, 0.10f)
-    )
+    val base = if (isAi) cs.surface else cs.primaryContainer
+    val textColor = if (isAi) cs.onSurface else cs.onPrimaryContainer
+    val stops = listOf(base, lerp(base, textColor, 0.04f), lerp(base, textColor, 0.08f))
 
     val t = rememberInfiniteTransition(label = "bubble-mono")
     val p by t.animateFloat(
@@ -1574,7 +1550,6 @@ private fun BubbleMono(
         end = Offset(400f + 220f * p, 360f - 180f * p)
     )
 
-    val textColor = mono.textPrimary
     val shape = RoundedCornerShape(
         topStart = corner,
         topEnd = corner,
@@ -1613,7 +1588,7 @@ private fun BubbleMono(
 
                 drawRoundRect(
                     brush = Brush.radialGradient(
-                        colors = listOf(Color.White.copy(alpha = 0.06f), Color.Transparent),
+                        colors = listOf(cs.surfaceBright.copy(alpha = 0.06f), Color.Transparent),
                         center = center,
                         radius = (min(size.width, size.height)) * 0.54f
                     ),
@@ -1622,9 +1597,9 @@ private fun BubbleMono(
 
                 drawRoundRect(
                     brush = Brush.sweepGradient(
-                        0f to mono.edgeSweepDark.copy(alpha = 0.12f),
-                        0.5f to mono.cardBorderMid.copy(alpha = 0.10f),
-                        1f to mono.edgeSweepDark.copy(alpha = 0.12f)
+                        0f to cs.outline.copy(alpha = 0.12f),
+                        0.5f to cs.outline.copy(alpha = 0.10f),
+                        1f to cs.outline.copy(alpha = 0.12f)
                     ),
                     style = Stroke(width = 0.8.dp.toPx()),
                     cornerRadius = cr
@@ -1635,7 +1610,7 @@ private fun BubbleMono(
             Text(
                 text = if (isTyping && text.isBlank()) "…" else text,
                 color = textColor,
-                style = MaterialTheme.typography.bodyMedium.copy(lineHeight = 18.sp)
+                style = MaterialTheme.typography.bodyMedium
             )
         }
     }
@@ -1652,7 +1627,6 @@ private fun JsonBubbleMono(
     var expanded by remember(pretty) { mutableStateOf(false) }
 
     val cs = MaterialTheme.colorScheme
-    val mono = monotoneColors()
     val clipboard = LocalClipboard.current
     val scope = rememberCoroutineScope()
     val clip = RoundedCornerShape(10.dp)
@@ -1677,9 +1651,9 @@ private fun JsonBubbleMono(
                     .background(
                         Brush.horizontalGradient(
                             listOf(
-                                mono.buttonContainer.copy(alpha = 0.22f),
-                                mono.edgeSweepMid.copy(alpha = 0.22f),
-                                mono.cardBorderMid.copy(alpha = 0.22f)
+                                cs.surfaceContainerHigh.copy(alpha = 0.22f),
+                                cs.outlineVariant.copy(alpha = 0.22f),
+                                cs.outline.copy(alpha = 0.22f)
                             )
                         )
                     )
@@ -1710,7 +1684,7 @@ private fun JsonBubbleMono(
                             snack?.showSnackbar("JSON copied")
                         }
                     },
-                    modifier = Modifier.size(28.dp)
+                    modifier = Modifier.size(48.dp)
                 ) {
                     Icon(
                         imageVector = Icons.Outlined.ContentCopy,
@@ -1726,8 +1700,7 @@ private fun JsonBubbleMono(
                         text = pretty,
                         color = cs.onSurface,
                         style = MaterialTheme.typography.bodySmall.copy(
-                            fontFamily = FontFamily.Monospace,
-                            lineHeight = 18.sp
+                            fontFamily = FontFamily.Monospace
                         ),
                         modifier = Modifier
                             .padding(10.dp)
@@ -1807,6 +1780,7 @@ private fun ChatComposer(
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
                 keyboardActions = KeyboardActions(onSend = { onSend() }),
                 colors = OutlinedTextFieldDefaults.colors(
+                    cursorColor = cs.onSurface,
                     unfocusedContainerColor = Color.Transparent,
                     focusedContainerColor = Color.Transparent,
                     disabledContainerColor = Color.Transparent,
@@ -1845,10 +1819,11 @@ private fun ChatComposer(
                 }
             }
 
-            FilledTonalButton(
+            Button(
                 onClick = onSend,
                 enabled = enabled && value.isNotBlank(),
-                shape = CircleShape,
+                modifier = Modifier.heightIn(min = 56.dp),
+                shape = MaterialTheme.shapes.medium,
                 contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp)
             ) {
                 Icon(
@@ -1859,7 +1834,11 @@ private fun ChatComposer(
         }
 
         if (onVoiceInstead != null) {
-            TextButton(onClick = onVoiceInstead, enabled = enabled) { Text("Use voice instead") }
+            TextButton(
+                onClick = onVoiceInstead,
+                enabled = enabled,
+                colors = ButtonDefaults.textButtonColors(contentColor = cs.onSurface)
+            ) { Text("Use voice instead") }
         }
         if (speechStatusText != null) {
             androidx.compose.foundation.layout.Spacer(Modifier.height(4.dp))
@@ -1929,7 +1908,8 @@ internal fun VoiceFirstComposer(
                 OutlinedButton(
                     onClick = onToggleSpeech,
                     enabled = micEnabled,
-                    shape = CircleShape,
+                    shape = MaterialTheme.shapes.medium,
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = cs.onSurface),
                     contentPadding = PaddingValues(vertical = 14.dp),
                     modifier = Modifier.weight(1f)
                 ) {
@@ -1937,16 +1917,12 @@ internal fun VoiceFirstComposer(
                     Spacer(Modifier.width(8.dp))
                     Text("Record again")
                 }
-                FilledTonalButton(
+                Button(
                     onClick = onSend,
                     enabled = enabled,
-                    colors = ButtonDefaults.filledTonalButtonColors(
-                        containerColor = ActionBlue,
-                        contentColor = Color.Black,
-                    ),
-                    shape = CircleShape,
+                    shape = MaterialTheme.shapes.medium,
                     contentPadding = PaddingValues(vertical = 14.dp),
-                    modifier = Modifier.weight(1f)
+                    modifier = Modifier.weight(1f).heightIn(min = 56.dp)
                 ) {
                     Text("Send")
                     Spacer(Modifier.width(8.dp))
@@ -1958,8 +1934,16 @@ internal fun VoiceFirstComposer(
                 onClick = onToggleSpeech,
                 enabled = micEnabled,
                 shape = CircleShape,
-                color = if (micEnabled) cs.primary else cs.onSurface.copy(alpha = 0.12f),
-                contentColor = if (micEnabled) cs.onPrimary else cs.onSurface.copy(alpha = 0.38f),
+                color = when {
+                    !micEnabled -> cs.onSurface.copy(alpha = 0.12f)
+                    speechRecording -> cs.error
+                    else -> cs.primary
+                },
+                contentColor = when {
+                    !micEnabled -> cs.onSurface.copy(alpha = 0.38f)
+                    speechRecording -> cs.onError
+                    else -> cs.onPrimary
+                },
                 modifier = Modifier.size(96.dp)
             ) {
                 Box(contentAlignment = Alignment.Center) {
@@ -1976,15 +1960,18 @@ internal fun VoiceFirstComposer(
                 style = MaterialTheme.typography.titleMedium,
                 color = when {
                     speechStatusIsError -> cs.error
-                    // Match the disabled mic and "Type instead" once the answer is locked.
-                    !micEnabled -> cs.onSurface.copy(alpha = 0.38f)
+                    !micEnabled && speechStatusText == null -> cs.onSurface.copy(alpha = 0.38f)
                     else -> cs.onSurface
                 }
             )
         }
 
         if (!speechRecording && !speechTranscribing) {
-            TextButton(onClick = onTypeInstead, enabled = enabled) {
+            TextButton(
+                onClick = onTypeInstead,
+                enabled = enabled,
+                colors = ButtonDefaults.textButtonColors(contentColor = cs.onSurface)
+            ) {
                 Icon(Icons.Filled.Keyboard, contentDescription = null, modifier = Modifier.size(18.dp))
                 Spacer(Modifier.width(6.dp))
                 Text(if (hasAnswer) "Edit by typing" else "Type instead")
@@ -1996,8 +1983,7 @@ internal fun VoiceFirstComposer(
 /* ─────────────────────────── Visual utilities ───────────────────────────── */
 
 @Composable
-private fun animatedMonotoneBackplate(): Brush {
-    val mono = monotoneColors()
+private fun animatedOutdoorBackplate(): Brush {
     val t = rememberInfiniteTransition(label = "bg-mono")
     val p by t.animateFloat(
         initialValue = 0f,
@@ -2013,35 +1999,9 @@ private fun animatedMonotoneBackplate(): Brush {
     val endY = 820f - 180f * p
 
     return Brush.linearGradient(
-        colors = mono.introBgStops,
+        colors = outdoorGradientStops(),
         start = Offset(0f, 0f),
         end = Offset(endX, endY)
-    )
-}
-
-@Composable
-private fun Modifier.neutralEdge(
-    alpha: Float = 0.16f,
-    corner: Dp = 12.dp,
-    stroke: Dp = 1.dp
-): Modifier {
-    val mono = monotoneColors()
-    return this.then(
-        Modifier.drawBehind {
-            val cr = CornerRadius(corner.toPx(), corner.toPx())
-            val sweep = Brush.sweepGradient(
-                0f to mono.edgeSweepDark.copy(alpha = alpha),
-                0.25f to mono.edgeSweepMid.copy(alpha = alpha),
-                0.5f to mono.cardBorderMid.copy(alpha = alpha * 0.9f),
-                0.75f to mono.edgeSweepMid.copy(alpha = alpha),
-                1f to mono.edgeSweepDark.copy(alpha = alpha)
-            )
-            drawRoundRect(
-                brush = sweep,
-                style = Stroke(width = stroke.toPx()),
-                cornerRadius = cr
-            )
-        }
     )
 }
 

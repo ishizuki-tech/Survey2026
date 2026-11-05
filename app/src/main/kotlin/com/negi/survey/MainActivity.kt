@@ -33,22 +33,19 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.Crossfade
-import androidx.compose.animation.core.LinearEasing
-import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.animateFloat
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
-import androidx.compose.animation.core.tween
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
@@ -65,6 +62,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.NavigateBefore
 import androidx.compose.material.icons.automirrored.outlined.NavigateNext
 import androidx.compose.material.icons.automirrored.outlined.Send
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Stop
@@ -73,9 +71,9 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LocalTonalElevationEnabled
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -86,6 +84,7 @@ import androidx.compose.material3.SnackbarResult
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
@@ -107,10 +106,11 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.Dp
@@ -159,7 +159,8 @@ import com.negi.survey.slm.SLM
 import com.negi.survey.slm.buildModelConfig
 import com.negi.survey.slm.modelIdentityForPath
 import com.negi.survey.ui.theme.SurveyNavTheme
-import com.negi.survey.ui.theme.monotoneColors
+import com.negi.survey.ui.theme.neutralEdge
+import com.negi.survey.ui.theme.outdoorBackplate
 import com.negi.survey.vm.AiViewModel
 import com.negi.survey.vm.AppViewModel
 import com.negi.survey.vm.DlState
@@ -178,7 +179,6 @@ import com.negi.survey.vm.NoOpQuestionSpeaker
 import com.negi.survey.vm.NodeType
 import com.negi.survey.vm.QuestionSpeaker
 import com.negi.survey.vm.SurveyViewModel
-import com.negi.survey.ui.theme.ActionBlue
 import com.negi.survey.vm.decomposeSingleChoiceAnswer
 import com.negi.survey.vm.composeSingleChoiceAnswer
 import com.negi.survey.vm.isValidNumberAnswer
@@ -308,15 +308,6 @@ class MainActivity : ComponentActivity() {
 /* ───────────────────────────── Visual Utilities ───────────────────────────── */
 
 @Composable
-private fun appBackplate(): Brush {
-    val mono = monotoneColors()
-    return Brush.verticalGradient(
-        0f to mono.screenTop,
-        1f to mono.screenBottom
-    )
-}
-
-@Composable
 private fun Modifier.neonEdgeThin(
     color: Color = MaterialTheme.colorScheme.primary,
     intensity: Float = 0.035f,
@@ -335,32 +326,6 @@ private fun Modifier.neonEdgeThin(
         )
     }
 )
-
-@Composable
-private fun Modifier.neutralEdge(
-    alpha: Float = 0.16f,
-    corner: Dp = 12.dp,
-    stroke: Dp = 1.dp
-): Modifier {
-    val mono = monotoneColors()
-    return this.then(
-        Modifier.drawBehind {
-            val cr = CornerRadius(corner.toPx(), corner.toPx())
-            val sweep = Brush.sweepGradient(
-                0f to mono.edgeSweepDark.copy(alpha = alpha),
-                0.25f to mono.edgeSweepMid.copy(alpha = alpha),
-                0.5f to mono.cardBorderMid.copy(alpha = alpha * 0.9f),
-                0.75f to mono.edgeSweepMid.copy(alpha = alpha),
-                1f to mono.edgeSweepDark.copy(alpha = alpha)
-            )
-            drawRoundRect(
-                brush = sweep,
-                style = Stroke(width = stroke.toPx()),
-                cornerRadius = cr
-            )
-        }
-    )
-}
 
 /* ───────────────────────────── Init Gate ───────────────────────────── */
 
@@ -408,7 +373,7 @@ fun InitGate(
         kick()
     }
 
-    val backplate = appBackplate()
+    val backplate = outdoorBackplate()
 
     when {
         gate.phase == InitializationUiState.Phase.LOADING -> {
@@ -430,30 +395,22 @@ fun InitGate(
                         .neonEdgeThin()
                 ) {
                     Column(
-                        modifier = Modifier.padding(horizontal = 24.dp, vertical = 20.dp),
+                        modifier = Modifier
+                            .verticalScroll(rememberScrollState())
+                            .padding(horizontal = 24.dp, vertical = 20.dp),
                         horizontalAlignment = Alignment.CenterHorizontally
                     ) {
                         CircularProgressIndicator(
                             modifier = Modifier.size(28.dp),
+                            color = MaterialTheme.colorScheme.outline,
                             trackColor = MaterialTheme.colorScheme.surfaceVariant
                         )
                         Spacer(Modifier.height(14.dp))
 
-                        val pulse = rememberInfiniteTransition(label = "init_gate_pulse")
-                        val alpha by pulse.animateFloat(
-                            initialValue = 0.35f,
-                            targetValue = 1f,
-                            animationSpec = infiniteRepeatable(
-                                animation = tween(durationMillis = 1100, easing = LinearEasing),
-                                repeatMode = RepeatMode.Reverse
-                            ),
-                            label = "init_gate_alpha"
-                        )
-
                         Text(
                             text = progressText,
                             style = MaterialTheme.typography.titleMedium,
-                            color = MaterialTheme.colorScheme.primary.copy(alpha = alpha)
+                            color = MaterialTheme.colorScheme.onSurface
                         )
                         Spacer(Modifier.height(6.dp))
                         Text(
@@ -488,7 +445,9 @@ fun InitGate(
                         )
                 ) {
                     Column(
-                        modifier = Modifier.padding(horizontal = 24.dp, vertical = 20.dp),
+                        modifier = Modifier
+                            .verticalScroll(rememberScrollState())
+                            .padding(horizontal = 24.dp, vertical = 20.dp),
                         horizontalAlignment = Alignment.CenterHorizontally
                     ) {
                         Text(
@@ -497,7 +456,10 @@ fun InitGate(
                             color = MaterialTheme.colorScheme.error
                         )
                         Spacer(Modifier.height(12.dp))
-                        OutlinedButton(onClick = { onRetry(error) { kick() } }) {
+                        OutlinedButton(
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.onSurface),
+                            onClick = { onRetry(error) { kick() } }
+                        ) {
                             Text(retryLabel(error))
                         }
                     }
@@ -593,7 +555,7 @@ fun AudioPermissionGate(
         return
     }
 
-    val backplate = appBackplate()
+    val backplate = outdoorBackplate()
 
     Box(
         modifier = modifier
@@ -616,14 +578,16 @@ fun AudioPermissionGate(
                 .neonEdgeThin()
         ) {
             Column(
-                modifier = Modifier.padding(horizontal = 24.dp, vertical = 20.dp),
+                modifier = Modifier
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 24.dp, vertical = 20.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
                 Icon(
                     imageVector = Icons.Filled.Mic,
                     contentDescription = "Microphone",
-                    tint = MaterialTheme.colorScheme.primary,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.size(32.dp)
                 )
                 Text(
@@ -637,9 +601,8 @@ fun AudioPermissionGate(
                 )
                 Button(
                     onClick = { launcher.launch(permission) },
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = MaterialTheme.colorScheme.primary
-                    )
+                    modifier = Modifier.heightIn(min = 56.dp),
+                    shape = MaterialTheme.shapes.medium
                 ) {
                     Text("Allow microphone")
                 }
@@ -797,7 +760,7 @@ fun AppNav() {
         }
     }
 
-    val backplate = appBackplate()
+    val backplate = outdoorBackplate()
 
     when {
         configLoading || (config == null && configError == null) -> {
@@ -828,11 +791,14 @@ fun AppNav() {
                         .neonEdgeThin()
                 ) {
                     Column(
-                        modifier = Modifier.padding(horizontal = 24.dp, vertical = 20.dp),
+                        modifier = Modifier
+                            .verticalScroll(rememberScrollState())
+                            .padding(horizontal = 24.dp, vertical = 20.dp),
                         horizontalAlignment = Alignment.CenterHorizontally
                     ) {
                         CircularProgressIndicator(
                             modifier = Modifier.size(28.dp),
+                            color = MaterialTheme.colorScheme.outline,
                             trackColor = MaterialTheme.colorScheme.surfaceVariant
                         )
                         Spacer(Modifier.height(14.dp))
@@ -874,7 +840,9 @@ fun AppNav() {
                         )
                 ) {
                     Column(
-                        modifier = Modifier.padding(horizontal = 24.dp, vertical = 20.dp),
+                        modifier = Modifier
+                            .verticalScroll(rememberScrollState())
+                            .padding(horizontal = 24.dp, vertical = 20.dp),
                         horizontalAlignment = Alignment.CenterHorizontally
                     ) {
                         Text(
@@ -884,6 +852,7 @@ fun AppNav() {
                         )
                         Spacer(Modifier.height(12.dp))
                         OutlinedButton(
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.onSurface),
                             onClick = {
                                 Log.d(MainActivity.TAG, "Error -> Back to selector. session=$sessionKey")
                                 sessionStore.clearSession(sessionKey)
@@ -969,7 +938,7 @@ fun AppNav() {
                 modifier = Modifier.fillMaxSize().imePadding(),
                 contentAlignment = Alignment.Center
             ) {
-                CircularProgressIndicator()
+                CircularProgressIndicator(color = MaterialTheme.colorScheme.outline)
             }
         } else {
             TtsEngineMissingScreen(
@@ -1572,7 +1541,10 @@ fun SurveyNavHost(
                             title = { Text("Survey exit incomplete") },
                             text = { Text(message) },
                             confirmButton = {
-                                TextButton(onClick = { retryHomeExit() }) { Text("Retry Back") }
+                                TextButton(
+                                    onClick = { retryHomeExit() },
+                                    colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.onSurface)
+                                ) { Text("Retry Back") }
                             },
                         )
                     }
@@ -1889,7 +1861,7 @@ private fun InfoNodeScreen(
     onReplay: () -> Unit = {},
     isSpeaking: Boolean = false,
 ) {
-    val backplate = appBackplate()
+    val backplate = outdoorBackplate()
     val scroll = rememberScrollState()
 
     Box(
@@ -1955,7 +1927,7 @@ private fun StopNodeScreen(
     message: String,
     onRestart: () -> Unit,
 ) {
-    val backplate = appBackplate()
+    val backplate = outdoorBackplate()
 
     Box(
         modifier = Modifier
@@ -2012,7 +1984,7 @@ internal fun TextNodeScreen(
     onReplay: () -> Unit = {},
     isSpeaking: Boolean = false
 ) {
-    val backplate = appBackplate()
+    val backplate = outdoorBackplate()
     val scroll = rememberScrollState()
     val focusRequester = remember { FocusRequester() }
     val keyboardController = LocalSoftwareKeyboardController.current
@@ -2071,6 +2043,8 @@ internal fun TextNodeScreen(
                     modifier = Modifier
                         .fillMaxWidth()
                         .focusRequester(focusRequester),
+                    colors = questionFieldColors(),
+                    textStyle = MaterialTheme.typography.bodyLarge,
                     minLines = 3
                 )
 
@@ -2102,7 +2076,7 @@ internal fun SingleChoiceNodeScreen(
     isSpeaking: Boolean = false,
     consentScroll: ConsentScrollState? = null
 ) {
-    val backplate = appBackplate()
+    val backplate = outdoorBackplate()
     val scroll = consentScroll?.scroll ?: rememberScrollState()
     val scrollInteraction = consentScroll?.scrollInteraction() ?: Modifier
     var otherText by rememberSaveable(question, otherTextOption) { mutableStateOf(initialOtherText) }
@@ -2168,16 +2142,12 @@ internal fun SingleChoiceNodeScreen(
                     )
                 } else {
                     options.forEach { opt ->
-                        val isSel = (selected == opt)
-                        if (isSel) {
-                            Button(onClick = { onSelect(null) }, modifier = Modifier.fillMaxWidth()) {
-                                Text(opt)
-                            }
-                        } else {
-                            OutlinedButton(onClick = { onSelect(opt) }, modifier = Modifier.fillMaxWidth()) {
-                                Text(opt)
-                            }
-                        }
+                        val isSelected = selected == opt
+                        AnswerOption(
+                            label = opt,
+                            isSelected = isSelected,
+                            onClick = { onSelect(if (isSelected) null else opt) }
+                        )
                     }
                 }
 
@@ -2186,6 +2156,8 @@ internal fun SingleChoiceNodeScreen(
                         value = otherText,
                         onValueChange = { otherText = it },
                         modifier = Modifier.fillMaxWidth(),
+                        colors = questionFieldColors(),
+                        textStyle = MaterialTheme.typography.bodyLarge,
                         label = { Text("Other details") },
                         singleLine = true,
                     )
@@ -2220,7 +2192,7 @@ private fun NumberNodeScreen(
     onReplay: () -> Unit = {},
     isSpeaking: Boolean = false,
 ) {
-    val backplate = appBackplate()
+    val backplate = outdoorBackplate()
     val scroll = rememberScrollState()
     val isSpecialAnswer = value in specialOptions
     val focusRequester = remember { FocusRequester() }
@@ -2276,21 +2248,20 @@ private fun NumberNodeScreen(
                     modifier = Modifier
                         .fillMaxWidth()
                         .focusRequester(focusRequester),
+                    colors = questionFieldColors(),
+                    textStyle = MaterialTheme.typography.bodyLarge,
                     label = { Text("Number") },
                     singleLine = true,
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                 )
 
                 specialOptions.forEach { option ->
-                    if (value == option) {
-                        Button(onClick = { onValueChange("") }, modifier = Modifier.fillMaxWidth()) {
-                            Text(option)
-                        }
-                    } else {
-                        OutlinedButton(onClick = { onSpecialSelect(option) }, modifier = Modifier.fillMaxWidth()) {
-                            Text(option)
-                        }
-                    }
+                    val isSelected = value == option
+                    AnswerOption(
+                        label = option,
+                        isSelected = isSelected,
+                        onClick = { if (isSelected) onValueChange("") else onSpecialSelect(option) }
+                    )
                 }
 
                 Spacer(Modifier.height(10.dp))
@@ -2307,7 +2278,7 @@ private fun NumberNodeScreen(
 }
 
 @Composable
-private fun MultiChoiceNodeScreen(
+internal fun MultiChoiceNodeScreen(
     title: String,
     question: String,
     options: List<String>,
@@ -2318,7 +2289,7 @@ private fun MultiChoiceNodeScreen(
     onReplay: () -> Unit = {},
     isSpeaking: Boolean = false
 ) {
-    val backplate = appBackplate()
+    val backplate = outdoorBackplate()
     val scroll = rememberScrollState()
 
     Box(
@@ -2374,16 +2345,7 @@ private fun MultiChoiceNodeScreen(
                     )
                 } else {
                     options.forEach { opt ->
-                        val isSel = opt in selected
-                        if (isSel) {
-                            Button(onClick = { onToggle(opt) }, modifier = Modifier.fillMaxWidth()) {
-                                Text(opt)
-                            }
-                        } else {
-                            OutlinedButton(onClick = { onToggle(opt) }, modifier = Modifier.fillMaxWidth()) {
-                                Text(opt)
-                            }
-                        }
+                        AnswerOption(label = opt, isSelected = opt in selected, onClick = { onToggle(opt) })
                     }
                 }
 
@@ -2401,6 +2363,45 @@ private fun MultiChoiceNodeScreen(
 }
 
 @Composable
+private fun questionFieldColors() = with(MaterialTheme.colorScheme) {
+    OutlinedTextFieldDefaults.colors(
+        cursorColor = onSurface,
+        focusedBorderColor = outline,
+        focusedLabelColor = onSurface
+    )
+}
+
+@Composable
+private fun AnswerOption(label: String, isSelected: Boolean, onClick: () -> Unit) {
+    val colors = MaterialTheme.colorScheme
+    // The surrounding card has tonal elevation. Options use the exact surface colors.
+    CompositionLocalProvider(LocalTonalElevationEnabled provides false) {
+        OutlinedButton(
+            onClick = onClick,
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(min = 56.dp)
+                .semantics { selected = isSelected },
+            shape = MaterialTheme.shapes.medium,
+            border = BorderStroke(if (isSelected) 2.dp else 1.dp, colors.outline),
+            colors = ButtonDefaults.outlinedButtonColors(
+                containerColor = if (isSelected) colors.primaryContainer else colors.surface,
+                contentColor = if (isSelected) colors.onPrimaryContainer else colors.onSurface
+            ),
+            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp)
+        ) {
+            Text(label, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
+            Spacer(Modifier.width(8.dp))
+            if (isSelected) {
+                Icon(Icons.Filled.Check, contentDescription = null, modifier = Modifier.size(20.dp))
+            } else {
+                Spacer(Modifier.width(20.dp))
+            }
+        }
+    }
+}
+
+@Composable
 private fun RowButtons(
     primaryLabel: String,
     onPrimary: () -> Unit,
@@ -2408,14 +2409,15 @@ private fun RowButtons(
     secondaryLabel: String,
     onSecondary: () -> Unit
 ) {
-    Row(
+    FlowRow(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment = Alignment.CenterVertically
+        verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
-        FilledTonalButton(
+        OutlinedButton(
             onClick = onSecondary,
-            shape = CircleShape,
+            colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.onSurface),
+            shape = MaterialTheme.shapes.medium,
             contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp)
         ) {
             Icon(
@@ -2426,11 +2428,11 @@ private fun RowButtons(
             Text(secondaryLabel)
         }
 
-        FilledTonalButton(
+        Button(
             onClick = onPrimary,
             enabled = primaryEnabled,
-            colors = ButtonDefaults.filledTonalButtonColors(containerColor = ActionBlue, contentColor = Color.Black),
-            shape = CircleShape,
+            modifier = Modifier.heightIn(min = 56.dp),
+            shape = MaterialTheme.shapes.medium,
             contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp)
         ) {
             Text(primaryLabel)
@@ -2498,6 +2500,7 @@ private fun HomeFreeTextComposer(
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
                 keyboardActions = KeyboardActions(onSend = { onSend() }),
                 colors = OutlinedTextFieldDefaults.colors(
+                    cursorColor = cs.onSurface,
                     unfocusedContainerColor = Color.Transparent,
                     focusedContainerColor = Color.Transparent,
                     disabledContainerColor = Color.Transparent,
@@ -2547,15 +2550,16 @@ private fun HomeFreeTextComposer(
             )
         }
 
-        Row(
+        FlowRow(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
+            verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            FilledTonalButton(
+            OutlinedButton(
                 onClick = onBack,
                 enabled = backEnabled,
-                shape = CircleShape,
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.onSurface),
+                shape = MaterialTheme.shapes.medium,
                 contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp)
             ) {
                 Icon(
@@ -2566,11 +2570,11 @@ private fun HomeFreeTextComposer(
                 Text("Back")
             }
 
-            FilledTonalButton(
+            Button(
                 onClick = onSend,
                 enabled = enabled,
-                colors = ButtonDefaults.filledTonalButtonColors(containerColor = ActionBlue, contentColor = Color.Black),
-                shape = CircleShape,
+                modifier = Modifier.heightIn(min = 56.dp),
+                shape = MaterialTheme.shapes.medium,
                 contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp)
             ) {
                 Text("Start")
@@ -2598,7 +2602,7 @@ private fun HomeScreen(
     backEnabled: Boolean = true,
     onUpdateFreeText: (String) -> Unit
 ) {
-    val backplate = appBackplate()
+    val backplate = outdoorBackplate()
     val focusManager = LocalFocusManager.current
 
     val surveyUuid by vmSurvey.surveyUuid.collectAsStateWithLifecycle()
@@ -3205,7 +3209,7 @@ private fun PlaceholderScreen(
     title: String,
     subtitle: String
 ) {
-    val backplate = appBackplate()
+    val backplate = outdoorBackplate()
 
     Box(
         modifier = Modifier

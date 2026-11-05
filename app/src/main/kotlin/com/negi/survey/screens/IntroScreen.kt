@@ -84,12 +84,10 @@ import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
-import com.negi.survey.ui.theme.ActionBlue
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.DividerDefaults
 import androidx.compose.material3.ElevatedCard
-import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -123,6 +121,8 @@ import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
@@ -132,7 +132,7 @@ import androidx.compose.ui.unit.sp
 import com.negi.survey.BuildConfig
 import com.negi.survey.vm.DeferredLegacyRecoveryEntry
 import com.negi.survey.vm.LegacyRecoveryLocalStatus
-import com.negi.survey.ui.theme.monotoneColors
+import com.negi.survey.ui.theme.outdoorGradientStops
 import com.negi.survey.vm.UploadStatus
 import com.negi.survey.vm.UploadStatusDetails
 import com.negi.survey.vm.UploadStatusEntry
@@ -246,15 +246,11 @@ private fun IntroCardMono(
     val cs = MaterialTheme.colorScheme
     val corner = 20.dp
 
-    /** Readability palette (shared light/dark monotone tokens). */
-    val mono = monotoneColors()
-    val textPrimary = mono.textPrimary
-    val textSecondary = mono.textSecondary
-    val textMuted = mono.textMuted
-    val textHint = mono.textHint
+    val textPrimary = cs.onSurface
+    val textSecondary = cs.onSurfaceVariant
 
     /** A slightly stronger card scrim to lift text from the animated background. */
-    val cardBg = mono.cardBg.copy(alpha = 0.86f)
+    val cardBg = cs.surface.copy(alpha = 0.86f)
 
     val optionIds = remember(options) { options.map { it.id } }
     val optionIdSet = remember(optionIds) { optionIds.toHashSet() }
@@ -325,9 +321,9 @@ private fun IntroCardMono(
             .wrapContentHeight()
             .wrapContentWidth()
             .drawBehind {
-                val dark = mono.cardBorderDark.copy(alpha = 0.65f)
-                val mid = mono.cardBorderMid.copy(alpha = 0.35f)
-                val light = mono.cardBorderLight.copy(alpha = 0.18f)
+                val dark = cs.outline.copy(alpha = 0.65f)
+                val mid = cs.outlineVariant.copy(alpha = 0.35f)
+                val light = cs.surfaceBright.copy(alpha = 0.18f)
                 val sweep = Brush.sweepGradient(
                     0f to dark,
                     0.25f to mid,
@@ -355,8 +351,8 @@ private fun IntroCardMono(
         ) {
             GradientHeadlineMono(
                 text = title,
-                colorTop = mono.headlineTop,
-                colorBottom = mono.headlineBottom
+                colorTop = cs.onSurface,
+                colorBottom = cs.onSurfaceVariant
             )
 
             Spacer(Modifier.padding(top = 14.dp))
@@ -382,9 +378,6 @@ private fun IntroCardMono(
                 uploadStatus = uploadStatus,
                 onResolveUploadStatusDetails = onResolveUploadStatusDetails,
                 onClearCompletedSurveys = onClearCompletedSurveys,
-                titleColor = textMuted,
-                countColor = textSecondary,
-                actionColor = mono.actionText
             )
 
             Spacer(Modifier.padding(top = 16.dp))
@@ -392,7 +385,7 @@ private fun IntroCardMono(
             Text(
                 text = "Select survey configuration",
                 style = MaterialTheme.typography.titleMedium.copy(letterSpacing = 0.2.sp),
-                color = textMuted,
+                color = cs.onSurfaceVariant,
                 modifier = Modifier
                     .align(Alignment.Start)
                     .padding(bottom = 8.dp)
@@ -414,9 +407,7 @@ private fun IntroCardMono(
                                     Log.d(TAG, "Config selected: ${selectedId} -> ${option.id}")
                                     selectedId = option.id
                                 }
-                            },
-                            textPrimary = textPrimary,
-                            textSecondary = textHint
+                            }
                         )
                         Spacer(Modifier.padding(top = 8.dp))
                     }
@@ -431,9 +422,6 @@ private fun IntroCardMono(
                 optionLabel = selectedOption.label,
                 optionDescription = selectedOption.description,
                 state = detailsState,
-                textPrimary = textPrimary,
-                textSecondary = textSecondary,
-                textMuted = textMuted,
                 onRetry = {
                     Log.d(TAG, "Retry resolve details: id=$selectedId")
                     detailsReloadEpoch = System.currentTimeMillis()
@@ -466,7 +454,7 @@ private fun IntroCardMono(
                 Text(
                     text = "About · Credits & licences",
                     style = MaterialTheme.typography.labelLarge.copy(letterSpacing = 0.2.sp),
-                    color = textMuted
+                    color = cs.onSurfaceVariant
                 )
             }
             if (showAbout) {
@@ -489,9 +477,9 @@ internal fun UploadStatusSummary(
     onResolveUploadStatusDetails: suspend () -> UploadStatusDetails,
     onClearCompletedSurveys: suspend (Set<String>) -> Unit,
     modifier: Modifier = Modifier,
-    titleColor: Color = monotoneColors().textMuted,
-    countColor: Color = monotoneColors().textSecondary,
-    actionColor: Color = monotoneColors().actionText,
+    titleColor: Color = MaterialTheme.colorScheme.onSurface,
+    countColor: Color = MaterialTheme.colorScheme.onSurfaceVariant,
+    actionColor: Color = MaterialTheme.colorScheme.onSurface,
 ) {
     var showUploadStatusDetails by remember { mutableStateOf(false) }
 
@@ -515,7 +503,7 @@ internal fun UploadStatusSummary(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Column(horizontalAlignment = Alignment.Start) {
+            Column(modifier = Modifier.weight(1f), horizontalAlignment = Alignment.Start) {
                 Text(
                     text = "Pending uploads: ${uploadStatus.pendingCount}",
                     style = MaterialTheme.typography.bodySmall,
@@ -659,9 +647,10 @@ private fun UploadStatusDetailsDialog(
              * one full-width row, spread to opposite ends — Material3's AlertDialog always
              * clusters confirmButton/dismissButton together otherwise.
              */
-            Row(
+            FlowRow(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 TextButton(
                     onClick = {
@@ -684,12 +673,16 @@ private fun UploadStatusDetailsDialog(
                         }
                     },
                     enabled = state is UploadStatusDetailsState.Ready && !clearing,
+                    colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error),
                     contentPadding = ButtonDefaults.TextButtonContentPadding,
                     modifier = Modifier.testTag("ClearCompletedUploadsButton")
                 ) {
                     Text("Clear List")
                 }
-                TextButton(onClick = onDismiss) { Text("Close") }
+                TextButton(
+                    onClick = onDismiss,
+                    colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.onSurface)
+                ) { Text("Close") }
             }
         }
     )
@@ -733,6 +726,7 @@ private fun DeferredLegacyRecoverySection(
             )
             TextButton(
                 onClick = onRefresh,
+                colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.onSurface),
                 contentPadding = ButtonDefaults.TextButtonContentPadding,
                 modifier = Modifier.testTag("RefreshLegacyRecoveryStatusButton"),
             ) {
@@ -838,14 +832,11 @@ private fun SelectedConfigDetailsMono(
     optionLabel: String,
     optionDescription: String,
     state: ResolvedDetailsState,
-    textPrimary: Color,
-    textSecondary: Color,
-    textMuted: Color,
     onRetry: () -> Unit,
 ) {
-    val mono = monotoneColors()
-    val bg = mono.detailsPanelBg.copy(alpha = 0.85f)
-    val border = mono.detailsPanelBorder.copy(alpha = 0.35f)
+    val cs = MaterialTheme.colorScheme
+    val bg = cs.surfaceContainerLow.copy(alpha = 0.85f)
+    val border = cs.outlineVariant.copy(alpha = 0.35f)
 
     var expanded by remember(configId) { mutableStateOf(false) }
 
@@ -881,7 +872,7 @@ private fun SelectedConfigDetailsMono(
                     Text(
                         text = "Loading config: $configId …",
                         style = MaterialTheme.typography.bodySmall.copy(lineHeight = 18.sp),
-                        color = mono.chipLabel,
+                        color = cs.onSurfaceVariant,
                         modifier = Modifier.testTag("ConfigDetailsLoading")
                     )
                 }
@@ -890,7 +881,7 @@ private fun SelectedConfigDetailsMono(
                     Text(
                         text = "Failed to load config: $configId",
                         style = MaterialTheme.typography.bodySmall.copy(lineHeight = 18.sp),
-                        color = mono.errorText,
+                        color = cs.error,
                         modifier = Modifier.testTag("ConfigDetailsErrorTitle")
                     )
 
@@ -899,7 +890,7 @@ private fun SelectedConfigDetailsMono(
                     Text(
                         text = (state.error.message ?: state.error::class.java.simpleName).take(240),
                         style = MaterialTheme.typography.bodySmall.copy(lineHeight = 18.sp),
-                        color = mono.errorTextMuted,
+                        color = cs.error,
                         modifier = Modifier.testTag("ConfigDetailsErrorMessage")
                     )
 
@@ -916,7 +907,7 @@ private fun SelectedConfigDetailsMono(
                             Text(
                                 text = "Retry",
                                 style = MaterialTheme.typography.labelLarge.copy(letterSpacing = 0.2.sp),
-                                color = mono.actionText
+                                color = cs.onSurface
                             )
                         }
                     }
@@ -928,7 +919,7 @@ private fun SelectedConfigDetailsMono(
                     Text(
                         text = d.summary,
                         style = MaterialTheme.typography.bodySmall.copy(lineHeight = 18.sp),
-                        color = mono.textSecondary,
+                        color = cs.onSurfaceVariant,
                         modifier = Modifier.testTag("ConfigDetailsSummary")
                     )
 
@@ -937,7 +928,7 @@ private fun SelectedConfigDetailsMono(
                     Text(
                         text = d.longText,
                         style = MaterialTheme.typography.bodySmall.copy(lineHeight = 18.sp),
-                        color = mono.chipLabel,
+                        color = cs.onSurfaceVariant,
                         modifier = Modifier.testTag("ConfigDetailsLongText")
                     )
                 }
@@ -946,10 +937,10 @@ private fun SelectedConfigDetailsMono(
             Spacer(Modifier.padding(top = 10.dp))
         }
 
-        Row(
+        FlowRow(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
+            verticalArrangement = Arrangement.spacedBy(4.dp)
         ) {
             MetaChipMono(label = "id", value = configId)
 
@@ -972,7 +963,7 @@ private fun SelectedConfigDetailsMono(
                 Text(
                     text = if (expanded) "Show less" else "Show more",
                     style = MaterialTheme.typography.labelLarge.copy(letterSpacing = 0.2.sp),
-                    color = mono.actionText
+                    color = cs.onSurface
                 )
             }
         }
@@ -988,15 +979,15 @@ private fun SelectedConfigDetailsMono(
  */
 @Composable
 private fun MetaChipMono(label: String, value: String) {
-    val mono = monotoneColors()
+    val cs = MaterialTheme.colorScheme
     val safeLabel = remember(label) { label.safeTestTagToken(32) }
 
     Row(
         modifier = Modifier
             .clip(RoundedCornerShape(999.dp))
-            .background(mono.chipBg)
+            .background(cs.surfaceContainerHigh)
             .border(
-                BorderStroke(1.dp, mono.chipBorder.copy(alpha = 0.35f)),
+                BorderStroke(1.dp, cs.outlineVariant.copy(alpha = 0.35f)),
                 RoundedCornerShape(999.dp)
             )
             .padding(horizontal = 10.dp, vertical = 6.dp)
@@ -1005,7 +996,7 @@ private fun MetaChipMono(label: String, value: String) {
         Text(
             text = "$label: ",
             style = MaterialTheme.typography.labelSmall.copy(letterSpacing = 0.2.sp),
-            color = mono.chipLabel
+            color = cs.onSurfaceVariant
         )
         Text(
             text = value,
@@ -1013,7 +1004,7 @@ private fun MetaChipMono(label: String, value: String) {
                 fontWeight = FontWeight.SemiBold,
                 letterSpacing = 0.2.sp
             ),
-            color = mono.chipValue,
+            color = cs.onSurface,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis
         )
@@ -1031,19 +1022,18 @@ private fun CtaRowMono(
     onRestart: (() -> Unit)?,
 ) {
     var confirmRestart by remember { mutableStateOf(false) }
-    val mono = monotoneColors()
+    val cs = MaterialTheme.colorScheme
 
-    Row(
+    FlowRow(
         modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.Center,
-        verticalAlignment = Alignment.CenterVertically
+        horizontalArrangement = Arrangement.spacedBy(12.dp, Alignment.CenterHorizontally),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
-        FilledTonalButton(
+        Button(
             onClick = onStart,
-            colors = ButtonDefaults.filledTonalButtonColors(containerColor = ActionBlue, contentColor = Color.Black),
-            shape = CircleShape,
+            shape = MaterialTheme.shapes.medium,
             contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp),
-            modifier = Modifier.testTag("StartButton")
+            modifier = Modifier.heightIn(min = 56.dp).testTag("StartButton")
         ) {
             Text("Start")
             Spacer(Modifier.width(8.dp))
@@ -1054,14 +1044,12 @@ private fun CtaRowMono(
         }
 
         if (showRestart && onRestart != null) {
-            Spacer(Modifier.width(12.dp))
-
             OutlinedButton(
                 enabled = !isRestarting,
                 onClick = { confirmRestart = true },
-                border = BorderStroke(1.dp, mono.outlineBorder.copy(alpha = 0.65f)),
+                shape = MaterialTheme.shapes.medium,
                 colors = ButtonDefaults.outlinedButtonColors(
-                    contentColor = mono.outlineContent
+                    contentColor = cs.onSurface
                 ),
                 modifier = Modifier.testTag("RestartButton")
             ) {
@@ -1093,7 +1081,10 @@ private fun CtaRowMono(
                 ) { Text("Restart") }
             },
             dismissButton = {
-                TextButton(onClick = { confirmRestart = false }) { Text("Cancel") }
+                TextButton(
+                    onClick = { confirmRestart = false },
+                    colors = ButtonDefaults.textButtonColors(contentColor = cs.onSurface)
+                ) { Text("Cancel") }
             }
         )
     }
@@ -1135,26 +1126,20 @@ private fun GradientHeadlineMono(
 private fun MonoConfigOptionChip(
     option: ConfigOptionUi,
     selected: Boolean,
-    onClick: () -> Unit,
-    textPrimary: Color,
-    textSecondary: Color
+    onClick: () -> Unit
 ) {
-    val mono = monotoneColors()
-    val background = if (selected) mono.optionSelectedBg else mono.optionUnselectedBg
-    val borderColor = if (selected) {
-        mono.optionSelectedBorder.copy(alpha = 0.90f)
-    } else {
-        mono.optionUnselectedBorder.copy(alpha = 0.55f)
-    }
-    val labelColor = if (selected) textPrimary else mono.optionUnselectedLabel
+    val cs = MaterialTheme.colorScheme
+    val background = if (selected) cs.primaryContainer else cs.surface
+    val labelColor = if (selected) cs.onPrimaryContainer else cs.onSurface
 
     Row(
         modifier = Modifier
             .fillMaxWidth()
             .defaultMinSize(minHeight = 56.dp)
-            .clip(RoundedCornerShape(14.dp))
+            .clip(MaterialTheme.shapes.medium)
             .background(background)
-            .border(BorderStroke(1.dp, borderColor), RoundedCornerShape(14.dp))
+            .border(BorderStroke(if (selected) 2.dp else 1.dp, cs.outline), MaterialTheme.shapes.medium)
+            .semantics { this.selected = selected }
             .clickable(
                 indication = null,
                 interactionSource = remember { MutableInteractionSource() },
@@ -1171,12 +1156,9 @@ private fun MonoConfigOptionChip(
             Text(
                 text = option.label,
                 style = MaterialTheme.typography.titleMedium.copy(
-                    fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
-                    lineHeight = 22.sp
+                    fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium
                 ),
-                color = labelColor,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
+                color = labelColor
             )
         }
 
@@ -1188,11 +1170,11 @@ private fun MonoConfigOptionChip(
                     .drawBehind {
                         val strokeWidth = 1.6.dp.toPx()
                         drawCircle(
-                            color = mono.optionSelectedBorder.copy(alpha = 0.88f),
+                            color = cs.onPrimaryContainer,
                             style = Stroke(width = strokeWidth)
                         )
                         drawCircle(
-                            color = mono.optionSelectedBorder.copy(alpha = 0.88f),
+                            color = cs.onPrimaryContainer,
                             radius = size.minDimension / 2.5f
                         )
                     }
@@ -1219,13 +1201,11 @@ private fun animatedMonotoneBackground(): Brush {
         label = "mono-bg-p"
     )
 
-    val mono = monotoneColors()
-
     val endX = 900f + 280f * p
     val endY = 720f - 220f * p
 
     return Brush.linearGradient(
-        colors = mono.introBgStops,
+        colors = outdoorGradientStops(),
         start = Offset(0f, 0f),
         end = Offset(endX, endY)
     )

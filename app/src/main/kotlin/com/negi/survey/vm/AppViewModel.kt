@@ -30,22 +30,25 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.negi.survey.utils.HeavyInitializer
-import com.negi.survey.ui.theme.monotoneColors
+import com.negi.survey.ui.theme.outdoorBackplate
 import com.negi.survey.utils.PersistentModelStore
 import java.io.File
 import kotlinx.coroutines.CancellationException
@@ -527,7 +530,7 @@ fun DownloadGate(
             Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .background(downloadGateBackplate())
+                    .background(outdoorBackplate())
             )
         }
 
@@ -547,13 +550,15 @@ fun DownloadGate(
             Column(
                 modifier = Modifier
                     .fillMaxSize()
-                    .background(downloadGateBackplate())
+                    .background(outdoorBackplate())
+                    .verticalScroll(rememberScrollState())
                     .padding(24.dp),
                 verticalArrangement = Arrangement.Center
             ) {
                 Text("Copying the selected file…")
                 Spacer(Modifier.height(12.dp))
                 LinearProgressIndicator(
+                    color = MaterialTheme.colorScheme.outline,
                     modifier = Modifier.fillMaxWidth()
                 )
             }
@@ -570,7 +575,8 @@ fun DownloadGate(
             Column(
                 modifier = Modifier
                     .fillMaxSize()
-                    .background(downloadGateBackplate())
+                    .background(outdoorBackplate())
+                    .verticalScroll(rememberScrollState())
                     .padding(24.dp),
                 verticalArrangement = Arrangement.Center
             ) {
@@ -579,6 +585,7 @@ fun DownloadGate(
 
                 if (pct != null) {
                     LinearProgressIndicator(
+                        color = MaterialTheme.colorScheme.outline,
                         progress = { (pct / 100f).coerceIn(0f, 1f) },
                         modifier = Modifier.fillMaxWidth()
                     )
@@ -586,6 +593,7 @@ fun DownloadGate(
                     Text("$pct%  ($got / $total bytes)")
                 } else {
                     LinearProgressIndicator(
+                        color = MaterialTheme.colorScheme.outline,
                         modifier = Modifier.fillMaxWidth()
                     )
                     Spacer(Modifier.height(8.dp))
@@ -598,7 +606,8 @@ fun DownloadGate(
             Column(
                 modifier = Modifier
                     .fillMaxSize()
-                    .background(downloadGateBackplate())
+                    .background(outdoorBackplate())
+                    .verticalScroll(rememberScrollState())
                     .padding(24.dp),
                 verticalArrangement = Arrangement.Center
             ) {
@@ -614,24 +623,6 @@ fun DownloadGate(
             content(state.file)
         }
     }
-}
-
-/**
- * The same backdrop used by the Intro/config-loading/model-init screens (see
- * MainActivity's appBackplate()), duplicated here so this pre-survey "loading
- * phase" of the flow stays visually consistent with the screen before it
- * (Intro) and never falls back to the app theme's default Surface background
- * underneath for a frame — which previously caused a brief flash when they
- * didn't match. Follows the system Light/Dark setting via [monotoneColors],
- * same as appBackplate() and IntroScreen.
- */
-@Composable
-private fun downloadGateBackplate(): Brush {
-    val mono = monotoneColors()
-    return Brush.verticalGradient(
-        0f to mono.screenTop,
-        1f to mono.screenBottom
-    )
 }
 
 /**
@@ -696,12 +687,18 @@ private fun ManualModelSelectionDialog(
             )
         },
         confirmButton = {
-            TextButton(onClick = { filePickerLauncher.launch(arrayOf("*/*")) }) {
+            TextButton(
+                onClick = { filePickerLauncher.launch(arrayOf("*/*")) },
+                colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.onSurface)
+            ) {
                 Text("Select File")
             }
         },
         dismissButton = {
-            TextButton(onClick = onSkip) {
+            TextButton(
+                onClick = onSkip,
+                colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.onSurface)
+            ) {
                 Text("Download New")
             }
         }
