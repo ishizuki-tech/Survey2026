@@ -140,10 +140,12 @@ import com.negi.survey.net.GitHubUploadTargetPolicy
 import com.negi.survey.net.GitHubUploader
 import com.negi.survey.screens.AiScreen
 import com.negi.survey.screens.ConfigOptionUi
+import com.negi.survey.screens.ConsentScrollState
 import com.negi.survey.screens.DoneScreen
 import com.negi.survey.screens.IntroScreen
 import com.negi.survey.screens.ReviewScreen
 import com.negi.survey.screens.SpeechController
+import com.negi.survey.screens.rememberConsentScrollState
 import com.negi.survey.screens.toggleSpeechRecordingWithTtsInterlock
 import com.negi.survey.runtime.HeavyRuntimeHandoff
 import com.negi.survey.runtime.NoOpHeavyRuntimeHandoff
@@ -1371,8 +1373,9 @@ fun SurveyNavHost(
     val latestNode by vmSurvey.currentNode.collectAsStateWithLifecycle()
     val latestNodeId = latestNode.id
 
-    /** Keep SpeechController aligned with the real survey run id. */
+    /** The run UUID also scopes Q00 scroll restoration. */
     val surveyUuid by vmSurvey.surveyUuid.collectAsStateWithLifecycle()
+    val consentScroll = rememberConsentScrollState(surveyUuid)
 
     /**
      * Defensive persistence:
@@ -1724,7 +1727,8 @@ fun SurveyNavHost(
                         },
                         onBack = { runCatching { ttsController.stop() }; vmSurvey.backToPrevious() },
                         onReplay = { toggleQuestionSpeaker(ttsController, node.question, node.id) },
-                        isSpeaking = ttsSpeaking
+                        isSpeaking = ttsSpeaking,
+                        consentScroll = consentScroll.takeIf { node.id == "Q00" }
                     )
                 }
 
@@ -2095,10 +2099,12 @@ internal fun SingleChoiceNodeScreen(
     onSubmit: (String?, String?) -> Unit,
     onBack: () -> Unit,
     onReplay: () -> Unit = {},
-    isSpeaking: Boolean = false
+    isSpeaking: Boolean = false,
+    consentScroll: ConsentScrollState? = null
 ) {
     val backplate = appBackplate()
-    val scroll = rememberScrollState()
+    val scroll = consentScroll?.scroll ?: rememberScrollState()
+    val scrollInteraction = consentScroll?.scrollInteraction() ?: Modifier
     var otherText by rememberSaveable(question, otherTextOption) { mutableStateOf(initialOtherText) }
 
     Box(
@@ -2124,6 +2130,7 @@ internal fun SingleChoiceNodeScreen(
             Column(
                 modifier = Modifier
                     .padding(horizontal = 24.dp, vertical = 20.dp)
+                    .then(scrollInteraction)
                     .verticalScroll(scroll),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
