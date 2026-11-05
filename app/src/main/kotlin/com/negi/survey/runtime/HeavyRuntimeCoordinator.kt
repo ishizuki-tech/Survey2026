@@ -71,6 +71,37 @@ class HeavyRuntimeCoordinator(
     private var releaseActiveLiteRt: (suspend (LiteRtGenerationLease) -> Unit)? = null
     private var whisperResident = false
 
+    /**
+     * Serializes a compatibility check and, if necessary, the current release callback
+     * before acquiring a replacement. The existing callback returns Unit and does not
+     * itself prove native teardown; callers must establish that guarantee before use.
+     * [acquire] owns any resource until it returns its exact
+     * lease and must clean up if it throws or is cancelled before returning.
+     *
+     * Callers must first
+     * establish a native inference safepoint and must validate compatibility using
+     * the runtime's own model and Engine configuration checks.
+     */
+    internal suspend fun transitionLiteRt(
+        isCompatible: suspend (LiteRtGenerationLease) -> Boolean,
+        releaseReplacement: suspend (LiteRtGenerationLease) -> Unit,
+        reuse: suspend (LiteRtGenerationLease) -> Unit = {},
+        acquire: suspend () -> LiteRtGenerationLease,
+    ): LiteRtGenerationLease = transitionMutex.withLock {
+        val current = activeLiteRtOwnership
+        if (current != null && isCompatible(current)) {
+            reuse(current)
+            return@withLock current
+        }
+        if (current != null) releaseOwnedLiteRt()
+
+        val acquired = acquire()
+        // No suspending or user callbacks between acquiring and publishing ownership.
+        activeLiteRtOwnership = acquired
+        releaseActiveLiteRt = releaseReplacement
+        acquired
+    }
+
     override suspend fun <T> withLiteRt(
         releaseLiteRt: suspend (LiteRtGenerationLease) -> Unit,
         generationLease: suspend () -> LiteRtGenerationLease,

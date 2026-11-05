@@ -34,6 +34,10 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.job
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -113,6 +117,64 @@ interface Repository {
      * Default: no-op for backends that don't require it.
      */
     suspend fun warmUp() {}
+}
+
+/** Selection shares the repository gate so previous native cleanup must finish first. */
+internal suspend fun initializeSurveyRuntime(
+    context: Context,
+    model: Model,
+    coordinator: com.negi.survey.runtime.HeavyRuntimeCoordinator,
+    onInitializationRequired: () -> Unit = {},
+) {
+    withTimeout(60_000L) {
+        AI_INFERENCE_GATE.withPermit {
+            val handoff = LiteRtPublicationHandoff()
+            suspend fun initialize() = LiteRtLM.initializeIfNeeded(
+                context, model, false, false, publicationHandoff = handoff,
+                onInitializationRequired = onInitializationRequired,
+            )
+            try {
+                coordinator.transitionLiteRt(
+                    isCompatible = { LiteRtLM.canReuseGeneration(it, model, false, false) },
+                    releaseReplacement = { LiteRtLM.retireGenerationAndWait(it, "survey-selection") },
+                    reuse = { initialize() },
+                    acquire = {
+                        initialize()
+                        checkNotNull(SLM.currentGenerationLease(model))
+                    },
+                )
+            } catch (error: Throwable) {
+                handoff.abandon()?.let { lease ->
+                    withContext(NonCancellable) {
+                        try { LiteRtLM.retireGenerationAndWait(lease, "survey-selection-abandoned") }
+                        catch (cleanup: Throwable) { error.addSuppressed(cleanup) }
+                    }
+                }
+                throw error
+            }
+        }
+    }
+}
+
+/** Per-repository admission; native serialization remains owned by the existing gate. */
+internal class RepositorySessionBoundary(private val gate: Semaphore) {
+    private var closed = false
+    private val collectors = mutableSetOf<Job>()
+
+    @Synchronized fun requireOpen() { check(!closed) { "Survey repository is closed." } }
+    @Synchronized fun register(job: Job) { requireOpen(); collectors.add(job) }
+    @Synchronized fun unregister(job: Job) { collectors.remove(job) }
+
+    suspend fun closeAndAwait(finish: suspend () -> Unit) {
+        val old = synchronized(this) { closed = true; collectors.toList() }
+        old.forEach { it.cancel(CancellationException("survey session ended")) }
+        val finished = withTimeoutOrNull(60_000L) {
+            old.forEach { it.join() }
+            gate.withPermit { finish() }
+            true
+        }
+        check(finished == true) { "Survey exit timed out waiting for native cleanup. Retry Back." }
+    }
 }
 
 /** Optional diagnostics-only correlation for a repository request. */
@@ -354,6 +416,8 @@ class LiteRtRepository(
     private val systemMessage: Message? = null,
     private val tools: List<Any> = emptyList(),
 ) : Repository {
+    private val sessionBoundary = RepositorySessionBoundary(AI_INFERENCE_GATE)
+
     /** This repository's exact published engine claim; never use the model path as a lease. */
     private val liteRtOwnership = AtomicReference<LiteRtGenerationLease?>(null)
 
@@ -363,7 +427,7 @@ class LiteRtRepository(
         }
 
     private suspend fun closeLiteRtGeneration(lease: LiteRtGenerationLease) {
-        SLM.closeGenerationIfCurrent(lease, reason = "AiRepository")
+        LiteRtLM.retireGenerationAndWait(lease, reason = "AiRepository")
     }
 
     /**
@@ -397,6 +461,20 @@ class LiteRtRepository(
             }
         ) {
             liteRtOwnership.compareAndSet(ownership, null)
+        }
+    }
+
+    /** Ends admission, cancels collectors, then awaits existing post-native cleanup. */
+    internal suspend fun endSurveySession() {
+        sessionBoundary.closeAndAwait {
+            val lease = LiteRtLM.generationAtSessionSafepoint(model) ?: return@closeAndAwait
+            runOnSlmThread {
+                LiteRtLM.resetConversationForGenerationAndWait(
+                    lease, model, supportImage, supportAudio, systemMessage, tools,
+                )
+            }
+            // Preserve the established bounded idle cleanup policy while at the selector.
+            LiteRtLM.cleanUp(model) {}
         }
     }
 
@@ -772,6 +850,10 @@ class LiteRtRepository(
      *   CancellationException is rethrown so a later lifecycle attempt may retry.
      */
     override suspend fun warmUp() {
+        sessionBoundary.requireOpen()
+        val warmUpJob = currentCoroutineContext().job
+        sessionBoundary.register(warmUpJob)
+        try {
         val ctx = appContext
         if (ctx == null) {
             RuntimeLogStore.w(TAG, "warmUp skipped: appContext=null")
@@ -783,6 +865,7 @@ class LiteRtRepository(
 
         val initialized =
             AI_INFERENCE_GATE.withPermit {
+                sessionBoundary.requireOpen()
                 val gateMs =
                     SystemClock.elapsedRealtime() -
                             startedAt
@@ -907,6 +990,7 @@ class LiteRtRepository(
                             PREFILL_WARMUP_TIMEOUT_MS
                         ) {
                             AI_INFERENCE_GATE.withPermit {
+                sessionBoundary.requireOpen()
                                 heavyRuntimeHandoff.withLiteRt(
                                     releaseLiteRt = ::closeLiteRtGeneration,
                                     generationLease = ::currentLiteRtLease,
@@ -1005,6 +1089,7 @@ class LiteRtRepository(
                 val cleanupAttempt: Result<Unit> =
                     runCatchingSuspend {
                         AI_INFERENCE_GATE.withPermit {
+                sessionBoundary.requireOpen()
                             runOnSlmThread {
                                 forceCleanUpAndInvalidate()
                             }
@@ -1237,6 +1322,9 @@ class LiteRtRepository(
                 error
             )
         }
+        } finally {
+            sessionBoundary.unregister(warmUpJob)
+        }
     }
 
     @OptIn(ExperimentalCoroutinesApi::class)
@@ -1249,6 +1337,9 @@ class LiteRtRepository(
         samplingProfile: SamplingProfile?,
     ): Flow<String> {
         return callbackFlow {
+            val collectorJob = currentCoroutineContext().job
+            sessionBoundary.register(collectorJob)
+            collectorJob.invokeOnCompletion { sessionBoundary.unregister(collectorJob) }
             val out = this
 
             val requestId = REQ_SEQ.incrementAndGet()
@@ -1324,6 +1415,7 @@ class LiteRtRepository(
             val driverJob = repoScope.launch(Dispatchers.Default) {
                 try {
                     AI_INFERENCE_GATE.withPermit {
+                sessionBoundary.requireOpen()
                         gateActive.set(true)
 
                         val completion = CompletableDeferred<String>()

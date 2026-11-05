@@ -23,13 +23,15 @@ import android.speech.tts.UtteranceProgressListener
 import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.viewModelScope
 import java.util.Locale
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * Minimal contract for reading survey question text aloud.
@@ -224,7 +226,7 @@ class TtsController(
         } else if (requested != null && requireEngine) {
             // Forced engine missing: never read questions with a different voice.
             Log.e(TAG, "Required TTS engine '$requested' is not installed; read-aloud disabled")
-            _error.value = "Read-aloud needs the voice app $requested for '$languageCode'. Please install it."
+            reportFailure("Read-aloud needs the voice app $requested for '$languageCode'. Please install it.")
             _isReady.value = false
             null
         } else {
@@ -240,7 +242,7 @@ class TtsController(
     private fun onEngineInit(status: Int) {
         if (status != TextToSpeech.SUCCESS) {
             Log.e(TAG, "TextToSpeech init failed: status=$status")
-            _error.value = "Text-to-speech engine failed to initialize"
+            reportFailure("Text-to-speech engine failed to initialize")
             _isReady.value = false
             return
         }
@@ -260,7 +262,7 @@ class TtsController(
                 "TTS language unavailable: defaultEngine=${tts.defaultEngine} " +
                     "locale=$locale result=$result"
             )
-            _error.value = "Text-to-speech voice for '$languageCode' isn't installed on this device"
+            reportFailure("Text-to-speech voice for '$languageCode' isn't installed on this device")
             _isReady.value = false
             return
         }
@@ -281,12 +283,12 @@ class TtsController(
             @Deprecated("Deprecated in Java", ReplaceWith(""))
             override fun onError(utteranceId: String?) {
                 _isSpeaking.value = false
-                _error.value = "Text-to-speech playback failed"
+                reportFailure("Text-to-speech playback failed")
             }
 
             override fun onError(utteranceId: String?, errorCode: Int) {
                 _isSpeaking.value = false
-                _error.value = "Text-to-speech playback failed (code=$errorCode)"
+                reportFailure("Text-to-speech playback failed (code=$errorCode)")
             }
         })
 
@@ -324,8 +326,19 @@ class TtsController(
         val result = tts.speak(trimmed, TextToSpeech.QUEUE_FLUSH, Bundle(), utteranceId)
         if (result == TextToSpeech.ERROR) {
             Log.e(TAG, "speak() returned ERROR for utteranceId=$utteranceId")
-            _error.value = "Text-to-speech failed to start"
+            reportFailure("Text-to-speech failed to start")
             _isSpeaking.value = false
+        }
+    }
+
+    private fun reportFailure(message: String) {
+        _error.value = message
+        val requested = enginePackage?.trim()?.ifBlank { null } ?: return
+        val language = TtsReadinessKey.normalizeLanguage(languageCode)
+        viewModelScope.launch {
+            ProcessTtsReadiness.store.invalidate {
+                it.enginePackage == requested && it.language == language
+            }
         }
     }
 

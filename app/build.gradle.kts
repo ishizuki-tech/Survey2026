@@ -718,6 +718,9 @@ extensions.configure<ApplicationExtension> {
             issue86Instrumentation.toString(),
         )
 
+        // Keep an explicit opt-out for selector-cycle regression testing.
+        buildConfigField("boolean", "CROSS_SURVEY_REUSE", providers.gradleProperty("slm.crossSurveyReuse").getOrElse("true").equals("true", true).toString())
+
         testInstrumentationRunner =
             "androidx.test.runner.AndroidJUnitRunner"
 
