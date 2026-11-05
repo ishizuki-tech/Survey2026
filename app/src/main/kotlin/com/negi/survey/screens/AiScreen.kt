@@ -80,14 +80,15 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
@@ -105,8 +106,6 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.outlined.NavigateBefore
-import androidx.compose.material.icons.automirrored.outlined.NavigateNext
 import androidx.compose.material.icons.automirrored.outlined.Send
 import androidx.compose.material.icons.filled.Keyboard
 import androidx.compose.material.icons.filled.KeyboardArrowDown
@@ -170,6 +169,9 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.negi.survey.BuildConfig
 import com.negi.survey.net.RuntimeLogStore
 import com.negi.survey.diagnostics.DiagnosticContentPolicy
@@ -191,6 +193,7 @@ import java.util.Locale
 import kotlin.collections.ArrayDeque
 import kotlin.math.abs
 import kotlin.math.min
+import kotlinx.coroutines.job
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
@@ -343,7 +346,8 @@ fun AiScreen(
     onBack: () -> Unit,
     speechController: SpeechController? = null,
     ttsController: QuestionSpeaker? = null,
-    autoReadQuestion: Boolean = false
+    autoReadQuestion: Boolean = false,
+    playbackLifecycle: Lifecycle = LocalLifecycleOwner.current.lifecycle
 ) {
     val nid = remember(nodeId) { nodeId.trim() }
     val localContext = LocalContext.current.applicationContext
@@ -488,16 +492,24 @@ fun AiScreen(
 
     LaunchedEffect(
         contextKey, presentation, autoReadTarget, ttsController, autoReadQuestion,
-        speechController, speechRecording, speechTranscribing
+        speechController, speechRecording, speechTranscribing, playbackLifecycle
     ) {
-        if (!ownsPresentation()) return@LaunchedEffect
-        val enabled = mayAutoRead()
-        // Keep the existing non-AI last-node deduplication aware of eligible AI visits.
-        if (enabled) vmSurvey.claimTtsAutoPlay(nid)
+        if (!ownsPresentation() || !mayAutoRead() ||
+            !playbackLifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
+        ) return@LaunchedEffect
+
+        // Keep the non-AI last-node deduplication aware of eligible AI visits.
+        vmSurvey.claimTtsAutoPlay(nid)
         val target = autoReadTarget ?: return@LaunchedEffect
-        if (ttsController == null || !enabled) return@LaunchedEffect
+        if (ttsController == null) return@LaunchedEffect
+
+        // Cancel this request across a stop, even if the app returns before TTS is ready.
+        val request = currentCoroutineContext().job
+        val stopObserver = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_STOP) request.cancel()
+        }
+        playbackLifecycle.addObserver(stopObserver)
         try {
-            // Keep the pending request in this effect so navigation cancels it before it can speak.
             ttsController.isReady.first { it }
             currentCoroutineContext().ensureActive()
             if (!ownsPresentation() || !mayAutoRead()) return@LaunchedEffect
@@ -506,9 +518,11 @@ fun AiScreen(
                 vmSurvey.followups.value[nid].orEmpty(),
                 completed = conversation.value.turnCompleted || vmSurvey.aiReasons.value[nid]?.terminal == true
             )
-            if (target != currentTarget) return@LaunchedEffect
+            if (target != currentTarget ||
+                !playbackLifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
+            ) return@LaunchedEffect
+
             val utteranceId = "$contextKey|visit=$presentation|q=${shortHash(target.text)}"
-            // Claim and request playback in the same main-thread turn, after all suspensions.
             if (vmSurvey.claimAiAutoRead(presentation, surveySessionId, nid, target)) {
                 ttsController.speak(target.text, utteranceId)
             }
@@ -516,6 +530,8 @@ fun AiScreen(
             throw cancelled
         } catch (error: Exception) {
             Log.w(TAG, "Unable to read AI question", error)
+        } finally {
+            playbackLifecycle.removeObserver(stopObserver)
         }
     }
 
@@ -1103,7 +1119,9 @@ fun AiScreen(
             CompactTopBar(
                 title = title,
                 onReplay = {
-                    if (ttsController != null && ownsPresentation()) {
+                    if (ttsController != null && ownsPresentation() &&
+                        playbackLifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
+                    ) {
                         if (ttsController.isSpeaking.value ||
                             (speechController?.isRecording?.value != true &&
                                 speechController?.isTranscribing?.value != true)
@@ -1122,7 +1140,7 @@ fun AiScreen(
         snackbarHost = { SnackbarHost(snack) },
         contentWindowInsets = zeroInsetsSafe()
     ) { pad ->
-        Box(
+        BoxWithConstraints(
             modifier = Modifier
                 .padding(pad)
                 .fillMaxSize()
@@ -1134,8 +1152,10 @@ fun AiScreen(
                         keyboard?.hide()
                     }
                 }
-                .padding(horizontal = 16.dp, vertical = 12.dp)
+                .padding(horizontal = 16.dp, vertical = 8.dp)
         ) {
+            // Keep the composer and navigation reachable when the IME leaves little vertical space.
+            val footerMaxHeight = maxHeight - minOf(64.dp, maxHeight / 4)
             Column(
                 modifier = Modifier.fillMaxSize(),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
@@ -1188,12 +1208,14 @@ fun AiScreen(
                     shadowElevation = 8.dp,
                     modifier = Modifier
                         .fillMaxWidth()
+                        .heightIn(max = footerMaxHeight)
                         .navigationBarsPadding()
                         .neutralEdge(alpha = 0.14f, corner = 16.dp, stroke = 1.dp)
                 ) {
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
+                            .verticalScroll(rememberScrollState())
                             .padding(top = 6.dp)
                     ) {
                         if (isTwoStepNode) {
@@ -1269,62 +1291,33 @@ fun AiScreen(
                             color = DividerDefaults.color
                         )
 
-                        FlowRow(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(horizontal = 12.dp, vertical = 12.dp),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            OutlinedButton(
-                                colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.onSurface),
-                                onClick = {
-                                    vmAI.resetStates()
-                                    onBack()
-                                },
-                                shape = MaterialTheme.shapes.medium,
-                                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp)
-                            ) {
-                                Icon(
-                                    imageVector = Icons.AutoMirrored.Outlined.NavigateBefore,
-                                    contentDescription = "Back"
-                                )
-                                Spacer(Modifier.width(8.dp))
-                                Text("Back")
-                            }
-
-                            Button(
-                                modifier = Modifier.heightIn(min = 56.dp),
-                                enabled = canAdvanceAiTurn(
-                                    aiLoading = loading,
-                                    mainSubmissionPending = submissionPending,
-                                    speechRecording = speechRecording,
-                                    speechTranscribing = speechTranscribing,
-                                ),
-                                onClick = {
-                                    if (!canAdvanceAiTurn(
-                                            aiLoading = loading,
-                                            mainSubmissionPending = submissionPending,
-                                            speechRecording = speechRecording,
-                                            speechTranscribing = speechTranscribing,
-                                        )
-                                    ) {
-                                        return@Button
-                                    }
+                        SurveyNavigationButtons(
+                            primaryLabel = "Next",
+                            primaryEnabled = canAdvanceAiTurn(
+                                aiLoading = loading,
+                                mainSubmissionPending = submissionPending,
+                                speechRecording = speechRecording,
+                                speechTranscribing = speechTranscribing,
+                            ),
+                            onPrimary = {
+                                if (canAdvanceAiTurn(
+                                        aiLoading = loading,
+                                        mainSubmissionPending = submissionPending,
+                                        speechRecording = speechRecording,
+                                        speechTranscribing = speechTranscribing,
+                                    )
+                                ) {
                                     vmAI.resetStates()
                                     onNext()
-                                },
-                                shape = MaterialTheme.shapes.medium,
-                                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp)
-                            ) {
-                                Text("Next")
-                                Spacer(Modifier.width(8.dp))
-                                Icon(
-                                    imageVector = Icons.AutoMirrored.Outlined.NavigateNext,
-                                    contentDescription = "Next"
-                                )
-                            }
-                        }
+                                }
+                            },
+                            secondaryLabel = "Back",
+                            onSecondary = {
+                                vmAI.resetStates()
+                                onBack()
+                            },
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
+                        )
                     }
                 }
             }
@@ -1819,12 +1812,9 @@ private fun ChatComposer(
                 }
             }
 
-            Button(
+            SurveyActionButton(
                 onClick = onSend,
-                enabled = enabled && value.isNotBlank(),
-                modifier = Modifier.heightIn(min = 56.dp),
-                shape = MaterialTheme.shapes.medium,
-                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp)
+                enabled = enabled && value.isNotBlank()
             ) {
                 Icon(
                     imageVector = Icons.AutoMirrored.Outlined.Send,
@@ -1901,30 +1891,22 @@ internal fun VoiceFirstComposer(
                 Text(speechStatusText, color = cs.error, style = MaterialTheme.typography.labelSmall)
             }
             Spacer(Modifier.height(10.dp))
-            androidx.compose.foundation.layout.Row(
+            FlowRow(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                OutlinedButton(
+                SurveyActionButton(
                     onClick = onToggleSpeech,
                     enabled = micEnabled,
-                    shape = MaterialTheme.shapes.medium,
-                    colors = ButtonDefaults.outlinedButtonColors(contentColor = cs.onSurface),
-                    contentPadding = PaddingValues(vertical = 14.dp),
-                    modifier = Modifier.weight(1f)
+                    primary = false
                 ) {
                     Icon(Icons.Filled.Mic, contentDescription = null)
                     Spacer(Modifier.width(8.dp))
-                    Text("Record again")
+                    Text("Record again", modifier = Modifier.weight(1f, fill = false))
                 }
-                Button(
-                    onClick = onSend,
-                    enabled = enabled,
-                    shape = MaterialTheme.shapes.medium,
-                    contentPadding = PaddingValues(vertical = 14.dp),
-                    modifier = Modifier.weight(1f).heightIn(min = 56.dp)
-                ) {
-                    Text("Send")
+                SurveyActionButton(onClick = onSend, enabled = enabled) {
+                    Text("Send", modifier = Modifier.weight(1f, fill = false))
                     Spacer(Modifier.width(8.dp))
                     Icon(Icons.AutoMirrored.Outlined.Send, contentDescription = null)
                 }

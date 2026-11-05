@@ -1,17 +1,26 @@
 package com.negi.survey.screens
 
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.size
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.semantics.SemanticsActions
+import androidx.compose.ui.unit.Density
+import androidx.compose.ui.unit.dp
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.test.SemanticsMatcher
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.hasAnyAncestor
+import androidx.compose.ui.test.hasAnyDescendant
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.isDialog
 import androidx.compose.ui.test.hasSetTextAction
@@ -19,11 +28,19 @@ import androidx.compose.ui.test.junit4.v2.createComposeRule
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performSemanticsAction
 import androidx.compose.ui.test.performTextInput
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.LifecycleRegistry
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.navigation3.runtime.rememberNavBackStack
 import androidx.test.platform.app.InstrumentationRegistry
 import android.view.KeyEvent
+import android.view.View
 import com.negi.survey.config.NodeDTO
 import com.negi.survey.config.SurveyConfig
 import com.negi.survey.slm.Repository
@@ -32,6 +49,7 @@ import com.negi.survey.vm.AiViewModel
 import com.negi.survey.vm.FlowHome
 import com.negi.survey.vm.NodeType
 import com.negi.survey.vm.QuestionSpeaker
+import com.negi.survey.vm.StopQuestionSpeakerInBackground
 import com.negi.survey.vm.SurveyAiReason
 import com.negi.survey.vm.SurveyViewModel
 import kotlinx.coroutines.CompletableDeferred
@@ -49,6 +67,8 @@ class AiScreenInteractionTest {
     @get:Rule val rule = createComposeRule()
     private lateinit var survey: SurveyViewModel
     private lateinit var ai: AiViewModel
+    private lateinit var hostView: View
+    private lateinit var playbackLifecycle: LifecycleRegistry
     private val speech = FakeSpeech()
     private val speaker = FakeSpeaker()
     private val repo = HoldingRepository()
@@ -62,9 +82,12 @@ class AiScreenInteractionTest {
         withSpeech: Boolean = true,
         twoStep: Boolean = false,
         readAloud: Boolean = true,
+        playbackState: Lifecycle.State? = null,
+        compact: Boolean = false,
         seed: SurveyViewModel.() -> Unit = {}
     ) {
         rule.setContent {
+            hostView = LocalView.current
             val stack = rememberNavBackStack(FlowHome)
             survey = remember { SurveyViewModel(stack, config(twoStep, readAloud)).apply {
                 goto("Q8")
@@ -75,8 +98,28 @@ class AiScreenInteractionTest {
             // Read unrelated state to force an ordinary parent recomposition.
             if (unrelated) androidx.compose.material3.Text("unrelated")
             if (visible && node.type == NodeType.AI) {
-                AiScreen(node.id, survey, ai, survey::advanceToNext, survey::backToPrevious,
-                    if (withSpeech) speech else null, speaker.takeIf { speakerAvailable }, autoplay)
+                val owner = LocalLifecycleOwner.current
+                val lifecycle = if (playbackState == null) owner.lifecycle else {
+                    val testOwner = remember {
+                        object : LifecycleOwner {
+                            override val lifecycle = LifecycleRegistry(this).apply {
+                                currentState = playbackState
+                            }
+                        }
+                    }
+                    playbackLifecycle = testOwner.lifecycle
+                    StopQuestionSpeakerInBackground(speaker, playbackLifecycle)
+                    playbackLifecycle
+                }
+                val density = LocalDensity.current
+                val contentDensity = if (compact) Density(density.density, fontScale = 2f) else density
+                Box(if (compact) Modifier.size(width = 280.dp, height = 260.dp) else Modifier) {
+                    CompositionLocalProvider(LocalDensity provides contentDensity) {
+                        AiScreen(node.id, survey, ai, survey::advanceToNext, survey::backToPrevious,
+                            if (withSpeech) speech else null, speaker.takeIf { speakerAvailable }, autoplay,
+                            playbackLifecycle = lifecycle)
+                    }
+                }
             }
         }
         rule.waitForIdle()
@@ -93,7 +136,12 @@ class AiScreenInteractionTest {
         rule.onNodeWithText("Type instead").performClick()
         rule.onNode(hasSetTextAction()).performTextInput("typed draft")
         rule.onNodeWithText("Use voice instead").performClick()
-        rule.onNodeWithText("typed draft").performClick()
+        rule.waitUntil(5_000) {
+            rule.runOnUiThread {
+                ViewCompat.getRootWindowInsets(hostView)?.isVisible(WindowInsetsCompat.Type.ime()) == false
+            }
+        }
+        rule.onNodeWithText("typed draft").performScrollTo().assertIsDisplayed().performClick()
         rule.onNode(hasSetTextAction()).assertExists()
         rule.runOnIdle { assertEquals("typed draft", ai.conversationStateFlow(contextKey).value.composerDraft) }
         rule.onNodeWithText("Use voice instead").performClick()
@@ -103,7 +151,7 @@ class AiScreenInteractionTest {
         rule.runOnIdle { speech.transitionToTranscribing() }
         rule.waitForIdle()
         rule.runOnIdle { speech.finish("recognized answer") }
-        rule.onNodeWithText("recognized answer").performClick()
+        rule.onNodeWithText("recognized answer").performScrollTo().assertIsDisplayed().performClick()
         rule.onNode(hasSetTextAction()).performTextInput(" edited")
         rule.runOnIdle { assertTrue(ai.conversationStateFlow(contextKey).value.composerDraft.contains("edited")) }
     }
@@ -139,7 +187,10 @@ class AiScreenInteractionTest {
                 ai.appendUserMessage(contextKey, "Answer ${index + 1}. " + "Earlier survey context. ".repeat(10))
             }
         }
-        val conversation = rule.onNode(SemanticsMatcher.keyIsDefined(SemanticsProperties.VerticalScrollAxisRange))
+        val conversation = rule.onNode(
+            SemanticsMatcher.keyIsDefined(SemanticsProperties.VerticalScrollAxisRange) and
+                hasAnyDescendant(hasText("Answer 1.", substring = true))
+        )
         val range = conversation.fetchSemanticsNode().config[SemanticsProperties.VerticalScrollAxisRange]
         assertTrue(range.maxValue() > 0f)
         conversation.performSemanticsAction(SemanticsActions.ScrollBy) { it(0f, -range.maxValue()) }
@@ -289,6 +340,70 @@ class AiScreenInteractionTest {
         }
         rule.waitForIdle()
         rule.runOnIdle { assertEquals(listOf("Follow-up?"), speaker.spoken) }
+    }
+
+    @Test fun stoppingActivePlaybackKeepsSurveyProgressAndAllowsManualReplay() {
+        host(playbackState = Lifecycle.State.RESUMED)
+        rule.runOnIdle {
+            assertEquals(listOf("Question"), speaker.spoken)
+            survey.setAnswer("Saved", "Q8")
+            speaker.isSpeaking.value = true
+        }
+        val session = rule.runOnIdle {
+            playbackLifecycle.currentState = Lifecycle.State.CREATED
+            survey.sessionId.value
+        }
+        rule.runOnIdle {
+            assertEquals(1, speaker.stopCalls)
+            assertTrue(!speaker.isSpeaking.value)
+            playbackLifecycle.currentState = Lifecycle.State.RESUMED
+        }
+        rule.runOnIdle {
+            assertEquals(listOf("Question"), speaker.spoken)
+            assertEquals("Saved", survey.getAnswer("Q8"))
+            assertEquals("Q8", survey.currentNodeId)
+            assertEquals(session, survey.sessionId.value)
+        }
+        rule.onNodeWithText("🔊").performClick()
+        rule.runOnIdle { assertEquals(listOf("Question", "Question"), speaker.spoken) }
+    }
+
+    @Test fun pendingFollowupIsCancelledAcrossStopEvenIfReadinessArrivesAfterResume() {
+        speaker.isReady.value = false
+        host(playbackState = Lifecycle.State.RESUMED) {
+            setAnswer("Saved", "Q8")
+            addFollowupQuestion("Q8", "Pending follow-up?")
+        }
+        rule.runOnIdle {
+            assertEquals(1, speaker.isReady.subscriptionCount.value)
+            playbackLifecycle.currentState = Lifecycle.State.CREATED
+            playbackLifecycle.currentState = Lifecycle.State.RESUMED
+            speaker.isReady.value = true
+        }
+        rule.runOnIdle { assertTrue(speaker.spoken.isEmpty()) }
+        rule.onNodeWithText("🔊").performClick()
+        rule.runOnIdle { assertEquals(listOf("Pending follow-up?"), speaker.spoken) }
+    }
+
+    @Test fun backgroundAttemptDoesNotConsumeAiAutoReadClaim() {
+        host(playbackState = Lifecycle.State.CREATED)
+        rule.runOnIdle {
+            assertTrue(speaker.spoken.isEmpty())
+            playbackLifecycle.currentState = Lifecycle.State.RESUMED
+        }
+        rule.runOnIdle {
+            assertTrue(speaker.spoken.isEmpty())
+            autoplay = false
+        }
+        rule.runOnIdle { autoplay = true }
+        rule.runOnIdle { assertEquals(listOf("Question"), speaker.spoken) }
+    }
+
+    @Test fun shortNarrowChatKeepsComposerAndNavigationReachableAtLargeFontScale() {
+        host(compact = true)
+        rule.onNodeWithContentDescription("Record answer").performScrollTo().assertIsDisplayed()
+        rule.onNodeWithText("Next").performScrollTo().assertIsDisplayed().assertIsEnabled()
+        rule.onNodeWithText("Back").performScrollTo().assertIsDisplayed().assertIsEnabled()
     }
 
     @Test fun readinessPlaysOnceAndLaterReadinessOrEligibilityChangesDoNotReplay() {
@@ -507,7 +622,10 @@ class AiScreenInteractionTest {
             spoken += text
             ids += utteranceId
         }
-        override fun stop() { stopCalls++ }
+        override fun stop() {
+            stopCalls++
+            isSpeaking.value = false
+        }
     }
     private class HoldingRepository : Repository {
         @Volatile var requests = 0

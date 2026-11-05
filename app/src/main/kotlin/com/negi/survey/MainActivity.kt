@@ -38,7 +38,6 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -59,8 +58,6 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.outlined.NavigateBefore
-import androidx.compose.material.icons.automirrored.outlined.NavigateNext
 import androidx.compose.material.icons.automirrored.outlined.Send
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Mic
@@ -68,7 +65,6 @@ import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.TextButton
-import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
@@ -138,6 +134,8 @@ import com.negi.survey.config.SurveyConfig
 import com.negi.survey.config.SurveyConfigLoader
 import com.negi.survey.net.GitHubUploadTargetPolicy
 import com.negi.survey.net.GitHubUploader
+import com.negi.survey.screens.SurveyActionButton
+import com.negi.survey.screens.SurveyNavigationButtons
 import com.negi.survey.screens.AiScreen
 import com.negi.survey.screens.ConfigOptionUi
 import com.negi.survey.screens.ConsentScrollState
@@ -161,6 +159,7 @@ import com.negi.survey.slm.modelIdentityForPath
 import com.negi.survey.ui.theme.SurveyNavTheme
 import com.negi.survey.ui.theme.neutralEdge
 import com.negi.survey.ui.theme.outdoorBackplate
+import com.negi.survey.vm.StopQuestionSpeakerInBackground
 import com.negi.survey.vm.AiViewModel
 import com.negi.survey.vm.AppViewModel
 import com.negi.survey.vm.DlState
@@ -599,11 +598,7 @@ fun AudioPermissionGate(
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
-                Button(
-                    onClick = { launcher.launch(permission) },
-                    modifier = Modifier.heightIn(min = 56.dp),
-                    shape = MaterialTheme.shapes.medium
-                ) {
+                SurveyActionButton(onClick = { launcher.launch(permission) }) {
                     Text("Allow microphone")
                 }
                 IconButton(
@@ -776,7 +771,7 @@ fun AppNav() {
                     .fillMaxSize()
                     .imePadding()
                     .background(backplate)
-                    .padding(24.dp),
+                    .padding(16.dp),
                 contentAlignment = Alignment.Center
             ) {
                 if (!showLoadingIndicator) return@Box
@@ -793,7 +788,7 @@ fun AppNav() {
                     Column(
                         modifier = Modifier
                             .verticalScroll(rememberScrollState())
-                            .padding(horizontal = 24.dp, vertical = 20.dp),
+                            .padding(horizontal = 20.dp, vertical = 16.dp),
                         horizontalAlignment = Alignment.CenterHorizontally
                     ) {
                         CircularProgressIndicator(
@@ -801,7 +796,7 @@ fun AppNav() {
                             color = MaterialTheme.colorScheme.outline,
                             trackColor = MaterialTheme.colorScheme.surfaceVariant
                         )
-                        Spacer(Modifier.height(14.dp))
+                        Spacer(Modifier.height(8.dp))
                         Text(
                             text = "Loading survey configuration…",
                             style = MaterialTheme.typography.titleMedium
@@ -824,7 +819,7 @@ fun AppNav() {
                     .fillMaxSize()
                     .imePadding()
                     .background(backplate)
-                    .padding(24.dp),
+                    .padding(16.dp),
                 contentAlignment = Alignment.Center
             ) {
                 Surface(
@@ -842,7 +837,7 @@ fun AppNav() {
                     Column(
                         modifier = Modifier
                             .verticalScroll(rememberScrollState())
-                            .padding(horizontal = 24.dp, vertical = 20.dp),
+                            .padding(horizontal = 20.dp, vertical = 16.dp),
                         horizontalAlignment = Alignment.CenterHorizontally
                     ) {
                         Text(
@@ -851,8 +846,8 @@ fun AppNav() {
                             color = MaterialTheme.colorScheme.error
                         )
                         Spacer(Modifier.height(12.dp))
-                        OutlinedButton(
-                            colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.onSurface),
+                        SurveyActionButton(
+                            primary = false,
                             onClick = {
                                 Log.d(MainActivity.TAG, "Error -> Back to selector. session=$sessionKey")
                                 sessionStore.clearSession(sessionKey)
@@ -1489,10 +1484,21 @@ fun SurveyNavHost(
         remember { NoOpQuestionSpeaker("Text-to-speech is disabled by configuration.") }
     }
 
-    DisposableEffect(ttsController) {
-        onDispose {
-            // Best-effort: stop any in-progress playback when leaving the host.
-            runCatching { ttsController.stop() }
+    val playbackLifecycle = LocalLifecycleOwner.current.lifecycle
+    StopQuestionSpeakerInBackground(ttsController, playbackLifecycle)
+
+    fun autoReadQuestion(nodeId: String, question: String, readAloud: Boolean) {
+        if (ttsAutoPlay && readAloud &&
+            playbackLifecycle.currentState.isAtLeast(Lifecycle.State.STARTED) &&
+            vmSurvey.claimTtsAutoPlay(nodeId)
+        ) {
+            runCatching { ttsController.speak(question, nodeId) }
+        }
+    }
+
+    fun replayQuestion(nodeId: String, question: String) {
+        if (playbackLifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
+            toggleQuestionSpeaker(ttsController, question, nodeId)
         }
     }
 
@@ -1618,9 +1624,7 @@ fun SurveyNavHost(
                     val ttsSpeaking by ttsController.isSpeaking.collectAsStateWithLifecycle()
 
                     LaunchedEffect(node.id, node.question, ttsAutoPlay, node.readAloud) {
-                        if (ttsAutoPlay && node.readAloud && vmSurvey.claimTtsAutoPlay(node.id)) {
-                            runCatching { ttsController.speak(node.question, node.id) }
-                        }
+                        autoReadQuestion(node.id, node.question, node.readAloud)
                     }
 
                     InfoNodeScreen(
@@ -1628,7 +1632,7 @@ fun SurveyNavHost(
                         text = node.question,
                         onNext = { runCatching { ttsController.stop() }; vmSurvey.advanceToNext() },
                         onBack = { runCatching { ttsController.stop() }; vmSurvey.backToPrevious() },
-                        onReplay = { toggleQuestionSpeaker(ttsController, node.question, node.id) },
+                        onReplay = { replayQuestion(node.id, node.question) },
                         isSpeaking = ttsSpeaking,
                     )
                 }
@@ -1654,9 +1658,7 @@ fun SurveyNavHost(
                     val ttsSpeaking by ttsController.isSpeaking.collectAsStateWithLifecycle()
 
                     LaunchedEffect(node.id, node.question, ttsAutoPlay) {
-                        if (ttsAutoPlay && node.readAloud && vmSurvey.claimTtsAutoPlay(node.id)) {
-                            runCatching { ttsController.speak(node.question, node.id) }
-                        }
+                        autoReadQuestion(node.id, node.question, node.readAloud)
                     }
 
                     TextNodeScreen(
@@ -1666,7 +1668,7 @@ fun SurveyNavHost(
                         onValueChange = { vmSurvey.setAnswer(it, node.id) },
                         onNext = { runCatching { ttsController.stop() }; vmSurvey.advanceToNext() },
                         onBack = { runCatching { ttsController.stop() }; vmSurvey.backToPrevious() },
-                        onReplay = { toggleQuestionSpeaker(ttsController, node.question, node.id) },
+                        onReplay = { replayQuestion(node.id, node.question) },
                         isSpeaking = ttsSpeaking
                     )
                 }
@@ -1677,9 +1679,7 @@ fun SurveyNavHost(
                     val ttsSpeaking by ttsController.isSpeaking.collectAsStateWithLifecycle()
 
                     LaunchedEffect(node.id, node.question, ttsAutoPlay) {
-                        if (ttsAutoPlay && node.readAloud && vmSurvey.claimTtsAutoPlay(node.id)) {
-                            runCatching { ttsController.speak(node.question, node.id) }
-                        }
+                        autoReadQuestion(node.id, node.question, node.readAloud)
                     }
 
                     SingleChoiceNodeScreen(
@@ -1698,7 +1698,7 @@ fun SurveyNavHost(
                             }
                         },
                         onBack = { runCatching { ttsController.stop() }; vmSurvey.backToPrevious() },
-                        onReplay = { toggleQuestionSpeaker(ttsController, node.question, node.id) },
+                        onReplay = { replayQuestion(node.id, node.question) },
                         isSpeaking = ttsSpeaking,
                         consentScroll = consentScroll.takeIf { node.id == "Q00" }
                     )
@@ -1711,9 +1711,7 @@ fun SurveyNavHost(
                     val answer = answers[node.id].orEmpty()
 
                     LaunchedEffect(node.id, node.question, ttsAutoPlay, node.readAloud) {
-                        if (ttsAutoPlay && node.readAloud && vmSurvey.claimTtsAutoPlay(node.id)) {
-                            runCatching { ttsController.speak(node.question, node.id) }
-                        }
+                        autoReadQuestion(node.id, node.question, node.readAloud)
                     }
 
                     NumberNodeScreen(
@@ -1726,7 +1724,7 @@ fun SurveyNavHost(
                         canSubmit = node.isValidNumberAnswer(answer),
                         onNext = { runCatching { ttsController.stop() }; vmSurvey.advanceToNext() },
                         onBack = { runCatching { ttsController.stop() }; vmSurvey.backToPrevious() },
-                        onReplay = { toggleQuestionSpeaker(ttsController, node.question, node.id) },
+                        onReplay = { replayQuestion(node.id, node.question) },
                         isSpeaking = ttsSpeaking,
                     )
                 }
@@ -1737,9 +1735,7 @@ fun SurveyNavHost(
                     val ttsSpeaking by ttsController.isSpeaking.collectAsStateWithLifecycle()
 
                     LaunchedEffect(node.id, node.question, ttsAutoPlay) {
-                        if (ttsAutoPlay && node.readAloud && vmSurvey.claimTtsAutoPlay(node.id)) {
-                            runCatching { ttsController.speak(node.question, node.id) }
-                        }
+                        autoReadQuestion(node.id, node.question, node.readAloud)
                     }
 
                     MultiChoiceNodeScreen(
@@ -1755,7 +1751,7 @@ fun SurveyNavHost(
                             vmSurvey.advanceToNext()
                         },
                         onBack = { runCatching { ttsController.stop() }; vmSurvey.backToPrevious() },
-                        onReplay = { toggleQuestionSpeaker(ttsController, node.question, node.id) },
+                        onReplay = { replayQuestion(node.id, node.question) },
                         isSpeaking = ttsSpeaking
                     )
                 }
@@ -1770,6 +1766,7 @@ fun SurveyNavHost(
                         onBack = { runCatching { ttsController.stop() }; vmSurvey.backToPrevious() },
                         speechController = speechController,
                         ttsController = ttsController.takeIf { ttsEnabled },
+                        playbackLifecycle = playbackLifecycle,
                         autoReadQuestion = ttsAutoPlay
                     )
                 }
@@ -1910,7 +1907,7 @@ private fun InfoNodeScreen(
 
                 Spacer(Modifier.height(10.dp))
 
-                RowButtons(
+                SurveyNavigationButtons(
                     primaryLabel = "Next",
                     onPrimary = onNext,
                     secondaryLabel = "Back",
@@ -1950,7 +1947,9 @@ private fun StopNodeScreen(
                 .neonEdgeThin(),
         ) {
             Column(
-                modifier = Modifier.padding(horizontal = 24.dp, vertical = 20.dp),
+                modifier = Modifier
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 24.dp, vertical = 20.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
                 if (title.isNotBlank()) {
@@ -1962,7 +1961,7 @@ private fun StopNodeScreen(
 
                 Spacer(Modifier.height(10.dp))
 
-                Button(
+                SurveyActionButton(
                     onClick = onRestart,
                     modifier = Modifier.fillMaxWidth(),
                 ) {
@@ -2050,7 +2049,7 @@ internal fun TextNodeScreen(
 
                 Spacer(Modifier.height(10.dp))
 
-                RowButtons(
+                SurveyNavigationButtons(
                     primaryLabel = "Next",
                     onPrimary = onNext,
                     secondaryLabel = "Back",
@@ -2165,7 +2164,7 @@ internal fun SingleChoiceNodeScreen(
 
                 Spacer(Modifier.height(10.dp))
 
-                RowButtons(
+                SurveyNavigationButtons(
                     primaryLabel = "Next",
                     onPrimary = { onSubmit(selected, otherText) },
                     primaryEnabled = selected != null &&
@@ -2265,7 +2264,7 @@ private fun NumberNodeScreen(
                 }
 
                 Spacer(Modifier.height(10.dp))
-                RowButtons(
+                SurveyNavigationButtons(
                     primaryLabel = "Next",
                     onPrimary = onNext,
                     primaryEnabled = canSubmit,
@@ -2351,7 +2350,7 @@ internal fun MultiChoiceNodeScreen(
 
                 Spacer(Modifier.height(10.dp))
 
-                RowButtons(
+                SurveyNavigationButtons(
                     primaryLabel = "Next",
                     onPrimary = onNext,
                     secondaryLabel = "Back",
@@ -2397,50 +2396,6 @@ private fun AnswerOption(label: String, isSelected: Boolean, onClick: () -> Unit
             } else {
                 Spacer(Modifier.width(20.dp))
             }
-        }
-    }
-}
-
-@Composable
-private fun RowButtons(
-    primaryLabel: String,
-    onPrimary: () -> Unit,
-    primaryEnabled: Boolean = true,
-    secondaryLabel: String,
-    onSecondary: () -> Unit
-) {
-    FlowRow(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalArrangement = Arrangement.spacedBy(8.dp)
-    ) {
-        OutlinedButton(
-            onClick = onSecondary,
-            colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.onSurface),
-            shape = MaterialTheme.shapes.medium,
-            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp)
-        ) {
-            Icon(
-                imageVector = Icons.AutoMirrored.Outlined.NavigateBefore,
-                contentDescription = secondaryLabel
-            )
-            Spacer(Modifier.width(8.dp))
-            Text(secondaryLabel)
-        }
-
-        Button(
-            onClick = onPrimary,
-            enabled = primaryEnabled,
-            modifier = Modifier.heightIn(min = 56.dp),
-            shape = MaterialTheme.shapes.medium,
-            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp)
-        ) {
-            Text(primaryLabel)
-            Spacer(Modifier.width(8.dp))
-            Icon(
-                imageVector = Icons.AutoMirrored.Outlined.NavigateNext,
-                contentDescription = primaryLabel
-            )
         }
     }
 }
@@ -2550,41 +2505,14 @@ private fun HomeFreeTextComposer(
             )
         }
 
-        FlowRow(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            OutlinedButton(
-                onClick = onBack,
-                enabled = backEnabled,
-                colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.onSurface),
-                shape = MaterialTheme.shapes.medium,
-                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp)
-            ) {
-                Icon(
-                    imageVector = Icons.AutoMirrored.Outlined.NavigateBefore,
-                    contentDescription = "Back"
-                )
-                Spacer(Modifier.width(8.dp))
-                Text("Back")
-            }
-
-            Button(
-                onClick = onSend,
-                enabled = enabled,
-                modifier = Modifier.heightIn(min = 56.dp),
-                shape = MaterialTheme.shapes.medium,
-                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp)
-            ) {
-                Text("Start")
-                Spacer(Modifier.width(8.dp))
-                Icon(
-                    imageVector = Icons.AutoMirrored.Outlined.NavigateNext,
-                    contentDescription = "Start"
-                )
-            }
-        }
+        SurveyNavigationButtons(
+            primaryLabel = "Start",
+            onPrimary = onSend,
+            primaryEnabled = enabled,
+            secondaryLabel = "Back",
+            onSecondary = onBack,
+            secondaryEnabled = backEnabled
+        )
     }
 }
 
@@ -3230,7 +3158,9 @@ private fun PlaceholderScreen(
                 .neonEdgeThin()
         ) {
             Column(
-                modifier = Modifier.padding(horizontal = 24.dp, vertical = 20.dp),
+                modifier = Modifier
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 20.dp, vertical = 16.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
                 Text(text = title, style = MaterialTheme.typography.titleLarge)

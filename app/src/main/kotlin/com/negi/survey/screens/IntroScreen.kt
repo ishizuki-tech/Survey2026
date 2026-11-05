@@ -58,7 +58,6 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
-import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -91,7 +90,6 @@ import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -1022,18 +1020,15 @@ private fun CtaRowMono(
     onRestart: (() -> Unit)?,
 ) {
     var confirmRestart by remember { mutableStateOf(false) }
-    val cs = MaterialTheme.colorScheme
 
     FlowRow(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.spacedBy(12.dp, Alignment.CenterHorizontally),
         verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
-        Button(
+        SurveyActionButton(
             onClick = onStart,
-            shape = MaterialTheme.shapes.medium,
-            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp),
-            modifier = Modifier.heightIn(min = 56.dp).testTag("StartButton")
+            modifier = Modifier.testTag("StartButton")
         ) {
             Text("Start")
             Spacer(Modifier.width(8.dp))
@@ -1044,13 +1039,10 @@ private fun CtaRowMono(
         }
 
         if (showRestart && onRestart != null) {
-            OutlinedButton(
+            SurveyActionButton(
                 enabled = !isRestarting,
                 onClick = { confirmRestart = true },
-                shape = MaterialTheme.shapes.medium,
-                colors = ButtonDefaults.outlinedButtonColors(
-                    contentColor = cs.onSurface
-                ),
+                primary = false,
                 modifier = Modifier.testTag("RestartButton")
             ) {
                 Icon(
@@ -1067,6 +1059,7 @@ private fun CtaRowMono(
     }
 
     if (confirmRestart) {
+        val cs = MaterialTheme.colorScheme
         AlertDialog(
             onDismissRequest = { confirmRestart = false },
             title = { Text("Restart engine?") },

@@ -16,6 +16,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.test.SemanticsNodeInteraction
 import androidx.compose.ui.test.assertHeightIsAtLeast
+import androidx.compose.ui.test.getUnclippedBoundsInRoot
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotSelected
@@ -34,6 +35,8 @@ import com.negi.survey.MultiChoiceNodeScreen
 import com.negi.survey.SingleChoiceNodeScreen
 import com.negi.survey.config.NodeDTO
 import com.negi.survey.config.SurveyConfig
+import com.negi.survey.ui.theme.DarkSecondaryContainer
+import com.negi.survey.ui.theme.LightSecondaryContainer
 import com.negi.survey.ui.theme.SurveyNavTheme
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -83,17 +86,28 @@ class OutdoorChoiceScreenTest {
         first.assertIsNotSelected().assertHeightIsAtLeast(56.dp)
         first.assertFill(Color.White)
         next.assertFill(Color(0xFF42A5F5))
-        val backFill = back.sampleFill()
-        assertTrue(backFill.red > 0.9f && backFill.green > 0.9f && backFill.blue > 0.9f)
-        first.performClick().assertIsSelected()
-        second.assertIsNotSelected().performClick().assertIsSelected()
+        back.assertFill(LightSecondaryContainer)
+        val backBounds = back.getUnclippedBoundsInRoot()
+        val nextBounds = next.getUnclippedBoundsInRoot()
+        assertEquals((backBounds.right - backBounds.left).value, (nextBounds.right - nextBounds.left).value, 0.01f)
+        assertEquals((backBounds.bottom - backBounds.top).value, (nextBounds.bottom - nextBounds.top).value, 0.01f)
+        back.assertHeightIsAtLeast(48.dp)
+        next.assertHeightIsAtLeast(48.dp)
+        // Invoke the button action without a touch ripple over the sampled color.
+        first.performSemanticsAction(SemanticsActions.OnClick) { assertTrue(it()) }
+        first.assertIsSelected()
+        second.assertIsNotSelected()
+        second.performSemanticsAction(SemanticsActions.OnClick) { assertTrue(it()) }
+        second.assertIsSelected()
         first.assertFill(Color(0xFFDCEEFF))
 
         rule.runOnIdle { dark = true }
         first.assertIsSelected().assertFill(Color(0xFF18354D))
-        second.assertIsSelected().performClick().assertIsNotSelected()
+        second.assertIsSelected().performSemanticsAction(SemanticsActions.OnClick) { assertTrue(it()) }
+        second.assertIsNotSelected()
         second.assertFill(Color(0xFF202428))
         next.assertFill(Color(0xFF90CAF9))
+        back.assertFill(DarkSecondaryContainer)
         next.performClick()
         rule.runOnIdle {
             assertEquals("Choice", vm.currentNodeId)
@@ -130,7 +144,22 @@ class OutdoorChoiceScreenTest {
             rule.onNodeWithText(option).performScrollTo().performClick().assertIsSelected()
             rule.onNodeWithText(option, useUnmergedTree = true).assertWrapsWithoutClipping()
         }
-        rule.onNodeWithText("Next").performScrollTo().assertIsDisplayed().assertIsEnabled()
+        for (label in listOf("Back", "Next")) {
+            rule.onNodeWithText(label).performScrollTo()
+                .assertIsDisplayed().assertIsEnabled().assertHeightIsAtLeast(48.dp)
+            val layouts = mutableListOf<TextLayoutResult>()
+            rule.onNodeWithText(label, useUnmergedTree = true)
+                .performSemanticsAction(SemanticsActions.GetTextLayoutResult) { it(layouts) }
+            val layout = layouts.single()
+            // The semantics action rebuilds the paragraph at max width. Check the glyph bounds.
+            for (line in 0 until layout.lineCount) {
+                assertFalse(layout.isLineEllipsized(line))
+                assertTrue("$label clips horizontally", layout.getLineRight(line) <= layout.size.width + 1)
+                assertTrue("$label clips vertically", layout.getLineBottom(line) <= layout.size.height + 1)
+            }
+            assertEquals(label.length, layout.getLineEnd(layout.lineCount - 1, visibleEnd = true))
+        }
+        rule.onNodeWithText(swahili).performScrollTo().assertIsSelected()
     }
 
     private fun SemanticsNodeInteraction.assertFill(expected: Color) {
