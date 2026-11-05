@@ -182,6 +182,9 @@ import com.negi.survey.ui.theme.monotoneColors
 import com.negi.survey.vm.AiViewModel
 import com.negi.survey.vm.QuestionSpeaker
 import com.negi.survey.vm.SurveyViewModel
+import com.negi.survey.vm.SurveyAiReason
+import com.negi.survey.vm.pendingAiFollowup
+import com.negi.survey.vm.resolveAiAutoReadTarget
 import com.negi.survey.vm.shouldAutoPlayQuestion
 import com.negi.survey.vm.toggleQuestionSpeaker
 import java.security.MessageDigest
@@ -190,11 +193,13 @@ import kotlin.collections.ArrayDeque
 import kotlin.math.abs
 import kotlin.math.min
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flowOf
-import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.json.Json
@@ -339,7 +344,7 @@ fun AiScreen(
     onBack: () -> Unit,
     speechController: SpeechController? = null,
     ttsController: QuestionSpeaker? = null,
-    autoReadFollowups: Boolean = false
+    autoReadQuestion: Boolean = false
 ) {
     val nid = remember(nodeId) { nodeId.trim() }
     val localContext = LocalContext.current.applicationContext
@@ -354,9 +359,8 @@ fun AiScreen(
     // Survey state
     // ---------------------------------------------------------------------
 
-    val rootQuestion by remember(vmSurvey, nid) {
-        vmSurvey.questions.map { it[nid].orEmpty() }
-    }.collectAsState(initial = vmSurvey.getQuestion(nid))
+    val questions by vmSurvey.questions.collectAsState()
+    val rootQuestion = questions[nid].orEmpty()
 
     val surveySessionId by vmSurvey.sessionId.collectAsState()
     val surveyUuid by vmSurvey.surveyUuid.collectAsState()
@@ -437,70 +441,82 @@ fun AiScreen(
     // Persistent chat + conversation state (B plan)
     // ---------------------------------------------------------------------
 
-    LaunchedEffect(contextKey, rootQuestion) {
+    val conversation = remember(vmAI, contextKey) { vmAI.conversationStateFlow(contextKey) }
+    val conv by conversation.collectAsState()
+    val presentation by vmSurvey.questionPresentation.collectAsState()
+    val savedFollowups by vmSurvey.followups.collectAsState()
+    val savedAnswers by vmSurvey.answers.collectAsState()
+
+    LaunchedEffect(contextKey, rootQuestion, presentation) {
+        if (!vmSurvey.ownsAiPresentation(presentation, surveySessionId, nid)) return@LaunchedEffect
+        val reason = vmSurvey.aiReasons.value[nid]
+        val pending = pendingAiFollowup(vmSurvey.followups.value[nid].orEmpty())
         vmAI.ensureConversationContext(
             contextKey = contextKey,
             rootQuestion = rootQuestion,
-            initialDraft = vmSurvey.getAnswer(nid)
+            initialDraft = if (pending == null) vmSurvey.getAnswer(nid) else ""
         )
         vmAI.ensureRootQuestionMessage(contextKey, nid, rootQuestion)
         vmAI.ensureActivePromptIfMain(contextKey, rootQuestion)
-        if (isTwoStepNode) {
-            val reason = vmSurvey.aiReasons.value[nid]
-            if (reason?.terminal == true) vmAI.completeValidationTurn(contextKey, rootQuestion)
-            else if (reason == com.negi.survey.vm.SurveyAiReason.FAILURE && !vmAI.isRunning) {
+        when {
+            isTwoStepNode && reason?.terminal == true ->
+                vmAI.completeValidationTurn(contextKey, rootQuestion)
+            isTwoStepNode && reason == SurveyAiReason.FAILURE && !vmAI.isRunning ->
                 vmAI.failValidationTurn(contextKey)
-            } else {
-                val pending = vmSurvey.followups.value[nid].orEmpty().lastOrNull { it.answer == null }
-                val current = vmAI.conversationStateFlow(contextKey).value
-                if (pending != null && current.activePromptQuestion != pending.question) {
-                    vmAI.setFollowupMode(contextKey, pending.question)
-                }
-            }
+            pending != null && !conversation.value.turnCompleted ->
+                vmAI.restoreFollowupMode(contextKey, pending.question)
         }
     }
 
-    val conv by vmAI.conversationStateFlow(contextKey)
-        .collectAsState(
-            initial = AiViewModel.ConversationState(
-                role = AiViewModel.ComposerRole.MAIN,
-                activePromptQuestion = rootQuestion,
-                composerDraft = vmSurvey.getAnswer(nid)
-            )
-        )
+    val autoReadTarget = resolveAiAutoReadTarget(
+        rootQuestion, savedAnswers[nid].orEmpty(), savedFollowups[nid].orEmpty(),
+        completed = conv.turnCompleted || aiReason?.terminal == true
+    )
 
-    // An already active follow-up belongs to a previous presentation (for example, Back).
-    var lastAutoReadFollowup by remember(contextKey) {
-        val active = vmAI.conversationStateFlow(contextKey).value
-            .takeIf { it.role == AiViewModel.ComposerRole.FOLLOWUP }
-            ?.activePromptQuestion?.trim()
-        val pending = if (isTwoStepNode) {
-            vmSurvey.followups.value[nid].orEmpty().lastOrNull { it.answer == null }
-                ?.question?.trim()
-        } else null
-        mutableStateOf(pending ?: active)
+    fun ownsPresentation() = vmSurvey.ownsAiPresentation(presentation, surveySessionId, nid)
+
+    fun mayAutoRead() = vmSurvey.currentNode.value.readAloud && shouldAutoPlayQuestion(
+        autoReadQuestion,
+        speechController?.isRecording?.value == true,
+        speechController?.isTranscribing?.value == true
+    )
+
+    if (ownsPresentation()) {
+        DisposableEffect(contextKey, presentation, ttsController) {
+            onDispose { ttsController?.stop() }
+        }
     }
-    LaunchedEffect(contextKey, conv.role, conv.activePromptQuestion) {
-        val followup = conv.activePromptQuestion.trim()
-            .takeIf { conv.role == AiViewModel.ComposerRole.FOLLOWUP && it.isNotEmpty() }
-            ?: return@LaunchedEffect
-        val current = vmAI.conversationStateFlow(contextKey).value
-        if (vmSurvey.currentNode.value.id.trim() != nid ||
-            vmSurvey.sessionId.value != surveySessionId ||
-            current.role != AiViewModel.ComposerRole.FOLLOWUP ||
-            current.activePromptQuestion.trim() != followup) return@LaunchedEffect
-        if (followup == lastAutoReadFollowup) return@LaunchedEffect
-        lastAutoReadFollowup = followup
-        if (shouldAutoPlayQuestion(autoReadFollowups,
-                speechController?.isRecording?.value == true,
-                speechController?.isTranscribing?.value == true)) {
-            try {
-                ttsController?.speak(followup, "$nid-followup-${shortHash(followup)}")
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (error: Exception) {
-                Log.w(TAG, "Unable to read follow-up", error)
+
+    LaunchedEffect(
+        contextKey, presentation, autoReadTarget, ttsController, autoReadQuestion,
+        speechController, speechRecording, speechTranscribing
+    ) {
+        if (!ownsPresentation()) return@LaunchedEffect
+        val enabled = mayAutoRead()
+        // Keep the existing non-AI last-node deduplication aware of eligible AI visits.
+        if (enabled) vmSurvey.claimTtsAutoPlay(nid)
+        val target = autoReadTarget ?: return@LaunchedEffect
+        if (ttsController == null || !enabled) return@LaunchedEffect
+        try {
+            // Keep the pending request in this effect so navigation cancels it before it can speak.
+            ttsController.isReady.first { it }
+            currentCoroutineContext().ensureActive()
+            if (!ownsPresentation() || !mayAutoRead()) return@LaunchedEffect
+            val currentTarget = resolveAiAutoReadTarget(
+                vmSurvey.getQuestion(nid), vmSurvey.getAnswer(nid),
+                vmSurvey.followups.value[nid].orEmpty(),
+                completed = conversation.value.turnCompleted || vmSurvey.aiReasons.value[nid]?.terminal == true
+            )
+            if (target != currentTarget) return@LaunchedEffect
+            val utteranceId = "$contextKey|visit=$presentation|q=${shortHash(target.text)}"
+            // Claim and request playback in the same main-thread turn, after all suspensions.
+            if (vmSurvey.claimAiAutoRead(presentation, surveySessionId, nid, target)) {
+                ttsController.speak(target.text, utteranceId)
             }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            Log.w(TAG, "Unable to read AI question", error)
         }
     }
 
@@ -1087,12 +1103,20 @@ fun AiScreen(
         topBar = {
             CompactTopBar(
                 title = title,
-                onReplay = { ttsController?.let {
-                    val prompt = conv.activePromptQuestion.takeIf {
-                        conv.role == AiViewModel.ComposerRole.FOLLOWUP && it.isNotBlank()
-                    } ?: rootQuestion
-                    toggleQuestionSpeaker(it, prompt, nid)
-                } },
+                onReplay = {
+                    if (ttsController != null && ownsPresentation()) {
+                        if (ttsController.isSpeaking.value ||
+                            (speechController?.isRecording?.value != true &&
+                                speechController?.isTranscribing?.value != true)
+                        ) {
+                            val completed = conversation.value.turnCompleted ||
+                                vmSurvey.aiReasons.value[nid]?.terminal == true
+                            val pending = pendingAiFollowup(vmSurvey.followups.value[nid].orEmpty())
+                            val prompt = pending?.question?.takeUnless { completed } ?: vmSurvey.getQuestion(nid)
+                            toggleQuestionSpeaker(ttsController, prompt, "$contextKey|visit=$presentation|manual")
+                        }
+                    }
+                },
                 isSpeaking = ttsSpeaking
             )
         },

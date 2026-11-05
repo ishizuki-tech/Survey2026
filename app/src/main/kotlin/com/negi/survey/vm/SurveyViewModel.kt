@@ -361,6 +361,29 @@ open class SurveyViewModel(
         return true
     }
 
+    // Navigation changes this value. Attaching a recreated Activity does not.
+    private val _questionPresentation = MutableStateFlow(0L)
+    internal val questionPresentation = _questionPresentation.asStateFlow()
+    private val aiAutoReadTargets = mutableSetOf<AiQuestionPlaybackTarget>()
+
+    private fun beginQuestionPresentation() {
+        aiAutoReadTargets.clear()
+        _questionPresentation.update { it + 1 }
+    }
+
+    @Synchronized
+    internal fun claimAiAutoRead(
+        presentation: Long,
+        session: Long,
+        nodeId: String,
+        target: AiQuestionPlaybackTarget
+    ): Boolean =
+        ownsAiPresentation(presentation, session, nodeId) && aiAutoReadTargets.add(target)
+
+    internal fun ownsAiPresentation(presentation: Long, session: Long, nodeId: String): Boolean =
+        questionPresentation.value == presentation && sessionId.value == session &&
+            currentNode.value.type == NodeType.AI && currentNodeId == nodeId
+
     private val _canGoBack = MutableStateFlow(false)
     val canGoBack: StateFlow<Boolean> = _canGoBack.asStateFlow()
 
@@ -1007,6 +1030,7 @@ open class SurveyViewModel(
     private fun push(node: Node) {
         _currentNode.value = node
         nodeStack.addLast(node.id)
+        beginQuestionPresentation()
 
         clearSelections()
         if (node.type == NodeType.SINGLE_CHOICE) _single.value = node.decomposeSingleChoiceAnswer(getAnswer(node.id)).selected
@@ -1126,6 +1150,7 @@ open class SurveyViewModel(
 
         updateCanGoBack()
         _sessionId.update { it + 1 }
+        beginQuestionPresentation()
 
         RuntimeLogStore.d(
             TAG,
@@ -1145,6 +1170,7 @@ open class SurveyViewModel(
 
         val prevId = nodeStack.last()
         _currentNode.value = nodeOf(prevId)
+        beginQuestionPresentation()
         updateCanGoBack()
 
         clearSelections()

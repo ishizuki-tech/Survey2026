@@ -1786,28 +1786,6 @@ fun SurveyNavHost(
 
                 entry<FlowAI> {
                     val node by vmSurvey.currentNode.collectAsStateWithLifecycle()
-                    val speechRecording by speechController.isRecording.collectAsStateWithLifecycle()
-                    val speechTranscribing by speechController.isTranscribing.collectAsStateWithLifecycle()
-
-                    LaunchedEffect(
-                        node.id,
-                        node.question,
-                        ttsAutoPlay,
-                        speechRecording,
-                        speechTranscribing
-                    ) {
-                        if (
-                            shouldAutoPlayQuestion(
-                                ttsAutoPlay,
-                                speechRecording,
-                                speechTranscribing
-                            ) && node.readAloud &&
-                            vmSurvey.claimTtsAutoPlay(node.id)
-                        ) {
-                            runCatching { ttsController.speak(node.question, node.id) }
-                        }
-                    }
-
                     AiScreen(
                         nodeId = node.id,
                         vmSurvey = vmSurvey,
@@ -1815,8 +1793,8 @@ fun SurveyNavHost(
                         onNext = { runCatching { ttsController.stop() }; vmSurvey.advanceToNext() },
                         onBack = { runCatching { ttsController.stop() }; vmSurvey.backToPrevious() },
                         speechController = speechController,
-                        ttsController = ttsController,
-                        autoReadFollowups = ttsAutoPlay && node.readAloud
+                        ttsController = ttsController.takeIf { ttsEnabled },
+                        autoReadQuestion = ttsAutoPlay
                     )
                 }
 
@@ -1858,6 +1836,9 @@ fun SurveyNavHost(
 
     BackHandler(enabled = canGoBack) {
         Log.d(MainActivity.TAG, "BackHandler -> backToPrevious. session=$sessionId voice=$voiceEnabled")
+        if (vmSurvey.currentNode.value.type == NodeType.AI) {
+            runCatching { ttsController.stop() }
+        }
         runCatching { speechController.stopRecording() }
         vmAI.resetStates()
         vmSurvey.backToPrevious()

@@ -10,7 +10,9 @@ import com.negi.survey.MainActivity
 import com.negi.survey.config.NodeDTO
 import com.negi.survey.config.SurveyConfig
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertSame
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 
@@ -23,6 +25,8 @@ class SurveySessionActivityRecreationTest {
         val sessionKey = "rotation-test@1"
         lateinit var survey: SurveyViewModel
         lateinit var firstOwnerStore: androidx.lifecycle.ViewModelStore
+        lateinit var target: AiQuestionPlaybackTarget
+        var presentation = 0L
 
         scenario.onActivity { activity ->
             val sessions = ViewModelProvider(activity)[SurveySessionStore::class.java]
@@ -32,7 +36,14 @@ class SurveySessionActivityRecreationTest {
 
             survey.advanceToNext()
             survey.setAnswer("kept answer", "Q1")
+            survey.addFollowupQuestion("Q1", "Pending?")
             assertEquals("Q1", survey.currentNodeId)
+            presentation = survey.questionPresentation.value
+            target = checkNotNull(resolveAiAutoReadTarget(
+                survey.getQuestion("Q1"), survey.getAnswer("Q1"),
+                survey.followups.value.getValue("Q1"), completed = false
+            ))
+            assertTrue(survey.claimAiAutoRead(presentation, survey.sessionId.value, "Q1", target))
         }
 
         scenario.recreate()
@@ -47,8 +58,10 @@ class SurveySessionActivityRecreationTest {
             assertEquals("Q1", restoredSurvey.currentNodeId)
             assertEquals("kept answer", restoredSurvey.getAnswer("Q1"))
 
-            val restoredNav = NavBackStack<NavKey>(FlowHome, FlowText)
+            val restoredNav = NavBackStack<NavKey>(FlowHome, FlowAI)
             restoredSurvey.attachNavigation(restoredNav)
+            assertEquals(presentation, restoredSurvey.questionPresentation.value)
+            assertFalse(restoredSurvey.claimAiAutoRead(presentation, restoredSurvey.sessionId.value, "Q1", target))
             restoredSurvey.advanceToNext()
             assertEquals("Done", restoredSurvey.currentNodeId)
             assertEquals(3, restoredNav.size)
@@ -73,7 +86,7 @@ class SurveySessionActivityRecreationTest {
             startId = "Start",
             nodes = listOf(
                 NodeDTO("Start", "START", nextId = "Q1"),
-                NodeDTO("Q1", "TEXT", question = "Question", nextId = "Done"),
+                NodeDTO("Q1", "AI", question = "Question", nextId = "Done"),
                 NodeDTO("Done", "DONE")
             )
         )
