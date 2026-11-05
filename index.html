@@ -8,30 +8,30 @@
   <script id="release-metadata" type="application/json">{
   "repository": "ishizuki-tech/Survey2026",
   "stable_tag": "",
-  "source_commit_sha": "d18f548840b034418d99000d7cb8f527cc0ce8cd",
-  "release_tag": "build-152-d18f548",
+  "source_commit_sha": "7cbed8ddecc583ab0093ad2eb6df3c7e9a3bf2f8",
+  "release_tag": "build-153-7cbed8d",
   "branch": "main",
-  "release_url": "https://github.com/ishizuki-tech/Survey2026/releases/tag/build-152-d18f548",
-  "download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/build-152-d18f548/Survey2026-d18f548-release.apk",
+  "release_url": "https://github.com/ishizuki-tech/Survey2026/releases/tag/build-153-7cbed8d",
+  "download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/build-153-7cbed8d/Survey2026-7cbed8d-release.apk",
   "config_files": {
     "english": {
-      "view_url": "https://github.com/ishizuki-tech/Survey2026/blob/d18f548840b034418d99000d7cb8f527cc0ce8cd/app/src/main/assets/survey_config10.yaml",
-      "download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/build-152-d18f548/survey_config10.yaml",
+      "view_url": "https://github.com/ishizuki-tech/Survey2026/blob/7cbed8ddecc583ab0093ad2eb6df3c7e9a3bf2f8/app/src/main/assets/survey_config10.yaml",
+      "download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/build-153-7cbed8d/survey_config10.yaml",
       "sha256": "2fe06c03a7794a3a3ee5f2c65b31587a624b7285ede7ae7376d5f1876a980287"
     },
     "swahili": {
-      "view_url": "https://github.com/ishizuki-tech/Survey2026/blob/d18f548840b034418d99000d7cb8f527cc0ce8cd/app/src/main/assets/survey_config_sw_10.yaml",
-      "download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/build-152-d18f548/survey_config_sw_10.yaml",
+      "view_url": "https://github.com/ishizuki-tech/Survey2026/blob/7cbed8ddecc583ab0093ad2eb6df3c7e9a3bf2f8/app/src/main/assets/survey_config_sw_10.yaml",
+      "download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/build-153-7cbed8d/survey_config_sw_10.yaml",
       "sha256": "0daafc936e9258fc5424bd8ae687d1ff91d68cb3e576cafa9b5eb0b850b9cf7f"
     }
   },
-  "apk_name": "Survey2026-d18f548-release.apk",
-  "apk_sha256": "2a33eadbf4379b5cb7534ae51c803077a5eb4d141de3959be20fdc3dd8301126",
+  "apk_name": "Survey2026-7cbed8d-release.apk",
+  "apk_sha256": "d516ccacfb38f1806e4f723afecb11dc5275f9aded24be9fa9ecf796b91dfa93",
   "signing_cert_sha256": "d6edef47ec6734a46122ab7fddb5e4f17d19d4d51ae3eaddfb32f309ee5036ea",
-  "short_sha": "d18f548",
-  "run_id": "42087946799",
-  "run_number": "152",
-  "generated_utc": "2026-11-05T18:59:09Z",
+  "short_sha": "7cbed8d",
+  "run_id": "42117173488",
+  "run_number": "153",
+  "generated_utc": "2026-11-05T22:04:55Z",
   "deployment_status": "Field validated",
   "verified_device": {
     "model": "Samsung SM-S731U",
@@ -80,71 +80,67 @@
         <h2>Build provenance</h2>
         
         <p>
-        <strong>Source:</strong> <code>d18f548840b034418d99000d7cb8f527cc0ce8cd</code></p>
+        <strong>Source:</strong> <code>7cbed8ddecc583ab0093ad2eb6df3c7e9a3bf2f8</code></p>
         <p><strong>Deployment status:</strong> <code>Field validated</code></p>
         <p><strong>Verified device:</strong> <code>Samsung SM-S731U, Android 16 (API 36)</code></p>
       </section>
-      <section class="config-files"><h2>What's New</h2><h3>feat(ui): add Q00-only consent auto-scroll</h3><pre class="whats-new-body">## Summary
+      <section class="config-files"><h2>What's New</h2><h3>feat(ui): add Material 3 outdoor light and dark themes</h3><pre class="whats-new-body">## Summary
 
-Add automatic scrolling exclusively to the Introduction &amp; Consent (Q00) screen.
+Introduce a fixed Material 3 Outdoor Light/Dark theme foundation for Survey2026, following the Android system theme.
 
 ## Changes
 
-- Start auto-scrolling after a 2-second pause at approximately 30 dp/second.
-- Preserve the existing scrollable layout, including the consent choices.
-- Cancel auto-scroll immediately on user interaction.
-- Restore scroll position when navigating Back to Q00.
-- Prevent auto-scroll from restarting after navigation or Activity recreation.
-- Reset scroll state for a new survey session.
-- Support both English and Swahili.
-- Keep all other Single-choice and Multiple-choice screens unchanged.
+- Add fixed Light and Dark ColorScheme palettes with Dynamic Color disabled by default.
+- Centralize six typography roles and shared Material 3 shapes.
+- Preserve existing `ActionBlue` compatibility for the subsequent screen migration.
+- Improve text contrast for About credit URLs, the licence text button, and initialization status messages.
+- Add Compose instrumentation tests for theme colors, contrast, typography, shapes, and Dynamic Color selection.
 
 ## Validation
 
-- 411 JVM tests passed.
-- 13 targeted Android instrumentation tests passed on Pixel 10 emulator.
-- Debug APK build passed.
-- AndroidTest APK build passed.
-- Git diff checks passed.
-
-## Remaining Verification
-
-- Physical-device UX validation is pending.
-- Activity recreation combined with viewport resizing may restore the scroll position slightly above the final bottom.
+- JVM unit tests: 411 passed.
+- Debug APK build: passed.
+- Theme instrumentation tests: 4 passed on Pixel 10 emulator during initial validation.
+- `git diff --check`: passed.
+- Final compatibility changes were not rerun on an Android device.
 
 ## Scope
 
-UI-only changes. No changes to TTS, Whisper, LiteRT-LM, survey routing, scoring, upload/recovery, or release infrastructure.
+Theme foundation and targeted contrast compatibility fixes only.
 
-Related: #136 (partial scope only; does not close the issue).</pre></section>
-      <a class="download" href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-152-d18f548/Survey2026-d18f548-release.apk">Download APK</a>
+No changes to survey logic, navigation, recording, TTS, AI inference, or upload behavior.
+
+## Follow-up
+
+Task 2 will migrate remaining screens and controls to consistent Material 3 semantic styling, including `ActionBlue` and `MonotonePalette` usage, with further screen-level regression and accessibility checks.</pre></section>
+      <a class="download" href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-153-7cbed8d/Survey2026-7cbed8d-release.apk">Download APK</a>
       <p class="note">Direct GitHub Release asset. No ZIP extraction is required.</p>
       <section class="config-files">
         <h2>Config files included in this APK</h2>
         <p class="note">These config files were extracted from the exact APK build shown on this page.</p>
-        <p><strong>English — survey_config10.yaml</strong><br><a href="https://github.com/ishizuki-tech/Survey2026/blob/d18f548840b034418d99000d7cb8f527cc0ce8cd/app/src/main/assets/survey_config10.yaml">View in browser</a> · <a href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-152-d18f548/survey_config10.yaml">Download</a><br><code>SHA-256: 2fe06c03a7794a3a3ee5f2c65b31587a624b7285ede7ae7376d5f1876a980287</code></p>
-        <p><strong>Swahili — survey_config_sw_10.yaml</strong><br><a href="https://github.com/ishizuki-tech/Survey2026/blob/d18f548840b034418d99000d7cb8f527cc0ce8cd/app/src/main/assets/survey_config_sw_10.yaml">View in browser</a> · <a href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-152-d18f548/survey_config_sw_10.yaml">Download</a><br><code>SHA-256: 0daafc936e9258fc5424bd8ae687d1ff91d68cb3e576cafa9b5eb0b850b9cf7f</code></p>
+        <p><strong>English — survey_config10.yaml</strong><br><a href="https://github.com/ishizuki-tech/Survey2026/blob/7cbed8ddecc583ab0093ad2eb6df3c7e9a3bf2f8/app/src/main/assets/survey_config10.yaml">View in browser</a> · <a href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-153-7cbed8d/survey_config10.yaml">Download</a><br><code>SHA-256: 2fe06c03a7794a3a3ee5f2c65b31587a624b7285ede7ae7376d5f1876a980287</code></p>
+        <p><strong>Swahili — survey_config_sw_10.yaml</strong><br><a href="https://github.com/ishizuki-tech/Survey2026/blob/7cbed8ddecc583ab0093ad2eb6df3c7e9a3bf2f8/app/src/main/assets/survey_config_sw_10.yaml">View in browser</a> · <a href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-153-7cbed8d/survey_config_sw_10.yaml">Download</a><br><code>SHA-256: 0daafc936e9258fc5424bd8ae687d1ff91d68cb3e576cafa9b5eb0b850b9cf7f</code></p>
       </section>
       <div class="qr-panel">
-        <div class="qr-box"><img src="qr.png" alt="QR code that downloads the Survey2026 APK for build-152-d18f548" width="300" height="300"></div>
-        <div><h2>Scan with Android</h2><p class="subtitle">This QR code downloads the APK for this build (build-152-d18f548).</p><code>https://github.com/ishizuki-tech/Survey2026/releases/download/build-152-d18f548/Survey2026-d18f548-release.apk</code></div>
+        <div class="qr-box"><img src="qr.png" alt="QR code that downloads the Survey2026 APK for build-153-7cbed8d" width="300" height="300"></div>
+        <div><h2>Scan with Android</h2><p class="subtitle">This QR code downloads the APK for this build (build-153-7cbed8d).</p><code>https://github.com/ishizuki-tech/Survey2026/releases/download/build-153-7cbed8d/Survey2026-7cbed8d-release.apk</code></div>
       </div>
       <div class="grid">
-        <div class="item"><span class="label">Release tag</span><code>build-152-d18f548</code></div>
+        <div class="item"><span class="label">Release tag</span><code>build-153-7cbed8d</code></div>
         <div class="item"><span class="label">Branch</span><code>main</code></div>
-        <div class="item"><span class="label">Commit SHA</span><code>d18f548</code></div>
-        <div class="item"><span class="label">APK filename</span><code>Survey2026-d18f548-release.apk</code></div>
-        <div class="item"><span class="label">Workflow run number</span><code>152</code></div>
-        <div class="item"><span class="label">APK SHA-256</span><code>2a33eadbf4379b5cb7534ae51c803077a5eb4d141de3959be20fdc3dd8301126</code></div>
+        <div class="item"><span class="label">Commit SHA</span><code>7cbed8d</code></div>
+        <div class="item"><span class="label">APK filename</span><code>Survey2026-7cbed8d-release.apk</code></div>
+        <div class="item"><span class="label">Workflow run number</span><code>153</code></div>
+        <div class="item"><span class="label">APK SHA-256</span><code>d516ccacfb38f1806e4f723afecb11dc5275f9aded24be9fa9ecf796b91dfa93</code></div>
         <div class="item"><span class="label">Signing certificate SHA-256</span><code>d6edef47ec6734a46122ab7fddb5e4f17d19d4d51ae3eaddfb32f309ee5036ea</code></div>
-        <div class="item"><span class="label">Generated timestamp</span><code>2026-11-05T18:59:09Z</code></div>
+        <div class="item"><span class="label">Generated timestamp</span><code>2026-11-05T22:04:55Z</code></div>
       </div>
       <div class="links">
-        <a href="https://github.com/ishizuki-tech/Survey2026/releases/tag/build-152-d18f548">GitHub Release</a>
-        <a href="https://github.com/ishizuki-tech/Survey2026/actions/runs/42087946799">GitHub Actions run</a>
+        <a href="https://github.com/ishizuki-tech/Survey2026/releases/tag/build-153-7cbed8d">GitHub Release</a>
+        <a href="https://github.com/ishizuki-tech/Survey2026/actions/runs/42117173488">GitHub Actions run</a>
         <a href="https://github.com/ishizuki-tech/Survey2026">Repository</a>
       </div>
-      <footer>Survey2026 release metadata generated 2026-11-05T18:59:09Z.</footer>
+      <footer>Survey2026 release metadata generated 2026-11-05T22:04:55Z.</footer>
     </section>
   </main>
 </body>
