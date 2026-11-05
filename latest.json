@@ -1,30 +1,30 @@
 {
   "repository": "ishizuki-tech/Survey2026",
   "stable_tag": "",
-  "source_commit_sha": "02e0e153f8f79f803b3ee2f3fc3b7db58e4b1470",
-  "release_tag": "build-151-02e0e15",
+  "source_commit_sha": "d18f548840b034418d99000d7cb8f527cc0ce8cd",
+  "release_tag": "build-152-d18f548",
   "branch": "main",
-  "release_url": "https://github.com/ishizuki-tech/Survey2026/releases/tag/build-151-02e0e15",
-  "download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/build-151-02e0e15/Survey2026-02e0e15-release.apk",
+  "release_url": "https://github.com/ishizuki-tech/Survey2026/releases/tag/build-152-d18f548",
+  "download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/build-152-d18f548/Survey2026-d18f548-release.apk",
   "config_files": {
     "english": {
-      "view_url": "https://github.com/ishizuki-tech/Survey2026/blob/02e0e153f8f79f803b3ee2f3fc3b7db58e4b1470/app/src/main/assets/survey_config10.yaml",
-      "download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/build-151-02e0e15/survey_config10.yaml",
+      "view_url": "https://github.com/ishizuki-tech/Survey2026/blob/d18f548840b034418d99000d7cb8f527cc0ce8cd/app/src/main/assets/survey_config10.yaml",
+      "download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/build-152-d18f548/survey_config10.yaml",
       "sha256": "2fe06c03a7794a3a3ee5f2c65b31587a624b7285ede7ae7376d5f1876a980287"
     },
     "swahili": {
-      "view_url": "https://github.com/ishizuki-tech/Survey2026/blob/02e0e153f8f79f803b3ee2f3fc3b7db58e4b1470/app/src/main/assets/survey_config_sw_10.yaml",
-      "download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/build-151-02e0e15/survey_config_sw_10.yaml",
+      "view_url": "https://github.com/ishizuki-tech/Survey2026/blob/d18f548840b034418d99000d7cb8f527cc0ce8cd/app/src/main/assets/survey_config_sw_10.yaml",
+      "download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/build-152-d18f548/survey_config_sw_10.yaml",
       "sha256": "0daafc936e9258fc5424bd8ae687d1ff91d68cb3e576cafa9b5eb0b850b9cf7f"
     }
   },
-  "apk_name": "Survey2026-02e0e15-release.apk",
-  "apk_sha256": "e3b3048731bc468c3d986c95392002ac68824d3520e3129ad0e24b2813a1b207",
+  "apk_name": "Survey2026-d18f548-release.apk",
+  "apk_sha256": "2a33eadbf4379b5cb7534ae51c803077a5eb4d141de3959be20fdc3dd8301126",
   "signing_cert_sha256": "d6edef47ec6734a46122ab7fddb5e4f17d19d4d51ae3eaddfb32f309ee5036ea",
-  "short_sha": "02e0e15",
-  "run_id": "41992987059",
-  "run_number": "151",
-  "generated_utc": "2026-11-05T08:23:15Z",
+  "short_sha": "d18f548",
+  "run_id": "42087946799",
+  "run_number": "152",
+  "generated_utc": "2026-11-05T18:59:09Z",
   "deployment_status": "Field validated",
   "verified_device": {
     "model": "Samsung SM-S731U",
