@@ -1,0 +1,12 @@
+{
+  "original_branch": "codex/tts-background-ui-refinement",
+  "branch_slug": "codex-tts-background-ui-refinement",
+  "commit_sha": "70799e3245bc42c19a5f318612c4e818b232598b",
+  "short_sha": "70799e3",
+  "apk_name": "Survey2026-codex-tts-background-ui-refinement-70799e3.apk",
+  "apk_sha256": "6fbd73a751affd1912226b2b0cb53a9b5f4ea0c9977b26a90fe4d5fce0b09dca",
+  "apk_download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-codex-tts-background-ui-refinement-70799e3-run-193/Survey2026-codex-tts-background-ui-refinement-70799e3.apk",
+  "page_url": "https://ishizuki-tech.github.io/Survey2026/codex-tts-background-ui-refinement/",
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/42125758171",
+  "generated_utc": "2026-11-05T23:04:59Z"
+}
