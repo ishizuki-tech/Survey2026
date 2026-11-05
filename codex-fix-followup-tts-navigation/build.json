@@ -1,0 +1,12 @@
+{
+  "original_branch": "codex/fix-followup-tts-navigation",
+  "branch_slug": "codex-fix-followup-tts-navigation",
+  "commit_sha": "65071088942a4548fd705d802f931483eb970371",
+  "short_sha": "6507108",
+  "apk_name": "Survey2026-codex-fix-followup-tts-navigation-6507108.apk",
+  "apk_sha256": "788b3ee7cebdf0c3a4be82f7947607aeae5e4b5714e6911c89defb531f9351ec",
+  "apk_download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-codex-fix-followup-tts-navigation-6507108-run-188/Survey2026-codex-fix-followup-tts-navigation-6507108.apk",
+  "page_url": "https://ishizuki-tech.github.io/Survey2026/codex-fix-followup-tts-navigation/",
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/41991975699",
+  "generated_utc": "2026-11-05T08:13:01Z"
+}
