@@ -1086,6 +1086,52 @@ class NativeLifecycleCoordinatorTest {
         assertNotNull(coordinator.completeFullTeardown(flight))
     }
 
+    @Test
+    fun conversation_replacement_publishes_only_after_close_and_signals_after_publication() =
+        runBlocking {
+            val coordinator = NativeLifecycleCoordinator()
+            val oldConversation = Any()
+            val freshConversation = Any()
+            val flight = coordinator.startConversationReplacement(oldConversation)
+            var published: Any = oldConversation
+
+            assertNull(coordinator.authorizeReplacement(flight))
+            assertSame(oldConversation, published)
+            assertFalse(flight.completion.isCompleted)
+            assertTrue(coordinator.confirmClose(flight, oldConversation))
+            val authorization = checkNotNull(coordinator.authorizeReplacement(flight))
+            assertSame(oldConversation, published)
+            val terminal = checkNotNull(coordinator.finalizeReplacementPublication(authorization) {
+                assertFalse(flight.completion.isCompleted)
+                published = freshConversation
+            })
+            assertSame(freshConversation, published)
+            assertFalse(flight.completion.isCompleted)
+            assertTrue(terminal.notifyWaiters())
+            assertEquals(NativeLifecycleCoordinator.TeardownOutcome.ReplacementPublished, flight.completion.await())
+            assertNull(coordinator.finalizeReplacementPublication(authorization) { published = oldConversation })
+            assertSame(freshConversation, published)
+        }
+
+    @Test
+    fun failed_conversation_publication_does_not_signal_ready() {
+        val coordinator = NativeLifecycleCoordinator()
+        val oldConversation = Any()
+        val flight = coordinator.startConversationReplacement(oldConversation)
+        assertTrue(coordinator.confirmClose(flight, oldConversation))
+        val authorization = checkNotNull(coordinator.authorizeReplacement(flight))
+        val failure = IllegalStateException("publication failed")
+
+        val thrown = runCatching {
+            coordinator.finalizeReplacementPublication(authorization) { throw failure }
+        }.exceptionOrNull()
+
+        assertSame(failure, thrown)
+        assertEquals(NativeLifecycleCoordinator.Status.TEARDOWN_IN_PROGRESS, coordinator.snapshot().status)
+        assertSame(flight, coordinator.snapshot().teardownFlight)
+        assertFalse(flight.completion.isCompleted)
+    }
+
     private fun NativeLifecycleCoordinator.startConversationReplacement(
         closeIdentity: Any,
         runtimeIdentity: Any = Any(),

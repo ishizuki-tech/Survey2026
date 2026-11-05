@@ -1587,6 +1587,68 @@ class SlmHelperInstrumentationTest {
     }
 
     @Test
+    fun survey_exit_and_reselection_keep_gpu_generation() = runBlocking {
+        org.junit.Assume.assumeTrue(
+            model.getStringConfigValue(ConfigKey.ACCELERATOR, "") == Accelerator.GPU.label,
+        )
+        val coordinator = com.negi.survey.runtime.HeavyRuntimeCoordinator {}
+        val publications = AtomicInteger(0)
+        val conversationCloses = AtomicInteger(0)
+        SLM.forceCleanUpAndWait(model)
+        LiteRtLM.initializationTestHooks = LiteRtLM.InitializationTestHooks(
+            beforeEnginePublication = { publications.incrementAndGet() },
+        )
+        LiteRtLM.nativeLifecycleTestHooks = LiteRtLM.NativeLifecycleTestHooks(
+            beforeNativeClose = { if (it == "conversation-reset") conversationCloses.incrementAndGet() },
+        )
+        try {
+            initializeSurveyRuntime(appCtx, model, coordinator)
+            val first = checkNotNull(SLM.currentGenerationLease(model))
+            assertTrue("GPU fallback must not count as GPU reuse", LiteRtLM.canReuseGeneration(first, model, false, false))
+            val config = com.negi.survey.config.SurveyConfig(
+                graph = com.negi.survey.config.SurveyConfig.Graph("Start"),
+            )
+            val repository = LiteRtRepository(model, config, appCtx, coordinator)
+            repository.endSurveySession()
+            assertEquals(1, conversationCloses.get())
+            initializeSurveyRuntime(appCtx, model, coordinator)
+            assertTrue(SLM.currentGenerationLease(model)?.sameGeneration(first) == true)
+            assertEquals("Compatible selection must not publish another Engine", 1, publications.get())
+        } finally {
+            LiteRtLM.initializationTestHooks = null
+            LiteRtLM.nativeLifecycleTestHooks = null
+            coordinator.releaseCurrent()
+            initializeModelBlocking(model)
+        }
+    }
+
+    @Test
+    fun generation_checked_reset_preserves_engine_and_rejects_stale_lease() = runBlocking {
+        val lease = checkNotNull(SLM.currentGenerationLease(model))
+        LiteRtLM.resetConversationForGenerationAndWait(
+            expected = lease,
+            model = model,
+            supportImage = false,
+            supportAudio = false,
+        )
+        assertTrue(SLM.currentGenerationLease(model)?.sameGeneration(lease) == true)
+        SLM.forceCleanUpAndWait(model)
+        try {
+            val failure = runCatching {
+                LiteRtLM.resetConversationForGenerationAndWait(
+                    expected = lease,
+                    model = model,
+                    supportImage = false,
+                    supportAudio = false,
+                )
+            }.exceptionOrNull()
+            assertTrue("A missing generation must not report a successful reset", failure != null)
+        } finally {
+            initializeModelBlocking(model)
+        }
+    }
+
+    @Test
     fun long_prompt_completes_and_non_empty() {
         val result =
             askMeta(

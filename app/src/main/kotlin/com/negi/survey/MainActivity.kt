@@ -68,6 +68,8 @@ import androidx.compose.material.icons.automirrored.outlined.Send
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -183,6 +185,8 @@ import com.negi.survey.vm.SurveySessionStore
 import com.negi.survey.vm.SurveyFinalizationState
 import com.negi.survey.vm.SurveyFinalizationStatePolicy
 import com.negi.survey.vm.SurveyFinalizationViewModel
+import com.negi.survey.vm.ProcessTtsReadiness
+import com.negi.survey.vm.TtsReadinessKey
 import com.negi.survey.vm.TtsController
 import androidx.lifecycle.compose.LifecycleResumeEffect
 import com.negi.survey.screens.TtsEngineMissingScreen
@@ -238,6 +242,7 @@ class MainActivity : ComponentActivity() {
 
         // Use application context to avoid accidentally retaining Activity.
         LiteRtLM.setApplicationContext(applicationContext)
+        ProcessTtsReadiness.observeChanges(applicationContext)
 
         configureEdgeToEdge()
 
@@ -367,7 +372,8 @@ private fun Modifier.neutralEdge(
 fun InitGate(
     modifier: Modifier = Modifier,
     key: Any? = Unit,
-    init: suspend () -> Unit,
+    init: suspend (showProgress: () -> Unit) -> Unit,
+    progressOnStart: Boolean = true,
     progressText: String = "Initializing…",
     subText: String = "Preparing on-device model and resources",
     onErrorMessage: (Throwable) -> String = { it.message ?: "Initialization failed" },
@@ -382,28 +388,14 @@ fun InitGate(
     onRetry: (error: Throwable, defaultRetry: () -> Unit) -> Unit = { _, defaultRetry -> defaultRetry() },
     content: @Composable () -> Unit
 ) {
-    var isLoading by remember(key) { mutableStateOf(true) }
-    var error by remember(key) { mutableStateOf<Throwable?>(null) }
+    val gate = remember(key) { InitializationUiState(progressOnStart) }
+    val error = gate.error
     var initJob by remember(key) { mutableStateOf<Job?>(null) }
     val scope = rememberCoroutineScope()
 
     fun kick() {
         initJob?.cancel()
-        isLoading = true
-        error = null
-        initJob = scope.launch {
-            try {
-                init()
-                isLoading = false
-            } catch (ce: CancellationException) {
-                // Cancellation is expected during recomposition/dispose; do not treat as error.
-                // Avoid rethrow to prevent cascading cancellation in parent scopes.
-                return@launch
-            } catch (t: Throwable) {
-                error = t
-                isLoading = false
-            }
-        }
+        initJob = scope.launch { gate.run(progressOnStart, init) }
     }
 
     DisposableEffect(key) {
@@ -417,7 +409,7 @@ fun InitGate(
     val backplate = appBackplate()
 
     when {
-        isLoading -> {
+        gate.phase == InitializationUiState.Phase.LOADING -> {
             Box(
                 modifier
                     .fillMaxSize()
@@ -498,20 +490,23 @@ fun InitGate(
                         horizontalAlignment = Alignment.CenterHorizontally
                     ) {
                         Text(
-                            text = onErrorMessage(error!!),
+                            text = onErrorMessage(error),
                             style = MaterialTheme.typography.titleMedium,
                             color = MaterialTheme.colorScheme.error
                         )
                         Spacer(Modifier.height(12.dp))
-                        OutlinedButton(onClick = { onRetry(error!!) { kick() } }) {
-                            Text(retryLabel(error!!))
+                        OutlinedButton(onClick = { onRetry(error) { kick() } }) {
+                            Text(retryLabel(error))
                         }
                     }
                 }
             }
         }
 
-        else -> content()
+        gate.phase == InitializationUiState.Phase.READY -> content()
+        // The runtime transition has not decided whether native acquisition is needed yet.
+        // Never expose survey content or initialization progress optimistically.
+        else -> Box(modifier.fillMaxSize().background(backplate))
     }
 }
 
@@ -804,6 +799,13 @@ fun AppNav() {
 
     when {
         configLoading || (config == null && configError == null) -> {
+            // Keep the timer scoped to this selection's pending presentation.
+            var showLoadingIndicator by remember(sessionKey) { mutableStateOf(false) }
+            LaunchedEffect(sessionKey) {
+                delay(300L)
+                showLoadingIndicator = true
+            }
+
             Box(
                 modifier = Modifier
                     .fillMaxSize()
@@ -812,6 +814,8 @@ fun AppNav() {
                     .padding(24.dp),
                 contentAlignment = Alignment.Center
             ) {
+                if (!showLoadingIndicator) return@Box
+
                 Surface(
                     tonalElevation = 6.dp,
                     shadowElevation = 8.dp,
@@ -914,31 +918,47 @@ fun AppNav() {
     val ttsGateNeedsEngine = remember(cfg, ttsGateEngine) {
         (cfg.tts.enabled ?: true) && (cfg.tts.requireEngine ?: false) && ttsGateEngine != null
     }
-    // null = check still running.
-    var ttsGateResult by remember(sessionKey, ttsGateEngine) {
-        mutableStateOf(if (ttsGateNeedsVoice || ttsGateNeedsEngine) null else TtsVoiceCheck.OK)
-    }
-    var ttsGateContinue by remember(sessionKey) { mutableStateOf(false) }
-    var ttsGateTick by remember(sessionKey) { mutableIntStateOf(0) }
-
-    LaunchedEffect(sessionKey, ttsGateEngine, ttsGateTick) {
-        if (ttsGateResult == TtsVoiceCheck.OK || ttsGateContinue) return@LaunchedEffect
-        val engine = ttsGateEngine ?: return@LaunchedEffect
-        val result = when {
-            ttsGateNeedsVoice -> checkTtsOfflineVoice(appContext, engine, ttsGateLang)
-            ttsGateNeedsEngine ->
-                if (isTtsEngineInstalled(appContext, engine)) TtsVoiceCheck.OK else TtsVoiceCheck.ENGINE_MISSING
-            else -> TtsVoiceCheck.OK
+    val ttsReadinessKey = remember(ttsGateEngine, ttsGateLang, ttsGateNeedsVoice, ttsGateNeedsEngine) {
+        ttsGateEngine?.takeIf { ttsGateNeedsVoice || ttsGateNeedsEngine }?.let {
+            TtsReadinessKey.create(it, ttsGateLang, ttsGateNeedsVoice, ttsGateNeedsEngine)
         }
-        Log.d(MainActivity.TAG, "TTS gate: engine=$engine lang=$ttsGateLang result=$result session=$sessionKey")
+    }
+    val readiness = ProcessTtsReadiness.store
+    // Seed the gate synchronously so a warm selection never composes the spinner.
+    var ttsGateResult by remember(sessionKey, ttsReadinessKey) {
+        mutableStateOf(
+            if (ttsReadinessKey == null || readiness.isReady(ttsReadinessKey)) TtsVoiceCheck.OK else null
+        )
+    }
+    var ttsGateContinue by remember(sessionKey, ttsReadinessKey) { mutableStateOf(false) }
+    var ttsGateTick by remember(sessionKey, ttsReadinessKey) { mutableIntStateOf(0) }
+
+    LaunchedEffect(sessionKey, ttsReadinessKey, ttsGateTick, ttsGateContinue) {
+        val key = ttsReadinessKey ?: return@LaunchedEffect
+        if (ttsGateResult == TtsVoiceCheck.OK || ttsGateContinue) return@LaunchedEffect
+        val result = readiness.check(key) {
+            val checked = if (key.requiresOfflineVoice) {
+                checkTtsOfflineVoice(appContext, key.enginePackage, key.language)
+            } else if (isTtsEngineInstalled(appContext, key.enginePackage)) {
+                TtsVoiceCheck.OK
+            } else {
+                TtsVoiceCheck.ENGINE_MISSING
+            }
+            if (ttsGateContinue) throw CancellationException("TTS readiness was skipped")
+            checked
+        }
+        Log.d(MainActivity.TAG, "TTS gate: engine=${key.enginePackage} lang=${key.language} result=$result session=$sessionKey")
         ttsGateResult = result
     }
 
     if (ttsGateResult != TtsVoiceCheck.OK && !ttsGateContinue) {
         val gateContext = LocalContext.current
-        // Re-check on return to the app, e.g. after downloading the voice in Settings.
-        LifecycleResumeEffect(ttsGateEngine) {
-            if (ttsGateResult != null) ttsGateTick++
+        // The missing-voice flow sends the user to system settings outside the app.
+        LifecycleResumeEffect(sessionKey, ttsReadinessKey) {
+            if (ttsGateResult != null && ttsGateEngine != null) {
+                ProcessTtsReadiness.invalidateVoiceData(ttsGateEngine)
+                ttsGateTick++
+            }
             onPauseOrDispose { }
         }
         val result = ttsGateResult
@@ -958,6 +978,7 @@ fun AppNav() {
                     ttsGateContinue = true
                 },
                 onExit = {
+                    ttsGateEngine?.let(ProcessTtsReadiness::invalidateVoiceData)
                     Log.w(MainActivity.TAG, "TTS gate failed ($result) -> exiting app. session=$sessionKey")
                     sessionStore.clearSession(sessionKey)
                     chosenId = null
@@ -1029,6 +1050,7 @@ fun AppNav() {
 
         InitGate(
             key = "slm_init@$sessionKey@${modelFile.absolutePath}",
+            progressOnStart = !BuildConfig.CROSS_SURVEY_REUSE,
             progressText = "Initializing Small Language Model…",
             subText = "Setting up accelerated runtime and buffers",
             onErrorMessage = { "Failed to initialize model: ${it.message}" },
@@ -1069,36 +1091,43 @@ fun AppNav() {
                     defaultRetry()
                 }
             },
-            init = {
+            init = { showProgress ->
                 withContext(Dispatchers.Default) {
                     try {
-                        heavyRuntimeCoordinator.withLiteRt(
-                            releaseLiteRt = { lease ->
-                                SLM.closeGenerationIfCurrent(lease, reason = "MainActivity")
-                            },
-                            generationLease = {
-                                checkNotNull(SLM.currentGenerationLease(slmModel))
-                            },
-                        ) {
-                            val handoff = LiteRtPublicationHandoff()
-                            try {
-                                LiteRtLM.initializeIfNeeded(
-                                    context = appContext,
-                                    model = slmModel,
-                                    supportImage = false,
-                                    supportAudio = false,
-                                    publicationHandoff = handoff,
-                                )
-                            } catch (error: Throwable) {
-                                handoff.abandon()?.let { lease ->
-                                    withContext(NonCancellable) {
-                                        LiteRtLM.closeGenerationIfCurrent(
-                                            lease,
-                                            reason = "MainActivity-abandoned-handoff",
-                                        )
+                        if (BuildConfig.CROSS_SURVEY_REUSE) {
+                            com.negi.survey.slm.initializeSurveyRuntime(
+                                appContext, slmModel, heavyRuntimeCoordinator,
+                                onInitializationRequired = showProgress,
+                            )
+                        } else {
+                            heavyRuntimeCoordinator.withLiteRt(
+                                releaseLiteRt = { lease ->
+                                    SLM.closeGenerationIfCurrent(lease, reason = "MainActivity")
+                                },
+                                generationLease = {
+                                    checkNotNull(SLM.currentGenerationLease(slmModel))
+                                },
+                            ) {
+                                val handoff = LiteRtPublicationHandoff()
+                                try {
+                                    LiteRtLM.initializeIfNeeded(
+                                        context = appContext,
+                                        model = slmModel,
+                                        supportImage = false,
+                                        supportAudio = false,
+                                        publicationHandoff = handoff,
+                                    )
+                                } catch (error: Throwable) {
+                                    handoff.abandon()?.let { lease ->
+                                        withContext(NonCancellable) {
+                                            LiteRtLM.closeGenerationIfCurrent(
+                                                lease,
+                                                reason = "MainActivity-abandoned-handoff",
+                                            )
+                                        }
                                     }
+                                    throw error
                                 }
-                                throw error
                             }
                         }
                     } catch (ce: CancellationException) {
@@ -1233,6 +1262,7 @@ fun AppNav() {
                         vmAI = vmAI,
                         backStack = backStack,
                         onResetToSelector = resetToSelector,
+                        onEndSurveySession = { (repo as LiteRtRepository).endSurveySession() },
                         whisperMeta = cfg.whisper,
                         ttsMeta = cfg.tts,
                         sessionId = sessionKey,
@@ -1249,6 +1279,7 @@ fun AppNav() {
                     vmAI = vmAI,
                     backStack = backStack,
                     onResetToSelector = resetToSelector,
+                    onEndSurveySession = { (repo as LiteRtRepository).endSurveySession() },
                     whisperMeta = cfg.whisper,
                     ttsMeta = cfg.tts,
                     sessionId = sessionKey,
@@ -1304,6 +1335,7 @@ fun SurveyNavHost(
     vmAI: AiViewModel,
     backStack: NavBackStack<NavKey>,
     onResetToSelector: () -> Unit = {},
+    onEndSurveySession: (suspend () -> Unit)? = null,
     whisperMeta: SurveyConfig.WhisperMeta = SurveyConfig.WhisperMeta(),
     ttsMeta: SurveyConfig.TtsMeta = SurveyConfig.TtsMeta(),
     sessionId: String = "session",
@@ -1514,6 +1546,33 @@ fun SurveyNavHost(
                     }
 
                     val homeBackScope = rememberCoroutineScope()
+                    val homeExit = rememberSaveable(sessionId, saver = HomeSurveyExitState.Saver) {
+                        HomeSurveyExitState()
+                    }
+                    fun retryHomeExit() {
+                        homeBackScope.launch {
+                            homeExit.exit(
+                                endSession = {
+                                    ttsController.stop()
+                                    speechController.stopRecording()
+                                    vmAI.resetStates()
+                                    checkNotNull(onEndSurveySession).invoke()
+                                    heavyRuntimeHandoff.releaseWhisper()
+                                },
+                                onSuccess = onResetToSelector,
+                            )
+                        }
+                    }
+                    homeExit.error?.let { message ->
+                        AlertDialog(
+                            onDismissRequest = homeExit::dismissError,
+                            title = { Text("Survey exit incomplete") },
+                            text = { Text(message) },
+                            confirmButton = {
+                                TextButton(onClick = { retryHomeExit() }) { Text("Retry Back") }
+                            },
+                        )
+                    }
 
                     HomeScreen(
                         vmSurvey = vmSurvey,
@@ -1522,21 +1581,27 @@ fun SurveyNavHost(
                         speechEnabled = voiceEnabled,
                         title = node.title,
                         text = node.question,
-                        onBack = {
+                        sessionOpen = homeExit.canStart,
+                        backEnabled = homeExit.canGoBack,
+                        onBack = onBack@{
+                            if (!homeExit.canGoBack) return@onBack
                             Log.d(
                                 MainActivity.TAG,
-                                "Home -> Back requested; closing SLM and returning to selector. session=$sessionId"
+                                "Home -> Back requested; ending survey session=$sessionId reuse=${BuildConfig.CROSS_SURVEY_REUSE}"
                             )
-                            homeBackScope.launch {
-                                runCatching { heavyRuntimeHandoff.releaseCurrent() }
-                                    .onFailure { t ->
-                                        Log.w(MainActivity.TAG, "Failed to release SLM on Home back.", t)
-                                    }
-                                vmAI.resetStates()
-                                onResetToSelector()
+                            if (BuildConfig.CROSS_SURVEY_REUSE && onEndSurveySession != null) {
+                                retryHomeExit()
+                            } else {
+                                homeBackScope.launch {
+                                    runCatching { heavyRuntimeHandoff.releaseCurrent() }
+                                        .onFailure { t -> Log.w(MainActivity.TAG, "Failed to release SLM on Home back.", t) }
+                                    vmAI.resetStates()
+                                    onResetToSelector()
+                                }
                             }
                         },
-                        onStart = {
+                        onStart = onStart@{
+                            if (!homeExit.canStart) return@onStart
                             /** Snapshot the home note text before resetting the run. */
                             val homeNote = runFreeTextShadow
 
@@ -2397,6 +2462,7 @@ private fun HomeFreeTextComposer(
     value: String,
     onValueChange: (String) -> Unit,
     enabled: Boolean,
+    backEnabled: Boolean = enabled,
     speechEnabled: Boolean,
     speechRecording: Boolean,
     speechTranscribing: Boolean,
@@ -2500,7 +2566,7 @@ private fun HomeFreeTextComposer(
         ) {
             FilledTonalButton(
                 onClick = onBack,
-                enabled = enabled,
+                enabled = backEnabled,
                 shape = CircleShape,
                 contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp)
             ) {
@@ -2540,6 +2606,8 @@ private fun HomeScreen(
     text: String,
     onStart: () -> Unit,
     onBack: () -> Unit,
+    sessionOpen: Boolean = true,
+    backEnabled: Boolean = true,
     onUpdateFreeText: (String) -> Unit
 ) {
     val backplate = appBackplate()
@@ -2759,7 +2827,8 @@ private fun HomeScreen(
                 HomeFreeTextComposer(
                     value = freeText,
                     onValueChange = onUpdateFreeText,
-                    enabled = !pendingStart,
+                    enabled = !pendingStart && sessionOpen,
+                    backEnabled = backEnabled && (!pendingStart || !sessionOpen),
                     speechEnabled = speechEnabled,
                     speechRecording = isRecording,
                     speechTranscribing = isTranscribing,

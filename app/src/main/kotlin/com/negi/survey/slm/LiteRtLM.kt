@@ -307,6 +307,30 @@ internal class PublicationCleanupClaim {
     fun adopt(): Boolean = state.compareAndSet(State.AVAILABLE, State.ADOPTED)
 
     fun claimCleanup(): Boolean = state.compareAndSet(State.AVAILABLE, State.CLEANUP_CLAIMED)
+
+    /** Adopt once, or recognize a prior adopter; cleanup ownership is irreversible. */
+    fun adoptForWarmReuse(): Boolean {
+        while (true) {
+            when (state.get()) {
+                State.AVAILABLE -> if (state.compareAndSet(State.AVAILABLE, State.ADOPTED)) return true
+                State.ADOPTED -> return true
+                State.CLEANUP_CLAIMED -> return false
+            }
+        }
+    }
+}
+
+/** Called under the runtime state lock before treating an instance as reusable. */
+internal fun requireWarmReuseAuthority(
+    claim: PublicationCleanupClaim?,
+    lifecycle: NativeLifecycleCoordinator.Snapshot,
+) {
+    check(lifecycle.status == NativeLifecycleCoordinator.Status.HEALTHY && !lifecycle.hasEngineCreationLease) {
+        "LiteRT-LM runtime is not available for warm reuse."
+    }
+    check(claim?.adoptForWarmReuse() != false) {
+        "LiteRT-LM runtime is being retired after an abandoned initialization. Retry after cleanup."
+    }
 }
 
 /** Atomic bridge between a cancellable initializer and native publication. */
@@ -353,6 +377,16 @@ class LiteRtPublicationHandoff {
 
 internal fun LiteRtGenerationLease.sameGeneration(other: LiteRtGenerationLease): Boolean =
     key == other.key && runtimeIdentity === other.runtimeIdentity
+
+internal fun requireExpectedGeneration(
+    expected: LiteRtGenerationLease,
+    key: String,
+    actualIdentity: Any?,
+) {
+    check(expected.key == key && actualIdentity === expected.runtimeIdentity) {
+        "LiteRT-LM expected generation is absent or has been replaced."
+    }
+}
 
 /** Result of a generation-scoped close request. */
 internal enum class GenerationCloseResult {
@@ -2144,6 +2178,10 @@ object LiteRtLM {
                             supportAudio = supportAudio,
                         )
                     ) {
+                        stateMutex.withLock {
+                            check(instances[key] === existing) { "LiteRT-LM warm runtime changed during initialization." }
+                            requireWarmReuseAuthority(existing.publicationCleanupClaim, nativeLifecycle.snapshot())
+                        }
                         if (
                             existing.conversationConfigSnapshot ==
                             desiredConversationConfig
@@ -3215,6 +3253,7 @@ object LiteRtLM {
         tools: List<Any> = emptyList(),
         samplingProfile: SamplingProfile? = null,
         publicationHandoff: LiteRtPublicationHandoff? = null,
+        onInitializationRequired: () -> Unit = {},
     ) {
         val appContext =
             context.applicationContext
@@ -3263,7 +3302,7 @@ object LiteRtLM {
                 ) &&
                         instance.conversationConfigSnapshot ==
                         desiredConversationConfig
-                if (compatible) instance.publicationCleanupClaim?.adopt()
+                if (compatible) requireWarmReuseAuthority(instance.publicationCleanupClaim, nativeLifecycle.snapshot())
                 compatible
             }
 
@@ -3301,13 +3340,17 @@ object LiteRtLM {
                 ) &&
                             instance.conversationConfigSnapshot ==
                             desiredConversationConfig
-                if (compatible) instance.publicationCleanupClaim?.adopt()
+                if (compatible) requireWarmReuseAuthority(instance.publicationCleanupClaim, nativeLifecycle.snapshot())
                 compatible
                 }
 
             if (readyAfterLock) {
                 return@withLock
             }
+
+            // Presentation notification after the final serialized readiness check.
+            // This never grants runtime admission or changes lifecycle ownership.
+            onInitializationRequired()
 
             val completion =
                 CompletableDeferred<String>()
@@ -3858,6 +3901,35 @@ object LiteRtLM {
     }
 
     /**
+     * Replaces the Conversation only for the specified current Engine generation.
+     * A successful return confirms that a replacement was published on that Engine;
+     * callers must still serialize subsequent work against other lifecycle changes.
+     */
+    internal suspend fun resetConversationForGenerationAndWait(
+        expected: LiteRtGenerationLease,
+        model: Model,
+        supportImage: Boolean,
+        supportAudio: Boolean,
+        systemMessage: Message? = null,
+        tools: List<Any> = emptyList(),
+    ) {
+        val key = runtimeKey(model)
+        check(expected.key == key) { "LiteRT-LM expected generation belongs to a different model." }
+        throwIfPoisoned(key)
+        awaitInitIfInFlight(key, reason = "resetConversationForGenerationAndWait")
+        resetConversationInternal(
+            key = key,
+            model = model,
+            supportImage = supportImage,
+            supportAudio = supportAudio,
+            systemMessage = systemMessage,
+            tools = tools,
+            reason = "resetConversationForGenerationAndWait",
+            expectedGeneration = expected,
+        )
+    }
+
+    /**
      * Recreate only the Conversation while retaining the initialized Engine.
      *
      * Callers must invoke this outside per-key session ownership. The lifecycle
@@ -3871,6 +3943,7 @@ object LiteRtLM {
         systemMessage: Message?,
         tools: List<Any>,
         reason: String,
+        expectedGeneration: LiteRtGenerationLease? = null,
     ) {
         val completion = CompletableDeferred<Throwable?>()
         nativeLifecycleScope.launch {
@@ -3884,6 +3957,7 @@ object LiteRtLM {
                         systemMessage = systemMessage,
                         tools = tools,
                         reason = reason,
+                        expectedGeneration = expectedGeneration,
                     )
                 }.exceptionOrNull()
             completion.complete(failure)
@@ -3899,6 +3973,7 @@ object LiteRtLM {
         systemMessage: Message?,
         tools: List<Any>,
         reason: String,
+        expectedGeneration: LiteRtGenerationLease?,
     ) {
         throwIfPoisoned(key)
         var captured: ReplacementPlanDecision.Started? = null
@@ -3910,7 +3985,10 @@ object LiteRtLM {
                 stateMutex.withLock {
                 throwIfPoisoned(key)
                 val instance = instances[key]
-                    ?: return@withLock ReplacementPlanDecision.Satisfied
+                if (expectedGeneration != null) {
+                    requireExpectedGeneration(expectedGeneration, key, instance?.runtimeIdentity)
+                }
+                if (instance == null) return@withLock ReplacementPlanDecision.Satisfied
                 val runState = getRunState(key)
 
                 if (runState.active.get()) {
@@ -3919,6 +3997,13 @@ object LiteRtLM {
 
                 if (supportImage && !instance.supportImage || supportAudio && !instance.supportAudio) {
                     throw IllegalStateException("resetConversationInternal rejected: requested capability is unavailable for key='$key'")
+                }
+
+                if (expectedGeneration != null) {
+                    check(engineCanServe(instance, model, supportImage, supportAudio)) {
+                        "LiteRT-LM expected generation is incompatible with the requested model."
+                    }
+                    requireWarmReuseAuthority(instance.publicationCleanupClaim, nativeLifecycle.snapshot())
                 }
 
                 val config = buildConversationConfig(model, systemMessage, tools)
@@ -4062,6 +4147,9 @@ object LiteRtLM {
                 if (instances[key] !== instance) {
                     throw IllegalStateException("Conversation replacement target changed for key='$key'.")
                 }
+                if (expectedGeneration != null) {
+                    requireExpectedGeneration(expectedGeneration, key, instance.runtimeIdentity)
+                }
                 terminalSignal = nativeLifecycle.finalizeReplacementPublication(authorization) {
                     instance.conversation = freshConversation
                     instance.conversationConfigSnapshot = config
@@ -4199,6 +4287,57 @@ object LiteRtLM {
             key = key,
             reason = "forceCleanUpAndWait",
         )
+    }
+
+    /** Called only while the repository inference gate is held at survey exit. */
+    internal suspend fun generationAtSessionSafepoint(model: Model): LiteRtGenerationLease? {
+        val key = runtimeKey(model)
+        awaitInitIfInFlight(key, reason = "survey-exit")
+        return stateMutex.withLock {
+            throwIfPoisoned(key)
+            val lifecycle = nativeLifecycle.snapshot()
+            check(lifecycle.status == NativeLifecycleCoordinator.Status.HEALTHY && !lifecycle.hasEngineCreationLease) {
+                "LiteRT-LM cleanup has not reached a survey-exit safepoint."
+            }
+            check(!getRunState(key).active.get()) { "LiteRT-LM native stream remains active at survey exit." }
+            instances[key]?.let { LiteRtGenerationLease(key, it.runtimeIdentity) }
+        }
+    }
+
+    /** Retires the exact generation and joins any already-started teardown for its key. */
+    internal suspend fun retireGenerationAndWait(lease: LiteRtGenerationLease, reason: String) {
+        closeGenerationIfCurrent(lease, reason)
+        val flight = stateMutex.withLock { fullTeardownAssociations[lease.key]?.flight }
+        if (flight != null) awaitFlight(flight)
+        stateMutex.withLock {
+            check(instances[lease.key]?.runtimeIdentity !== lease.runtimeIdentity) {
+                "LiteRT-LM generation remains resident after retirement."
+            }
+            val lifecycle = nativeLifecycle.snapshot()
+            check(lifecycle.status == NativeLifecycleCoordinator.Status.HEALTHY && !lifecycle.hasEngineCreationLease) {
+                "LiteRT-LM retirement is not confirmed."
+            }
+        }
+    }
+
+    /** Checks the existing Engine compatibility rules against an exact generation. */
+    internal suspend fun canReuseGeneration(
+        expected: LiteRtGenerationLease,
+        model: Model,
+        supportImage: Boolean,
+        supportAudio: Boolean,
+    ): Boolean {
+        val key = runtimeKey(model)
+        if (expected.key != key) return false
+        throwIfPoisoned(key)
+        awaitInitIfInFlight(key, reason = "canReuseGeneration")
+        return stateMutex.withLock {
+            val instance = instances[key] ?: return@withLock false
+            if (instance.runtimeIdentity !== expected.runtimeIdentity) return@withLock false
+            if (!engineCanServe(instance, model, supportImage, supportAudio)) return@withLock false
+            requireWarmReuseAuthority(instance.publicationCleanupClaim, nativeLifecycle.snapshot())
+            true
+        }
     }
 
     /** Returns the exact currently published Engine generation, if one exists. */
