@@ -1,0 +1,12 @@
+{
+  "original_branch": "codex/issue-156-review-bottom-first",
+  "branch_slug": "codex-issue-156-review-bottom-first",
+  "commit_sha": "4116e9a783d3a900f04089baccb6e21ca0881a2c",
+  "short_sha": "4116e9a",
+  "apk_name": "Survey2026-codex-issue-156-review-bottom-first-4116e9a.apk",
+  "apk_sha256": "327922e35ff682ca53438c89f498e61b8f0da52f20be5ce1888ee43005472dfb",
+  "apk_download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-codex-issue-156-review-bottom-first-4116e9a-run-194/Survey2026-codex-issue-156-review-bottom-first-4116e9a.apk",
+  "page_url": "https://ishizuki-tech.github.io/Survey2026/codex-issue-156-review-bottom-first/",
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/42270702681",
+  "generated_utc": "2026-11-06T18:34:12Z"
+}
