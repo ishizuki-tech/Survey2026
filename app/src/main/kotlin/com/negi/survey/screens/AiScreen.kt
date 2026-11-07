@@ -1083,19 +1083,6 @@ fun AiScreen(
                             .verticalScroll(rememberScrollState())
                             .padding(top = 6.dp)
                     ) {
-                        if (isTwoStepNode) {
-                            if (BuildConfig.DEBUG) {
-                                // The running chain records FAILURE as its recovery fallback.
-                                // Only present that status once the active attempt has stopped.
-                                aiReason?.takeUnless { processing && it == SurveyAiReason.FAILURE }?.let {
-                                    Text(
-                                        "Status: ${it.wireValue.replace('_', ' ')}",
-                                        modifier = Modifier.padding(horizontal = 12.dp)
-                                    )
-                                }
-                            }
-                        }
-
                         val composerEnabled = textFieldEnabled && !processing && !inputClosed
                         val onToggleSpeech: (() -> Unit)? = speechController?.let { sc ->
                             {
@@ -1567,7 +1554,10 @@ internal fun AiConversation(
                         raw = item.json.orEmpty(),
                         snack = snack
                     )
-                    item.outcome != null -> FieldOutcomeRow(item.outcome)
+                    item.outcome != null -> FieldOutcomeRow(
+                        outcome = item.outcome,
+                        nextFollowupNumber = followups.size + 1
+                    )
                     item.json != null -> JsonBubbleMono(pretty = item.json, snack = snack)
                     else -> FieldMessage(text = item.text.orEmpty(), isAi = isAi, typing = item.isTyping)
                 }

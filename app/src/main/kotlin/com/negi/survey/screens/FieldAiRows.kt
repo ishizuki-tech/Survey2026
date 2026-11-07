@@ -181,7 +181,7 @@ internal fun FieldProcessingRow(reviewing: Boolean, visible: Boolean) {
 }
 
 @Composable
-internal fun FieldOutcomeRow(outcome: AiTurnOutcome) {
+internal fun FieldOutcomeRow(outcome: AiTurnOutcome, nextFollowupNumber: Int) {
     val (heading, explanation) = when (outcome) {
         AiTurnOutcome.ACHIEVED ->
             "Answer complete" to "Your answer meets the requirements. No follow-up question is needed."
@@ -192,7 +192,9 @@ internal fun FieldOutcomeRow(outcome: AiTurnOutcome) {
         AiTurnOutcome.FOLLOWUP_GENERATION_FAILED ->
             "Follow-up generation failed" to "We couldn't prepare another question."
         AiTurnOutcome.DUPLICATE_FOLLOWUP ->
-            "Follow-up already asked" to "The generated question was already asked."
+            "No new follow-up available" to
+                "The ${followupOrdinal(nextFollowupNumber)} follow-up question matched a question already asked, " +
+                "so no additional question was shown."
         AiTurnOutcome.UNKNOWN ->
             "AI review unavailable" to "We couldn't complete the AI review."
         AiTurnOutcome.UNABLE_REFUSED ->
@@ -216,6 +218,21 @@ internal fun FieldOutcomeRow(outcome: AiTurnOutcome) {
             Text(heading, style = MaterialTheme.typography.titleSmall, color = color)
             Text(explanation, style = MaterialTheme.typography.bodySmall, color = colors.onSurfaceVariant)
         }
+    }
+}
+
+private fun followupOrdinal(number: Int): String = when (number) {
+    1 -> "first"
+    2 -> "second"
+    3 -> "third"
+    else -> {
+        val suffix = if (number % 100 in 11..13) "th" else when (number % 10) {
+            1 -> "st"
+            2 -> "nd"
+            3 -> "rd"
+            else -> "th"
+        }
+        "$number$suffix"
     }
 }
 

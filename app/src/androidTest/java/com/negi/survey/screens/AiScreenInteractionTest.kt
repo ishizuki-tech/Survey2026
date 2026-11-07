@@ -1690,7 +1690,8 @@ class AiScreenInteractionTest {
         val duplicate = ControlledResponse()
         val secondScore = NEEDS_FOLLOWUP.replace("30", "45")
         repo.streamedResponses = listOf(firstEval, firstFollowup, secondEval, duplicate)
-        host(twoStep = true)
+        val restoration = StateRestorationTester(rule)
+        host(twoStep = true, restoration = restoration, useNavDisplay = true)
         enterAndSend("main answer")
         sendChunk(firstEval, NEEDS_FOLLOWUP, expected = NEEDS_FOLLOWUP)
         firstEval.finish()
@@ -1716,6 +1717,36 @@ class AiScreenInteractionTest {
         assertEquals(FIRST_FOLLOWUP, followup.question)
         assertEquals("two bags", followup.answer)
         assertEquals(4, repo.requests)
+
+        rule.runOnIdle { survey.goto("Done") }
+        rule.onNodeWithText("Away from AI").assertIsDisplayed()
+        rule.runOnIdle { survey.backToPrevious() }
+        assertDuplicateOutcome("second")
+        restoration.emulateSavedInstanceStateRestore()
+        assertDuplicateOutcome("second")
+    }
+
+    @Test fun duplicateMessageCountsTheNextAttemptFromAcceptedHistory() {
+        val duplicate = AiViewModel.ChatItem(
+            "duplicate", AiViewModel.ChatSender.AI, outcome = AiTurnOutcome.DUPLICATE_FOLLOWUP
+        )
+        var followups by mutableStateOf(emptyList<SurveyViewModel.FollowupEntry>())
+        rule.setContent {
+            AiConversation(
+                nodeId = "Q8", presentation = 1L, chatItems = listOf(duplicate),
+                followups = followups, loading = false, fieldEvaluation = true,
+                snack = remember { SnackbarHostState() }, modifier = Modifier.fillMaxSize()
+            )
+        }
+        for ((count, ordinal) in listOf(0 to "first", 1 to "second", 2 to "third")) {
+            rule.runOnIdle {
+                followups = List(count) { index ->
+                    SurveyViewModel.FollowupEntry("Accepted question ${index + 1}?", answer = "Sample answer")
+                }
+            }
+            rule.onNodeWithText("No new follow-up available").assertIsDisplayed()
+            rule.onNodeWithText(duplicateExplanation(ordinal)).assertIsDisplayed()
+        }
     }
 
     @Test fun generationErrorResolvesTheSlotAndRetryRetiresItWithoutASecondStep() {
@@ -1772,7 +1803,14 @@ class AiScreenInteractionTest {
         rule.onNodeWithText(heading).assertIsDisplayed()
         rule.onNodeWithText(explanation).assertIsDisplayed()
         rule.onNodeWithText(NO_FOLLOWUP).assertDoesNotExist()
+        rule.onNodeWithText("Status:", substring = true).assertDoesNotExist()
     }
+
+    private fun duplicateExplanation(ordinal: String) =
+        "The $ordinal follow-up question matched a question already asked, so no additional question was shown."
+
+    private fun assertDuplicateOutcome(ordinal: String) =
+        assertOutcome("No new follow-up available", duplicateExplanation(ordinal))
 
     private fun assertUnavailableFollowup(
         score: AiViewModel.ChatItem,
@@ -1781,13 +1819,12 @@ class AiScreenInteractionTest {
     ) {
         rule.waitUntil(5_000) { ai.conversationStateFlow(contextKey).value.validationFailed && !ai.isRunning }
         if (outcome == AiTurnOutcome.DUPLICATE_FOLLOWUP) {
-            assertOutcome("Follow-up already asked", "The generated question was already asked.")
+            assertDuplicateOutcome("second")
             rule.onNodeWithText("Evaluation failed").assertDoesNotExist()
         } else {
             assertOutcome("Follow-up generation failed", "We couldn't prepare another question.")
         }
         rule.onNodeWithText(PREPARING_FOLLOWUP).assertDoesNotExist()
-        rule.onNodeWithText("Status: failure").assertIsDisplayed()
         assertEquals(SurveyAiReason.FAILURE, survey.aiReasons.value[survey.currentNodeId])
         val notice = chatRows().single { it.outcome != null }
         assertEquals(slot.copy(followupNotice = null, outcome = outcome), notice)
@@ -1995,7 +2032,7 @@ class AiScreenInteractionTest {
         assertOutcome("AI review unavailable", "We couldn't complete the AI review.")
         rule.onNodeWithText("Evaluation failed").assertDoesNotExist()
         rule.onNodeWithText("Follow-up generation failed").assertDoesNotExist()
-        rule.onNodeWithText("Follow-up already asked").assertDoesNotExist()
+        rule.onNodeWithText("No new follow-up available").assertDoesNotExist()
         rule.onNodeWithText("Answer complete").assertDoesNotExist()
         rule.onNodeWithText("Next").assertIsEnabled()
         assertEquals(0, showRequests)
