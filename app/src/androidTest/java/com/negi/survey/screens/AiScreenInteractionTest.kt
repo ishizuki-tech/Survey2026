@@ -52,6 +52,7 @@ import com.negi.survey.vm.QuestionSpeaker
 import com.negi.survey.vm.StopQuestionSpeakerInBackground
 import com.negi.survey.vm.SurveyAiReason
 import com.negi.survey.vm.SurveyViewModel
+import com.negi.survey.vm.toggleQuestionSpeaker
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.flow.Flow
@@ -76,6 +77,7 @@ class AiScreenInteractionTest {
     private var autoplay by mutableStateOf(true)
     private var speakerAvailable by mutableStateOf(true)
     private var unrelated by mutableStateOf(false)
+    private var retainedAiNodeId by mutableStateOf<String?>(null)
     private val contextKey get() = "sid=${survey.sessionId.value}|nid=${survey.currentNodeId}"
 
     private fun host(
@@ -84,20 +86,21 @@ class AiScreenInteractionTest {
         readAloud: Boolean = true,
         playbackState: Lifecycle.State? = null,
         compact: Boolean = false,
+        firstNode: String = "Q8",
         seed: SurveyViewModel.() -> Unit = {}
     ) {
         rule.setContent {
             hostView = LocalView.current
             val stack = rememberNavBackStack(FlowHome)
             survey = remember { SurveyViewModel(stack, config(twoStep, readAloud)).apply {
-                goto("Q8")
+                goto(firstNode)
                 seed()
             } }
             ai = remember { AiViewModel(repo) }
             val node by survey.currentNode.collectAsState()
             // Read unrelated state to force an ordinary parent recomposition.
             if (unrelated) androidx.compose.material3.Text("unrelated")
-            if (visible && node.type == NodeType.AI) {
+            if (visible) {
                 val owner = LocalLifecycleOwner.current
                 val lifecycle = if (playbackState == null) owner.lifecycle else {
                     val testOwner = remember {
@@ -111,13 +114,20 @@ class AiScreenInteractionTest {
                     StopQuestionSpeakerInBackground(speaker, playbackLifecycle)
                     playbackLifecycle
                 }
-                val density = LocalDensity.current
-                val contentDensity = if (compact) Density(density.density, fontScale = 2f) else density
-                Box(if (compact) Modifier.size(width = 280.dp, height = 260.dp) else Modifier) {
-                    CompositionLocalProvider(LocalDensity provides contentDensity) {
-                        AiScreen(node.id, survey, ai, survey::advanceToNext, survey::backToPrevious,
-                            if (withSpeech) speech else null, speaker.takeIf { speakerAvailable }, autoplay,
-                            playbackLifecycle = lifecycle)
+                SurveyQuestionAutoRead(
+                    survey, ai, speaker.takeIf { speakerAvailable },
+                    speech.takeIf { withSpeech }, autoplay, lifecycle
+                )
+                val aiNodeId = retainedAiNodeId ?: node.id.takeIf { node.type == NodeType.AI }
+                if (aiNodeId != null) {
+                    val density = LocalDensity.current
+                    val contentDensity = if (compact) Density(density.density, fontScale = 2f) else density
+                    Box(if (compact) Modifier.size(width = 280.dp, height = 260.dp) else Modifier) {
+                        CompositionLocalProvider(LocalDensity provides contentDensity) {
+                            AiScreen(aiNodeId, survey, ai, survey::advanceToNext, survey::backToPrevious,
+                                if (withSpeech) speech else null, speaker.takeIf { speakerAvailable },
+                                playbackLifecycle = lifecycle)
+                        }
                     }
                 }
             }
@@ -296,6 +306,131 @@ class AiScreenInteractionTest {
         }
         rule.onNodeWithText("🔊").performClick()
         rule.runOnIdle { assertEquals("Question", speaker.spoken.last()) }
+    }
+
+    @Test fun failureQ07StaysSilentFromQ06AndQ08AndCanBeReplayed() {
+        host(firstNode = "Q06") { setAiReason("Q07", SurveyAiReason.FAILURE) }
+        rule.runOnIdle {
+            assertEquals(listOf("Number"), speaker.spoken)
+            survey.advanceToNext()
+        }
+        rule.runOnIdle {
+            assertEquals("Q07", survey.currentNodeId)
+            assertEquals(listOf("Number"), speaker.spoken)
+            survey.setAnswer("Saved", "Q07")
+            survey.addFollowupQuestion("Q07", "Historical follow-up?")
+            survey.advanceToNext()
+        }
+        rule.runOnIdle {
+            assertEquals("Q08", survey.currentNodeId)
+            assertEquals(listOf("Number", "Next question"), speaker.spoken)
+            survey.backToPrevious()
+        }
+        rule.runOnIdle {
+            assertEquals("Q07", survey.currentNodeId)
+            assertEquals(listOf("Number", "Next question"), speaker.spoken)
+        }
+        rule.onNodeWithText("🔊").performClick()
+        rule.runOnIdle {
+            assertEquals(listOf("Number", "Next question", "Historical follow-up?"), speaker.spoken)
+        }
+    }
+
+    @Test fun newQ07AndFollowupAfterSuccessfulRetryEachSpeakOnce() {
+        host(firstNode = "Q06")
+        rule.runOnIdle { survey.advanceToNext() }
+        rule.runOnIdle {
+            assertEquals(listOf("Number", "Q07 original"), speaker.spoken)
+            survey.setAiReason("Q07", SurveyAiReason.FAILURE)
+        }
+        rule.runOnIdle {
+            assertEquals(listOf("Number", "Q07 original"), speaker.spoken)
+            survey.setAnswer("Saved", "Q07")
+            survey.addFollowupQuestion("Q07", "New follow-up?")
+            survey.setAiReason("Q07", null)
+        }
+        rule.runOnIdle { unrelated = true }
+        rule.runOnIdle {
+            assertEquals(listOf("Number", "Q07 original", "New follow-up?"), speaker.spoken)
+        }
+    }
+
+    @Test fun ordinaryNodeTypesSpeakTheirOwnQuestion() {
+        host(firstNode = "Info")
+        val spoken = mutableListOf<String>()
+        for ((id, prompt) in listOf(
+            "Info" to "Info", "Text" to "Text", "Single" to "Single",
+            "Multi" to "Multi", "Q06" to "Number"
+        )) {
+            spoken += prompt
+            rule.runOnIdle {
+                assertEquals(id, survey.currentNodeId)
+                assertEquals(spoken, speaker.spoken)
+                if (id != "Q06") survey.advanceToNext()
+            }
+        }
+    }
+
+    @Test fun queuedOrdinaryReplayTakesPrecedenceOverWaitingAutoplay() {
+        speaker.isReady.value = false
+        host(firstNode = "Q06")
+        rule.runOnIdle {
+            assertEquals(1, speaker.isReady.subscriptionCount.value)
+            survey.noteQueuedOrdinaryReplay("Q06")
+            toggleQuestionSpeaker(speaker, "Number", "manual")
+            speaker.isReady.value = true
+        }
+        rule.runOnIdle { assertEquals(listOf("manual"), speaker.ids) }
+    }
+
+    @Test fun rapidForwardBackAndLateReadinessRejectOldNumberAndAiPresentations() {
+        speaker.isReady.value = false
+        host(firstNode = "Q06")
+        rule.runOnIdle {
+            assertEquals(1, speaker.isReady.subscriptionCount.value)
+            survey.advanceToNext()
+        }
+        rule.runOnIdle {
+            assertEquals(1, speaker.isReady.subscriptionCount.value)
+            survey.backToPrevious()
+            survey.advanceToNext()
+            survey.advanceToNext()
+            speaker.isReady.value = true
+        }
+        rule.runOnIdle { assertEquals(listOf("Next question"), speaker.spoken) }
+    }
+
+    @Test fun disposingRetainedAiEntryDoesNotStopOrDuplicateNewOwnerPlayback() {
+        speaker.holdPlayback = true
+        host(firstNode = "Q06")
+        rule.runOnIdle {
+            assertEquals(listOf("Number"), speaker.spoken)
+            survey.advanceToNext()
+        }
+        rule.runOnIdle {
+            assertEquals(listOf("Number", "Q07 original"), speaker.spoken)
+            retainedAiNodeId = "Q07"
+            survey.advanceToNext()
+            survey.backToPrevious()
+            survey.backToPrevious()
+        }
+
+        // The outgoing AI screen remains composed after the new owner has started.
+        rule.onNodeWithText("Question • Q07").assertExists()
+        rule.runOnIdle {
+            assertEquals("Q06", survey.currentNodeId)
+            assertEquals(listOf("Number", "Q07 original", "Number"), speaker.spoken)
+            assertEquals(2, speaker.stopCalls)
+            assertTrue(speaker.isSpeaking.value)
+            retainedAiNodeId = null
+        }
+
+        rule.onNodeWithText("Question • Q07").assertDoesNotExist()
+        rule.runOnIdle {
+            assertEquals(listOf("Number", "Q07 original", "Number"), speaker.spoken)
+            assertEquals(2, speaker.stopCalls)
+            assertTrue(speaker.isSpeaking.value)
+        }
     }
 
     @Test fun autoplayRespectsPreferencesAndSpeechState() {
@@ -617,10 +752,12 @@ class AiScreenInteractionTest {
         override val errorMessage = MutableStateFlow<String?>(null)
         val spoken = mutableListOf<String>()
         val ids = mutableListOf<String>()
+        var holdPlayback = false
         var stopCalls = 0
         override fun speak(text: String, utteranceId: String) {
             spoken += text
             ids += utteranceId
+            if (holdPlayback) isSpeaking.value = true
         }
         override fun stop() {
             stopCalls++
@@ -642,6 +779,13 @@ class AiScreenInteractionTest {
     private fun config(twoStep: Boolean, readAloud: Boolean) = SurveyConfig(
         graph = SurveyConfig.Graph(startId = "Start", nodes = listOf(
             NodeDTO(id = "Start", type = "START", nextId = "Q8"),
+            NodeDTO(id = "Info", type = "INFO", question = "Info", nextId = "Text"),
+            NodeDTO(id = "Text", type = "TEXT", question = "Text", nextId = "Single"),
+            NodeDTO(id = "Single", type = "SINGLE_CHOICE", question = "Single", options = listOf("One"), nextId = "Multi"),
+            NodeDTO(id = "Multi", type = "MULTI_CHOICE", question = "Multi", options = listOf("One"), nextId = "Q06"),
+            NodeDTO(id = "Q06", type = "NUMBER", question = "Number", nextId = "Q07"),
+            NodeDTO(id = "Q07", type = "AI", question = "Q07 original", nextId = "Q08"),
+            NodeDTO(id = "Q08", type = "AI", question = "Next question", nextId = "Done"),
             NodeDTO(id = "Q8", type = "AI", question = "Question", nextId = "Q9", readAloud = readAloud),
             NodeDTO(id = "Q9", type = "AI", question = "Other question", nextId = "Done"),
             NodeDTO(id = "Done", type = "DONE"),
