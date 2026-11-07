@@ -170,7 +170,6 @@ import androidx.compose.ui.window.DialogProperties
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.negi.survey.BuildConfig
 import com.negi.survey.net.RuntimeLogStore
@@ -185,22 +184,16 @@ import com.negi.survey.vm.QuestionSpeaker
 import com.negi.survey.vm.SurveyViewModel
 import com.negi.survey.vm.SurveyAiReason
 import com.negi.survey.vm.pendingAiFollowup
-import com.negi.survey.vm.resolveAiAutoReadTarget
-import com.negi.survey.vm.shouldAutoPlayQuestion
 import com.negi.survey.vm.toggleQuestionSpeaker
 import java.security.MessageDigest
 import java.util.Locale
 import kotlin.collections.ArrayDeque
 import kotlin.math.abs
 import kotlin.math.min
-import kotlinx.coroutines.job
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.collect
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.launch
 import kotlinx.serialization.ExperimentalSerializationApi
@@ -346,7 +339,6 @@ fun AiScreen(
     onBack: () -> Unit,
     speechController: SpeechController? = null,
     ttsController: QuestionSpeaker? = null,
-    autoReadQuestion: Boolean = false,
     playbackLifecycle: Lifecycle = LocalLifecycleOwner.current.lifecycle
 ) {
     val nid = remember(nodeId) { nodeId.trim() }
@@ -447,8 +439,6 @@ fun AiScreen(
     val conversation = remember(vmAI, contextKey) { vmAI.conversationStateFlow(contextKey) }
     val conv by conversation.collectAsState()
     val presentation by vmSurvey.questionPresentation.collectAsState()
-    val savedFollowups by vmSurvey.followups.collectAsState()
-    val savedAnswers by vmSurvey.answers.collectAsState()
 
     LaunchedEffect(contextKey, rootQuestion, presentation) {
         if (!vmSurvey.ownsAiPresentation(presentation, surveySessionId, nid)) return@LaunchedEffect
@@ -471,69 +461,7 @@ fun AiScreen(
         }
     }
 
-    val autoReadTarget = resolveAiAutoReadTarget(
-        rootQuestion, savedAnswers[nid].orEmpty(), savedFollowups[nid].orEmpty(),
-        completed = conv.turnCompleted || aiReason?.terminal == true
-    )
-
     fun ownsPresentation() = vmSurvey.ownsAiPresentation(presentation, surveySessionId, nid)
-
-    fun mayAutoRead() = vmSurvey.currentNode.value.readAloud && shouldAutoPlayQuestion(
-        autoReadQuestion,
-        speechController?.isRecording?.value == true,
-        speechController?.isTranscribing?.value == true
-    )
-
-    if (ownsPresentation()) {
-        DisposableEffect(contextKey, presentation, ttsController) {
-            onDispose { ttsController?.stop() }
-        }
-    }
-
-    LaunchedEffect(
-        contextKey, presentation, autoReadTarget, ttsController, autoReadQuestion,
-        speechController, speechRecording, speechTranscribing, playbackLifecycle
-    ) {
-        if (!ownsPresentation() || !mayAutoRead() ||
-            !playbackLifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
-        ) return@LaunchedEffect
-
-        // Keep the non-AI last-node deduplication aware of eligible AI visits.
-        vmSurvey.claimTtsAutoPlay(nid)
-        val target = autoReadTarget ?: return@LaunchedEffect
-        if (ttsController == null) return@LaunchedEffect
-
-        // Cancel this request across a stop, even if the app returns before TTS is ready.
-        val request = currentCoroutineContext().job
-        val stopObserver = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_STOP) request.cancel()
-        }
-        playbackLifecycle.addObserver(stopObserver)
-        try {
-            ttsController.isReady.first { it }
-            currentCoroutineContext().ensureActive()
-            if (!ownsPresentation() || !mayAutoRead()) return@LaunchedEffect
-            val currentTarget = resolveAiAutoReadTarget(
-                vmSurvey.getQuestion(nid), vmSurvey.getAnswer(nid),
-                vmSurvey.followups.value[nid].orEmpty(),
-                completed = conversation.value.turnCompleted || vmSurvey.aiReasons.value[nid]?.terminal == true
-            )
-            if (target != currentTarget ||
-                !playbackLifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
-            ) return@LaunchedEffect
-
-            val utteranceId = "$contextKey|visit=$presentation|q=${shortHash(target.text)}"
-            if (vmSurvey.claimAiAutoRead(presentation, surveySessionId, nid, target)) {
-                ttsController.speak(target.text, utteranceId)
-            }
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (error: Exception) {
-            Log.w(TAG, "Unable to read AI question", error)
-        } finally {
-            playbackLifecycle.removeObserver(stopObserver)
-        }
-    }
 
     val chatItems by vmAI.chatHistoryFlow(contextKey).collectAsState(initial = emptyList())
 

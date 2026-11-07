@@ -137,6 +137,7 @@ import com.negi.survey.net.GitHubUploader
 import com.negi.survey.screens.SurveyActionButton
 import com.negi.survey.screens.SurveyNavigationButtons
 import com.negi.survey.screens.AiScreen
+import com.negi.survey.screens.SurveyQuestionAutoRead
 import com.negi.survey.screens.ConfigOptionUi
 import com.negi.survey.screens.ConsentScrollState
 import com.negi.survey.screens.DoneScreen
@@ -198,7 +199,6 @@ import com.negi.survey.vm.UploadStatusViewModel
 import com.negi.survey.vm.UploadStatus
 import com.negi.survey.vm.UploadStatusDetails
 import com.negi.survey.vm.WhisperSpeechController
-import com.negi.survey.vm.shouldAutoPlayQuestion
 import com.negi.survey.vm.toggleQuestionSpeaker
 import java.util.Locale
 import java.text.SimpleDateFormat
@@ -1487,17 +1487,14 @@ fun SurveyNavHost(
     val playbackLifecycle = LocalLifecycleOwner.current.lifecycle
     StopQuestionSpeakerInBackground(ttsController, playbackLifecycle)
 
-    fun autoReadQuestion(nodeId: String, question: String, readAloud: Boolean) {
-        if (ttsAutoPlay && readAloud &&
-            playbackLifecycle.currentState.isAtLeast(Lifecycle.State.STARTED) &&
-            vmSurvey.claimTtsAutoPlay(nodeId)
-        ) {
-            runCatching { ttsController.speak(question, nodeId) }
-        }
-    }
+    SurveyQuestionAutoRead(
+        vmSurvey, vmAI, ttsController.takeIf { ttsEnabled }, speechController,
+        ttsAutoPlay, playbackLifecycle
+    )
 
     fun replayQuestion(nodeId: String, question: String) {
         if (playbackLifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
+            if (ttsEnabled && !ttsController.isReady.value) vmSurvey.noteQueuedOrdinaryReplay(nodeId)
             toggleQuestionSpeaker(ttsController, question, nodeId)
         }
     }
@@ -1623,10 +1620,6 @@ fun SurveyNavHost(
                     val node by vmSurvey.currentNode.collectAsStateWithLifecycle()
                     val ttsSpeaking by ttsController.isSpeaking.collectAsStateWithLifecycle()
 
-                    LaunchedEffect(node.id, node.question, ttsAutoPlay, node.readAloud) {
-                        autoReadQuestion(node.id, node.question, node.readAloud)
-                    }
-
                     InfoNodeScreen(
                         title = node.title,
                         text = node.question,
@@ -1657,10 +1650,6 @@ fun SurveyNavHost(
                     val answers by vmSurvey.answers.collectAsStateWithLifecycle()
                     val ttsSpeaking by ttsController.isSpeaking.collectAsStateWithLifecycle()
 
-                    LaunchedEffect(node.id, node.question, ttsAutoPlay) {
-                        autoReadQuestion(node.id, node.question, node.readAloud)
-                    }
-
                     TextNodeScreen(
                         title = node.title,
                         question = node.question,
@@ -1677,10 +1666,6 @@ fun SurveyNavHost(
                     val answers by vmSurvey.answers.collectAsStateWithLifecycle()
                     val node by vmSurvey.currentNode.collectAsStateWithLifecycle()
                     val ttsSpeaking by ttsController.isSpeaking.collectAsStateWithLifecycle()
-
-                    LaunchedEffect(node.id, node.question, ttsAutoPlay) {
-                        autoReadQuestion(node.id, node.question, node.readAloud)
-                    }
 
                     SingleChoiceNodeScreen(
                         title = node.title,
@@ -1710,10 +1695,6 @@ fun SurveyNavHost(
                     val ttsSpeaking by ttsController.isSpeaking.collectAsStateWithLifecycle()
                     val answer = answers[node.id].orEmpty()
 
-                    LaunchedEffect(node.id, node.question, ttsAutoPlay, node.readAloud) {
-                        autoReadQuestion(node.id, node.question, node.readAloud)
-                    }
-
                     NumberNodeScreen(
                         title = node.title,
                         question = node.question,
@@ -1733,10 +1714,6 @@ fun SurveyNavHost(
                     val node by vmSurvey.currentNode.collectAsStateWithLifecycle()
                     val selected by vmSurvey.multi.collectAsStateWithLifecycle()
                     val ttsSpeaking by ttsController.isSpeaking.collectAsStateWithLifecycle()
-
-                    LaunchedEffect(node.id, node.question, ttsAutoPlay) {
-                        autoReadQuestion(node.id, node.question, node.readAloud)
-                    }
 
                     MultiChoiceNodeScreen(
                         title = node.title,
@@ -1766,8 +1743,7 @@ fun SurveyNavHost(
                         onBack = { runCatching { ttsController.stop() }; vmSurvey.backToPrevious() },
                         speechController = speechController,
                         ttsController = ttsController.takeIf { ttsEnabled },
-                        playbackLifecycle = playbackLifecycle,
-                        autoReadQuestion = ttsAutoPlay
+                        playbackLifecycle = playbackLifecycle
                     )
                 }
 

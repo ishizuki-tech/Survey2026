@@ -9,6 +9,8 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.negi.survey.MainActivity
 import com.negi.survey.config.NodeDTO
 import com.negi.survey.config.SurveyConfig
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertSame
@@ -20,13 +22,60 @@ import org.junit.runner.RunWith
 class SurveySessionActivityRecreationTest {
 
     @Test
+    fun autoplayRejectsMismatchedPresentationSessionNodeIdAndNodeType() = runBlocking(Dispatchers.Main) {
+        val survey = SurveyViewModel(NavBackStack<NavKey>(FlowHome), testConfig())
+        val priorSession = survey.sessionId.value
+        survey.resetToStart()
+        survey.advanceToNext()
+        val priorPresentation = survey.questionSpeechOwner()
+        survey.advanceToNext()
+        survey.backToPrevious()
+
+        val current = survey.questionSpeechOwner()
+        val target = QuestionPlaybackTarget("Question")
+        assertEquals(priorPresentation.copy(presentation = current.presentation), current)
+        val mismatches = listOf(
+            "stale presentation" to priorPresentation,
+            "stale session" to current.copy(session = priorSession),
+            "wrong node ID" to current.copy(nodeId = "Done"),
+            "wrong node type" to current.copy(nodeType = NodeType.NUMBER)
+        )
+        for ((reason, request) in mismatches) {
+            assertFalse(reason, survey.ownsQuestionSpeech(request))
+            assertFalse("$reason must not claim playback", survey.claimQuestionAutoRead(request, target))
+        }
+        assertTrue("Rejected requests must leave the valid claim available", survey.claimQuestionAutoRead(current, target))
+    }
+
+    @Test
+    fun autoplayRejectsEntryRetainedBelowTheTopOfTheNavigationStack() = runBlocking(Dispatchers.Main) {
+        val nav = NavBackStack<NavKey>(FlowHome)
+        val survey = SurveyViewModel(nav, testConfig())
+        survey.advanceToNext()
+        val owner = survey.questionSpeechOwner()
+        val target = QuestionPlaybackTarget("Question")
+        assertEquals(FlowAI, nav.last())
+
+        // Keep the request identity intact and move only the matching entry off the top.
+        nav.add(FlowNumber)
+        assertEquals(owner, survey.questionSpeechOwner())
+        assertEquals(FlowAI, nav[nav.lastIndex - 1])
+        assertFalse(survey.ownsQuestionSpeech(owner))
+        assertFalse(survey.claimQuestionAutoRead(owner, target))
+
+        nav.removeLastOrNull()
+        assertTrue(survey.ownsQuestionSpeech(owner))
+        assertTrue(survey.claimQuestionAutoRead(owner, target))
+    }
+
+    @Test
     fun active_survey_progress_survives_activity_recreation_and_true_session_end_clears_it() {
         val scenario = ActivityScenario.launch(MainActivity::class.java)
         val sessionKey = "rotation-test@1"
         lateinit var survey: SurveyViewModel
         lateinit var firstOwnerStore: androidx.lifecycle.ViewModelStore
-        lateinit var target: AiQuestionPlaybackTarget
-        var presentation = 0L
+        lateinit var target: QuestionPlaybackTarget
+        lateinit var playbackOwner: QuestionSpeechOwner
 
         scenario.onActivity { activity ->
             val sessions = ViewModelProvider(activity)[SurveySessionStore::class.java]
@@ -38,12 +87,12 @@ class SurveySessionActivityRecreationTest {
             survey.setAnswer("kept answer", "Q1")
             survey.addFollowupQuestion("Q1", "Pending?")
             assertEquals("Q1", survey.currentNodeId)
-            presentation = survey.questionPresentation.value
+            playbackOwner = survey.questionSpeechOwner()
             target = checkNotNull(resolveAiAutoReadTarget(
                 survey.getQuestion("Q1"), survey.getAnswer("Q1"),
                 survey.followups.value.getValue("Q1"), completed = false
             ))
-            assertTrue(survey.claimAiAutoRead(presentation, survey.sessionId.value, "Q1", target))
+            assertTrue(survey.claimQuestionAutoRead(playbackOwner, target))
         }
 
         scenario.recreate()
@@ -60,8 +109,8 @@ class SurveySessionActivityRecreationTest {
 
             val restoredNav = NavBackStack<NavKey>(FlowHome, FlowAI)
             restoredSurvey.attachNavigation(restoredNav)
-            assertEquals(presentation, restoredSurvey.questionPresentation.value)
-            assertFalse(restoredSurvey.claimAiAutoRead(presentation, restoredSurvey.sessionId.value, "Q1", target))
+            assertEquals(playbackOwner, restoredSurvey.questionSpeechOwner())
+            assertFalse(restoredSurvey.claimQuestionAutoRead(playbackOwner, target))
             restoredSurvey.advanceToNext()
             assertEquals("Done", restoredSurvey.currentNodeId)
             assertEquals(3, restoredNav.size)

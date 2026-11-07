@@ -28,9 +28,16 @@ class AiQuestionPlaybackTest {
         assertNull(select(entries = listOf(first), completed = true))
     }
 
+    @Test fun failureSuppressesOriginalAndStaleFollowupUntilOutcomeClears() {
+        assertNull(select(reason = SurveyAiReason.FAILURE))
+        assertNull(select("Original answer", listOf(first), reason = SurveyAiReason.FAILURE))
+        assertEquals(second, select("Original answer", listOf(first, second))?.followup)
+    }
+
     private fun select(
         answer: String = "",
         entries: List<FollowupEntry> = emptyList(),
-        completed: Boolean = false
-    ) = resolveAiAutoReadTarget("Original?", answer, entries, completed)
+        completed: Boolean = false,
+        reason: SurveyAiReason? = null
+    ) = resolveAiAutoReadTarget("Original?", answer, entries, completed, reason)
 }
