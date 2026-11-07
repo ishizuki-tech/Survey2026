@@ -39,6 +39,8 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
@@ -47,13 +49,21 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.snapshots.Snapshot
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.layout
+import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.dp
 
-import com.negi.survey.vm.SurveyViewModel
+import com.negi.survey.vm.NodeType
 import com.negi.survey.vm.SurveyFinalizationState
+import com.negi.survey.vm.SurveyViewModel
+import kotlinx.coroutines.flow.filter
+
+private const val REVIEW_ACTIONS_INDEX = 3
 
 /**
  * Review screen that renders a compact, read-only summary of the session.
@@ -72,7 +82,7 @@ import com.negi.survey.vm.SurveyFinalizationState
  *    still tied to [MaterialTheme.typography] for consistency.
  *
  * @param vm Backing ViewModel providing the survey state.
- * @param onNext Invoked when the user presses the “Next” button.
+ * @param onFinish Invoked when the user presses the “Finish” button.
  * @param onBack Invoked when the user presses the “Back” button.
  */
 @Composable
@@ -88,10 +98,21 @@ fun ReviewScreen(
     val answerLabel = MaterialTheme.typography.labelMedium
     val answerBody = MaterialTheme.typography.bodyMedium
 
-    // Collect VM state with explicit empty defaults for safety.
-    val allQuestions by vm.questions.collectAsState(initial = emptyMap())
-    val allAnswers by vm.answers.collectAsState(initial = emptyMap())
-    val allFollowups by vm.followups.collectAsState(initial = emptyMap())
+    // The first measure needs the current content to resolve the scroll bounds.
+    val allQuestions by vm.questions.collectAsState()
+    val allAnswers by vm.answers.collectAsState()
+    val allFollowups by vm.followups.collectAsState()
+
+    // Navigation 3 can keep the outgoing Review composed during its transition.
+    // Only a presentation of Review itself starts a fresh visit.
+    val reviewPresentations = remember(vm) {
+        vm.questionPresentation.filter { vm.currentNode.value.type == NodeType.REVIEW }
+    }
+    val presentation by reviewPresentations.collectAsState(initial = vm.questionPresentation.value)
+    val (listState, initialPlacement) = key(presentation) {
+        val state = rememberLazyListState(initialFirstVisibleItemIndex = REVIEW_ACTIONS_INDEX)
+        state to rememberInitialReviewPlacement(state)
+    }
 
     /**
      * Build a stable union of node IDs that own either a question or an answer.
@@ -132,10 +153,12 @@ fun ReviewScreen(
 
     Scaffold(containerColor = Color.Transparent) { pad ->
         LazyColumn(
+            state = listState,
             modifier = Modifier
                 .padding(pad)
                 .fillMaxSize()
-                .padding(horizontal = 16.dp, vertical = 12.dp),
+                .padding(horizontal = 16.dp, vertical = 12.dp)
+                .then(initialPlacement),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             // Header.
@@ -241,7 +264,7 @@ fun ReviewScreen(
                 }
             }
 
-            // Bottom buttons.
+            // Bottom buttons (REVIEW_ACTIONS_INDEX).
             item {
                 val finishing = finalizationState is SurveyFinalizationState.Finishing
                 val error = (finalizationState as? SurveyFinalizationState.Error)?.message
@@ -276,6 +299,47 @@ fun ReviewScreen(
         }
     }
 }
+
+/**
+ * Insets can shrink the viewport just after the first measure. Preserve the initial
+ * anchor through that resize if the list is still at its initial, untouched position.
+ */
+@Composable
+private fun rememberInitialReviewPlacement(state: LazyListState): Modifier =
+    remember(state) {
+        var initialConstraints: Constraints? = null
+        var initialPosition: Pair<Int, Int>? = null
+        Modifier.layout { measurable, constraints ->
+            val firstMeasure = initialConstraints == null
+            if (!firstMeasure && constraints != initialConstraints) {
+                val position = initialPosition
+                initialPosition = null
+                Snapshot.withoutReadObservation {
+                    if (position != null && !state.isScrollInProgress &&
+                        !state.lastScrolledForward && !state.lastScrolledBackward &&
+                        position == (state.firstVisibleItemIndex to state.firstVisibleItemScrollOffset)
+                    ) {
+                        state.requestScrollToItem(REVIEW_ACTIONS_INDEX)
+                    }
+                }
+            }
+
+            val placeable = measurable.measure(constraints)
+            if (firstMeasure) {
+                initialConstraints = constraints
+                Snapshot.withoutReadObservation {
+                    val index = state.firstVisibleItemIndex
+                    val offset = state.firstVisibleItemScrollOffset
+                    // An oversized footer starts at its buttons, with more error text below.
+                    // A restored position elsewhere should never be treated as the anchor.
+                    if (!state.canScrollForward || (index == REVIEW_ACTIONS_INDEX && offset == 0)) {
+                        initialPosition = index to offset
+                    }
+                }
+            }
+            layout(placeable.width, placeable.height) { placeable.placeRelative(0, 0) }
+        }
+    }
 
 /**
  * Immutable view model for a single Q/A row in the review card.
