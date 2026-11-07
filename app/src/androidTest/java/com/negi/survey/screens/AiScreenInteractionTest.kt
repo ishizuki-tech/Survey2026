@@ -19,18 +19,23 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.platform.SoftwareKeyboardController
+import androidx.compose.ui.text.TextLayoutResult
+import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.semantics.SemanticsProperties
+import androidx.compose.ui.test.SemanticsNodeInteraction
 import androidx.compose.ui.test.assertCountEquals
+import androidx.compose.ui.test.click
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.SemanticsMatcher
@@ -39,10 +44,12 @@ import androidx.compose.ui.test.pressKey
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.test.assertIsFocused
 import androidx.compose.ui.test.assertIsNotFocused
+import androidx.compose.ui.test.assertIsSelected
 import androidx.compose.ui.test.assert
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.hasClickAction
+import androidx.compose.ui.test.hasContentDescription
 import androidx.compose.ui.test.hasAnyAncestor
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.isDialog
@@ -61,6 +68,7 @@ import androidx.compose.ui.test.performSemanticsAction
 import androidx.compose.ui.test.performScrollToIndex
 import androidx.compose.ui.test.performScrollToNode
 import androidx.compose.ui.test.performTextInput
+import androidx.compose.ui.test.performTextReplacement
 import androidx.compose.ui.test.performTouchInput
 import androidx.compose.ui.test.swipeDown
 import androidx.compose.ui.test.swipeUp
@@ -83,6 +91,7 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.view.KeyEvent
 import android.view.View
+import android.view.ViewConfiguration
 import android.view.WindowManager
 import com.negi.survey.config.NodeDTO
 import com.negi.survey.config.SurveyConfig
@@ -256,32 +265,228 @@ class AiScreenInteractionTest {
         ai.setFollowupMode(contextKey, question)
     }
 
-    @Test fun voiceModeSwitchingPreservesDraftAndTranscriptCanBeEdited() {
-        host()
-        rule.onNodeWithContentDescription("Record answer").assertExists()
-        waitForKeyboard(visible = false)
-        rule.onNodeWithText("Type instead").performClick()
+    @Test fun typeModeStartsAtEndAndKeepsUserSelectionDuringEditing() {
+        host(productionImeInsets = true) { setAnswer("typed draft", "Q8") }
+        val editor = rule.onNode(hasSetTextAction())
+        val type = rule.onNodeWithText("Type")
+        val speak = rule.onNodeWithText("Speak")
+
+        type.performClick().assertIsSelected()
         waitForKeyboard(visible = true)
-        rule.onNode(hasSetTextAction()).assertIsFocused().performTextInput("typed draft")
-        rule.onNodeWithText("Use voice instead").performClick()
-        rule.waitUntil(5_000) {
-            rule.runOnUiThread {
-                ViewCompat.getRootWindowInsets(hostView)?.isVisible(WindowInsetsCompat.Type.ime()) == false
-            }
+        editor.assertCaretAt(11)
+        editor.tapAtTextOffset(5)
+        editor.assertCaretAt(5)
+        editor.performTextInput("!")
+        editor.assertCaretAt(6)
+        rule.runOnIdle { assertEquals("typed! draft", survey.getAnswer("Q8")) }
+
+        editor.performSemanticsAction(SemanticsActions.SetSelection) { it(1, 4, false) }
+        rule.runOnIdle { unrelated = true }
+        editor.assertSelection(1, 4)
+        rule.runOnIdle { ai.updateComposerDraft(contextKey, "typed! draft updated") }
+        editor.assertSelection(1, 4)
+
+        speak.assertIsDisplayed().performClick().assertIsSelected()
+        waitForKeyboard(visible = false)
+        type.performClick().assertIsSelected()
+        waitForKeyboard(visible = true)
+        editor.assertCaretAt("typed! draft updated".length)
+    }
+
+    private fun SemanticsNodeInteraction.tapAtTextOffset(offset: Int) {
+        val layouts = mutableListOf<TextLayoutResult>()
+        performSemanticsAction(SemanticsActions.GetTextLayoutResult) { it(layouts) }
+        val cursor = layouts.single().getCursorRect(offset)
+        // The unlabeled Material 3 editor insets its text by 16 dp.
+        performTouchInput {
+            // Each call represents an independent tap rather than a double-tap word selection.
+            advanceEventTime(ViewConfiguration.getDoubleTapTimeout().toLong() + 1)
+            click(Offset(16.dp.toPx() + cursor.left, center.y))
         }
-        rule.onNodeWithText("typed draft").performScrollTo().assertIsDisplayed().performClick()
-        rule.onNode(hasSetTextAction()).assertExists()
+    }
+
+    private fun SemanticsNodeInteraction.assertCaretAt(offset: Int) = assertSelection(offset, offset)
+
+    private fun SemanticsNodeInteraction.assertSelection(start: Int, end: Int) =
+        assert(SemanticsMatcher.expectValue(SemanticsProperties.TextSelectionRange, TextRange(start, end)))
+
+    @Test fun inputModeAndDraftSurviveBackAndNextWithinSurvey() {
+        host(useNavDisplay = true, initialNode = "Q06", productionImeInsets = true) {
+            setAnswer("Q08 saved answer", "Q08")
+        }
+        val type = rule.onNodeWithText("Type")
+        val speak = rule.onNodeWithText("Speak")
+        val editor = rule.onNode(hasSetTextAction())
+        val back = rule.onNodeWithText("Back")
+        val next = rule.onNodeWithText("Next")
+
+        rule.runOnIdle { survey.advanceToNext() }
+        assertQuestionFits("Q07 original question")
+        speak.assertIsSelected()
+        type.performClick().assertIsSelected()
+        waitForKeyboard(visible = true)
+        editor.performTextInput("Q07 draft")
+
+        back.performScrollTo().performClick()
+        rule.onNodeWithText("Experience").assertIsDisplayed()
+        rule.runOnIdle { survey.advanceToNext() }
+        assertQuestionFits("Q07 original question")
+        type.assertIsSelected()
+        editor.assertIsNotFocused()
+        waitForKeyboard(visible = false)
+        rule.onNodeWithText("Q07 draft").assertIsDisplayed()
+
+        next.performScrollTo().performClick()
+        assertQuestionFits("Q08 original question")
+        type.assertIsSelected()
+        editor.assertIsNotFocused()
+        waitForKeyboard(visible = false)
+        rule.onNodeWithText("Q07 draft").assertDoesNotExist()
+        rule.onNodeWithText("Q08 saved answer").assertIsDisplayed()
+
+        editor.tapAtTextOffset(3)
+        editor.assertIsFocused().assertCaretAt(3)
+        waitForKeyboard(visible = true)
+        dismissKeyboardWithBack()
+        // The activity delegates system Back directly to the survey ViewModel.
+        rule.runOnIdle { survey.backToPrevious() }
+        assertQuestionFits("Q07 original question")
+        type.assertIsSelected()
+        editor.assertIsNotFocused()
+        editor.assertCaretAt(0)
+        waitForKeyboard(visible = false)
+        rule.onNodeWithText("Q07 draft").assertIsDisplayed()
+        next.performScrollTo().performClick()
+        assertQuestionFits("Q08 original question")
+        type.assertIsSelected()
+        editor.assertIsNotFocused()
+
+        speak.performClick().assertIsSelected()
+        back.performScrollTo().performClick()
+        assertQuestionFits("Q07 original question")
+        speak.assertIsSelected()
+        rule.onNodeWithText("Tap to answer").assertIsDisplayed()
+        rule.runOnIdle {
+            assertEquals("Q07 draft", ai.conversationStateFlow(contextKey).value.composerDraft)
+            assertEquals("Q07 draft", survey.getAnswer("Q07"))
+        }
+
+        next.performScrollTo().performClick()
+        assertQuestionFits("Q08 original question")
+        speak.assertIsSelected()
+        next.performScrollTo().performClick()
+        assertQuestionFits("Q09 original question")
+        speak.assertIsSelected()
+        waitForKeyboard(visible = false)
+    }
+
+    @Test fun newSurveySessionResetsInputModeToSpeak() {
+        host(useNavDisplay = true, initialNode = "Q06", productionImeInsets = true)
+        rule.runOnIdle { survey.advanceToNext() }
+        rule.onNodeWithText("Type").performClick().assertIsSelected()
+        waitForKeyboard(visible = true)
+
+        rule.onNodeWithText("Back").performScrollTo().performClick()
+        rule.onNodeWithText("Experience").assertIsDisplayed()
+        rule.runOnIdle {
+            val previousSession = survey.sessionId.value
+            survey.resetToStart()
+            assertTrue(survey.sessionId.value > previousSession)
+        }
+        rule.onNodeWithText("Home").assertIsDisplayed()
+        rule.runOnIdle { survey.goto("Q07") }
+        assertQuestionFits("Q07 original question")
+        rule.onNodeWithText("Speak").assertIsSelected()
+        rule.onNodeWithContentDescription("Record answer").assertIsDisplayed()
+        rule.onNode(hasSetTextAction()).assertDoesNotExist()
+        waitForKeyboard(visible = false)
+    }
+
+    @Test fun voiceModeSwitchingPreservesDraftAndTranscriptCanBeEdited() {
+        host(productionImeInsets = true)
+        val speak = rule.onNodeWithText("Speak")
+        val type = rule.onNodeWithText("Type")
+        val editor = rule.onNode(hasSetTextAction())
+        speak.assertIsSelected()
+        rule.onNodeWithText("Tap to answer").assertIsDisplayed()
+        rule.onNodeWithContentDescription("Record answer").assertIsDisplayed()
+        editor.assertDoesNotExist()
+        waitForKeyboard(visible = false)
+
+        type.performClick().assertIsSelected()
+        waitForKeyboard(visible = true)
+        editor.assertIsFocused().performTextInput("typed draft")
+        assertSharedAnswerField()
+        rule.onNodeWithText("Record again").assertDoesNotExist()
+        speak.assertIsDisplayed().performClick().assertIsSelected()
+        waitForKeyboard(visible = false)
+        editor.assertDoesNotExist()
+        rule.onNodeWithText("Tap to answer").assertIsDisplayed()
         rule.runOnIdle { assertEquals("typed draft", ai.conversationStateFlow(contextKey).value.composerDraft) }
-        rule.onNodeWithText("Use voice instead").performClick()
-        rule.onNodeWithText("Record again").performClick()
+
+        type.performClick().assertIsSelected()
+        editor.assertIsFocused()
+        waitForKeyboard(visible = true)
+        rule.onNodeWithText("typed draft").assertIsDisplayed()
+        dismissKeyboardWithBack()
+        type.assertIsSelected().performClick()
+        waitForKeyboard(visible = true)
+        // The first switch above covers touch. Invoke this one while the IME is still moving.
+        speak.performSemanticsAction(SemanticsActions.OnClick).assertIsSelected()
+        waitForKeyboard(visible = false)
+        rule.onNodeWithContentDescription("Record answer").performClick()
         rule.runOnIdle { speech.capture.value = true }
         rule.onNodeWithText("Stop").performClick()
         rule.runOnIdle { speech.transitionToTranscribing() }
-        rule.waitForIdle()
+        rule.onNodeWithText("Transcribing…").assertExists()
         rule.runOnIdle { speech.finish("recognized answer") }
-        rule.onNodeWithText("recognized answer").performScrollTo().assertIsDisplayed().performClick()
-        rule.onNode(hasSetTextAction()).performTextInput(" edited")
-        rule.runOnIdle { assertTrue(ai.conversationStateFlow(contextKey).value.composerDraft.contains("edited")) }
+        speak.assertIsSelected()
+        editor.assertIsNotFocused()
+        waitForKeyboard(visible = false)
+        assertSharedAnswerField()
+        val field = rule.onNodeWithTag("ai-answer-field")
+        val recordAgain = rule.onNodeWithText("Record again").assertIsDisplayed()
+        assertTrue(recordAgain.fetchSemanticsNode().boundsInRoot.top >= field.fetchSemanticsNode().boundsInRoot.bottom)
+
+        editor.performScrollTo().tapAtTextOffset(4)
+        editor.assertIsFocused()
+        waitForKeyboard(visible = true)
+        editor.assertCaretAt("recognized answer".length)
+        speak.assertIsSelected().assertIsDisplayed()
+        assertSharedAnswerField()
+        editor.tapAtTextOffset(4)
+        editor.assertCaretAt(4)
+        editor.performTextInput("!")
+        editor.assertCaretAt(5)
+        rule.runOnIdle { assertEquals("reco!gnized answer", survey.getAnswer("Q8")) }
+        editor.performTextReplacement("")
+        editor.assertIsFocused()
+        rule.onNodeWithContentDescription("Send").assertIsNotEnabled()
+        type.performClick().assertIsSelected()
+        speak.performClick().assertIsSelected()
+        waitForKeyboard(visible = false)
+        assertSharedAnswerField()
+        editor.performClick().performTextInput("edited transcript")
+        rule.runOnIdle {
+            assertEquals("edited transcript", ai.conversationStateFlow(contextKey).value.composerDraft)
+            assertEquals("edited transcript", survey.getAnswer("Q8"))
+        }
+        dismissKeyboardWithBack()
+        speak.assertIsSelected()
+        rule.onNodeWithText("Record again").performScrollTo().assertIsDisplayed()
+        rule.onNodeWithContentDescription("Send").performScrollTo().performClick()
+        rule.waitUntil(5_000) { repo.requests == 1 }
+        assertEquals(listOf("edited transcript"), userMessages())
+    }
+
+    private fun assertSharedAnswerField() {
+        val inAnswerField = hasAnyAncestor(hasTestTag("ai-answer-field"))
+        val editor = rule.onNode(inAnswerField and hasSetTextAction()).assertIsDisplayed()
+        val send = rule.onNode(inAnswerField and hasContentDescription("Send")).assertIsDisplayed()
+        assertTrue(send.fetchSemanticsNode().boundsInRoot.left >= editor.fetchSemanticsNode().boundsInRoot.right)
+        rule.onNode(inAnswerField and hasContentDescription("Start recording")).assertDoesNotExist()
+        rule.onNode(inAnswerField and hasContentDescription("Record answer")).assertDoesNotExist()
+        rule.onNode(inAnswerField and hasText("Record again")).assertDoesNotExist()
     }
 
     @Test fun textOnlyFallbackFocusesOnEntryWithoutReopeningTheDismissedKeyboard() {
@@ -291,6 +496,8 @@ class AiScreenInteractionTest {
         waitForKeyboard(visible = true)
         editor.performTextInput("answer")
         rule.onNodeWithContentDescription("Record answer").assertDoesNotExist()
+        rule.onNodeWithText("Speak").assertDoesNotExist()
+        assertSharedAnswerField()
         rule.runOnIdle { assertEquals("answer", survey.getAnswer("Q8")) }
 
         dismissKeyboardWithBack()
@@ -357,7 +564,7 @@ class AiScreenInteractionTest {
     @Test fun sendOnceDisablesSubmissionAndPreservesKeyboardDuringInference() {
         host()
         rule.onNodeWithText("Next").assertIsEnabled()
-        rule.onNodeWithText("Type instead").performClick()
+        rule.onNodeWithText("Type").performClick()
         val send = rule.onNodeWithContentDescription("Send")
         send.assertIsNotEnabled()
         rule.onNode(hasSetTextAction()).performTextInput("answer")
@@ -678,7 +885,7 @@ class AiScreenInteractionTest {
         rule.runOnIdle { survey.backToPrevious() }
         assertLatestEdgeVisible(answerId)
 
-        rule.onNodeWithText("Type instead").performClick()
+        rule.onNodeWithText("Type").performClick()
         waitForKeyboard(visible = true)
         assertLatestEdgeVisible(answerId)
         val answerBottom = rule.onNodeWithTag(answerId).fetchSemanticsNode().boundsInRoot.bottom
@@ -756,7 +963,7 @@ class AiScreenInteractionTest {
         assertQuestionFits("Question")
         rule.runOnIdle { unrelated = true }
         waitForKeyboard(visible = false)
-        rule.onNodeWithText("Use voice instead").performClick()
+        rule.onNodeWithText("Speak").performClick()
         waitForKeyboard(visible = false)
         assertQuestionFits("Question")
     }
@@ -805,19 +1012,26 @@ class AiScreenInteractionTest {
             streamed.complete(Unit)
         }
 
+        fun selectSpeak() {
+            val speak = rule.onNodeWithText("Speak").assertIsEnabled()
+            // In a very short IME viewport the selector shares the scrollable footer.
+            if (!speak.isDisplayed()) speak.performScrollTo()
+            speak.performClick().assertIsSelected()
+        }
+
         waitForFollowup(FIRST_FOLLOWUP)
-        rule.onNodeWithText("Use voice instead").performScrollTo().assertIsEnabled().performClick()
+        selectSpeak()
         waitForKeyboard(visible = false)
         // Measure away from either end, where changing the viewport can clamp the range.
         scrollManuallyTo(8)
         val manualPosition = conversationPosition()
         restoration.emulateSavedInstanceStateRestore()
         assertEquals(manualPosition, conversationPosition(), 0f)
-        rule.onNodeWithText("Type instead").performClick()
+        rule.onNodeWithText("Type").performClick()
         waitForKeyboard(visible = true)
         rule.onNode(hasSetTextAction()).performTextInput("draft edit")
         assertEquals(manualPosition, conversationPosition(), 0f)
-        rule.onNodeWithText("Use voice instead").performScrollTo().assertIsEnabled().performClick()
+        selectSpeak()
         waitForKeyboard(visible = false)
         assertEquals(manualPosition, conversationPosition(), 0f)
         rule.runOnIdle { survey.setAnswer("Updated main answer", "Q8") }
@@ -831,13 +1045,14 @@ class AiScreenInteractionTest {
         }
 
         // A transcript changes the draft without creating a new conversation question.
-        rule.onNodeWithText("Record again").performClick()
+        rule.onNodeWithContentDescription("Record answer").performScrollTo().performClick()
         rule.runOnIdle { speech.transitionToTranscribing() }
         rule.waitForIdle()
         rule.runOnIdle { speech.finish("two bags") }
         assertEquals(manualPosition, conversationPosition(), 0f)
-        rule.onNodeWithText("Send").performClick()
+        rule.onNodeWithContentDescription("Send").performClick()
         waitForFollowup(SECOND_FOLLOWUP)
+        rule.onNodeWithText("Speak").assertIsSelected()
         waitForKeyboard(visible = false)
         rule.runOnIdle {
             val entries = survey.followups.value.getValue("Q8")
@@ -856,7 +1071,7 @@ class AiScreenInteractionTest {
         enterAndSend("main answer")
         repo.release.complete(Unit)
         waitForFollowup(FIRST_FOLLOWUP)
-        rule.onNodeWithText("Use voice instead").performClick()
+        rule.onNodeWithText("Speak").performClick()
         waitForKeyboard(visible = false)
         scrollToOriginalQuestion()
         val manualPosition = conversationPosition()
@@ -865,7 +1080,7 @@ class AiScreenInteractionTest {
         assertEquals(manualPosition, conversationPosition(), 0f)
         rule.onNodeWithText("Question").assertIsDisplayed()
 
-        rule.onNodeWithText("Type instead").performClick()
+        rule.onNodeWithText("Type").performClick()
         waitForKeyboard(visible = true)
         rule.runOnIdle { survey.goto("Done") }
         rule.onNodeWithText("Away from AI").assertIsDisplayed()
@@ -923,7 +1138,7 @@ class AiScreenInteractionTest {
     }
 
     private fun enterAndSend(answer: String) {
-        rule.onNodeWithText("Type instead").performClick()
+        rule.onNodeWithText("Type").performClick()
         rule.onNode(hasSetTextAction()).performTextInput(answer)
         waitForKeyboard(visible = true)
         rule.onNodeWithContentDescription("Send").performClick()
@@ -997,7 +1212,7 @@ class AiScreenInteractionTest {
         val finishStream = CompletableDeferred<Unit>()
         repo.pauseAfterFirstChunk = finishStream
         host(twoStep = true)
-        rule.onNodeWithText("Type instead").performClick()
+        rule.onNodeWithText("Type").performClick()
         rule.onNode(hasSetTextAction()).performTextInput("main answer")
         waitForKeyboard(visible = true)
         rule.onNodeWithContentDescription("Send").performClick()
@@ -1018,6 +1233,7 @@ class AiScreenInteractionTest {
         rule.waitForIdle()
         waitForKeyboard(visible = true)
         assertQuestionFits(FIRST_FOLLOWUP)
+        rule.onNodeWithText("Type").assertIsSelected()
         rule.onNode(hasSetTextAction()).assertIsFocused()
         rule.runOnIdle {
             assertEquals(2, repo.requests)
@@ -1311,7 +1527,7 @@ class AiScreenInteractionTest {
         val response = ControlledResponse()
         repo.streamedResponses = listOf(response)
         host(productionImeInsets = true)
-        rule.onNodeWithText("Type instead").performClick()
+        rule.onNodeWithText("Type").performClick()
         val editor = rule.onNode(hasSetTextAction())
         editor.performTextInput("main answer")
         waitForKeyboard(visible = true)
@@ -1461,7 +1677,7 @@ class AiScreenInteractionTest {
         repo.streamedResponses = listOf(firstEval, firstFollowup, secondEval, secondFollowup)
         host(twoStep = true)
         captureFieldUi("10-voice-composer")
-        rule.onNodeWithText("Type instead").performClick()
+        rule.onNodeWithText("Type").performClick()
         val editor = rule.onNode(hasSetTextAction())
         waitForKeyboard(visible = true)
         captureFieldUi("09-type-composer")
@@ -1620,7 +1836,7 @@ class AiScreenInteractionTest {
         rule.runOnIdle { speech.finish("Two bags of maize") }
         rule.onNodeWithText("Two bags of maize").assertIsDisplayed()
         assertTrue(userMessages().isEmpty())
-        rule.onNodeWithText("Send").performClick()
+        rule.onNodeWithContentDescription("Send").performClick()
         assertScan()
         val result = """{"score":95,"missing_points":[],"followup_needed":false}"""
         sendChunk(response, result, result)
@@ -1794,6 +2010,8 @@ class AiScreenInteractionTest {
         rule.onNodeWithContentDescription("Send").assertDoesNotExist()
         rule.onNodeWithContentDescription("Record answer").assertDoesNotExist()
         rule.onNodeWithText("Retry saved answers").assertDoesNotExist()
+        rule.onNodeWithText("Type").assertDoesNotExist()
+        rule.onNodeWithText("Speak").assertDoesNotExist()
         waitForKeyboard(visible = false)
     }
 
@@ -2105,7 +2323,7 @@ class AiScreenInteractionTest {
         stop.assertIsDisplayed().assertIsEnabled()
         rule.onNode(hasSetTextAction()).assertDoesNotExist()
         rule.onNodeWithContentDescription("Record answer").assertDoesNotExist()
-        rule.onNodeWithText("Send").assertDoesNotExist()
+        rule.onNodeWithContentDescription("Send").assertDoesNotExist()
         rule.onNodeWithText("Next").assertIsNotEnabled()
         rule.runOnIdle { assertEquals(0, speech.stopCalls) }
 
@@ -2143,7 +2361,9 @@ class AiScreenInteractionTest {
         host()
         rule.onNodeWithContentDescription("Record answer").performClick()
         rule.onNode(hasText("Starting microphone…") and hasAnyAncestor(isDialog())).assertIsDisplayed()
-        rule.onNodeWithText("Send").assertDoesNotExist()
+        rule.onNodeWithContentDescription("Send").assertDoesNotExist()
+        rule.onNodeWithText("Type").assertIsNotEnabled()
+        rule.onNodeWithText("Speak").assertIsSelected().assertIsNotEnabled()
         rule.onNodeWithText("0:00").assertExists()
         rule.runOnIdle { speech.capture.value = true }
         rule.onNode(hasText("Listening…") and hasAnyAncestor(isDialog())).assertIsDisplayed()
@@ -2153,9 +2373,12 @@ class AiScreenInteractionTest {
         rule.runOnIdle { assertEquals(1, speech.stopCalls); speech.transitionToTranscribing() }
         rule.onNodeWithText("Stop").assertDoesNotExist()
         rule.onNodeWithText("Transcribing…").assertExists()
-        rule.onNodeWithText("Send").assertDoesNotExist()
+        rule.onNodeWithText("Type").assertIsNotEnabled()
+        rule.onNodeWithText("Speak").assertIsSelected().assertIsNotEnabled()
+        rule.onNodeWithContentDescription("Send").assertDoesNotExist()
         rule.runOnIdle { speech.finish("first") }
-        rule.onNodeWithText("Record again").performClick()
+        rule.onNodeWithText("Type").assertIsEnabled()
+        rule.onNodeWithText("Record again").performScrollTo().performClick()
         rule.onNodeWithText("0:00").assertExists()
         InstrumentationRegistry.getInstrumentation().sendKeyDownUpSync(KeyEvent.KEYCODE_BACK)
         rule.runOnIdle { assertEquals(2, speech.stopCalls) }
@@ -2725,7 +2948,8 @@ class AiScreenInteractionTest {
             NodeDTO(id = "Multi", type = "MULTI_CHOICE", question = "Multi", options = listOf("One"), nextId = "Q06"),
             NodeDTO(id = "Q06", type = "NUMBER", question = "Number", nextId = "Q07"),
             NodeDTO(id = "Q07", type = "AI", question = "Q07 original question", nextId = "Q08"),
-            NodeDTO(id = "Q08", type = "AI", question = "Q08 original question", nextId = "Done"),
+            NodeDTO(id = "Q08", type = "AI", question = "Q08 original question", nextId = "Q09"),
+            NodeDTO(id = "Q09", type = "AI", question = "Q09 original question", nextId = "Done"),
             NodeDTO(id = "Done", type = "DONE"),
         )),
         prompts = listOf(if (twoStep) {

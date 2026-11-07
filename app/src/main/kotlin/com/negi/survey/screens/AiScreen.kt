@@ -65,7 +65,6 @@ package com.negi.survey.screens
 import android.content.ClipData
 import android.os.SystemClock
 import android.util.Log
-import androidx.compose.animation.Crossfade
 import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
@@ -88,13 +87,14 @@ import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.sizeIn
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
@@ -105,7 +105,11 @@ import androidx.compose.foundation.lazy.LazyListLayoutInfo
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.relocation.BringIntoViewRequester
+import androidx.compose.foundation.relocation.bringIntoViewRequester
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
@@ -114,10 +118,10 @@ import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.Send
-import androidx.compose.material.icons.filled.Keyboard
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.outlined.ContentCopy
+import androidx.compose.material.icons.outlined.Keyboard
 import androidx.compose.material3.DividerDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ButtonDefaults
@@ -133,7 +137,6 @@ import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -153,13 +156,16 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
 import androidx.compose.ui.input.nestedscroll.NestedScrollSource
 import androidx.compose.ui.input.nestedscroll.nestedScroll
@@ -170,10 +176,14 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
+import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
@@ -512,8 +522,52 @@ fun AiScreen(
         }
     }
 
-    var typingMode by remember(contextKey) { mutableStateOf(false) }
-    val showTextComposer = speechController == null || typingMode
+    val prefersTypedInput by vmSurvey.prefersTypedAiInput.collectAsState()
+    val typeSelected = speechController == null || prefersTypedInput
+    val focusRequester = remember(contextKey, presentation) { FocusRequester() }
+    var textOnlyFocusHandled by key(contextKey) { rememberSaveable { mutableStateOf(false) } }
+    var typeFocusRequested by remember(contextKey, presentation) { mutableStateOf(false) }
+    var editorFocused by remember(contextKey, presentation) { mutableStateOf(false) }
+    val composerEnabled = textFieldEnabled && !processing && !inputClosed
+    var transcriptReady by key(contextKey) { rememberSaveable { mutableStateOf(false) } }
+    val showTextComposer = typeSelected || (textFieldEnabled && (transcriptReady || editorFocused))
+    val answerPrompt = if (conv.role == AiViewModel.ComposerRole.MAIN) rootQuestion else conv.activePromptQuestion
+    val displayedDraft = if (processing) "" else conv.composerDraft
+    var editorState by remember(contextKey, presentation, conv.role, answerPrompt) {
+        mutableStateOf(TextFieldValue(displayedDraft))
+    }
+    var transcriptFocusHandled by remember(contextKey, presentation, conv.role, answerPrompt, transcriptReady) {
+        mutableStateOf(false)
+    }
+    var placingTranscriptCaret by remember(contextKey, presentation, conv.role, answerPrompt) {
+        mutableStateOf(false)
+    }
+    // Keep the ViewModel draft authoritative while retaining selection and composition for IME edits.
+    val previousEditorState = editorState
+    val editorValue = if (previousEditorState.text == displayedDraft) previousEditorState else {
+        previousEditorState.copy(text = displayedDraft, composition = null)
+    }
+    val applyingTranscriptCaret = placingTranscriptCaret
+    SideEffect {
+        if (editorState == previousEditorState) editorState = editorValue
+        if (applyingTranscriptCaret) placingTranscriptCaret = false
+    }
+
+    LaunchedEffect(contextKey, presentation, speechController, typeSelected, composerEnabled, typeFocusRequested) {
+        // A preference inherited from another question does not request keyboard focus.
+        val shouldFocus = typeFocusRequested || (speechController == null && !textOnlyFocusHandled)
+        if (!typeSelected || !composerEnabled || !shouldFocus || !ownsPresentation()) return@LaunchedEffect
+        typeFocusRequested = false
+        if (speechController == null) textOnlyFocusHandled = true
+        val draft = conversation.value.composerDraft
+        editorState = editorState.copy(
+            text = draft,
+            selection = TextRange(draft.length),
+            composition = editorState.composition.takeIf { editorState.text == draft }
+        )
+        focusRequester.requestFocus()
+        keyboard?.show()
+    }
 
     /**
      * StepSnapshot persistence is consumed directly from AiViewModel.stepHistory
@@ -766,6 +820,7 @@ fun AiScreen(
             val traceId = vmSurvey.answerTraceId(nid)
             WhisperTraceRegistry.start(localContext, surveyUuid)?.event("RECORDING_STARTED", traceId, nid, mapOf("inputSource" to "voice"))
             vmAI.updateComposerDraft(contextKey, "")
+            transcriptReady = false
             lastCommitted = null
 
             if (conv.role == AiViewModel.ComposerRole.MAIN) {
@@ -782,6 +837,7 @@ fun AiScreen(
             val text = speechPartial.trim()
             if (text.isNotEmpty() && text != lastCommitted) {
                 vmAI.updateComposerDraft(contextKey, text)
+                transcriptReady = true
                 lastCommitted = text
 
                 if (conv.role == AiViewModel.ComposerRole.MAIN) {
@@ -851,6 +907,7 @@ fun AiScreen(
         submittedInPresentation = true
         vmAI.appendUserMessage(contextKey, input)
         vmAI.updateComposerDraft(contextKey, "")
+        transcriptReady = false
         return true
     }
 
@@ -1031,8 +1088,19 @@ fun AiScreen(
             // Reserve space for the question as well as the scrollable composer when the
             // keyboard leaves a short viewport. Include the gap between the two regions.
             val conversationGap = 10.dp
+            // Below this height, let the selector scroll with the footer so the
+            // selector, editor and conversation can each remain reachable.
+            val pinModeSelector = speechController != null && maxHeight >= 180.dp
+            val footerScrollState = rememberScrollState()
+            val sendButtonRequester = remember { BringIntoViewRequester() }
+            LaunchedEffect(maxHeight, editorFocused, showTextComposer) {
+                // Center the visible slice on Send when the whole field cannot fit.
+                if (editorFocused && showTextComposer) sendButtonRequester.bringIntoView()
+            }
             val footerMaxHeight = if (showTextComposer) {
-                (maxHeight - minOf(96.dp, maxHeight / 2) - conversationGap).coerceAtLeast(0.dp)
+                // The pinned selector also needs room above the editor in a short IME viewport.
+                val conversationShare = if (pinModeSelector) maxHeight / 4 else maxHeight / 2
+                (maxHeight - minOf(96.dp, conversationShare) - conversationGap).coerceAtLeast(0.dp)
             } else {
                 maxHeight - minOf(64.dp, maxHeight / 4)
             }
@@ -1080,109 +1148,179 @@ fun AiScreen(
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .verticalScroll(rememberScrollState())
+                            .then(if (pinModeSelector) Modifier else Modifier.verticalScroll(footerScrollState))
                             .padding(top = 6.dp)
                     ) {
-                        val composerEnabled = textFieldEnabled && !processing && !inputClosed
-                        val onToggleSpeech: (() -> Unit)? = speechController?.let { sc ->
-                            {
-                                if (!sc.isRecording.value) {
-                                    keyboard?.hide()
-                                    focusManager.clearFocus(force = true)
-                                    val traceId = vmSurvey.beginAnswerTransaction(nid, "voice")
-                                    WhisperTraceRegistry.beginVoiceTransaction(localContext, surveyUuid, nid, traceId)
-                                }
-                                toggleSpeechRecordingWithTtsInterlock(sc, ttsController)
+                        if (!inputClosed && speechController != null) {
+                            Row(
+                                modifier = Modifier
+                                    .align(Alignment.End)
+                                    .padding(end = 12.dp)
+                                    .selectableGroup()
+                                    .background(MaterialTheme.colorScheme.surfaceContainer, CircleShape)
+                                    .padding(horizontal = 3.dp)
+                            ) {
+                                AnswerModeOption(
+                                    label = "Type",
+                                    icon = Icons.Outlined.Keyboard,
+                                    selected = typeSelected,
+                                    onClick = {
+                                        if (composerEnabled && !inputBlocked() && ownsPresentation()) {
+                                            if (typeSelected) {
+                                                focusRequester.requestFocus()
+                                                keyboard?.show()
+                                            } else {
+                                                typeFocusRequested = true
+                                                vmSurvey.setPrefersTypedAiInput(true)
+                                            }
+                                        }
+                                    },
+                                    enabled = composerEnabled
+                                )
+                                AnswerModeOption(
+                                    label = "Speak",
+                                    icon = Icons.Filled.Mic,
+                                    selected = !typeSelected,
+                                    onClick = {
+                                        if (composerEnabled && !inputBlocked() && ownsPresentation()) {
+                                            keyboard?.hide()
+                                            focusManager.clearFocus(force = true)
+                                            typeFocusRequested = false
+                                            vmSurvey.setPrefersTypedAiInput(false)
+                                        }
+                                    },
+                                    enabled = composerEnabled
+                                )
                             }
                         }
-                        val onSendAnswer: () -> Unit = {
-                            if (composerEnabled) submit()
-                        }
-                        val displayedDraft = if (processing) "" else conv.composerDraft
-                        if (inputClosed) {
-                            Text(
-                                "Answer input is closed",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
+                        Column(
+                            modifier = Modifier.fillMaxWidth()
+                                .then(if (pinModeSelector) Modifier.verticalScroll(footerScrollState) else Modifier)
+                        ) {
+                            val onToggleSpeech: (() -> Unit)? = speechController?.let { sc ->
+                                {
+                                    if (!sc.isRecording.value) {
+                                        keyboard?.hide()
+                                        focusManager.clearFocus(force = true)
+                                        val traceId = vmSurvey.beginAnswerTransaction(nid, "voice")
+                                        WhisperTraceRegistry.beginVoiceTransaction(localContext, surveyUuid, nid, traceId)
+                                    }
+                                    toggleSpeechRecordingWithTtsInterlock(sc, ttsController)
+                                }
+                            }
+                            val onSendAnswer: () -> Unit = {
+                                if (composerEnabled) submit()
+                            }
+                            if (inputClosed) {
+                                Text(
+                                    "Answer input is closed",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
+                                )
+                            } else {
+                                if (showTextComposer) {
+                                    // Adjacent AI questions can reuse the same navigation entry.
+                                    key(contextKey, presentation) {
+                                        ChatComposer(
+                                            value = editorValue,
+                                            onValueChange = { updated ->
+                                                val current = conversation.value
+                                                val textChanged = updated.text != editorState.text
+                                                if (placingTranscriptCaret && !textChanged &&
+                                                    updated.selection.collapsed && updated.composition == null
+                                                ) {
+                                                    // Compose places the cursor at the tap after requesting focus.
+                                                    // Keep the end position for that first transcript tap only.
+                                                    placingTranscriptCaret = false
+                                                } else if (!textChanged) {
+                                                    editorState = updated
+                                                } else if (composerEnabled && !inputBlocked() &&
+                                                    !(isTwoStepNode && (current.validationFailed || current.turnCompleted))
+                                                ) {
+                                                    editorState = updated
+                                                    vmAI.updateComposerDraft(contextKey, updated.text)
+                                                    if (current.role == AiViewModel.ComposerRole.MAIN) {
+                                                        vmSurvey.setAnswer(updated.text, nid)
+                                                    }
+                                                }
+                                            },
+                                            onSend = onSendAnswer,
+                                            enabled = composerEnabled,
+                                            textFieldEnabled = textFieldEnabled,
+                                            sendModifier = Modifier.bringIntoViewRequester(sendButtonRequester),
+                                            editorModifier = Modifier
+                                                .focusRequester(focusRequester)
+                                                .onFocusChanged {
+                                                    if (it.isFocused && !editorFocused && !typeSelected &&
+                                                        transcriptReady && !transcriptFocusHandled
+                                                    ) {
+                                                        transcriptFocusHandled = true
+                                                        val draft = conversation.value.composerDraft
+                                                        editorState = TextFieldValue(draft, selection = TextRange(draft.length))
+                                                        placingTranscriptCaret = true
+                                                    }
+                                                    editorFocused = it.isFocused
+                                                }
+                                        )
+                                    }
+                                }
+                                if (!typeSelected && onToggleSpeech != null) {
+                                    VoiceRecordingAction(
+                                        recordAgain = transcriptReady,
+                                        enabled = composerEnabled,
+                                        onRecord = onToggleSpeech
+                                    )
+                                }
+                                if (speechStatusText != null) {
+                                    Text(
+                                        text = speechStatusText,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = if (speechStatusIsError) MaterialTheme.colorScheme.error
+                                        else MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.align(Alignment.CenterHorizontally)
+                                            .padding(horizontal = 12.dp, vertical = 4.dp)
+                                    )
+                                }
+                            }
+
+                            HorizontalDivider(
+                                thickness = DividerDefaults.Thickness,
+                                color = DividerDefaults.color
                             )
-                        } else if (showTextComposer) {
-                            ChatComposer(
-                                value = displayedDraft,
-                                onValueChange = { t ->
-                                    val current = conversation.value
-                                    if (composerEnabled && !inputBlocked() &&
-                                        !(isTwoStepNode && (current.validationFailed || current.turnCompleted))
+
+                            SurveyNavigationButtons(
+                                primaryLabel = "Next",
+                                primaryEnabled = canAdvanceAiTurn(
+                                    aiLoading = loading,
+                                    mainSubmissionPending = submissionPending,
+                                    speechRecording = speechRecording,
+                                    speechTranscribing = speechTranscribing,
+                                ),
+                                onPrimary = {
+                                    if (canAdvanceAiTurn(
+                                            aiLoading = loading,
+                                            mainSubmissionPending = submissionPending,
+                                            speechRecording = speechRecording,
+                                            speechTranscribing = speechTranscribing,
+                                        )
                                     ) {
-                                        vmAI.updateComposerDraft(contextKey, t)
-                                        if (current.role == AiViewModel.ComposerRole.MAIN) vmSurvey.setAnswer(t, nid)
+                                        keyboard?.hide()
+                                        focusManager.clearFocus(force = true)
+                                        vmAI.resetStates()
+                                        onNext()
                                     }
                                 },
-                                onSend = onSendAnswer,
-                                enabled = composerEnabled,
-                                textFieldEnabled = textFieldEnabled,
-                                speechEnabled = speechController != null,
-                                speechRecording = speechRecording,
-                                speechTranscribing = speechTranscribing,
-                                speechStatusText = speechStatusText,
-                                speechStatusIsError = speechStatusIsError,
-                                onToggleSpeech = onToggleSpeech,
-                                onVoiceInstead = if (speechController != null) {{
-                                    keyboard?.hide()
-                                    focusManager.clearFocus(force = true)
-                                    typingMode = false
-                                }} else null
-                            )
-                        } else if (onToggleSpeech != null) {
-                            VoiceFirstComposer(
-                                value = displayedDraft,
-                                enabled = composerEnabled,
-                                speechRecording = speechRecording,
-                                speechTranscribing = speechTranscribing,
-                                speechStatusText = speechStatusText,
-                                speechStatusIsError = speechStatusIsError,
-                                onToggleSpeech = onToggleSpeech,
-                                onSend = onSendAnswer,
-                                onTypeInstead = { typingMode = true }
-                            )
-                        }
-
-                        HorizontalDivider(
-                            thickness = DividerDefaults.Thickness,
-                            color = DividerDefaults.color
-                        )
-
-                        SurveyNavigationButtons(
-                            primaryLabel = "Next",
-                            primaryEnabled = canAdvanceAiTurn(
-                                aiLoading = loading,
-                                mainSubmissionPending = submissionPending,
-                                speechRecording = speechRecording,
-                                speechTranscribing = speechTranscribing,
-                            ),
-                            onPrimary = {
-                                if (canAdvanceAiTurn(
-                                        aiLoading = loading,
-                                        mainSubmissionPending = submissionPending,
-                                        speechRecording = speechRecording,
-                                        speechTranscribing = speechTranscribing,
-                                    )
-                                ) {
+                                secondaryLabel = "Back",
+                                onSecondary = {
                                     keyboard?.hide()
                                     focusManager.clearFocus(force = true)
                                     vmAI.resetStates()
-                                    onNext()
-                                }
-                            },
-                            secondaryLabel = "Back",
-                            onSecondary = {
-                                keyboard?.hide()
-                                focusManager.clearFocus(force = true)
-                                vmAI.resetStates()
-                                onBack()
-                            },
-                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
-                        )
+                                    onBack()
+                                },
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
+                            )
+                        }
                     }
                 }
             }
@@ -1711,30 +1849,57 @@ private fun JsonBubbleMono(
 /* ───────────────────────────── Composer ─────────────────────────────────── */
 
 @Composable
+private fun AnswerModeOption(
+    label: String,
+    icon: ImageVector,
+    selected: Boolean,
+    enabled: Boolean,
+    onClick: () -> Unit
+) {
+    val colors = MaterialTheme.colorScheme
+    val contentColor = when {
+        !enabled -> colors.onSurface.copy(alpha = 0.38f)
+        selected -> colors.onSecondaryContainer
+        else -> colors.onSurfaceVariant
+    }
+    Box(
+        modifier = Modifier
+            .sizeIn(minWidth = 48.dp, minHeight = 48.dp)
+            .clip(CircleShape)
+            .selectable(
+                selected = selected,
+                enabled = enabled,
+                role = Role.RadioButton,
+                onClick = onClick
+            ),
+        contentAlignment = Alignment.Center
+    ) {
+        Row(
+            modifier = Modifier
+                .background(
+                    if (selected) colors.secondaryContainer else Color.Transparent,
+                    CircleShape
+                )
+                .padding(horizontal = 10.dp, vertical = 6.dp),
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(icon, contentDescription = null, modifier = Modifier.size(16.dp), tint = contentColor)
+            Text(label, color = contentColor, style = MaterialTheme.typography.labelMedium)
+        }
+    }
+}
+
+@Composable
 private fun ChatComposer(
-    value: String,
-    onValueChange: (String) -> Unit,
+    value: TextFieldValue,
+    onValueChange: (TextFieldValue) -> Unit,
     onSend: () -> Unit,
     enabled: Boolean,
     textFieldEnabled: Boolean,
-    speechEnabled: Boolean = false,
-    speechRecording: Boolean = false,
-    speechTranscribing: Boolean = false,
-    speechStatusText: String? = null,
-    speechStatusIsError: Boolean = false,
-    onToggleSpeech: (() -> Unit)? = null,
-    onVoiceInstead: (() -> Unit)? = null
+    sendModifier: Modifier,
+    editorModifier: Modifier
 ) {
-    val keyboard = LocalSoftwareKeyboardController.current
-    val focusRequester = remember { FocusRequester() }
-    var entryFocusHandled by rememberSaveable { mutableStateOf(false) }
-    LaunchedEffect(enabled) {
-        // Retain the one-time entry decision across restoration of this composer.
-        if (!enabled || entryFocusHandled) return@LaunchedEffect
-        entryFocusHandled = true
-        focusRequester.requestFocus()
-        keyboard?.show()
-    }
     val cs = MaterialTheme.colorScheme
 
     Column(
@@ -1742,9 +1907,10 @@ private fun ChatComposer(
             .fillMaxWidth()
             .padding(horizontal = 12.dp, vertical = 8.dp)
     ) {
-        androidx.compose.foundation.layout.Row(
+        Row(
             modifier = Modifier
                 .fillMaxWidth()
+                .testTag("ai-answer-field")
                 .shadow(elevation = 8.dp, shape = CircleShape, clip = false)
                 .background(
                     brush = Brush.linearGradient(
@@ -1764,7 +1930,7 @@ private fun ChatComposer(
                 onValueChange = onValueChange,
                 modifier = Modifier
                     .weight(1f)
-                    .focusRequester(focusRequester)
+                    .then(editorModifier)
                     .semantics {
                         if (!enabled) stateDescription = "Answer input inactive"
                     },
@@ -1788,38 +1954,10 @@ private fun ChatComposer(
                 textStyle = MaterialTheme.typography.bodyMedium
             )
 
-            if (speechEnabled && onToggleSpeech != null) {
-                val tint = cs.onSurfaceVariant
-                val micEnabled = (enabled || speechRecording) && !speechTranscribing
-
-                IconButton(
-                    onClick = onToggleSpeech,
-                    enabled = micEnabled
-                ) {
-                    Crossfade(
-                        targetState = speechRecording,
-                        label = "mic-toggle-composer"
-                    ) { rec ->
-                        if (rec) {
-                            Icon(
-                                imageVector = Icons.Filled.Stop,
-                                contentDescription = "Stop recording",
-                                tint = tint
-                            )
-                        } else {
-                            Icon(
-                                imageVector = Icons.Filled.Mic,
-                                contentDescription = "Start recording",
-                                tint = tint
-                            )
-                        }
-                    }
-                }
-            }
-
             SurveyActionButton(
                 onClick = onSend,
-                enabled = enabled && value.isNotBlank()
+                modifier = sendModifier,
+                enabled = enabled && value.text.isNotBlank()
             ) {
                 Icon(
                     imageVector = Icons.AutoMirrored.Outlined.Send,
@@ -1827,142 +1965,46 @@ private fun ChatComposer(
                 )
             }
         }
-
-        if (onVoiceInstead != null) {
-            TextButton(
-                onClick = onVoiceInstead,
-                enabled = enabled,
-                colors = ButtonDefaults.textButtonColors(contentColor = cs.onSurface)
-            ) { Text("Use voice instead") }
-        }
-        if (speechStatusText != null) {
-            androidx.compose.foundation.layout.Spacer(Modifier.height(4.dp))
-            Text(
-                text = speechStatusText,
-                style = MaterialTheme.typography.labelSmall,
-                color = if (speechStatusIsError) cs.error else cs.onSurfaceVariant,
-                modifier = Modifier.padding(start = 4.dp, top = 2.dp)
-            )
-        }
     }
 }
 
-/**
- * Voice-first answer area: a large mic button while there is no answer yet,
- * then the transcript with Send and Record again. Typing is a secondary
- * action ("Type instead"); tapping the transcript also opens it for editing.
- */
+/** Centered recording action shared by initial Speak and transcript editing. */
 @Composable
-internal fun VoiceFirstComposer(
-    value: String,
+internal fun VoiceRecordingAction(
+    recordAgain: Boolean,
     enabled: Boolean,
-    speechRecording: Boolean,
-    speechTranscribing: Boolean,
-    speechStatusText: String?,
-    speechStatusIsError: Boolean,
-    onToggleSpeech: () -> Unit,
-    onSend: () -> Unit,
-    onTypeInstead: () -> Unit
+    onRecord: () -> Unit
 ) {
     val cs = MaterialTheme.colorScheme
-    val micEnabled = (enabled || speechRecording) && !speechTranscribing
-    val hasAnswer = value.isNotBlank() && !speechRecording && !speechTranscribing
-
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 12.dp, vertical = 12.dp),
-        horizontalAlignment = Alignment.CenterHorizontally
+    Box(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
+        contentAlignment = Alignment.Center
     ) {
-        if (hasAnswer) {
+        Column(
+            modifier = Modifier.clickable(enabled = enabled, role = Role.Button, onClick = onRecord),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
             Surface(
-                onClick = onTypeInstead,
-                enabled = enabled,
-                shape = RoundedCornerShape(16.dp),
-                color = cs.surfaceVariant.copy(alpha = 0.6f),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(max = 160.dp)
-            ) {
-                Text(
-                    text = value,
-                    style = MaterialTheme.typography.bodyLarge,
-                    modifier = Modifier
-                        .verticalScroll(rememberScrollState())
-                        .padding(horizontal = 14.dp, vertical = 12.dp)
-                )
-            }
-            if (speechStatusIsError && !speechStatusText.isNullOrBlank()) {
-                Text(speechStatusText, color = cs.error, style = MaterialTheme.typography.labelSmall)
-            }
-            Spacer(Modifier.height(10.dp))
-            FlowRow(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                SurveyActionButton(
-                    onClick = onToggleSpeech,
-                    enabled = micEnabled,
-                    primary = false
-                ) {
-                    Icon(Icons.Filled.Mic, contentDescription = null)
-                    Spacer(Modifier.width(8.dp))
-                    Text("Record again", modifier = Modifier.weight(1f, fill = false))
-                }
-                SurveyActionButton(onClick = onSend, enabled = enabled) {
-                    Text("Send", modifier = Modifier.weight(1f, fill = false))
-                    Spacer(Modifier.width(8.dp))
-                    Icon(Icons.AutoMirrored.Outlined.Send, contentDescription = null)
-                }
-            }
-        } else {
-            Surface(
-                onClick = onToggleSpeech,
-                enabled = micEnabled,
                 shape = CircleShape,
-                color = when {
-                    !micEnabled -> cs.onSurface.copy(alpha = 0.12f)
-                    speechRecording -> cs.error
-                    else -> cs.primary
-                },
-                contentColor = when {
-                    !micEnabled -> cs.onSurface.copy(alpha = 0.38f)
-                    speechRecording -> cs.onError
-                    else -> cs.onPrimary
-                },
+                color = if (enabled) cs.primary else cs.onSurface.copy(alpha = 0.12f),
+                contentColor = if (enabled) cs.onPrimary else cs.onSurface.copy(alpha = 0.38f),
                 modifier = Modifier.size(96.dp)
             ) {
                 Box(contentAlignment = Alignment.Center) {
                     Icon(
-                        imageVector = if (speechRecording) Icons.Filled.Stop else Icons.Filled.Mic,
-                        contentDescription = if (speechRecording) "Stop recording" else "Record answer",
+                        imageVector = Icons.Filled.Mic,
+                        contentDescription = if (recordAgain) null else "Record answer",
                         modifier = Modifier.size(48.dp)
                     )
                 }
             }
             Spacer(Modifier.height(8.dp))
             Text(
-                text = speechStatusText ?: "Tap to answer",
+                text = if (recordAgain) "Record again" else "Tap to answer",
+                textAlign = TextAlign.Center,
                 style = MaterialTheme.typography.titleMedium,
-                color = when {
-                    speechStatusIsError -> cs.error
-                    !micEnabled && speechStatusText == null -> cs.onSurface.copy(alpha = 0.38f)
-                    else -> cs.onSurface
-                }
+                color = if (enabled) cs.onSurface else cs.onSurface.copy(alpha = 0.38f)
             )
-        }
-
-        if (!speechRecording && !speechTranscribing) {
-            TextButton(
-                onClick = onTypeInstead,
-                enabled = enabled,
-                colors = ButtonDefaults.textButtonColors(contentColor = cs.onSurface)
-            ) {
-                Icon(Icons.Filled.Keyboard, contentDescription = null, modifier = Modifier.size(18.dp))
-                Spacer(Modifier.width(6.dp))
-                Text(if (hasAnswer) "Edit by typing" else "Type instead")
-            }
         }
     }
 }

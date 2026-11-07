@@ -107,8 +107,10 @@ import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
@@ -1651,6 +1653,7 @@ fun SurveyNavHost(
                     val ttsSpeaking by ttsController.isSpeaking.collectAsStateWithLifecycle()
 
                     TextNodeScreen(
+                        questionId = node.id,
                         title = node.title,
                         question = node.question,
                         value = answers[node.id].orEmpty(),
@@ -1668,6 +1671,7 @@ fun SurveyNavHost(
                     val ttsSpeaking by ttsController.isSpeaking.collectAsStateWithLifecycle()
 
                     SingleChoiceNodeScreen(
+                        questionId = node.id,
                         title = node.title,
                         question = node.question,
                         options = node.options,
@@ -1696,6 +1700,7 @@ fun SurveyNavHost(
                     val answer = answers[node.id].orEmpty()
 
                     NumberNodeScreen(
+                        questionId = node.id,
                         title = node.title,
                         question = node.question,
                         value = answer,
@@ -1741,7 +1746,7 @@ fun SurveyNavHost(
                         vmAI = vmAI,
                         onNext = { runCatching { ttsController.stop() }; vmSurvey.advanceToNext() },
                         onBack = { runCatching { ttsController.stop() }; vmSurvey.backToPrevious() },
-                        speechController = speechController,
+                        speechController = speechController.takeIf { voiceEnabled },
                         ttsController = ttsController.takeIf { ttsEnabled },
                         playbackLifecycle = playbackLifecycle
                     )
@@ -1952,6 +1957,7 @@ private fun StopNodeScreen(
 internal fun TextNodeScreen(
     title: String,
     question: String,
+    questionId: String = question,
     value: String,
     onValueChange: (String) -> Unit,
     onNext: () -> Unit,
@@ -1961,13 +1967,6 @@ internal fun TextNodeScreen(
 ) {
     val backplate = outdoorBackplate()
     val scroll = rememberScrollState()
-    val focusRequester = remember { FocusRequester() }
-    val keyboardController = LocalSoftwareKeyboardController.current
-
-    LaunchedEffect(Unit) {
-        runCatching { focusRequester.requestFocus() }
-        keyboardController?.show()
-    }
 
     Box(
         modifier = Modifier
@@ -2012,14 +2011,11 @@ internal fun TextNodeScreen(
                     }
                 }
 
-                OutlinedTextField(
+                SurveyQuestionTextField(
+                    questionId = questionId,
                     value = value,
                     onValueChange = onValueChange,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .focusRequester(focusRequester),
-                    colors = questionFieldColors(),
-                    textStyle = MaterialTheme.typography.bodyLarge,
+                    autoFocus = true,
                     minLines = 3
                 )
 
@@ -2040,6 +2036,7 @@ internal fun TextNodeScreen(
 internal fun SingleChoiceNodeScreen(
     title: String,
     question: String,
+    questionId: String = question,
     options: List<String>,
     selected: String?,
     onSelect: (String?) -> Unit,
@@ -2127,12 +2124,10 @@ internal fun SingleChoiceNodeScreen(
                 }
 
                 if (shouldShowOtherDetails(selected, otherTextOption)) {
-                    OutlinedTextField(
+                    SurveyQuestionTextField(
+                        questionId = questionId,
                         value = otherText,
                         onValueChange = { otherText = it },
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = questionFieldColors(),
-                        textStyle = MaterialTheme.typography.bodyLarge,
                         label = { Text("Other details") },
                         singleLine = true,
                     )
@@ -2154,9 +2149,10 @@ internal fun SingleChoiceNodeScreen(
 }
 
 @Composable
-private fun NumberNodeScreen(
+internal fun NumberNodeScreen(
     title: String,
     question: String,
+    questionId: String = question,
     value: String,
     specialOptions: List<String>,
     onValueChange: (String) -> Unit,
@@ -2170,13 +2166,6 @@ private fun NumberNodeScreen(
     val backplate = outdoorBackplate()
     val scroll = rememberScrollState()
     val isSpecialAnswer = value in specialOptions
-    val focusRequester = remember { FocusRequester() }
-    val keyboardController = LocalSoftwareKeyboardController.current
-
-    LaunchedEffect(Unit) {
-        runCatching { focusRequester.requestFocus() }
-        keyboardController?.show()
-    }
 
     Box(
         modifier = Modifier
@@ -2217,14 +2206,11 @@ private fun NumberNodeScreen(
                     IconButton(onClick = onReplay) { Text(if (isSpeaking) "\u23F9" else "\uD83D\uDD0A") }
                 }
 
-                OutlinedTextField(
+                SurveyQuestionTextField(
+                    questionId = questionId,
                     value = if (isSpecialAnswer) "" else value,
                     onValueChange = onValueChange,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .focusRequester(focusRequester),
-                    colors = questionFieldColors(),
-                    textStyle = MaterialTheme.typography.bodyLarge,
+                    autoFocus = true,
                     label = { Text("Number") },
                     singleLine = true,
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
@@ -2335,6 +2321,55 @@ internal fun MultiChoiceNodeScreen(
             }
         }
     }
+}
+
+@Composable
+private fun SurveyQuestionTextField(
+    questionId: String,
+    value: String,
+    onValueChange: (String) -> Unit,
+    autoFocus: Boolean = false,
+    label: (@Composable () -> Unit)? = null,
+    singleLine: Boolean = false,
+    minLines: Int = 1,
+    keyboardOptions: KeyboardOptions = KeyboardOptions.Default,
+) {
+    val focusRequester = remember(questionId) { FocusRequester() }
+    val keyboardController = LocalSoftwareKeyboardController.current
+    var editorState by remember(questionId) {
+        mutableStateOf(TextFieldValue(value, selection = TextRange(value.length)))
+    }
+    // Accept text from the answer owner while keeping the IME state when it echoes an edit.
+    val previousState = editorState
+    val editorValue = if (previousState.text == value) previousState else {
+        previousState.copy(text = value, composition = null)
+    }
+    SideEffect {
+        if (editorState == previousState) editorState = editorValue
+    }
+
+    LaunchedEffect(focusRequester, autoFocus) {
+        if (autoFocus) {
+            runCatching { focusRequester.requestFocus() }
+            keyboardController?.show()
+        }
+    }
+
+    OutlinedTextField(
+        value = editorValue,
+        onValueChange = { updated ->
+            val textChanged = updated.text != editorState.text
+            editorState = updated
+            if (textChanged) onValueChange(updated.text)
+        },
+        modifier = Modifier.fillMaxWidth().focusRequester(focusRequester),
+        colors = questionFieldColors(),
+        textStyle = MaterialTheme.typography.bodyLarge,
+        label = label,
+        singleLine = singleLine,
+        minLines = minLines,
+        keyboardOptions = keyboardOptions,
+    )
 }
 
 @Composable
