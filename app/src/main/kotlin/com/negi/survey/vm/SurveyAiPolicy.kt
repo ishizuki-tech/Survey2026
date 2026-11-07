@@ -11,6 +11,28 @@ enum class SurveyAiReason(val wireValue: String, val terminal: Boolean) {
     FAILURE("failure", false)
 }
 
+/** Conversation presentation for a finished turn. Survey export uses [SurveyAiReason]. */
+enum class AiTurnOutcome {
+    ACHIEVED, LIMIT_REACHED, EVALUATION_FAILED, FOLLOWUP_GENERATION_FAILED, DUPLICATE_FOLLOWUP,
+    UNKNOWN, UNABLE_REFUSED;
+
+    companion object {
+        internal fun fromSavedReason(reason: SurveyAiReason?): AiTurnOutcome? = when (reason) {
+            SurveyAiReason.ACHIEVED -> ACHIEVED
+            SurveyAiReason.LIMIT_REACHED -> LIMIT_REACHED
+            SurveyAiReason.FAILURE -> UNKNOWN
+            SurveyAiReason.UNABLE_REFUSED -> UNABLE_REFUSED
+            null -> null
+        }
+    }
+}
+
+internal sealed interface FollowupAcceptance {
+    data class Accepted(val question: String) : FollowupAcceptance
+    data object Invalid : FollowupAcceptance
+    data object Duplicate : FollowupAcceptance
+}
+
 internal enum class SurveyAiDecision { ACHIEVED, GENERATE, LIMIT_REACHED, FAILURE }
 
 internal data class SurveyAiEvaluation(
@@ -131,13 +153,24 @@ internal object SurveyAiPolicy {
         .replace(Regex("[\\s_-]+"), "_")
 
     fun acceptQuestion(raw: String, timedOut: Boolean, error: String?, existing: List<String>): String? {
-        if (timedOut || error != null) return null
+        return (classifyQuestion(raw, timedOut, error, existing) as? FollowupAcceptance.Accepted)?.question
+    }
+
+    fun classifyQuestion(
+        raw: String,
+        timedOut: Boolean,
+        error: String?,
+        existing: List<String>
+    ): FollowupAcceptance {
+        if (timedOut || error != null) return FollowupAcceptance.Invalid
         val question = raw.trim()
         // These survey assets request exactly one plain-text question. Fail closed on other formats.
         if (question.isEmpty() || question.contains('\n') || question.contains('\r') ||
             question.startsWith("{") || question.startsWith("[") || question.startsWith("```") ||
             question.count { it == '?' || it == '？' } != 1 ||
-            question.last() !in listOf('?', '？')) return null
-        return question.takeIf { q -> existing.none { normalize(it) == normalize(q) } }
+            question.last() !in listOf('?', '？')) return FollowupAcceptance.Invalid
+        val normalized = normalize(question)
+        return if (existing.any { normalize(it) == normalized }) FollowupAcceptance.Duplicate
+        else FollowupAcceptance.Accepted(question)
     }
 }

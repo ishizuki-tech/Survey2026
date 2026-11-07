@@ -193,6 +193,13 @@ open class SurveyViewModel(
     private val _sessionId = MutableStateFlow(0L)
     val sessionId: StateFlow<Long> = _sessionId.asStateFlow()
 
+    private val _prefersTypedAiInput = MutableStateFlow(false)
+    internal val prefersTypedAiInput = _prefersTypedAiInput.asStateFlow()
+
+    internal fun setPrefersTypedAiInput(prefersType: Boolean) {
+        _prefersTypedAiInput.value = prefersType
+    }
+
     private val _surveyUuid = MutableStateFlow(newTimeOrderedSurveyId())
     val surveyUuid: StateFlow<String> = _surveyUuid.asStateFlow()
     private var trace: SurveyTrace? = traceContext?.let { SurveyTraceRegistry.start(it, _surveyUuid.value) }
@@ -1130,6 +1137,7 @@ open class SurveyViewModel(
         resetFollowups()
         resetAudioRefs()
         clearSelections()
+        _prefersTypedAiInput.value = false
 
         // A new run may visit the same node IDs, so allow their TTS to auto-play again.
         lastAutoPlayedTtsNodeId = null

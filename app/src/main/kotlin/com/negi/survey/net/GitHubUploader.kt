@@ -16,6 +16,7 @@ package com.negi.survey.net
 import android.util.Base64
 import android.util.Base64OutputStream
 import android.util.Log
+import com.negi.survey.BuildConfig
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.IOException
@@ -755,6 +756,7 @@ object GitHubUploader {
         maxAttempts: Int = DEFAULT_MAX_ATTEMPTS,
         allowNon2xxCodes: Set<Int> = emptySet()
     ): HttpResponse {
+        if (BuildConfig.ISSUE157_DA) throw IOException("GitHub uploads are disabled in Survey D+A.")
         var attempt = 0
         var lastError: IOException? = null
 

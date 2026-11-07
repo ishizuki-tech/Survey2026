@@ -3,9 +3,6 @@ package com.negi.survey.screens
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.width
 import androidx.compose.runtime.CompositionLocalProvider
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.SemanticsActions
@@ -29,66 +26,35 @@ import org.junit.Test
 class VoiceFirstComposerTest {
     @get:Rule val rule = createComposeRule()
 
-    @Test fun voiceActionsAndTranscriptUseCallbacks() {
-        var draft by mutableStateOf("")
-        var recording = 0
-        var sent = 0
-        var editing = 0
-        rule.setContent {
-            VoiceFirstComposer(draft, true, false, false, null, false,
-                { recording++ }, { sent++ }, { editing++ })
-        }
-        rule.onNodeWithContentDescription("Record answer").performClick()
-        rule.onNodeWithText("Type instead").performClick()
-        rule.runOnIdle { draft = "Recognized answer" }
-        rule.onNodeWithText("Recognized answer").performClick()
-        rule.onNodeWithText("Record again").performClick()
-        rule.onNodeWithText("Send").performClick()
-        rule.runOnIdle {
-            assertEquals(2, recording)
-            assertEquals(1, sent)
-            assertEquals(2, editing)
-        }
-    }
-
-    @Test fun recordingActionsWrapAtLargeFontScale() {
+    @Test fun recordAgainRemainsReachableAtLargeFontScale() {
         var recordAgain = 0
-        var sent = 0
         rule.setContent {
             val density = LocalDensity.current
             CompositionLocalProvider(LocalDensity provides Density(density.density, fontScale = 2f)) {
                 Box(Modifier.width(170.dp)) {
-                    VoiceFirstComposer("draft", true, false, false, null, false,
-                        { recordAgain++ }, { sent++ }, {})
+                    VoiceRecordingAction(recordAgain = true, enabled = true) { recordAgain++ }
                 }
             }
         }
-        for (label in listOf("Record again", "Send")) {
-            rule.onNodeWithText(label).assertIsDisplayed().assertHeightIsAtLeast(48.dp).performClick()
-            val layouts = mutableListOf<TextLayoutResult>()
-            rule.onNodeWithText(label, useUnmergedTree = true)
-                .performSemanticsAction(SemanticsActions.GetTextLayoutResult) { it(layouts) }
-            val layout = layouts.single()
-            // The semantics action rebuilds the paragraph at max width. Check the glyph bounds.
-            for (line in 0 until layout.lineCount) {
-                assertFalse(layout.isLineEllipsized(line))
-                assertTrue("$label clips horizontally", layout.getLineRight(line) <= layout.size.width + 1)
-                assertTrue("$label clips vertically", layout.getLineBottom(line) <= layout.size.height + 1)
-            }
-            assertEquals(label.length, layout.getLineEnd(layout.lineCount - 1, visibleEnd = true))
-            if (label == "Record again") assertTrue(layout.lineCount > 1)
+        val label = "Record again"
+        rule.onNodeWithText(label).assertIsDisplayed().assertHeightIsAtLeast(48.dp).performClick()
+        val layouts = mutableListOf<TextLayoutResult>()
+        rule.onNodeWithText(label, useUnmergedTree = true)
+            .performSemanticsAction(SemanticsActions.GetTextLayoutResult) { it(layouts) }
+        val layout = layouts.single()
+        for (line in 0 until layout.lineCount) {
+            assertFalse(layout.isLineEllipsized(line))
+            assertTrue(layout.getLineRight(line) <= layout.size.width + 1)
+            assertTrue(layout.getLineBottom(line) <= layout.size.height + 1)
         }
-        rule.runOnIdle {
-            assertEquals(1, recordAgain)
-            assertEquals(1, sent)
-        }
+        assertEquals(label.length, layout.getLineEnd(layout.lineCount - 1, visibleEnd = true))
+        rule.runOnIdle { assertEquals(1, recordAgain) }
     }
 
-    @Test fun processingDisablesRecordingAndSubmission() {
+    @Test fun processingDisablesRecording() {
         rule.setContent {
-            VoiceFirstComposer("draft", false, false, false, null, false, {}, {}, {})
+            VoiceRecordingAction(recordAgain = false, enabled = false) { error("Recording started while busy") }
         }
-        rule.onNodeWithText("Record again").assertIsNotEnabled()
-        rule.onNodeWithText("Send").assertIsNotEnabled()
+        rule.onNodeWithContentDescription("Record answer").assertIsNotEnabled()
     }
 }

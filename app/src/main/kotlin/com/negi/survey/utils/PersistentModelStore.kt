@@ -40,6 +40,7 @@ import android.provider.MediaStore
 import android.util.Log
 import androidx.annotation.ChecksSdkIntAtLeast
 import androidx.annotation.RequiresApi
+import com.negi.survey.BuildConfig
 import java.io.File
 
 object PersistentModelStore {
@@ -47,7 +48,7 @@ object PersistentModelStore {
     private const val TAG = "PersistentModelStore"
 
     /** Subfolder under the public Downloads collection where models are kept. */
-    private const val SUBFOLDER = "Survey2026Models"
+    private val SUBFOLDER = if (BuildConfig.ISSUE157_DA) "Survey2026Models-da" else "Survey2026Models"
 
     private val RELATIVE_PATH: String
         get() = Environment.DIRECTORY_DOWNLOADS + File.separator + SUBFOLDER

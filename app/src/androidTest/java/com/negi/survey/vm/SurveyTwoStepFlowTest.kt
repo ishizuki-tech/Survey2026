@@ -29,6 +29,7 @@ class SurveyTwoStepFlowTest {
             run(survey, ai)
             assertEquals(listOf(PromptPhase.EVAL), repo.phases)
             assertEquals(reason, survey.aiReasons.value["Q8"])
+            assertEquals(AiTurnOutcome.fromSavedReason(reason), onlyOutcome(ai))
             assertTrue(ai.conversationStateFlow("context").value.turnCompleted)
             assertTrue(survey.followups.value.isEmpty())
         }
@@ -39,6 +40,7 @@ class SurveyTwoStepFlowTest {
         run(survey, ai)
         assertEquals(1, survey.followups.value["Q8"]!!.size)
         assertFalse(ai.conversationStateFlow("context").value.turnCompleted)
+        assertTrue(ai.chatHistoryFlow("context").value.none { it.outcome != null })
         survey.answerLastFollowup("Q8", "Two bags per acre")
         run(survey, ai)
         assertEquals(listOf(PromptPhase.EVAL, PromptPhase.FOLLOWUP, PromptPhase.EVAL), repo.phases)
@@ -187,22 +189,36 @@ class SurveyTwoStepFlowTest {
     }
 
     @Test fun malformed_empty_generation_and_timeout_preserve_saved_input_for_retry() = runBlocking {
-        for (script in listOf(listOf("{}"), listOf(low, ""), listOf("TIMEOUT"), listOf(low, "FAIL"))) {
+        val evaluationFailed = AiTurnOutcome.EVALUATION_FAILED
+        val generationFailed = AiTurnOutcome.FOLLOWUP_GENERATION_FAILED
+        val cases = listOf(
+            listOf("{}") to evaluationFailed,
+            listOf("TIMEOUT") to evaluationFailed,
+            listOf("FAIL") to evaluationFailed,
+            listOf(low, "") to generationFailed,
+            listOf(low, "Malformed output") to generationFailed,
+            listOf(low, "TIMEOUT") to generationFailed,
+            listOf(low, "FAIL") to generationFailed
+        )
+        for ((script, expected) in cases) {
             val (survey, ai, repo) = fixture(3, script + listOf(low, "How much yield was lost?"))
             ai.updateComposerDraft("context", "FAW affected my crop")
             run(survey, ai)
             assertEquals(SurveyAiReason.FAILURE, survey.aiReasons.value["Q8"])
             assertFalse(ai.conversationStateFlow("context").value.turnCompleted)
             assertTrue(ai.conversationStateFlow("context").value.validationFailed)
+            assertEquals(expected, onlyOutcome(ai))
             assertEquals("FAW affected my crop", ai.conversationStateFlow("context").value.composerDraft)
             assertEquals(3, survey.remainingFollowups("Q8"))
             val messages = ai.chatHistoryFlow("context").value.count { it.sender == AiViewModel.ChatSender.USER }
             ai.resetStates()
             ai.ensureConversationContext("context", "Original question", survey.getAnswer("Q8"))
             assertTrue(ai.conversationStateFlow("context").value.validationFailed)
+            assertEquals(expected, onlyOutcome(ai))
             run(survey, ai)
             assertEquals(script.size + 2, repo.prompts.size)
             assertEquals(1, survey.followups.value["Q8"]!!.size)
+            assertTrue(ai.chatHistoryFlow("context").value.none { it.outcome != null })
             assertEquals(messages, ai.chatHistoryFlow("context").value.count { it.sender == AiViewModel.ChatSender.USER })
             assertEquals("FAW affected my crop", survey.getAnswer("Q8"))
         }
@@ -224,6 +240,7 @@ class SurveyTwoStepFlowTest {
             assertTrue(survey.followups.value["Q8"].isNullOrEmpty())
             assertEquals(2, survey.remainingFollowups("Q8"))
             assertTrue(ai.conversationStateFlow("context").value.validationFailed)
+            assertEquals(AiTurnOutcome.EVALUATION_FAILED, onlyOutcome(ai))
             assertEquals("FAW affected my crop", survey.getAnswer("Q8"))
         }
     }
@@ -295,6 +312,7 @@ class SurveyTwoStepFlowTest {
         assertEquals(1, ai.chatHistoryFlow("context").value.count { it.text == question })
         assertEquals(SurveyAiReason.FAILURE, survey.aiReasons.value["Q8"])
         assertTrue(ai.conversationStateFlow("context").value.validationFailed)
+        assertEquals(AiTurnOutcome.DUPLICATE_FOLLOWUP, onlyOutcome(ai))
     }
 
     @Test fun compound_target_partial_followup_leaves_only_remaining_component() = runBlocking {
@@ -388,6 +406,7 @@ class SurveyTwoStepFlowTest {
         withTimeout(5_000) { replacement.join() }
         old.join()
         assertEquals(SurveyAiReason.ACHIEVED, survey.aiReasons.value["Q8"])
+        assertEquals(AiTurnOutcome.ACHIEVED, onlyOutcome(ai))
         assertTrue(survey.followups.value.isEmpty())
         assertEquals(2, survey.remainingFollowups("Q8"))
         assertFalse(ai.conversationStateFlow("context").value.validationFailed)
@@ -404,6 +423,9 @@ class SurveyTwoStepFlowTest {
         survey.resetToStart()
         assertEquals("{}", survey.aiReasonsJson())
     }
+
+    private fun onlyOutcome(ai: AiViewModel) =
+        ai.chatHistoryFlow("context").value.mapNotNull { it.outcome }.single()
 
     private suspend fun run(
         survey: SurveyViewModel,

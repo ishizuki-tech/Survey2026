@@ -231,4 +231,29 @@ class SurveyAiPolicyTest {
         assertFalse(SurveyAiReason.FAILURE.terminal)
         assertTrue(SurveyAiReason.UNABLE_REFUSED.terminal)
     }
+    @Test fun typed_acceptance_preserves_validation_order_and_duplicate_normalization() {
+        val existing = listOf("How many bags?")
+        val cases = listOf(
+            Triple(" how MANY  bags？ ", false, null) to FollowupAcceptance.Duplicate,
+            Triple("How many bags", false, null) to FollowupAcceptance.Invalid,
+            Triple("How many bags??", false, null) to FollowupAcceptance.Invalid,
+            Triple("How many bags?", true, null) to FollowupAcceptance.Invalid,
+            Triple("How many bags?", false, "failure") to FollowupAcceptance.Invalid,
+            Triple(" Which unit? ", false, null) to FollowupAcceptance.Accepted("Which unit?")
+        )
+        for ((input, expected) in cases) {
+            val (raw, timedOut, error) = input
+            assertEquals(expected, SurveyAiPolicy.classifyQuestion(raw, timedOut, error, existing))
+            assertEquals(
+                (expected as? FollowupAcceptance.Accepted)?.question,
+                SurveyAiPolicy.acceptQuestion(raw, timedOut, error, existing)
+            )
+        }
+    }
+
+    @Test fun saved_failure_without_detail_is_unknown() {
+        assertEquals(AiTurnOutcome.UNKNOWN, AiTurnOutcome.fromSavedReason(SurveyAiReason.FAILURE))
+        assertNull(AiTurnOutcome.fromSavedReason(null))
+    }
+
 }

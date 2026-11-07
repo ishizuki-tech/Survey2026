@@ -2,6 +2,8 @@ package com.negi.survey.vm
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.viewmodel.initializer
+import androidx.lifecycle.viewmodel.viewModelFactory
 import androidx.navigation3.runtime.NavBackStack
 import androidx.navigation3.runtime.NavKey
 import androidx.test.core.app.ActivityScenario
@@ -9,8 +11,13 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.negi.survey.MainActivity
 import com.negi.survey.config.NodeDTO
 import com.negi.survey.config.SurveyConfig
+import com.negi.survey.slm.Repository
+import com.negi.survey.slm.RepositoryTraceContext
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertSame
@@ -124,6 +131,51 @@ class SurveySessionActivityRecreationTest {
         scenario.close()
     }
 
+    @Test
+    fun detailedOutcomeSurvivesActivityRecreationInTheSurveySession() {
+        val aiFactory = viewModelFactory {
+            initializer {
+                AiViewModel(object : Repository {
+                    override fun buildPrompt(userPrompt: String) = userPrompt
+                    override suspend fun request(prompt: String, traceContext: RepositoryTraceContext?) =
+                        flowOf("Invalid evaluation fixture")
+                })
+            }
+        }
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            val sessionKey = "outcome-rotation-test"
+            lateinit var chain: Job
+            lateinit var contextKey: String
+            lateinit var ai: AiViewModel
+            scenario.onActivity { activity ->
+                val owner = ViewModelProvider(activity)[SurveySessionStore::class.java].ownerFor(sessionKey)
+                val survey = ViewModelProvider(owner, surveyFactory(NavBackStack<NavKey>(FlowHome)))[SurveyViewModel::class.java]
+                survey.advanceToNext()
+                survey.setAnswer("Sample answer", "Q1")
+                contextKey = "sid=${survey.sessionId.value}|nid=Q1"
+                ai = ViewModelProvider(owner, aiFactory)[AiViewModel::class.java]
+                ai.ensureConversationContext(contextKey, "Question", "")
+                ai.appendUserMessage(contextKey, "Sample answer")
+                chain = ai.evaluateSurveyTwoStepAsync(survey, "Q1", contextKey, "Question")
+            }
+            runBlocking { withTimeout(5_000) { chain.join() } }
+            val outcomeRow = ai.chatHistoryFlow(contextKey).value.single { it.outcome != null }
+            assertEquals(AiTurnOutcome.EVALUATION_FAILED, outcomeRow.outcome)
+
+            scenario.recreate()
+
+            scenario.onActivity { activity ->
+                val sessions = ViewModelProvider(activity)[SurveySessionStore::class.java]
+                val owner = sessions.ownerFor(sessionKey)
+                val restored = ViewModelProvider(owner, aiFactory)[AiViewModel::class.java]
+                assertSame(ai, restored)
+                assertTrue(restored.conversationStateFlow(contextKey).value.validationFailed)
+                assertEquals(outcomeRow, restored.chatHistoryFlow(contextKey).value.single { it.outcome != null })
+                sessions.clearSession(sessionKey)
+            }
+        }
+    }
+
     private fun surveyFactory(nav: NavBackStack<NavKey>) = object : ViewModelProvider.Factory {
         @Suppress("UNCHECKED_CAST")
         override fun <T : ViewModel> create(modelClass: Class<T>): T =
@@ -138,6 +190,7 @@ class SurveySessionActivityRecreationTest {
                 NodeDTO("Q1", "AI", question = "Question", nextId = "Done"),
                 NodeDTO("Done", "DONE")
             )
-        )
+        ),
+        prompts = listOf(SurveyConfig.Prompt("Q1", evalPrompt = "{{ANSWER}}", followupPrompt = "{{QUESTION}}"))
     )
 }
