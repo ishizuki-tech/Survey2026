@@ -342,7 +342,8 @@ class AiViewModel(
      * @param isTyping True when this is a streaming typing placeholder.
      * @param createdAtUptimeMs Monotonic timestamp for ordering/diagnostics.
      * @param isFollowupQuestion True for the rendered question of an accepted follow-up.
-     * @param followupNotice Presentation state for an attempt without an accepted question.
+     * @param followupNotice Temporary presentation while preparing a follow-up.
+     * @param outcome Final presentation for an owned attempt.
      */
     data class ChatItem(
         val id: String,
@@ -353,12 +354,13 @@ class AiViewModel(
         val createdAtUptimeMs: Long = SystemClock.uptimeMillis(),
         val isFollowupQuestion: Boolean = false,
         val followupNotice: FollowupNotice? = null,
-        val evaluation: EvaluationPresentation? = null
+        val evaluation: EvaluationPresentation? = null,
+        val outcome: AiTurnOutcome? = null
     )
 
     enum class EvaluationPresentation { REVIEWING, REVIEWED, UNAVAILABLE }
 
-    enum class FollowupNotice { PREPARING, UNAVAILABLE }
+    enum class FollowupNotice { PREPARING }
 
     /** Composer role per conversation context. */
     enum class ComposerRole {
@@ -631,14 +633,18 @@ class AiViewModel(
                         "followup_needed" to traceFollowupNeeded,
                         "remainingFollowupCapacity" to remaining, "policyMissingPoints" to admittedMissingPoints
                     ))
+                    var outcome: AiTurnOutcome? = null
                     val reason = when (decision) {
                         SurveyAiDecision.ACHIEVED -> SurveyAiReason.ACHIEVED
                         SurveyAiDecision.LIMIT_REACHED -> SurveyAiReason.LIMIT_REACHED
-                        SurveyAiDecision.FAILURE -> SurveyAiReason.FAILURE
+                        SurveyAiDecision.FAILURE -> {
+                            outcome = AiTurnOutcome.EVALUATION_FAILED
+                            SurveyAiReason.FAILURE
+                        }
                         SurveyAiDecision.GENERATE -> {
-                            val question = generation?.let { generated ->
+                            val acceptance = generation?.let { generated ->
                                 generated.followups.firstOrNull()?.let { candidate ->
-                                    SurveyAiPolicy.acceptQuestion(
+                                    SurveyAiPolicy.classifyQuestion(
                                         candidate,
                                         generated.timedOut,
                                         generated.error,
@@ -646,6 +652,7 @@ class AiViewModel(
                                     )
                                 }
                             }
+                            val question = (acceptance as? FollowupAcceptance.Accepted)?.question
                             if (generation != null) {
                                 survey.traceEvent("AI_FOLLOWUP_FINISHED", answerTraceId, nodeId, mapOf(
                                     "rawResponse" to DiagnosticContentPolicy.rawOrNull(generation.raw), "responseLength" to generation.raw.length,
@@ -656,16 +663,32 @@ class AiViewModel(
                                     "candidate" to DiagnosticContentPolicy.rawOrNull(generation.followups.firstOrNull()), "candidateLength" to (generation.followups.firstOrNull()?.length ?: 0), "extractionSuccess" to (question != null)
                                 ))
                             }
-                            if (question != null && survey.addFollowupQuestion(nodeId, question)) {
+                            if (generation != null && question != null && survey.addFollowupQuestion(nodeId, question)) {
                                 survey.traceEvent("AI_FOLLOWUP_ACCEPTED", answerTraceId, nodeId, mapOf("followup" to DiagnosticContentPolicy.rawOrNull(question), "followupLength" to question.length))
-                                finishTwoStepFollowupLocked(generation.runId, question)
+                                finishTwoStepFollowupLocked(generation.runId, question, outcome = null)
                                 setFollowupMode(contextKey, question)
                                 null
                             } else {
-                                generation?.let { finishTwoStepFollowupLocked(it.runId, question = null) }
+                                outcome = if (acceptance == FollowupAcceptance.Duplicate) {
+                                    AiTurnOutcome.DUPLICATE_FOLLOWUP
+                                } else {
+                                    AiTurnOutcome.FOLLOWUP_GENERATION_FAILED
+                                }
                                 survey.traceEvent("AI_FOLLOWUP_REJECTED", answerTraceId, nodeId, mapOf("candidate" to DiagnosticContentPolicy.rawOrNull(generation?.followups?.firstOrNull()), "candidateLength" to (generation?.followups?.firstOrNull()?.length ?: 0)))
                                 SurveyAiReason.FAILURE
                             }
+                        }
+                    }
+                    val finalOutcome = outcome ?: AiTurnOutcome.fromSavedReason(reason)
+                    if (finalOutcome != null) {
+                        if (generation != null) {
+                            finishTwoStepFollowupLocked(generation.runId, question = null, outcome = finalOutcome)
+                        } else {
+                            commitTwoStepChatItemLocked(ChatItem(
+                                id = "outcome-$nodeId-${evaluation.runId}",
+                                sender = ChatSender.AI,
+                                outcome = finalOutcome
+                            ))
                         }
                     }
                     survey.setAiReason(nodeId, reason)
@@ -782,7 +805,7 @@ class AiViewModel(
             val retained = rows.filterIndexed { index, row ->
                 row.id != "typing-${chat.nodeId}" &&
                     !(index > lastTurnBoundary && (row.id.startsWith("eval-${chat.nodeId}-") ||
-                        row.followupNotice == FollowupNotice.UNAVAILABLE))
+                        row.outcome != null))
             }
             (retained + ChatItem(
                 "typing-${chat.nodeId}", ChatSender.AI, text = "…", isTyping = true,
@@ -831,7 +854,7 @@ class AiViewModel(
     }
 
     /** Resolve the owned preparation row once, preserving its key and position. */
-    private fun finishTwoStepFollowupLocked(runId: Long, question: String?) {
+    private fun finishTwoStepFollowupLocked(runId: Long, question: String?, outcome: AiTurnOutcome?) {
         val chat = twoStepChatForPublicationLocked() ?: return
         val id = "fu-${chat.nodeId}-$runId"
         chatStore[chat.contextKey]?.update { rows ->
@@ -840,7 +863,8 @@ class AiViewModel(
                     row.copy(
                         text = question,
                         isFollowupQuestion = question != null,
-                        followupNotice = if (question == null) FollowupNotice.UNAVAILABLE else null
+                        followupNotice = null,
+                        outcome = outcome
                     )
                 } else row
             }

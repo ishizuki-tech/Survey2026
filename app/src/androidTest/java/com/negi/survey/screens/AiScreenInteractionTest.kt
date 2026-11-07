@@ -30,6 +30,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.semantics.SemanticsProperties
+import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.SemanticsMatcher
@@ -41,6 +42,7 @@ import androidx.compose.ui.test.assertIsNotFocused
 import androidx.compose.ui.test.assert
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
+import androidx.compose.ui.test.hasClickAction
 import androidx.compose.ui.test.hasAnyAncestor
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.isDialog
@@ -48,6 +50,7 @@ import androidx.compose.ui.test.isDisplayed
 import androidx.compose.ui.test.hasSetTextAction
 import androidx.compose.ui.test.junit4.StateRestorationTester
 import androidx.compose.ui.test.junit4.v2.createComposeRule
+import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
@@ -86,6 +89,7 @@ import com.negi.survey.config.SurveyConfig
 import com.negi.survey.slm.Repository
 import com.negi.survey.slm.RepositoryTraceContext
 import com.negi.survey.ui.theme.SurveyNavTheme
+import com.negi.survey.vm.AiTurnOutcome
 import com.negi.survey.vm.AiViewModel
 import com.negi.survey.vm.FlowAI
 import com.negi.survey.vm.FlowDone
@@ -489,21 +493,21 @@ class AiScreenInteractionTest {
 
         scrollManuallyTo(chatRows().lastIndex)
         rule.onNodeWithText("Q07 original question").assertIsDisplayed()
-        rule.runOnIdle { survey.backToPrevious() }
+        rule.onNodeWithText("Back").performScrollTo().performClick()
         rule.onNodeWithText("Experience").assertIsDisplayed()
         rule.runOnIdle { survey.advanceToNext() }
         assertLatestEdgeVisible(slot.id)
-        rule.onNodeWithText(NO_FOLLOWUP).assertIsDisplayed()
+        rule.onNodeWithText("Follow-up generation failed").assertIsDisplayed()
         rule.onNodeWithText(PREPARING_FOLLOWUP).assertDoesNotExist()
 
         scrollManuallyTo(chatRows().lastIndex)
         rule.onNodeWithText("Q07 original question").assertIsDisplayed()
-        rule.runOnIdle { survey.advanceToNext() }
+        rule.onNodeWithText("Next").performScrollTo().assertIsEnabled().performClick()
         assertQuestionFits("Q08 original question")
         rule.runOnIdle { survey.backToPrevious() }
         assertLatestEdgeVisible(slot.id)
-        rule.onNodeWithText(NO_FOLLOWUP).assertIsDisplayed()
-        rule.onNodeWithText("Retry saved answers").performScrollTo().assertIsEnabled()
+        assertOutcome("Follow-up generation failed", "We couldn't prepare another question.")
+        rule.onNodeWithTag("restored-outcome-Q07").assertDoesNotExist()
     }
 
     @Test fun backDuringReviewingOrPreparingReturnsToTheLatestRetainedQ07Row() {
@@ -540,8 +544,9 @@ class AiScreenInteractionTest {
         }
 
         returnFromExperience(scan.id)
-        assertLatestEdgeVisible(q07History.value.last { it.text == "main answer" }.id)
-        rule.onNodeWithText("Retry saved answers").performScrollTo().performClick()
+        assertLatestEdgeVisible("restored-outcome-Q07")
+        rule.onNodeWithText("AI review unavailable").assertIsDisplayed()
+        runSavedAnswerEvaluation()
 
         sendChunk(retryEvaluation, NEEDS_FOLLOWUP, expected = NEEDS_FOLLOWUP)
         retryEvaluation.finish()
@@ -551,7 +556,9 @@ class AiScreenInteractionTest {
         assertLatestEdgeVisible(slot.id)
 
         returnFromExperience(slot.id)
-        assertLatestEdgeVisible(score.id)
+        assertLatestEdgeVisible("restored-outcome-Q07")
+        rule.onNodeWithText("AI review unavailable").assertIsDisplayed()
+        assertTrue(score in q07History.value)
         rule.onNodeWithText(PREPARING_FOLLOWUP).assertDoesNotExist()
     }
 
@@ -621,6 +628,45 @@ class AiScreenInteractionTest {
             rule.runOnIdle { presentation++ }
             assertLatestEdgeVisible(finalRow.id)
         }
+    }
+
+    @Test fun fallbackBelongsToTheCurrentTurnAfterAnEarlierOutcome() {
+        val root = AiViewModel.ChatItem("qroot-Q8", AiViewModel.ChatSender.AI, "Original question")
+        val previousOutcome = AiViewModel.ChatItem(
+            "previous-outcome", AiViewModel.ChatSender.AI, outcome = AiTurnOutcome.EVALUATION_FAILED
+        )
+        val newAnswer = AiViewModel.ChatItem("new-answer", AiViewModel.ChatSender.USER, "New answer")
+        val acceptedFollowup = AiViewModel.ChatItem(
+            "accepted-followup", AiViewModel.ChatSender.AI, FIRST_FOLLOWUP, isFollowupQuestion = true
+        )
+        var rows by mutableStateOf(listOf(root, previousOutcome, newAnswer))
+        var fallback by mutableStateOf<AiTurnOutcome?>(AiTurnOutcome.UNKNOWN)
+        rule.setContent {
+            AiConversation(
+                nodeId = "Q8", presentation = 1L, chatItems = rows, followups = emptyList(), loading = false,
+                snack = remember { SnackbarHostState() }, modifier = Modifier.fillMaxSize(), fieldEvaluation = true,
+                fallbackOutcome = fallback
+            )
+        }
+
+        rule.onAllNodesWithText("AI review unavailable").assertCountEquals(1)
+        rule.onNodeWithTag(previousOutcome.id).assertIsDisplayed()
+        assertLatestEdgeVisible("restored-outcome-Q8")
+
+        rule.runOnIdle {
+            rows = listOf(root, previousOutcome, acceptedFollowup)
+            fallback = null
+        }
+        assertQuestionFits(FIRST_FOLLOWUP)
+        rule.onNodeWithText("AI review unavailable").assertDoesNotExist()
+        rule.onNodeWithTag(previousOutcome.id).assertIsDisplayed()
+
+        // A published follow-up also starts a new turn, even without a retained user row.
+        rule.runOnIdle { fallback = AiTurnOutcome.UNKNOWN }
+        conversation.performScrollToIndex(0)
+        rule.onAllNodesWithText("AI review unavailable").assertCountEquals(1)
+        rule.onNodeWithTag(previousOutcome.id).assertIsDisplayed()
+        assertLatestEdgeVisible("restored-outcome-Q8")
     }
 
     @Test fun keyboardResizeKeepsTheReentryAnswerVisibleAboveTheComposer() {
@@ -983,9 +1029,7 @@ class AiScreenInteractionTest {
         rule.onNode(hasSetTextAction()).performImeAction()
         rule.waitUntil(5_000) { ai.conversationStateFlow(contextKey).value.turnCompleted }
         rule.waitForIdle()
-        rule.onNodeWithContentDescription("Send").assertIsNotEnabled()
-        waitForKeyboard(visible = true)
-        assertInactiveComposer()
+        assertOutcome("Answer complete", "Your answer meets the requirements. No follow-up question is needed.")
         assertReviewed(95)
         rule.runOnIdle {
             assertEquals(listOf("main answer", "two bags"), userMessages())
@@ -1568,7 +1612,10 @@ class AiScreenInteractionTest {
         rule.onNodeWithContentDescription("Record answer").performClick()
         rule.runOnIdle { speech.capture.value = true }
         rule.onNodeWithText("Stop").performClick()
-        rule.runOnIdle { speech.transitionToTranscribing() }
+        rule.runOnIdle {
+            assertEquals(1, speech.stopCalls)
+            speech.transitionToTranscribing()
+        }
         rule.onNodeWithText("Transcribing…").assertIsDisplayed()
         rule.runOnIdle { speech.finish("Two bags of maize") }
         rule.onNodeWithText("Two bags of maize").assertIsDisplayed()
@@ -1612,7 +1659,7 @@ class AiScreenInteractionTest {
             assertTrue(chatRows().none { it.isTyping || it.followupNotice != null || it.id == cancelledSlot.id })
             assertTrue(originalScore in chatRows())
             rule.runOnIdle { visible = true }
-            rule.onNodeWithText("Retry saved answers").assertIsEnabled().performClick()
+            runSavedAnswerEvaluation()
         } finally {
             releaseLate.complete(Unit)
         }
@@ -1662,7 +1709,7 @@ class AiScreenInteractionTest {
         sendChunk(duplicate, FIRST_FOLLOWUP, expected = FIRST_FOLLOWUP)
         duplicate.finish()
 
-        assertUnavailableFollowup(score, slot)
+        assertUnavailableFollowup(score, slot, AiTurnOutcome.DUPLICATE_FOLLOWUP)
         assertEquals(firstTurn, chatRows().filter { it in firstTurn })
         assertEquals(listOf("main answer", "two bags"), userMessages())
         val followup = survey.followups.value.getValue("Q8").single()
@@ -1695,26 +1742,55 @@ class AiScreenInteractionTest {
         assertTrue(survey.followups.value["Q8"].isNullOrEmpty())
         assertEquals(2, repo.requests)
 
-        rule.onNodeWithText("Retry saved answers").performScrollTo().performClick()
+        runSavedAnswerEvaluation()
         sendChunk(retryEval, passingScore, expected = passingScore)
         retryEval.finish()
         rule.waitUntil(5_000) { ai.conversationStateFlow(contextKey).value.turnCompleted && !ai.isRunning }
         assertReviewed(95)
-        rule.onNodeWithText(NO_FOLLOWUP).assertDoesNotExist()
+        assertOutcome("Answer complete", "Your answer meets the requirements. No follow-up question is needed.")
         assertTrue(chatRows().none { it.id == slot.id || it.followupNotice != null || it.isFollowupQuestion })
         assertEquals(listOf("main answer"), userMessages())
         assertEquals(3, repo.requests)
     }
 
-    private fun assertUnavailableFollowup(score: AiViewModel.ChatItem, slot: AiViewModel.ChatItem) {
+    private fun runSavedAnswerEvaluation() = rule.runOnIdle {
+        ai.evaluateSurveyTwoStepAsync(survey, survey.currentNodeId, contextKey, survey.getQuestion(survey.currentNodeId))
+    }
+
+    private fun assertClosedComposer() {
+        rule.onNodeWithText("Answer input is closed").assertIsDisplayed()
+        rule.onNode(hasSetTextAction()).assertDoesNotExist()
+        rule.onNodeWithContentDescription("Send").assertDoesNotExist()
+        rule.onNodeWithContentDescription("Record answer").assertDoesNotExist()
+        rule.onNodeWithText("Retry saved answers").assertDoesNotExist()
+        waitForKeyboard(visible = false)
+    }
+
+    private fun assertOutcome(heading: String, explanation: String) {
+        assertClosedComposer()
+        rule.onAllNodesWithText(heading).assertCountEquals(1)
+        rule.onNodeWithText(heading).assertIsDisplayed()
+        rule.onNodeWithText(explanation).assertIsDisplayed()
+        rule.onNodeWithText(NO_FOLLOWUP).assertDoesNotExist()
+    }
+
+    private fun assertUnavailableFollowup(
+        score: AiViewModel.ChatItem,
+        slot: AiViewModel.ChatItem,
+        outcome: AiTurnOutcome = AiTurnOutcome.FOLLOWUP_GENERATION_FAILED
+    ) {
         rule.waitUntil(5_000) { ai.conversationStateFlow(contextKey).value.validationFailed && !ai.isRunning }
-        rule.onNodeWithText(NO_FOLLOWUP).assertIsDisplayed()
+        if (outcome == AiTurnOutcome.DUPLICATE_FOLLOWUP) {
+            assertOutcome("Follow-up already asked", "The generated question was already asked.")
+            rule.onNodeWithText("Evaluation failed").assertDoesNotExist()
+        } else {
+            assertOutcome("Follow-up generation failed", "We couldn't prepare another question.")
+        }
         rule.onNodeWithText(PREPARING_FOLLOWUP).assertDoesNotExist()
         rule.onNodeWithText("Status: failure").assertIsDisplayed()
-        rule.onNodeWithText("Retry saved answers").performScrollTo().assertIsEnabled()
         assertEquals(SurveyAiReason.FAILURE, survey.aiReasons.value[survey.currentNodeId])
-        val notice = chatRows().single { it.followupNotice == AiViewModel.FollowupNotice.UNAVAILABLE }
-        assertEquals(slot.copy(followupNotice = AiViewModel.FollowupNotice.UNAVAILABLE), notice)
+        val notice = chatRows().single { it.outcome != null }
+        assertEquals(slot.copy(followupNotice = null, outcome = outcome), notice)
         assertEquals(listOf(score, notice), chatRows().takeLast(2))
     }
 
@@ -1771,8 +1847,8 @@ class AiScreenInteractionTest {
     }
 
     private fun evaluationControl(id: String) = rule.onNode(
-        hasAnyAncestor(hasTestTag(id)) and
-            (hasText("Answer reviewed", substring = true) or hasText("Evaluation unavailable", substring = true))
+        hasAnyAncestor(hasTestTag(id)) and hasClickAction() and
+            (hasText("Answer reviewed", substring = true) or hasText("Evaluation details", substring = true))
     )
 
     private fun assertReviewed(score: Int) {
@@ -1841,8 +1917,8 @@ class AiScreenInteractionTest {
         assertLatestEdgeVisible("typing-Q8", oversized = rowGeometry("typing-Q8").height > conversationViewport().height)
     }
 
-    @Test fun blankImeSendKeepsDraftAndFailedTwoStepRetryUsesTheAcceptedAnswer() {
-        repo.responses = listOf("invalid evaluation", """{"score":95,"missing_points":[],"followup_needed":false}""")
+    @Test fun blankImeSendKeepsDraftAndEvaluationFailureClosesTheComposer() {
+        repo.responses = listOf("invalid evaluation")
         host(withSpeech = false, twoStep = true)
         waitForKeyboard(visible = true)
         val editor = rule.onNode(hasSetTextAction()).assertIsFocused()
@@ -1858,21 +1934,98 @@ class AiScreenInteractionTest {
         assertInactiveComposer()
         repo.release.complete(Unit)
         rule.waitUntil(5_000) { ai.conversationStateFlow(contextKey).value.validationFailed && !ai.loading.value }
+        assertOutcome("Evaluation failed", "We couldn't evaluate your answer.")
         rule.onNodeWithText("Reviewing your answer…").assertDoesNotExist()
         rule.onNodeWithText("Answer reviewed", substring = true).assertDoesNotExist()
         val failed = chatRows().single { it.json == "invalid evaluation" }
         evaluationControl(failed.id).assertIsDisplayed().performClick()
         rule.onNodeWithText("Raw JSON").performClick()
         rule.onNodeWithText("invalid evaluation").assertIsDisplayed()
-        rule.onNodeWithText("Retry saved answers").assertIsEnabled().performClick()
-        rule.waitUntil(5_000) { ai.conversationStateFlow(contextKey).value.turnCompleted }
-        assertInactiveComposer()
-        waitForKeyboard(visible = true)
         rule.runOnIdle {
             assertEquals("accepted", survey.getAnswer("Q8"))
             assertEquals(listOf("accepted"), userMessages())
-            assertEquals(2, repo.requests)
+            assertEquals(1, repo.requests)
         }
+    }
+
+    @Test fun limitOutcomeSurvivesRestorationWithoutReopeningTheKeyboard() {
+        val evaluation = ControlledResponse()
+        repo.streamedResponses = listOf(evaluation)
+        val restoration = StateRestorationTester(rule)
+        var showRequests = 0
+        host(twoStep = true, withSpeech = false, restoration = restoration, onKeyboardShow = { showRequests++ }) {
+            repeat(maxFollowups) { index ->
+                check(addFollowupQuestion("Q8", "Sample question ${index + 1}?"))
+                answerLastFollowup("Q8", "Sample clarification")
+            }
+        }
+        waitForKeyboard(visible = true)
+        rule.onNode(hasSetTextAction()).performTextInput("Sample answer")
+        rule.onNodeWithContentDescription("Send").performClick()
+        sendChunk(evaluation, NEEDS_FOLLOWUP, expected = NEEDS_FOLLOWUP)
+        evaluation.finish()
+        rule.waitUntil(5_000) { !ai.isRunning && survey.aiReasons.value["Q8"] == SurveyAiReason.LIMIT_REACHED }
+        assertOutcome("Follow-up limit reached", "No more follow-up questions can be asked.")
+        rule.onNodeWithText("Answer complete").assertDoesNotExist()
+        val outcome = chatRows().single { it.outcome == AiTurnOutcome.LIMIT_REACHED }
+        val trailingRow = AiViewModel.ChatItem("retained-note", AiViewModel.ChatSender.AI, "Retained context")
+        rule.runOnIdle { ai.upsertChatItem(contextKey, trailingRow) }
+        conversation.performScrollToIndex(0)
+        repeat(3) {
+            rule.runOnIdle { unrelated = !unrelated }
+            assertOutcome("Follow-up limit reached", "No more follow-up questions can be asked.")
+            rule.onNodeWithTag("restored-outcome-Q8").assertDoesNotExist()
+            assertLatestEdgeVisible(trailingRow.id)
+        }
+
+        restoration.emulateSavedInstanceStateRestore()
+        assertOutcome("Follow-up limit reached", "No more follow-up questions can be asked.")
+        rule.onNodeWithTag("restored-outcome-Q8").assertDoesNotExist()
+        assertEquals(listOf(outcome, trailingRow), chatRows().takeLast(2))
+        assertEquals(1, showRequests)
+        assertEquals(1, repo.requests)
+    }
+
+    @Test fun historicalFailureUsesTheGenericOutcomeAndDoesNotFocusTheComposer() {
+        var showRequests = 0
+        host(twoStep = true, withSpeech = false, onKeyboardShow = { showRequests++ }) {
+            setAnswer("Sample answer", "Q8")
+            setAiReason("Q8", SurveyAiReason.FAILURE)
+        }
+        assertOutcome("AI review unavailable", "We couldn't complete the AI review.")
+        rule.onNodeWithText("Evaluation failed").assertDoesNotExist()
+        rule.onNodeWithText("Follow-up generation failed").assertDoesNotExist()
+        rule.onNodeWithText("Follow-up already asked").assertDoesNotExist()
+        rule.onNodeWithText("Answer complete").assertDoesNotExist()
+        rule.onNodeWithText("Next").assertIsEnabled()
+        assertEquals(0, showRequests)
+        assertEquals(0, repo.requests)
+        assertTrue(speaker.spoken.isEmpty())
+    }
+
+    @Test fun compatibleTerminalReasonUsesANeutralOutcome() {
+        host(twoStep = true, withSpeech = false) {
+            setAiReason("Q8", SurveyAiReason.UNABLE_REFUSED)
+        }
+        assertOutcome("AI review ended", "No further follow-up question is available.")
+        rule.onNodeWithText("Answer complete").assertDoesNotExist()
+        assertEquals(SurveyAiReason.UNABLE_REFUSED, survey.aiReasons.value["Q8"])
+    }
+
+    @Test fun finalizationWhileReadingHistoryDoesNotJumpToTheOutcome() {
+        val evaluation = ControlledResponse()
+        repo.streamedResponses = listOf(evaluation)
+        host(twoStep = true, productionImeInsets = true)
+        appendConversationHistory()
+        enterAndSend("Sample answer")
+        scrollToOriginalQuestion()
+        evaluation.finish(IllegalStateException("scripted failure"))
+        rule.waitUntil(5_000) { !ai.isRunning && ai.conversationStateFlow(contextKey).value.validationFailed }
+        assertClosedComposer()
+        rule.onNodeWithText("Question").assertIsDisplayed()
+        assertTrue(conversationPosition() > 0f)
+        conversation.performScrollToIndex(0)
+        assertOutcome("Evaluation failed", "We couldn't evaluate your answer.")
     }
 
     @Test fun acceptedMainAnswerDoesNotReappearAsDraftOnNavigationReentry() {
@@ -1896,6 +2049,56 @@ class AiScreenInteractionTest {
             assertEquals("saved answer", survey.getAnswer("Q8"))
             assertEquals(listOf("saved answer"), userMessages())
             assertEquals(1, ai.chatHistoryFlow(contextKey).value.count { it.json != null })
+        }
+    }
+
+    @Test fun finalizedInputKeepsExplicitStopAndIgnoresLateTranscription() {
+        host(twoStep = true, useNavDisplay = true)
+        rule.onNodeWithContentDescription("Record answer").performClick()
+        rule.runOnIdle { speech.capture.value = true }
+        val stop = rule.onNode(hasText("Stop") and hasAnyAncestor(isDialog()))
+        stop.assertIsDisplayed().assertIsEnabled()
+
+        // Publish a result while recording to exercise the exceptional overlap.
+        rule.runOnIdle {
+            survey.setAnswer("Accepted answer", "Q8")
+            ai.appendUserMessage(contextKey, "Accepted answer")
+            survey.setAiReason("Q8", SurveyAiReason.ACHIEVED)
+        }
+        stop.assertIsDisplayed().assertIsEnabled()
+        rule.onNode(hasSetTextAction()).assertDoesNotExist()
+        rule.onNodeWithContentDescription("Record answer").assertDoesNotExist()
+        rule.onNodeWithText("Send").assertDoesNotExist()
+        rule.onNodeWithText("Next").assertIsNotEnabled()
+        rule.runOnIdle { assertEquals(0, speech.stopCalls) }
+
+        stop.performClick()
+        stop.assertIsDisplayed().assertIsNotEnabled()
+        InstrumentationRegistry.getInstrumentation().sendKeyDownUpSync(KeyEvent.KEYCODE_BACK)
+        rule.runOnIdle {
+            assertEquals(1, speech.stopCalls)
+            speech.transitionToTranscribing()
+        }
+        stop.assertDoesNotExist()
+        assertOutcome("Answer complete", "Your answer meets the requirements. No follow-up question is needed.")
+        rule.onNodeWithText("Next").assertIsNotEnabled()
+
+        rule.runOnIdle { speech.finish("Late transcript") }
+        assertOutcome("Answer complete", "Your answer meets the requirements. No follow-up question is needed.")
+        rule.onNodeWithText("Late transcript").assertDoesNotExist()
+        rule.onNodeWithText("Next").assertIsEnabled()
+
+        rule.runOnIdle { survey.goto("Done") }
+        rule.onNodeWithText("Away from AI").assertIsDisplayed()
+        rule.runOnIdle { survey.backToPrevious() }
+        assertOutcome("Answer complete", "Your answer meets the requirements. No follow-up question is needed.")
+        rule.runOnIdle {
+            assertEquals(1, speech.stopCalls)
+            assertEquals("Accepted answer", survey.getAnswer("Q8"))
+            assertEquals(listOf("Accepted answer"), userMessages())
+            assertEquals(SurveyAiReason.ACHIEVED, survey.aiReasons.value["Q8"])
+            assertEquals("", ai.conversationStateFlow(contextKey).value.composerDraft)
+            assertEquals(0, repo.requests)
         }
     }
 

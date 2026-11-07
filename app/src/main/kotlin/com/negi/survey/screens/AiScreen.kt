@@ -126,7 +126,6 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Scaffold
@@ -191,6 +190,7 @@ import com.negi.survey.slm.FollowupExtractor
 import com.negi.survey.slm.PromptPhase
 import com.negi.survey.ui.theme.neutralEdge
 import com.negi.survey.ui.theme.outdoorGradientStops
+import com.negi.survey.vm.AiTurnOutcome
 import com.negi.survey.vm.AiViewModel
 import com.negi.survey.vm.QuestionSpeaker
 import com.negi.survey.vm.SurveyViewModel
@@ -454,6 +454,11 @@ fun AiScreen(
         rememberSaveable { mutableStateOf(false) }
     }
     val processing = loading || submissionPending
+    val fallbackOutcome = if (isTwoStepNode && !processing) {
+        AiTurnOutcome.fromSavedReason(aiReason)
+            ?: AiTurnOutcome.UNKNOWN.takeIf { conv.validationFailed || conv.turnCompleted }
+    } else null
+    val inputClosed = fallbackOutcome != null
     val followOutput = processing ||
         (submittedInPresentation && (conv.turnCompleted || conv.validationFailed))
 
@@ -493,6 +498,12 @@ fun AiScreen(
 
     fun ownsPresentation() = vmSurvey.ownsAiPresentation(presentation, surveySessionId, nid)
 
+    LaunchedEffect(contextKey, presentation, inputClosed) {
+        if (!inputClosed || !ownsPresentation()) return@LaunchedEffect
+        focusManager.clearFocus(force = true)
+        keyboard?.hide()
+    }
+
     val prettyJson = remember {
         Json {
             prettyPrint = true
@@ -512,8 +523,9 @@ fun AiScreen(
 
     LaunchedEffect(error) {
         val msg = error ?: return@LaunchedEffect
+        if (isTwoStepNode) return@LaunchedEffect
         snack.showSnackbar(msg)
-        if (!isTwoStepNode) vmAI.removeTypingMessage(contextKey, nid)
+        vmAI.removeTypingMessage(contextKey, nid)
     }
 
     // ---------------------------------------------------------------------
@@ -739,8 +751,13 @@ fun AiScreen(
     var wasTranscribing by remember(contextKey) { mutableStateOf(false) }
     var lastCommitted by remember(contextKey) { mutableStateOf<String?>(null) }
 
-    LaunchedEffect(speechRecording, speechTranscribing, speechPartial) {
+    LaunchedEffect(speechRecording, speechTranscribing, speechPartial, inputClosed) {
         if (speechController == null) return@LaunchedEffect
+        if (inputClosed) {
+            wasRecording = false
+            wasTranscribing = false
+            return@LaunchedEffect
+        }
 
         val startedThisUtterance =
             (!wasRecording && !wasTranscribing) && (speechRecording || speechTranscribing)
@@ -837,14 +854,10 @@ fun AiScreen(
         return true
     }
 
-    fun runTwoStep(retry: Boolean = false) {
-        if (inputBlocked()) return
+    fun runTwoStep() {
+        if (inputClosed || inputBlocked()) return
         val current = conversation.value
-        if (retry) {
-            if (!current.validationFailed) return
-            submissionPending = true
-            submittedInPresentation = true
-        } else if (current.turnCompleted || current.validationFailed ||
+        if (current.turnCompleted || current.validationFailed ||
             !acceptAnswer(current.composerDraft.trim(), current.role)
         ) return
         scope.launch {
@@ -853,9 +866,10 @@ fun AiScreen(
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                vmSurvey.setAiReason(nid, com.negi.survey.vm.SurveyAiReason.FAILURE)
-                vmAI.failValidationTurn(contextKey)
-                snack.showSnackbar("Validation failed. Retry using the saved answers.")
+                if (ownsPresentation()) {
+                    vmSurvey.setAiReason(nid, SurveyAiReason.FAILURE)
+                    vmAI.failValidationTurn(contextKey)
+                }
             } finally {
                 submissionPending = false
             }
@@ -1047,6 +1061,7 @@ fun AiScreen(
                         loading = loading,
                         followOutput = followOutput,
                         fieldEvaluation = isTwoStepNode,
+                        fallbackOutcome = fallbackOutcome,
                         snack = snack,
                         modifier = Modifier.weight(1f).fillMaxWidth()
                     )
@@ -1079,17 +1094,9 @@ fun AiScreen(
                                     )
                                 }
                             }
-                            if (conv.validationFailed) {
-                                OutlinedButton(
-                                    colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.onSurface),
-                                    enabled = !loading && !submissionPending && !speechRecording && !speechTranscribing,
-                                    onClick = { runTwoStep(retry = true) }
-                                ) { Text("Retry saved answers") }
-                            }
                         }
 
-                        val composerEnabled = textFieldEnabled && !processing &&
-                            !(isTwoStepNode && (conv.validationFailed || conv.turnCompleted))
+                        val composerEnabled = textFieldEnabled && !processing && !inputClosed
                         val onToggleSpeech: (() -> Unit)? = speechController?.let { sc ->
                             {
                                 if (!sc.isRecording.value) {
@@ -1105,7 +1112,14 @@ fun AiScreen(
                             if (composerEnabled) submit()
                         }
                         val displayedDraft = if (processing) "" else conv.composerDraft
-                        if (showTextComposer) {
+                        if (inputClosed) {
+                            Text(
+                                "Answer input is closed",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
+                            )
+                        } else if (showTextComposer) {
                             ChatComposer(
                                 value = displayedDraft,
                                 onValueChange = { t ->
@@ -1372,11 +1386,12 @@ internal fun AiConversation(
     snack: SnackbarHostState,
     modifier: Modifier,
     followOutput: Boolean = loading,
-    fieldEvaluation: Boolean = false
+    fieldEvaluation: Boolean = false,
+    fallbackOutcome: AiTurnOutcome? = null
 ) {
     val rootId = "qroot-$nodeId"
     val latestPublishedId = chatItems.lastOrNull { it.isFollowupQuestion }?.id
-    val (newestFirst, latestRestoredId) = remember(chatItems, followups, rootId) {
+    val (newestFirst, latestRestoredId) = remember(chatItems, followups, rootId, fallbackOutcome) {
         val rows = chatItems.toMutableList()
         var previousQuestionIndex = rows.indexOfFirst { it.id == rootId }
         var restoredId: String? = null
@@ -1391,6 +1406,18 @@ internal fun AiConversation(
                 rows.add(++previousQuestionIndex, AiViewModel.ChatItem(id, AiViewModel.ChatSender.AI, text = entry.question))
                 id
             }
+        }
+        // Only retained rows establish turn boundaries. Reconstructed questions fill gaps
+        // in the history and may appear after a retained outcome.
+        val hasCurrentOutcome = chatItems.asReversed().asSequence()
+            .takeWhile { it.sender != AiViewModel.ChatSender.USER && !it.isFollowupQuestion }
+            .any { it.outcome != null }
+        if (fallbackOutcome != null && !hasCurrentOutcome) {
+            rows.add(AiViewModel.ChatItem(
+                id = "restored-outcome-$nodeId",
+                sender = AiViewModel.ChatSender.AI,
+                outcome = fallbackOutcome
+            ))
         }
         rows.asReversed() to restoredId
     }
@@ -1540,8 +1567,7 @@ internal fun AiConversation(
                         raw = item.json.orEmpty(),
                         snack = snack
                     )
-                    item.followupNotice == AiViewModel.FollowupNotice.UNAVAILABLE ->
-                        FieldFollowupUnavailable()
+                    item.outcome != null -> FieldOutcomeRow(item.outcome)
                     item.json != null -> JsonBubbleMono(pretty = item.json, snack = snack)
                     else -> FieldMessage(text = item.text.orEmpty(), isAi = isAi, typing = item.isTyping)
                 }

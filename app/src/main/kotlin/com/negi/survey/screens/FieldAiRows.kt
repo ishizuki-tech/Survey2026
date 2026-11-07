@@ -28,6 +28,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
+import androidx.compose.material.icons.outlined.ErrorOutline
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -61,6 +62,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.currentStateAsState
+import com.negi.survey.vm.AiTurnOutcome
 import com.negi.survey.vm.parseStrictModelJsonObject
 import kotlin.math.PI
 import kotlin.math.cos
@@ -179,15 +181,41 @@ internal fun FieldProcessingRow(reviewing: Boolean, visible: Boolean) {
 }
 
 @Composable
-internal fun FieldFollowupUnavailable() {
+internal fun FieldOutcomeRow(outcome: AiTurnOutcome) {
+    val (heading, explanation) = when (outcome) {
+        AiTurnOutcome.ACHIEVED ->
+            "Answer complete" to "Your answer meets the requirements. No follow-up question is needed."
+        AiTurnOutcome.LIMIT_REACHED ->
+            "Follow-up limit reached" to "No more follow-up questions can be asked."
+        AiTurnOutcome.EVALUATION_FAILED ->
+            "Evaluation failed" to "We couldn't evaluate your answer."
+        AiTurnOutcome.FOLLOWUP_GENERATION_FAILED ->
+            "Follow-up generation failed" to "We couldn't prepare another question."
+        AiTurnOutcome.DUPLICATE_FOLLOWUP ->
+            "Follow-up already asked" to "The generated question was already asked."
+        AiTurnOutcome.UNKNOWN ->
+            "AI review unavailable" to "We couldn't complete the AI review."
+        AiTurnOutcome.UNABLE_REFUSED ->
+            "AI review ended" to "No further follow-up question is available."
+    }
+    val colors = MaterialTheme.colorScheme
+    val (icon, color) = when (outcome) {
+        AiTurnOutcome.ACHIEVED -> Icons.Filled.Check to colors.primary
+        AiTurnOutcome.EVALUATION_FAILED, AiTurnOutcome.FOLLOWUP_GENERATION_FAILED, AiTurnOutcome.UNKNOWN ->
+            Icons.Outlined.ErrorOutline to colors.error
+        else -> Icons.Outlined.Info to colors.onSurfaceVariant
+    }
     Row(
-        Modifier.heightIn(min = 48.dp).semantics(mergeDescendants = true) { liveRegion = LiveRegionMode.Polite },
+        Modifier.widthIn(max = 520.dp).padding(vertical = 6.dp)
+            .semantics(mergeDescendants = true) { liveRegion = LiveRegionMode.Polite },
         horizontalArrangement = Arrangement.spacedBy(8.dp),
-        verticalAlignment = Alignment.CenterVertically
+        verticalAlignment = Alignment.Top
     ) {
-        val color = MaterialTheme.colorScheme.onSurfaceVariant
-        Icon(Icons.Outlined.Info, contentDescription = null, tint = color, modifier = Modifier.size(18.dp))
-        Text("No new follow-up question was available.", style = MaterialTheme.typography.bodySmall, color = color)
+        Icon(icon, contentDescription = null, tint = color, modifier = Modifier.size(18.dp))
+        Column {
+            Text(heading, style = MaterialTheme.typography.titleSmall, color = color)
+            Text(explanation, style = MaterialTheme.typography.bodySmall, color = colors.onSurfaceVariant)
+        }
     }
 }
 
@@ -196,7 +224,7 @@ internal fun FieldEvaluationDetails(reviewed: Boolean, raw: String, snack: Snack
     var expanded by rememberSaveable { mutableStateOf(false) }
     var rawExpanded by rememberSaveable { mutableStateOf(false) }
     val colors = MaterialTheme.colorScheme
-    val heading = if (reviewed) "Answer reviewed" else "Evaluation unavailable"
+    val heading = if (reviewed) "Answer reviewed" else "Evaluation details"
     Surface(
         modifier = Modifier.widthIn(max = 520.dp),
         color = colors.surfaceContainer,
