@@ -1,12 +1,12 @@
 {
   "original_branch": "codex/field-ai-five-outcomes",
   "branch_slug": "codex-field-ai-five-outcomes",
-  "commit_sha": "4928c3b142c789819a4a309d6c995e6995f4e310",
-  "short_sha": "4928c3b",
-  "apk_name": "Survey2026-codex-field-ai-five-outcomes-4928c3b.apk",
-  "apk_sha256": "8226b227ba286bb3bbaed70fcdddbcdd2f7e21fe0f2b796d0e3b0cf3bb8ad704",
-  "apk_download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-codex-field-ai-five-outcomes-4928c3b-run-199/Survey2026-codex-field-ai-five-outcomes-4928c3b.apk",
+  "commit_sha": "c5f8f10834d01624b163495a24eb49d87081f118",
+  "short_sha": "c5f8f10",
+  "apk_name": "Survey2026-codex-field-ai-five-outcomes-c5f8f10.apk",
+  "apk_sha256": "5968796dfe381e505198caa27d71554a49e81b777c608826619a2b601c679708",
+  "apk_download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-codex-field-ai-five-outcomes-c5f8f10-run-200/Survey2026-codex-field-ai-five-outcomes-c5f8f10.apk",
   "page_url": "https://ishizuki-tech.github.io/Survey2026/codex-field-ai-five-outcomes/",
-  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/42353094715",
-  "generated_utc": "2026-11-07T08:00:11Z"
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/42421579417",
+  "generated_utc": "2026-11-07T22:45:23Z"
 }
