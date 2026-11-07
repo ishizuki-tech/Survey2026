@@ -509,18 +509,28 @@ extensions.configure<ApplicationExtension> {
         providers.gradleProperty("issue86Instrumentation").orNull.equals("true", ignoreCase = true)
     val issue86ApplicationId = "com.negi.survey.issue86.it"
     val issue86TestApplicationId = "com.negi.survey.issue86.it.test"
-    val isolatedBuild = localBuild || issue86Instrumentation
+    // Opt-in package for the side-by-side Issue #157 D+A comparison.
+    val issue157Da = requiredBooleanProperty("issue157Da")
+    require(!issue157Da || (!localBuild && !issue86Instrumentation)) {
+        "issue157Da cannot be combined with localBuild or issue86Instrumentation."
+    }
+    val isolatedBuild = localBuild || issue86Instrumentation || issue157Da
+    val disableGitHubUploads = issue86Instrumentation || issue157Da
     // This is deliberately independent from build type, CI, upload routing, signing, and secrets.
     // Full diagnostics remain the default unless a real Production APK explicitly opts in.
     val diagnosticsProduction = requiredBooleanProperty("diagnostics.production")
     val applicationIdForBuild =
         when {
+            issue157Da -> "com.negi.survey.da"
             issue86Instrumentation -> issue86ApplicationId
             localBuild -> "com.negi.survey.local"
             else -> appId
         }
-    val appLabelResource =
-        if (isolatedBuild) "@string/app_name_local" else "@string/app_name"
+    val appLabelResource = when {
+        issue157Da -> "@string/app_name_da"
+        isolatedBuild -> "@string/app_name_local"
+        else -> "@string/app_name"
+    }
 
     /* ------------------------------------------------------------------------
      * GitHub configuration
@@ -578,13 +588,12 @@ extensions.configure<ApplicationExtension> {
         environmentNames =
             listOf("GH_TOKEN"),
     )
-    // Never embed, route to, or accept a GitHub destination in the Issue #86 test target.
-    // This is applied after property/environment resolution so neither can override isolation.
-    val effectiveGhOwner = if (issue86Instrumentation) "" else ghOwner
-    val effectiveGhRepo = if (issue86Instrumentation) "" else ghRepo
-    val effectiveGhBranch = if (issue86Instrumentation) "" else ghBranch
-    val effectiveGhPathPrefix = if (issue86Instrumentation) "" else ghPathPrefix
-    val effectiveGhToken = if (issue86Instrumentation) "" else ghToken
+    // Apply isolation after property/environment resolution so neither can enable routing.
+    val effectiveGhOwner = if (disableGitHubUploads) "" else ghOwner
+    val effectiveGhRepo = if (disableGitHubUploads) "" else ghRepo
+    val effectiveGhBranch = if (disableGitHubUploads) "" else ghBranch
+    val effectiveGhPathPrefix = if (disableGitHubUploads) "" else ghPathPrefix
+    val effectiveGhToken = if (disableGitHubUploads) "" else ghToken
 
     /* ------------------------------------------------------------------------
      * Hugging Face configuration
@@ -637,7 +646,7 @@ extensions.configure<ApplicationExtension> {
 
     // Debug builds may embed development credentials when explicitly enabled.
     val embedDebugSecrets =
-        prop(
+        !issue157Da && prop(
             "debug.embedSecrets",
             "true",
         ).equals(
@@ -647,7 +656,7 @@ extensions.configure<ApplicationExtension> {
 
     // Internal release builds may embed GitHub and HF credentials only when explicitly enabled.
     val allowReleaseSecrets =
-        prop(
+        !issue157Da && prop(
             "release.allowSecrets",
             "false",
         ).equals(
@@ -671,6 +680,8 @@ extensions.configure<ApplicationExtension> {
             testApplicationId = issue86TestApplicationId
         }
         manifestPlaceholders["appLabel"] = appLabelResource
+        manifestPlaceholders["allowAppBackup"] = (!issue157Da).toString()
+        buildConfigField("boolean", "ISSUE157_DA", issue157Da.toString())
         minSdk = 26
         targetSdk = 36
 
@@ -797,7 +808,7 @@ extensions.configure<ApplicationExtension> {
                 "String",
                 "GH_TOKEN",
                 quote(
-                    if (embedDebugSecrets && !issue86Instrumentation) {
+                    if (embedDebugSecrets && !disableGitHubUploads) {
                         effectiveGhToken
                     } else {
                         ""
@@ -813,25 +824,25 @@ extensions.configure<ApplicationExtension> {
             buildConfigField(
                 "String",
                 "SUPABASE_URL",
-                quote(supabaseUrl),
+                quote(if (issue157Da) "" else supabaseUrl),
             )
 
             buildConfigField(
                 "String",
                 "SUPABASE_ANON_KEY",
-                quote(supabaseAnonKey),
+                quote(if (issue157Da) "" else supabaseAnonKey),
             )
 
             buildConfigField(
                 "String",
                 "SUPABASE_LOG_BUCKET",
-                quote(supabaseLogBucket),
+                quote(if (issue157Da) "" else supabaseLogBucket),
             )
 
             buildConfigField(
                 "String",
                 "SUPABASE_LOG_PATH_PREFIX",
-                quote(supabaseLogPrefix),
+                quote(if (issue157Da) "" else supabaseLogPrefix),
             )
         }
 
@@ -880,7 +891,7 @@ extensions.configure<ApplicationExtension> {
                 "String",
                 "GH_TOKEN",
                 quote(
-                    if (allowReleaseSecrets && !issue86Instrumentation) {
+                    if (allowReleaseSecrets && !disableGitHubUploads) {
                         effectiveGhToken
                     } else {
                         ""
@@ -896,25 +907,25 @@ extensions.configure<ApplicationExtension> {
             buildConfigField(
                 "String",
                 "SUPABASE_URL",
-                quote(supabaseUrl),
+                quote(if (issue157Da) "" else supabaseUrl),
             )
 
             buildConfigField(
                 "String",
                 "SUPABASE_ANON_KEY",
-                quote(supabaseAnonKey),
+                quote(if (issue157Da) "" else supabaseAnonKey),
             )
 
             buildConfigField(
                 "String",
                 "SUPABASE_LOG_BUCKET",
-                quote(supabaseLogBucket),
+                quote(if (issue157Da) "" else supabaseLogBucket),
             )
 
             buildConfigField(
                 "String",
                 "SUPABASE_LOG_PATH_PREFIX",
-                quote(supabaseLogPrefix),
+                quote(if (issue157Da) "" else supabaseLogPrefix),
             )
 
             // Debug signing is available only as an explicit local/CI opt-in.

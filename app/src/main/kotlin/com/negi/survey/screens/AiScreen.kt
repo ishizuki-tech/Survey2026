@@ -73,6 +73,7 @@ import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.MutatePriority
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -98,6 +99,12 @@ import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyLayoutScrollScope
+import androidx.compose.foundation.lazy.LazyListLayoutInfo
+import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -108,7 +115,6 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.Send
 import androidx.compose.material.icons.filled.Keyboard
-import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.outlined.ContentCopy
@@ -132,35 +138,41 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
-import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
-import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.Path
-import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.graphics.lerp
+import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.ClipEntry
 import androidx.compose.ui.platform.LocalClipboard
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.Dp
@@ -170,7 +182,6 @@ import androidx.compose.ui.window.DialogProperties
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.negi.survey.BuildConfig
 import com.negi.survey.net.RuntimeLogStore
@@ -185,19 +196,13 @@ import com.negi.survey.vm.QuestionSpeaker
 import com.negi.survey.vm.SurveyViewModel
 import com.negi.survey.vm.SurveyAiReason
 import com.negi.survey.vm.pendingAiFollowup
-import com.negi.survey.vm.resolveAiAutoReadTarget
-import com.negi.survey.vm.shouldAutoPlayQuestion
 import com.negi.survey.vm.toggleQuestionSpeaker
 import java.security.MessageDigest
 import java.util.Locale
 import kotlin.collections.ArrayDeque
-import kotlin.math.abs
-import kotlin.math.min
-import kotlinx.coroutines.job
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.first
@@ -211,8 +216,6 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 
 private const val TAG = "AiScreen"
-private const val TYPING_UPDATE_THROTTLE_MS = 90L
-private const val AUTO_SCROLL_THROTTLE_MS = 40L
 
 internal fun followupCapacityRemaining(entries: List<SurveyViewModel.FollowupEntry>, maxFollowups: Int = 2): Int =
     (maxFollowups - entries.size).coerceAtLeast(0)
@@ -346,7 +349,6 @@ fun AiScreen(
     onBack: () -> Unit,
     speechController: SpeechController? = null,
     ttsController: QuestionSpeaker? = null,
-    autoReadQuestion: Boolean = false,
     playbackLifecycle: Lifecycle = LocalLifecycleOwner.current.lifecycle
 ) {
     val nid = remember(nodeId) { nodeId.trim() }
@@ -356,7 +358,6 @@ fun AiScreen(
     val focusManager = LocalFocusManager.current
     val scope = rememberCoroutineScope()
     val snack = remember { SnackbarHostState() }
-    val density = LocalDensity.current
 
     // ---------------------------------------------------------------------
     // Survey state
@@ -434,7 +435,6 @@ fun AiScreen(
     // ---------------------------------------------------------------------
 
     val loading by vmAI.loading.collectAsState()
-    val stream by vmAI.stream.collectAsState()
     val error by vmAI.error.collectAsState()
     val aiReasons by vmSurvey.aiReasons.collectAsState()
     val aiReason = aiReasons[nid]
@@ -448,7 +448,14 @@ fun AiScreen(
     val conv by conversation.collectAsState()
     val presentation by vmSurvey.questionPresentation.collectAsState()
     val savedFollowups by vmSurvey.followups.collectAsState()
-    val savedAnswers by vmSurvey.answers.collectAsState()
+    val followups = savedFollowups[nid].orEmpty()
+    val pendingQuestion = pendingAiFollowup(followups)?.question
+    var submittedInPresentation by key(contextKey, presentation) {
+        rememberSaveable { mutableStateOf(false) }
+    }
+    val processing = loading || submissionPending
+    val followOutput = processing ||
+        (submittedInPresentation && (conv.turnCompleted || conv.validationFailed))
 
     LaunchedEffect(contextKey, rootQuestion, presentation) {
         if (!vmSurvey.ownsAiPresentation(presentation, surveySessionId, nid)) return@LaunchedEffect
@@ -457,7 +464,9 @@ fun AiScreen(
         vmAI.ensureConversationContext(
             contextKey = contextKey,
             rootQuestion = rootQuestion,
-            initialDraft = if (pending == null) vmSurvey.getAnswer(nid) else ""
+            initialDraft = if (pending == null && !vmAI.isRunning &&
+                !(isTwoStepNode && reason != null)
+            ) vmSurvey.getAnswer(nid) else ""
         )
         vmAI.ensureRootQuestionMessage(contextKey, nid, rootQuestion)
         vmAI.ensureActivePromptIfMain(contextKey, rootQuestion)
@@ -466,76 +475,23 @@ fun AiScreen(
                 vmAI.completeValidationTurn(contextKey, rootQuestion)
             isTwoStepNode && reason == SurveyAiReason.FAILURE && !vmAI.isRunning ->
                 vmAI.failValidationTurn(contextKey)
-            pending != null && !conversation.value.turnCompleted ->
-                vmAI.restoreFollowupMode(contextKey, pending.question)
         }
     }
 
-    val autoReadTarget = resolveAiAutoReadTarget(
-        rootQuestion, savedAnswers[nid].orEmpty(), savedFollowups[nid].orEmpty(),
-        completed = conv.turnCompleted || aiReason?.terminal == true
-    )
+    LaunchedEffect(contextKey, presentation, pendingQuestion) {
+        if (pendingQuestion == null ||
+            !vmSurvey.ownsAiPresentation(presentation, surveySessionId, nid) ||
+            pendingAiFollowup(vmSurvey.followups.value[nid].orEmpty())?.question != pendingQuestion ||
+            conversation.value.turnCompleted
+        ) return@LaunchedEffect
+        val reason = vmSurvey.aiReasons.value[nid]
+        if (isTwoStepNode && (reason?.terminal == true ||
+                (reason == SurveyAiReason.FAILURE && !vmAI.isRunning))
+        ) return@LaunchedEffect
+        vmAI.restoreFollowupMode(contextKey, pendingQuestion)
+    }
 
     fun ownsPresentation() = vmSurvey.ownsAiPresentation(presentation, surveySessionId, nid)
-
-    fun mayAutoRead() = vmSurvey.currentNode.value.readAloud && shouldAutoPlayQuestion(
-        autoReadQuestion,
-        speechController?.isRecording?.value == true,
-        speechController?.isTranscribing?.value == true
-    )
-
-    if (ownsPresentation()) {
-        DisposableEffect(contextKey, presentation, ttsController) {
-            onDispose { ttsController?.stop() }
-        }
-    }
-
-    LaunchedEffect(
-        contextKey, presentation, autoReadTarget, ttsController, autoReadQuestion,
-        speechController, speechRecording, speechTranscribing, playbackLifecycle
-    ) {
-        if (!ownsPresentation() || !mayAutoRead() ||
-            !playbackLifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
-        ) return@LaunchedEffect
-
-        // Keep the non-AI last-node deduplication aware of eligible AI visits.
-        vmSurvey.claimTtsAutoPlay(nid)
-        val target = autoReadTarget ?: return@LaunchedEffect
-        if (ttsController == null) return@LaunchedEffect
-
-        // Cancel this request across a stop, even if the app returns before TTS is ready.
-        val request = currentCoroutineContext().job
-        val stopObserver = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_STOP) request.cancel()
-        }
-        playbackLifecycle.addObserver(stopObserver)
-        try {
-            ttsController.isReady.first { it }
-            currentCoroutineContext().ensureActive()
-            if (!ownsPresentation() || !mayAutoRead()) return@LaunchedEffect
-            val currentTarget = resolveAiAutoReadTarget(
-                vmSurvey.getQuestion(nid), vmSurvey.getAnswer(nid),
-                vmSurvey.followups.value[nid].orEmpty(),
-                completed = conversation.value.turnCompleted || vmSurvey.aiReasons.value[nid]?.terminal == true
-            )
-            if (target != currentTarget ||
-                !playbackLifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
-            ) return@LaunchedEffect
-
-            val utteranceId = "$contextKey|visit=$presentation|q=${shortHash(target.text)}"
-            if (vmSurvey.claimAiAutoRead(presentation, surveySessionId, nid, target)) {
-                ttsController.speak(target.text, utteranceId)
-            }
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (error: Exception) {
-            Log.w(TAG, "Unable to read AI question", error)
-        } finally {
-            playbackLifecycle.removeObserver(stopObserver)
-        }
-    }
-
-    val chatItems by vmAI.chatHistoryFlow(contextKey).collectAsState(initial = emptyList())
 
     val prettyJson = remember {
         Json {
@@ -547,21 +503,6 @@ fun AiScreen(
 
     var typingMode by remember(contextKey) { mutableStateOf(false) }
     val showTextComposer = speechController == null || typingMode
-    val focusRequester = remember { FocusRequester() }
-    val scroll = rememberScrollState()
-
-    val bottomThresholdPx = remember(density) { with(density) { 28.dp.roundToPx() } }
-    val isPinnedToBottom by remember {
-        derivedStateOf {
-            val max = scroll.maxValue
-            val cur = scroll.value
-            (max - cur) <= bottomThresholdPx
-        }
-    }
-
-    var lastAutoScrollMs by remember(contextKey) { mutableLongStateOf(0L) }
-    var lastTypingUpdateMs by remember(contextKey) { mutableLongStateOf(0L) }
-    var lastTypingLen by remember(contextKey) { mutableIntStateOf(0) }
 
     /**
      * StepSnapshot persistence is consumed directly from AiViewModel.stepHistory
@@ -569,47 +510,10 @@ fun AiScreen(
      * Compose render state avoids recomposition solely for persistence side effects.
      */
 
-    LaunchedEffect(contextKey, showTextComposer) {
-        if (!showTextComposer || !textFieldEnabled) return@LaunchedEffect
-        delay(30)
-        if (speechController?.isRecording?.value == true ||
-            speechController?.isTranscribing?.value == true) return@LaunchedEffect
-        focusRequester.requestFocus()
-        keyboard?.show()
-    }
-
     LaunchedEffect(error) {
         val msg = error ?: return@LaunchedEffect
         snack.showSnackbar(msg)
-        vmAI.removeTypingMessage(contextKey, nid)
-    }
-
-    // ---------------------------------------------------------------------
-    // Typing bubble orchestration (persisted)
-    // ---------------------------------------------------------------------
-
-    LaunchedEffect(loading, stream) {
-        if (!loading) return@LaunchedEffect
-
-        val now = SystemClock.uptimeMillis()
-        val len = stream.length
-
-        val shouldUpdate =
-            (now - lastTypingUpdateMs) >= TYPING_UPDATE_THROTTLE_MS &&
-                    (abs(len - lastTypingLen) >= 8 || len < 12)
-
-        if (!shouldUpdate) return@LaunchedEffect
-
-        lastTypingUpdateMs = now
-        lastTypingLen = len
-
-        vmAI.upsertTypingMessage(contextKey, nid, stream.ifBlank { "…" })
-    }
-
-    LaunchedEffect(loading) {
-        if (!loading) {
-            vmAI.removeTypingMessage(contextKey, nid)
-        }
+        if (!isTwoStepNode) vmAI.removeTypingMessage(contextKey, nid)
     }
 
     // ---------------------------------------------------------------------
@@ -666,26 +570,13 @@ fun AiScreen(
                     null
                 }
 
-                if (showAsJson) {
-                    val pretty = prettyOrRaw(prettyJson, stepRaw)
-                    vmAI.upsertChatItem(
-                        contextKey,
-                        AiViewModel.ChatItem(
-                            id = stepMsgId,
-                            sender = AiViewModel.ChatSender.AI,
-                            json = pretty
-                        )
-                    )
-                } else {
-                    vmAI.upsertChatItem(
-                        contextKey,
-                        AiViewModel.ChatItem(
-                            id = stepMsgId,
-                            sender = AiViewModel.ChatSender.AI,
-                            text = stepPlainText
-                        )
-                    )
-                }
+                val stepItem = AiViewModel.ChatItem(
+                    id = stepMsgId,
+                    sender = AiViewModel.ChatSender.AI,
+                    json = if (showAsJson) prettyOrRaw(prettyJson, stepRaw) else null,
+                    text = stepPlainText
+                )
+                vmAI.upsertChatItem(contextKey, stepItem)
 
                 /**
                  * IMPORTANT:
@@ -736,19 +627,18 @@ fun AiScreen(
                         val displayedAsPlain =
                             (!showAsJson) && (stepPlainText?.trim() == fuNorm)
 
-                        if (!displayedAsPlain) {
-                            val fuqId = "fuq-$nid-${step.runId}"
-                            vmAI.upsertChatItem(
-                                contextKey = contextKey,
-                                item = AiViewModel.ChatItem(
-                                    id = fuqId,
-                                    sender = AiViewModel.ChatSender.AI,
-                                    text = fuNorm
-                                )
-                            )
-                        }
-
                         if (vmSurvey.addFollowupQuestion(nid, fuNorm)) {
+                            val questionItem = if (displayedAsPlain) {
+                                stepItem.copy(isFollowupQuestion = true)
+                            } else {
+                                AiViewModel.ChatItem(
+                                    id = "fuq-$nid-${step.runId}",
+                                    sender = AiViewModel.ChatSender.AI,
+                                    text = fuNorm,
+                                    isFollowupQuestion = true
+                                )
+                            }
+                            vmAI.upsertChatItem(contextKey, questionItem)
                             vmAI.setFollowupMode(contextKey, fuNorm)
 
                             // Info log: do not include raw text preview (use len + hash).
@@ -902,30 +792,6 @@ fun AiScreen(
     }
 
     // ---------------------------------------------------------------------
-    // Auto-scroll (pinned-to-bottom only)
-    // ---------------------------------------------------------------------
-
-    LaunchedEffect(chatItems.size) {
-        if (!isPinnedToBottom) return@LaunchedEffect
-        val now = SystemClock.uptimeMillis()
-        if ((now - lastAutoScrollMs) < AUTO_SCROLL_THROTTLE_MS) return@LaunchedEffect
-        lastAutoScrollMs = now
-
-        delay(16)
-        scroll.animateScrollTo(scroll.maxValue)
-    }
-
-    LaunchedEffect(stream, loading) {
-        if (!loading || !isPinnedToBottom) return@LaunchedEffect
-        val now = SystemClock.uptimeMillis()
-        if ((now - lastAutoScrollMs) < AUTO_SCROLL_THROTTLE_MS) return@LaunchedEffect
-        lastAutoScrollMs = now
-
-        delay(24)
-        scroll.scrollTo(scroll.maxValue)
-    }
-
-    // ---------------------------------------------------------------------
     // Submit logic (ALWAYS TWO-STEP if configured)
     // ---------------------------------------------------------------------
 
@@ -947,23 +813,40 @@ fun AiScreen(
             buildSecondPrompt = { prompt }
         )
 
-    fun runTwoStep(retry: Boolean = false) {
-        if (loading || submissionPending || speechRecording || speechTranscribing) return
-        if (!retry) {
-            val input = conv.composerDraft.trim()
-            if (input.isBlank()) return
-            if (conv.role == AiViewModel.ComposerRole.MAIN) {
-                if (!vmSurvey.consumeAcceptedVoiceTransaction(nid)) {
-                    vmSurvey.beginAnswerTransaction(nid, inputSource = "typed")
-                }
-                vmSurvey.setAnswer(input, nid)
+    fun inputBlocked(): Boolean =
+        submissionPending || vmAI.loading.value || vmAI.isRunning ||
+            speechController?.isRecording?.value == true ||
+            speechController?.isTranscribing?.value == true
+
+    fun acceptAnswer(input: String, role: AiViewModel.ComposerRole): Boolean {
+        if (input.isBlank()) return false
+        if (role == AiViewModel.ComposerRole.FOLLOWUP) {
+            val pending = pendingAiFollowup(vmSurvey.followups.value[nid].orEmpty())
+            if (pending?.question != conversation.value.activePromptQuestion) return false
+            vmSurvey.answerLastFollowup(nid, input)
+        } else {
+            if (isTwoStepNode && !vmSurvey.consumeAcceptedVoiceTransaction(nid)) {
+                vmSurvey.beginAnswerTransaction(nid, inputSource = "typed")
             }
-            else vmSurvey.answerLastFollowup(nid, input)
-            vmAI.appendUserMessage(contextKey, input)
+            vmSurvey.setAnswer(input, nid)
         }
         submissionPending = true
-        keyboard?.hide()
-        focusManager.clearFocus(force = true)
+        submittedInPresentation = true
+        vmAI.appendUserMessage(contextKey, input)
+        vmAI.updateComposerDraft(contextKey, "")
+        return true
+    }
+
+    fun runTwoStep(retry: Boolean = false) {
+        if (inputBlocked()) return
+        val current = conversation.value
+        if (retry) {
+            if (!current.validationFailed) return
+            submissionPending = true
+            submittedInPresentation = true
+        } else if (current.turnCompleted || current.validationFailed ||
+            !acceptAnswer(current.composerDraft.trim(), current.role)
+        ) return
         scope.launch {
             try {
                 vmAI.evaluateSurveyTwoStepAsync(vmSurvey, nid, contextKey, rootQuestion).join()
@@ -980,30 +863,17 @@ fun AiScreen(
     }
 
     fun submit() {
+        if (inputBlocked()) return
         if (isTwoStepNode) {
-            runTwoStep(retry = conv.validationFailed)
+            runTwoStep()
             return
         }
-        if (loading || submissionPending) return
-        if (speechRecording || speechTranscribing) {
-            scope.launch { snack.showSnackbar("Speech is active. Stop recording first.") }
-            return
-        }
+        val current = conversation.value
+        val input = current.composerDraft.trim()
+        if (!acceptAnswer(input, current.role)) return
+        vmAI.beginValidationTurn(contextKey)
 
-        val input = conv.composerDraft.trim()
-        if (input.isBlank()) return
-
-        val isSubmittingMain = (conv.role == AiViewModel.ComposerRole.MAIN)
-
-        if (!isSubmittingMain) {
-            vmSurvey.answerLastFollowup(nid, input)
-            vmAI.appendUserMessage(contextKey, input)
-            vmAI.beginValidationTurn(contextKey)
-            submissionPending = true
-            vmAI.updateComposerDraft(contextKey, "")
-            keyboard?.hide()
-            focusManager.clearFocus(force = true)
-
+        if (current.role == AiViewModel.ComposerRole.FOLLOWUP) {
             scope.launch {
                 val runId = "ai-followup-${nid}-${SystemClock.uptimeMillis()}-${System.nanoTime()}"
                 val t0 = SystemClock.uptimeMillis()
@@ -1045,15 +915,9 @@ fun AiScreen(
             return
         }
 
-        vmAI.beginValidationTurn(contextKey)
-        vmSurvey.setAnswer(input, nid)
-        vmAI.appendUserMessage(contextKey, input)
-
-        val questionForTurn =
-            if (isSubmittingMain) rootQuestion else conv.activePromptQuestion.ifBlank { rootQuestion }
+        val questionForTurn = rootQuestion
         val answerForTurn = input
 
-        submissionPending = true
         scope.launch {
             val runId = "ai-${nid}-${SystemClock.uptimeMillis()}-${System.nanoTime()}"
             val t0 = SystemClock.uptimeMillis()
@@ -1100,10 +964,6 @@ fun AiScreen(
                 RuntimeLogStore.i(TAG, "Submit end runId=$runId node=$nid elapsed=${SystemClock.uptimeMillis() - t0}ms")
             }
         }
-
-        vmAI.updateComposerDraft(contextKey, "")
-        keyboard?.hide()
-        focusManager.clearFocus(force = true)
     }
 
     // ---------------------------------------------------------------------
@@ -1154,52 +1014,42 @@ fun AiScreen(
                 }
                 .padding(horizontal = 16.dp, vertical = 8.dp)
         ) {
-            // Keep the composer and navigation reachable when the IME leaves little vertical space.
-            val footerMaxHeight = maxHeight - minOf(64.dp, maxHeight / 4)
+            // Reserve space for the question as well as the scrollable composer when the
+            // keyboard leaves a short viewport. Include the gap between the two regions.
+            val conversationGap = 10.dp
+            val footerMaxHeight = if (showTextComposer) {
+                (maxHeight - minOf(96.dp, maxHeight / 2) - conversationGap).coerceAtLeast(0.dp)
+            } else {
+                maxHeight - minOf(64.dp, maxHeight / 4)
+            }
             Column(
                 modifier = Modifier.fillMaxSize(),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
+                verticalArrangement = Arrangement.spacedBy(conversationGap)
             ) {
-                Box(
-                    modifier = Modifier
-                        .weight(1f)
-                        .fillMaxWidth()
-                ) {
-                    Column(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .verticalScroll(scroll),
-                        verticalArrangement = Arrangement.spacedBy(10.dp)
-                    ) {
-                        chatItems.forEach { m ->
-                            val isAi = m.sender == AiViewModel.ChatSender.AI
-                            androidx.compose.foundation.layout.Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = if (isAi) Arrangement.Start else Arrangement.End
-                            ) {
-                                if (m.json != null) {
-                                    JsonBubbleMono(pretty = m.json, snack = snack)
-                                } else {
-                                    ChatBubble(
-                                        text = m.text.orEmpty(),
-                                        isAi = isAi,
-                                        isTyping = m.isTyping
-                                    )
-                                }
-                            }
-                        }
-                    }
-
-                    androidx.compose.animation.AnimatedVisibility(
-                        visible = !isPinnedToBottom && chatItems.isNotEmpty(),
-                        modifier = Modifier
-                            .align(Alignment.BottomCenter)
-                            .padding(bottom = 8.dp)
-                    ) {
-                        JumpToBottomPill(
-                            onClick = { scope.launch { scroll.animateScrollTo(scroll.maxValue) } }
-                        )
-                    }
+                key(surveyUuid, contextKey) {
+                    if (!isTwoStepNode) PublishStreamingChatRow(vmAI, contextKey, nid)
+                    val history = remember(vmAI, contextKey) { vmAI.chatHistoryFlow(contextKey) }
+                    val chatItems by history.collectAsState()
+                    // Persistence can deliver the new pending question before the chain swaps
+                    // its preparation row. Defer the fallback while temporary output is present.
+                    val lastRow = chatItems.lastOrNull()
+                    val hasTemporaryOutput = lastRow?.isTyping == true ||
+                        lastRow?.followupNotice == AiViewModel.FollowupNotice.PREPARING
+                    val visibleFollowups =
+                        if (isTwoStepNode && hasTemporaryOutput &&
+                            pendingQuestion != null && followups.lastOrNull()?.answer == null
+                        ) followups.dropLast(1) else followups
+                    AiConversation(
+                        nodeId = nid,
+                        presentation = presentation,
+                        chatItems = chatItems,
+                        followups = visibleFollowups,
+                        loading = loading,
+                        followOutput = followOutput,
+                        fieldEvaluation = isTwoStepNode,
+                        snack = snack,
+                        modifier = Modifier.weight(1f).fillMaxWidth()
+                    )
                 }
 
                 Surface(
@@ -1220,7 +1070,14 @@ fun AiScreen(
                     ) {
                         if (isTwoStepNode) {
                             if (BuildConfig.DEBUG) {
-                                aiReason?.let { Text("Status: ${it.wireValue.replace('_', ' ')}", modifier = Modifier.padding(horizontal = 12.dp)) }
+                                // The running chain records FAILURE as its recovery fallback.
+                                // Only present that status once the active attempt has stopped.
+                                aiReason?.takeUnless { processing && it == SurveyAiReason.FAILURE }?.let {
+                                    Text(
+                                        "Status: ${it.wireValue.replace('_', ' ')}",
+                                        modifier = Modifier.padding(horizontal = 12.dp)
+                                    )
+                                }
                             }
                             if (conv.validationFailed) {
                                 OutlinedButton(
@@ -1231,7 +1088,7 @@ fun AiScreen(
                             }
                         }
 
-                        val composerEnabled = textFieldEnabled && !loading && !submissionPending &&
+                        val composerEnabled = textFieldEnabled && !processing &&
                             !(isTwoStepNode && (conv.validationFailed || conv.turnCompleted))
                         val onToggleSpeech: (() -> Unit)? = speechController?.let { sc ->
                             {
@@ -1245,21 +1102,24 @@ fun AiScreen(
                             }
                         }
                         val onSendAnswer: () -> Unit = {
-                            if (composerEnabled && conv.composerDraft.isNotBlank()) {
-                                submit()
-                                typingMode = false
-                            }
+                            if (composerEnabled) submit()
                         }
+                        val displayedDraft = if (processing) "" else conv.composerDraft
                         if (showTextComposer) {
                             ChatComposer(
-                                value = conv.composerDraft,
+                                value = displayedDraft,
                                 onValueChange = { t ->
-                                    vmAI.updateComposerDraft(contextKey, t)
-                                    if (conv.role == AiViewModel.ComposerRole.MAIN) vmSurvey.setAnswer(t, nid)
+                                    val current = conversation.value
+                                    if (composerEnabled && !inputBlocked() &&
+                                        !(isTwoStepNode && (current.validationFailed || current.turnCompleted))
+                                    ) {
+                                        vmAI.updateComposerDraft(contextKey, t)
+                                        if (current.role == AiViewModel.ComposerRole.MAIN) vmSurvey.setAnswer(t, nid)
+                                    }
                                 },
                                 onSend = onSendAnswer,
                                 enabled = composerEnabled,
-                                focusRequester = focusRequester,
+                                textFieldEnabled = textFieldEnabled,
                                 speechEnabled = speechController != null,
                                 speechRecording = speechRecording,
                                 speechTranscribing = speechTranscribing,
@@ -1274,7 +1134,7 @@ fun AiScreen(
                             )
                         } else if (onToggleSpeech != null) {
                             VoiceFirstComposer(
-                                value = conv.composerDraft,
+                                value = displayedDraft,
                                 enabled = composerEnabled,
                                 speechRecording = speechRecording,
                                 speechTranscribing = speechTranscribing,
@@ -1307,12 +1167,16 @@ fun AiScreen(
                                         speechTranscribing = speechTranscribing,
                                     )
                                 ) {
+                                    keyboard?.hide()
+                                    focusManager.clearFocus(force = true)
                                     vmAI.resetStates()
                                     onNext()
                                 }
                             },
                             secondaryLabel = "Back",
                             onSecondary = {
+                                keyboard?.hide()
+                                focusManager.clearFocus(force = true)
                                 vmAI.resetStates()
                                 onBack()
                             },
@@ -1326,7 +1190,12 @@ fun AiScreen(
 
     if (speechController != null && speechRecording) {
         var stopRequested by remember(speechController) { mutableStateOf(false) }
-        RecordingTimerOverlay(recordingElapsedSeconds, speechStatusText, stopRequested) {
+        RecordingTimerOverlay(
+            question = followups.lastOrNull()?.question ?: rootQuestion,
+            elapsedSeconds = recordingElapsedSeconds,
+            statusText = speechStatusText,
+            stopRequested = stopRequested
+        ) {
             if (!stopRequested && speechController.isRecording.value) {
                 stopRequested = true
                 speechController.stopRecording()
@@ -1342,7 +1211,7 @@ fun AiScreen(
                 }
             }
             vmAI.resetStates()
-            vmAI.removeTypingMessage(contextKey, nid)
+            if (!isTwoStepNode) vmAI.removeTypingMessage(contextKey, nid)
         }
     }
 }
@@ -1356,6 +1225,7 @@ fun AiScreen(
  */
 @Composable
 private fun RecordingTimerOverlay(
+    question: String,
     elapsedSeconds: Int,
     statusText: String?,
     stopRequested: Boolean,
@@ -1383,6 +1253,15 @@ private fun RecordingTimerOverlay(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.Center
             ) {
+                if (question.isNotBlank()) {
+                    Text(
+                        text = question,
+                        style = MaterialTheme.typography.bodyLarge,
+                        modifier = Modifier.heightIn(max = 160.dp)
+                            .verticalScroll(rememberScrollState(), reverseScrolling = true)
+                    )
+                    Spacer(Modifier.height(16.dp))
+                }
                 Text(
                     text = elapsed,
                     style = MaterialTheme.typography.displayMedium,
@@ -1470,143 +1349,237 @@ private fun CompactTopBar(
 }
 
 @Composable
-private fun JumpToBottomPill(
-    onClick: () -> Unit
-) {
-    val cs = MaterialTheme.colorScheme
-    Surface(
-        color = cs.surfaceVariant.copy(alpha = 0.72f),
-        shape = RoundedCornerShape(999.dp),
-        tonalElevation = 0.dp,
-        shadowElevation = 6.dp,
-        modifier = Modifier
-            .neutralEdge(alpha = 0.14f, corner = 999.dp, stroke = 1.dp)
-            .clickable(
-                indication = null,
-                interactionSource = remember { MutableInteractionSource() }
-            ) { onClick() }
-    ) {
-        androidx.compose.foundation.layout.Row(
-            modifier = Modifier.heightIn(min = 48.dp).padding(horizontal = 12.dp, vertical = 8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(6.dp)
-        ) {
-            Icon(
-                imageVector = Icons.Filled.KeyboardArrowDown,
-                contentDescription = "Jump to bottom",
-                tint = cs.onSurfaceVariant,
-                modifier = Modifier.size(18.dp)
-            )
-            Text(
-                text = "Jump to bottom",
-                style = MaterialTheme.typography.labelMedium,
-                color = cs.onSurfaceVariant
-            )
+private fun PublishStreamingChatRow(vmAI: AiViewModel, contextKey: String, nodeId: String) {
+    // Token updates invalidate this scope instead of the composer and its input session.
+    val stream by vmAI.stream.collectAsState()
+    val loading by vmAI.loading.collectAsState()
+    LaunchedEffect(vmAI, contextKey, nodeId, loading, stream) {
+        if (loading) {
+            vmAI.upsertTypingMessage(contextKey, nodeId, stream.ifBlank { "…" })
+        } else {
+            vmAI.removeTypingMessage(contextKey, nodeId)
         }
     }
 }
 
-/* ───────────────────────────── Chat bubbles ─────────────────────────────── */
-
 @Composable
-private fun ChatBubble(
-    text: String,
-    isAi: Boolean,
-    isTyping: Boolean,
-    maxWidth: Dp = 520.dp
+internal fun AiConversation(
+    nodeId: String,
+    presentation: Long,
+    chatItems: List<AiViewModel.ChatItem>,
+    followups: List<SurveyViewModel.FollowupEntry>,
+    loading: Boolean,
+    snack: SnackbarHostState,
+    modifier: Modifier,
+    followOutput: Boolean = loading,
+    fieldEvaluation: Boolean = false
 ) {
-    val cs = MaterialTheme.colorScheme
-
-    val corner = 12.dp
-    val padH = 10.dp
-    val padV = 7.dp
-    val tailW = 7f
-    val tailH = 6f
-
-    val base = if (isAi) cs.surface else cs.primaryContainer
-    val textColor = if (isAi) cs.onSurface else cs.onPrimaryContainer
-    val stops = listOf(base, lerp(base, textColor, 0.04f), lerp(base, textColor, 0.08f))
-
-    val t = rememberInfiniteTransition(label = "bubble-mono")
-    val p by t.animateFloat(
-        initialValue = 0f,
-        targetValue = 1f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 4600, easing = LinearEasing),
-            repeatMode = RepeatMode.Restart
-        ),
-        label = "p"
-    )
-    val grad = Brush.linearGradient(
-        colors = stops,
-        start = Offset(0f, 0f),
-        end = Offset(400f + 220f * p, 360f - 180f * p)
-    )
-
-    val shape = RoundedCornerShape(
-        topStart = corner,
-        topEnd = corner,
-        bottomStart = if (isAi) 4.dp else corner,
-        bottomEnd = if (isAi) corner else 4.dp
-    )
-
-    // shadowElevation here was rendering as a flat gray tint across the
-    // WHOLE bubble on-device (not just a drop shadow at the edges), pulling
-    // every fill color down by ~40-50 points regardless of theme -- which is
-    // what kept the AI bubble looking "dark gray" even after its fill color
-    // itself was fixed to follow Light/Dark. Dropped to 0.dp; the bubble
-    // still reads as a distinct shape via its own fill + border sweep below.
-    Surface(
-        color = Color.Transparent,
-        tonalElevation = 0.dp,
-        shadowElevation = 0.dp,
-        shape = shape,
-        modifier = Modifier
-            .widthIn(max = maxWidth)
-            .drawBehind {
-                val cr = CornerRadius(corner.toPx(), corner.toPx())
-                drawRoundRect(brush = grad, cornerRadius = cr)
-
-                val x = if (isAi) 12f else size.width - 12f
-                val dir = if (isAi) -1 else 1
-                drawPath(
-                    path = Path().apply {
-                        moveTo(x, size.height)
-                        lineTo(x + dir * tailW, size.height - tailH)
-                        lineTo(x + dir * tailW * 0.4f, size.height - tailH * 0.6f)
-                        close()
-                    },
-                    brush = grad
-                )
-
-                drawRoundRect(
-                    brush = Brush.radialGradient(
-                        colors = listOf(cs.surfaceBright.copy(alpha = 0.06f), Color.Transparent),
-                        center = center,
-                        radius = (min(size.width, size.height)) * 0.54f
-                    ),
-                    cornerRadius = cr
-                )
-
-                drawRoundRect(
-                    brush = Brush.sweepGradient(
-                        0f to cs.outline.copy(alpha = 0.12f),
-                        0.5f to cs.outline.copy(alpha = 0.10f),
-                        1f to cs.outline.copy(alpha = 0.12f)
-                    ),
-                    style = Stroke(width = 0.8.dp.toPx()),
-                    cornerRadius = cr
-                )
+    val rootId = "qroot-$nodeId"
+    val latestPublishedId = chatItems.lastOrNull { it.isFollowupQuestion }?.id
+    val (newestFirst, latestRestoredId) = remember(chatItems, followups, rootId) {
+        val rows = chatItems.toMutableList()
+        var previousQuestionIndex = rows.indexOfFirst { it.id == rootId }
+        var restoredId: String? = null
+        // Retained survey state can supply questions whose in-memory chat rows are missing.
+        followups.forEachIndexed { index, entry ->
+            val publishedIndex = rows.indexOfLast { it.isFollowupQuestion && it.text == entry.question }
+            restoredId = if (publishedIndex >= 0) {
+                previousQuestionIndex = publishedIndex
+                null
+            } else {
+                val id = "restored-followup-$nodeId-$index-${entry.askedAt}"
+                rows.add(++previousQuestionIndex, AiViewModel.ChatItem(id, AiViewModel.ChatSender.AI, text = entry.question))
+                id
             }
-    ) {
-        Box(Modifier.padding(horizontal = padH, vertical = padV)) {
-            Text(
-                text = if (isTyping && text.isBlank()) "…" else text,
-                color = textColor,
-                style = MaterialTheme.typography.bodyMedium
-            )
+        }
+        rows.asReversed() to restoredId
+    }
+
+    // Use the same order and keys as the LazyColumn. Live processing has its own
+    // scrolling behavior. The opening target is the newest committed component.
+    val entryRowId = newestFirst.firstOrNull {
+        !it.isTyping && it.evaluation != AiViewModel.EvaluationPresentation.REVIEWING &&
+            it.followupNotice != AiViewModel.FollowupNotice.PREPARING
+    }?.id
+
+    // Navigation creates a presentation. Activity recreation can restore its viewport.
+    val scroll = key(presentation) {
+        rememberLazyListState(
+            initialFirstVisibleItemIndex = newestFirst.indexOfFirst { it.id == entryRowId }.coerceAtLeast(0)
+        )
+    }
+    var positionedRowId by key(presentation) { rememberSaveable { mutableStateOf<String?>(null) } }
+    val following = key(presentation) { rememberSaveable { mutableStateOf(true) } }
+    val readingGesture = remember(following) {
+        object : NestedScrollConnection {
+            override fun onPostScroll(consumed: Offset, available: Offset, source: NestedScrollSource): Offset {
+                if (source == NestedScrollSource.UserInput && consumed.y != 0f) {
+                    following.value = false
+                }
+                return Offset.Zero
+            }
         }
     }
+    // Fresh visits start with the existing history. Recreation keeps the last handled
+    // publication so a follow-up accepted while the viewport was detached can still be shown.
+    val handledPublication = key(presentation) { rememberSaveable { mutableStateOf(latestPublishedId) } }
+    var seenPublication by handledPublication
+    var settledRestoration by remember(scroll) { mutableStateOf(latestRestoredId) }
+    SideEffect {
+        // Acceptance and chat publication can arrive in separate snapshots during inference.
+        if (!loading || latestRestoredId == null) settledRestoration = latestRestoredId
+    }
+
+    val newPublicationId = latestPublishedId?.takeIf { it != seenPublication }
+    val openingRowId = entryRowId.takeIf { positionedRowId == null }
+    val targetId = newPublicationId ?: openingRowId
+    val activeQuestionId = settledRestoration ?: latestPublishedId ?: rootId
+    val outputId = newestFirst.firstOrNull()?.id?.takeIf { followOutput && it != activeQuestionId }
+    val currentOutputId by rememberUpdatedState(outputId)
+    val currentRows by rememberUpdatedState(newestFirst)
+    val fieldOutputId = outputId.takeIf { fieldEvaluation }
+    val followStreamingOutput = !fieldEvaluation && outputId != null
+    LaunchedEffect(scroll, targetId, newPublicationId, following.value, fieldOutputId, followStreamingOutput) {
+        if (targetId != null) {
+            val layout = snapshotFlow { scroll.layoutInfo }.first {
+                it.viewportSize.height > 0 && it.totalItemsCount == currentRows.size &&
+                    currentRows.any { row -> row.id == targetId }
+            }
+            if (newPublicationId != null || layout.revealDelta(targetId, false) != 0) {
+                scroll.scroll(MutatePriority.PreventUserInput) {
+                    val index = currentRows.indexOfFirst { it.id == targetId }
+                    if (index >= 0) LazyLayoutScrollScope(scroll, this).snapToItem(index, 0)
+                }
+            }
+            positionedRowId = targetId
+            if (newPublicationId != null) {
+                seenPublication = newPublicationId
+                following.value = true
+            }
+        } else if (!followStreamingOutput) {
+            if (!following.value) return@LaunchedEffect
+            // Reverse layout otherwise preserves the old anchor when new output is
+            // inserted below it. Keep the live edge only for readers who stayed there.
+            if (fieldOutputId != null) {
+                snapshotFlow {
+                    scroll.layoutInfo.viewportSize.height > 0 &&
+                        scroll.layoutInfo.totalItemsCount == currentRows.size
+                }.first { it }
+                val index = currentRows.indexOfFirst { it.id == fieldOutputId }
+                if (index >= 0 && scroll.layoutInfo.revealDelta(fieldOutputId, false) != 0) {
+                    scroll.scrollToItem(index)
+                }
+            }
+            // Keep the positioned component readable as the IME reduces the viewport.
+            // Accordion remeasurement does not change the viewport height.
+            var height = scroll.layoutInfo.viewportSize.height
+            snapshotFlow { scroll.layoutInfo.viewportSize.height }.collect { newHeight ->
+                val shrank = newHeight in 1 until height
+                height = newHeight
+                val id = positionedRowId
+                if (shrank && following.value && currentOutputId == null && id != null) {
+                    val index = currentRows.indexOfFirst { it.id == id }
+                    if (index >= 0 && scroll.layoutInfo.revealDelta(id, false) != 0) {
+                        scroll.scrollToItem(index)
+                    }
+                }
+            }
+        } else {
+            fun correction(): Int {
+                if (!following.value || scroll.isScrollInProgress) return 0
+                val id = currentOutputId ?: return 0
+                val rows = currentRows
+                if (scroll.layoutInfo.totalItemsCount != rows.size) return 0
+                val index = rows.indexOfFirst { it.id == id }
+                return scroll.followCorrection(id, index)
+            }
+
+            while (following.value) {
+                snapshotFlow { correction() }.first { it != 0 }
+                withFrameNanos { }
+                val delta = correction()
+                if (delta == 0) continue
+                // Isolate one default-priority mutation so a user gesture can interrupt it.
+                // The reader's gesture, rather than cancellation alone, disables following.
+                coroutineScope {
+                    launch {
+                        scroll.scroll {
+                            if (following.value) scrollBy(delta.toFloat())
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    LazyColumn(
+        modifier = modifier.nestedScroll(readingGesture).testTag("AI conversation"),
+        state = scroll,
+        reverseLayout = true,
+        verticalArrangement = Arrangement.spacedBy(10.dp, Alignment.Top)
+    ) {
+        items(newestFirst, key = { it.id }) { item ->
+            val isAi = item.sender == AiViewModel.ChatSender.AI
+            androidx.compose.foundation.layout.Row(
+                modifier = Modifier.fillMaxWidth().testTag(item.id),
+                horizontalArrangement = if (isAi) Arrangement.Start else Arrangement.End
+            ) {
+                when {
+                    item.evaluation == AiViewModel.EvaluationPresentation.REVIEWING ||
+                        item.followupNotice == AiViewModel.FollowupNotice.PREPARING -> {
+                        val visible by remember(scroll, item.id) {
+                            derivedStateOf { scroll.layoutInfo.visibleItemsInfo.any { it.key == item.id } }
+                        }
+                        FieldProcessingRow(
+                            reviewing = item.evaluation == AiViewModel.EvaluationPresentation.REVIEWING,
+                            visible = visible
+                        )
+                    }
+                    item.evaluation != null -> FieldEvaluationDetails(
+                        reviewed = item.evaluation == AiViewModel.EvaluationPresentation.REVIEWED,
+                        raw = item.json.orEmpty(),
+                        snack = snack
+                    )
+                    item.followupNotice == AiViewModel.FollowupNotice.UNAVAILABLE ->
+                        FieldFollowupUnavailable()
+                    item.json != null -> JsonBubbleMono(pretty = item.json, snack = snack)
+                    else -> FieldMessage(text = item.text.orEmpty(), isAi = isAi, typing = item.isTyping)
+                }
+            }
+        }
+    }
+}
+
+private fun LazyListState.followCorrection(id: String, index: Int): Int {
+    val layout = layoutInfo
+    val viewport = layout.viewportEndOffset - layout.viewportStartOffset
+    val visible = layout.visibleItemsInfo
+    if (index < 0 || viewport <= 0 || visible.isEmpty()) return 0
+
+    // Take at most a fraction of the current viewport per frame. When a newly inserted
+    // target is still unmeasured, approach its index until its actual edges are available.
+    val step = (viewport / 12).coerceAtLeast(1)
+    val delta = layout.revealDelta(id, followNewestEnd = true) ?: when {
+        index < visible.first().index -> -step
+        index > visible.last().index -> step
+        else -> 0 // The row identity has changed and layout has not caught up yet.
+    }
+    return when {
+        delta < -1 && canScrollBackward -> delta.coerceAtLeast(-step)
+        delta > 1 && canScrollForward -> delta.coerceAtMost(step)
+        else -> 0
+    }
+}
+
+private fun LazyListLayoutInfo.revealDelta(id: String, followNewestEnd: Boolean): Int? {
+    val row = visibleItemsInfo.firstOrNull { it.key == id } ?: return null
+    // Reverse layout measures from the visual bottom, where the newest output lines
+    // appear and where an oversized question meets the composer.
+    val bottomDelta = row.offset - viewportStartOffset
+    if (row.size > viewportEndOffset - viewportStartOffset || bottomDelta < 0) return bottomDelta
+    if (followNewestEnd) return 0
+    // A fitting question should be fully readable. Output follows only its growing end.
+    return (row.offset + row.size - viewportEndOffset).coerceAtLeast(0)
 }
 
 /* ───────────────────────────── JSON bubble ──────────────────────────────── */
@@ -1617,7 +1590,7 @@ private fun JsonBubbleMono(
     collapsedMaxHeight: Dp = 92.dp,
     snack: SnackbarHostState? = null
 ) {
-    var expanded by remember(pretty) { mutableStateOf(false) }
+    var expanded by rememberSaveable { mutableStateOf(false) }
 
     val cs = MaterialTheme.colorScheme
     val clipboard = LocalClipboard.current
@@ -1727,7 +1700,7 @@ private fun ChatComposer(
     onValueChange: (String) -> Unit,
     onSend: () -> Unit,
     enabled: Boolean,
-    focusRequester: FocusRequester,
+    textFieldEnabled: Boolean,
     speechEnabled: Boolean = false,
     speechRecording: Boolean = false,
     speechTranscribing: Boolean = false,
@@ -1736,6 +1709,16 @@ private fun ChatComposer(
     onToggleSpeech: (() -> Unit)? = null,
     onVoiceInstead: (() -> Unit)? = null
 ) {
+    val keyboard = LocalSoftwareKeyboardController.current
+    val focusRequester = remember { FocusRequester() }
+    var entryFocusHandled by rememberSaveable { mutableStateOf(false) }
+    LaunchedEffect(enabled) {
+        // Retain the one-time entry decision across restoration of this composer.
+        if (!enabled || entryFocusHandled) return@LaunchedEffect
+        entryFocusHandled = true
+        focusRequester.requestFocus()
+        keyboard?.show()
+    }
     val cs = MaterialTheme.colorScheme
 
     Column(
@@ -1765,15 +1748,21 @@ private fun ChatComposer(
                 onValueChange = onValueChange,
                 modifier = Modifier
                     .weight(1f)
-                    .focusRequester(focusRequester),
-                placeholder = { Text("Type your answer…") },
+                    .focusRequester(focusRequester)
+                    .semantics {
+                        if (!enabled) stateDescription = "Answer input inactive"
+                    },
+                placeholder = { Text(if (enabled) "Type your answer…" else "Answer input inactive") },
                 minLines = 1,
                 maxLines = 5,
-                enabled = enabled,
+                // Keep the input session alive while Send and draft changes are gated.
+                enabled = textFieldEnabled,
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
                 keyboardActions = KeyboardActions(onSend = { onSend() }),
                 colors = OutlinedTextFieldDefaults.colors(
-                    cursorColor = cs.onSurface,
+                    cursorColor = if (enabled) cs.onSurface else Color.Transparent,
+                    focusedPlaceholderColor = if (enabled) cs.onSurfaceVariant else cs.onSurface.copy(alpha = 0.38f),
+                    unfocusedPlaceholderColor = if (enabled) cs.onSurfaceVariant else cs.onSurface.copy(alpha = 0.38f),
                     unfocusedContainerColor = Color.Transparent,
                     focusedContainerColor = Color.Transparent,
                     disabledContainerColor = Color.Transparent,

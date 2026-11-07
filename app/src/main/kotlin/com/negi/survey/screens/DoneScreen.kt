@@ -55,6 +55,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import com.negi.survey.BuildConfig
 import com.negi.survey.net.SurveyExportJsonBuilder
 import com.negi.survey.utils.DeviceUploadTagProvider
 import com.negi.survey.utils.DeviceUploadTag
@@ -208,6 +209,8 @@ fun DoneScreen(
  * Auto-save helpers (no user interaction)
  * ============================================================ */
 
+private val exportSubfolder = if (BuildConfig.ISSUE157_DA) "SurveyNav-da" else "SurveyNav"
+
 private data class SaveResult(
     val uri: Uri?,
     val file: File?,
@@ -235,7 +238,7 @@ private fun saveToDownloadsQPlus(
     val values = ContentValues().apply {
         put(MediaStore.Downloads.DISPLAY_NAME, fileName)
         put(MediaStore.Downloads.MIME_TYPE, "application/json")
-        put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/SurveyNav")
+        put(MediaStore.Downloads.RELATIVE_PATH, "${Environment.DIRECTORY_DOWNLOADS}/$exportSubfolder")
         put(MediaStore.Downloads.IS_PENDING, 1)
     }
 
@@ -255,7 +258,7 @@ private fun saveToDownloadsQPlus(
         return SaveResult(
             uri = uri,
             file = null,
-            location = "Downloads/SurveyNav/$fileName"
+            location = "${Environment.DIRECTORY_DOWNLOADS}/$exportSubfolder/$fileName"
         )
     } catch (t: Throwable) {
         resolver.delete(uri, null, null)
@@ -270,7 +273,7 @@ private fun saveToAppExternalPreQ(
 ): SaveResult {
     val base = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
         ?: context.filesDir
-    val dir = File(base, "SurveyNav").apply { mkdirs() }
+    val dir = File(base, exportSubfolder).apply { mkdirs() }
     val file = File(dir, fileName)
     file.writeText(content, Charsets.UTF_8)
 

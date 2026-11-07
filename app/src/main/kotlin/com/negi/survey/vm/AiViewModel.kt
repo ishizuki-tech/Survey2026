@@ -109,10 +109,10 @@ class AiViewModel(
         private const val MAX_CONTEXT_KEYS = 24
 
         /**
-         * Reduce UI churn / O(n^2) string concatenation.
-         * Stream is emitted in chunks of at least this many newly appended chars.
+         * Batch intermediate stream snapshots to reduce UI churn and string copies.
+         * Completion publishes the remaining text regardless of this minimum.
          */
-        private const val STREAM_EMIT_MIN_DELTA_CHARS = 96
+        private const val STREAM_EMIT_MIN_DELTA_CHARS = 8
 
         /** Logcat chunk size to avoid line truncation. */
         private const val LOG_CHUNK = 3_200
@@ -341,6 +341,8 @@ class AiViewModel(
      * @param json JSON payload (pretty string).
      * @param isTyping True when this is a streaming typing placeholder.
      * @param createdAtUptimeMs Monotonic timestamp for ordering/diagnostics.
+     * @param isFollowupQuestion True for the rendered question of an accepted follow-up.
+     * @param followupNotice Presentation state for an attempt without an accepted question.
      */
     data class ChatItem(
         val id: String,
@@ -348,8 +350,15 @@ class AiViewModel(
         val text: String? = null,
         val json: String? = null,
         val isTyping: Boolean = false,
-        val createdAtUptimeMs: Long = SystemClock.uptimeMillis()
+        val createdAtUptimeMs: Long = SystemClock.uptimeMillis(),
+        val isFollowupQuestion: Boolean = false,
+        val followupNotice: FollowupNotice? = null,
+        val evaluation: EvaluationPresentation? = null
     )
+
+    enum class EvaluationPresentation { REVIEWING, REVIEWED, UNAVAILABLE }
+
+    enum class FollowupNotice { PREPARING, UNAVAILABLE }
 
     /** Composer role per conversation context. */
     enum class ComposerRole {
@@ -372,6 +381,16 @@ class AiViewModel(
         val turnCompleted: Boolean = false,
         val validationFailed: Boolean = false
     )
+
+    internal class TwoStepChat(
+        val contextKey: String,
+        val nodeId: String,
+        val isCurrentSurvey: () -> Boolean,
+        val acceptsEvaluation: (StepSnapshot) -> Boolean
+    )
+
+    // Installed and cleared with the execution owner under executionLock.
+    private var activeTwoStepChat: TwoStepChat? = null
 
     private val chatStore = ConcurrentHashMap<String, MutableStateFlow<List<ChatItem>>>()
     private val conversationStore = ConcurrentHashMap<String, MutableStateFlow<ConversationState>>()
@@ -433,9 +452,12 @@ class AiViewModel(
         }
 
         conversationStore[contextKey]?.update { cur ->
-            val apq = cur.activePromptQuestion.ifBlank { rootQuestion }
-            val draft = if (cur.role == ComposerRole.MAIN && cur.composerDraft.isBlank() && initialDraft.isNotBlank()) initialDraft else cur.composerDraft
-            cur.copy(activePromptQuestion = apq, composerDraft = draft)
+            // An initialized context owns its draft, including an empty draft after Send.
+            if (cur.activePromptQuestion.isNotBlank()) cur
+            else cur.copy(
+                activePromptQuestion = rootQuestion,
+                composerDraft = cur.composerDraft.ifBlank { initialDraft }
+            )
         }
     }
 
@@ -520,6 +542,9 @@ class AiViewModel(
         val remaining = survey.remainingFollowups(nodeId)
         val requiredComponents = survey.requiredComponentsFor(nodeId)
         val requiredComponentIds = survey.requiredComponentCatalogFor(nodeId).map { it.id }
+        fun admission(raw: String, timedOut: Boolean, error: String?) = SurveyAiPolicy.evaluateAdmission(
+            raw, timedOut, error, remaining, requiredComponents, requiredComponentIds,
+        )
         var admittedMissingPoints = emptyList<String>()
         var traceMissingPoints = emptyList<String>()
         var traceFollowupNeeded: Boolean? = null
@@ -539,15 +564,15 @@ class AiViewModel(
             firstSamplingProfile = evalSamplingProfile,
             secondSamplingProfile = followupSamplingProfile,
             proceedOnTimeout = false,
+            twoStepChat = TwoStepChat(
+                contextKey, nodeId,
+                isCurrentSurvey = { survey.surveyUuid.value == runUuid },
+                acceptsEvaluation = {
+                    admission(it.raw, it.timedOut, it.error).decision != SurveyAiDecision.FAILURE
+                }
+            ),
             shouldRunSecond = { result ->
-                val admission = SurveyAiPolicy.evaluateAdmission(
-                    result.raw,
-                    result.timedOut,
-                    result.error,
-                    remaining,
-                    requiredComponents,
-                    requiredComponentIds,
-                )
+                val admission = admission(result.raw, result.timedOut, result.error)
                 val traceJson = parseStrictModelJsonObject(result.raw)
                 traceParseSuccess = traceJson != null
                 traceMissingPoints = (traceJson?.get("missing_points") as? JsonArray)
@@ -592,9 +617,6 @@ class AiViewModel(
                         "followup_needed" to traceFollowupNeeded,
                         "parseSuccess" to traceParseSuccess, "error" to DiagnosticContentPolicy.rawOrNull(evaluation.error)
                     ))
-                    upsertChatItem(contextKey, ChatItem(
-                        id = "eval-$nodeId-${evaluation.runId}", sender = ChatSender.AI, json = evaluation.raw
-                    ))
                     val decision = SurveyAiPolicy.evaluate(
                         evaluation.raw,
                         evaluation.timedOut,
@@ -636,12 +658,11 @@ class AiViewModel(
                             }
                             if (question != null && survey.addFollowupQuestion(nodeId, question)) {
                                 survey.traceEvent("AI_FOLLOWUP_ACCEPTED", answerTraceId, nodeId, mapOf("followup" to DiagnosticContentPolicy.rawOrNull(question), "followupLength" to question.length))
-                                upsertChatItem(contextKey, ChatItem(
-                                    id = "fu-$nodeId-${generation.runId}", sender = ChatSender.AI, text = question
-                                ))
+                                finishTwoStepFollowupLocked(generation.runId, question)
                                 setFollowupMode(contextKey, question)
                                 null
                             } else {
+                                generation?.let { finishTwoStepFollowupLocked(it.runId, question = null) }
                                 survey.traceEvent("AI_FOLLOWUP_REJECTED", answerTraceId, nodeId, mapOf("candidate" to DiagnosticContentPolicy.rawOrNull(generation?.followups?.firstOrNull()), "candidateLength" to (generation?.followups?.firstOrNull()?.length ?: 0)))
                                 SurveyAiReason.FAILURE
                             }
@@ -657,7 +678,6 @@ class AiViewModel(
                     ))
                     if (reason?.terminal == true) completeValidationTurn(contextKey, rootQuestion)
                     else if (reason == SurveyAiReason.FAILURE) failValidationTurn(contextKey)
-                    removeTypingMessage(contextKey, nodeId)
                 }
             },
             repositoryTraceContextForRun = { _, phase ->
@@ -726,7 +746,12 @@ class AiViewModel(
     /**
      * Upsert the typing bubble for a node.
      */
-    fun upsertTypingMessage(contextKey: String, nodeId: String, text: String) {
+    fun upsertTypingMessage(
+        contextKey: String,
+        nodeId: String,
+        text: String,
+        evaluation: EvaluationPresentation? = null
+    ) {
         val id = "typing-$nodeId"
         upsertChatItem(
             contextKey = contextKey,
@@ -734,7 +759,8 @@ class AiViewModel(
                 id = id,
                 sender = ChatSender.AI,
                 text = text,
-                isTyping = true
+                isTyping = true,
+                evaluation = evaluation
             )
         )
     }
@@ -745,6 +771,99 @@ class AiViewModel(
     fun removeTypingMessage(contextKey: String, nodeId: String) {
         val id = "typing-$nodeId"
         removeChatItem(contextKey, id)
+    }
+
+    /** Start a fresh attempt and retire any Score from the failed attempt on this answer. */
+    private fun startTwoStepChatLocked(chat: TwoStepChat) {
+        touchContextKey(chat.contextKey)
+        val flow = chatStore.getOrPut(chat.contextKey) { MutableStateFlow(emptyList()) }
+        flow.update { rows ->
+            val lastTurnBoundary = rows.indexOfLast { it.sender == ChatSender.USER || it.isFollowupQuestion }
+            val retained = rows.filterIndexed { index, row ->
+                row.id != "typing-${chat.nodeId}" &&
+                    !(index > lastTurnBoundary && (row.id.startsWith("eval-${chat.nodeId}-") ||
+                        row.followupNotice == FollowupNotice.UNAVAILABLE))
+            }
+            (retained + ChatItem(
+                "typing-${chat.nodeId}", ChatSender.AI, text = "…", isTyping = true,
+                evaluation = EvaluationPresentation.REVIEWING
+            ))
+                .takeLast(MAX_CHAT_ITEMS)
+        }
+    }
+
+    /** Swap the temporary row for the committed item in one chat-history update. */
+    private fun commitTwoStepChatItemLocked(item: ChatItem) {
+        val chat = twoStepChatForPublicationLocked() ?: return
+        chatStore[chat.contextKey]?.update { rows ->
+            val typingId = "typing-${chat.nodeId}"
+            if (rows.any { it.id == item.id }) {
+                rows.filterNot { it.id == typingId }
+            } else {
+                val typingIndex = rows.indexOfFirst { it.id == typingId }
+                if (typingIndex >= 0) {
+                    rows.toMutableList().apply { this[typingIndex] = item }
+                } else {
+                    (rows + item).takeLast(MAX_CHAT_ITEMS)
+                }
+            }
+        }
+    }
+
+    private fun commitTwoStepScoreLocked(step: StepSnapshot) {
+        val chat = twoStepChatForPublicationLocked() ?: return
+        commitTwoStepChatItemLocked(ChatItem(
+            id = "eval-${chat.nodeId}-${step.runId}",
+            sender = ChatSender.AI,
+            json = step.raw,
+            evaluation = if (chat.acceptsEvaluation(step)) EvaluationPresentation.REVIEWED
+                else EvaluationPresentation.UNAVAILABLE
+        ))
+    }
+
+    private fun startTwoStepFollowupLocked(runId: Long) {
+        val chat = twoStepChatForPublicationLocked() ?: return
+        upsertChatItem(chat.contextKey, ChatItem(
+            id = "fu-${chat.nodeId}-$runId",
+            sender = ChatSender.AI,
+            followupNotice = FollowupNotice.PREPARING
+        ))
+    }
+
+    /** Resolve the owned preparation row once, preserving its key and position. */
+    private fun finishTwoStepFollowupLocked(runId: Long, question: String?) {
+        val chat = twoStepChatForPublicationLocked() ?: return
+        val id = "fu-${chat.nodeId}-$runId"
+        chatStore[chat.contextKey]?.update { rows ->
+            rows.map { row ->
+                if (row.id == id && row.followupNotice == FollowupNotice.PREPARING) {
+                    row.copy(
+                        text = question,
+                        isFollowupQuestion = question != null,
+                        followupNotice = if (question == null) FollowupNotice.UNAVAILABLE else null
+                    )
+                } else row
+            }
+        }
+    }
+
+    private fun publishTwoStepScoreStreamLocked(text: String) {
+        val chat = twoStepChatForPublicationLocked() ?: return
+        upsertTypingMessage(
+            chat.contextKey, chat.nodeId, text.ifBlank { "…" }, EvaluationPresentation.REVIEWING
+        )
+    }
+
+    private fun twoStepChatForPublicationLocked(): TwoStepChat? =
+        activeTwoStepChat?.takeIf { evalJobRef.get()?.isActive == true && it.isCurrentSurvey() }
+
+    private fun clearTwoStepChatLocked() {
+        activeTwoStepChat?.let { chat ->
+            chatStore[chat.contextKey]?.update { rows ->
+                rows.filterNot { it.id == "typing-${chat.nodeId}" || it.followupNotice == FollowupNotice.PREPARING }
+            }
+        }
+        activeTwoStepChat = null
     }
 
     /**
@@ -758,7 +877,10 @@ class AiViewModel(
             val next = if (idx == -1) {
                 cur + item
             } else {
-                cur.toMutableList().also { it[idx] = item }.toList()
+                cur.toMutableList().apply {
+                    // Replaying a step can refresh its row without changing its accepted identity.
+                    this[idx] = if (cur[idx].isFollowupQuestion) item.copy(isFollowupQuestion = true) else item
+                }.toList()
             }
             next.takeLast(MAX_CHAT_ITEMS)
         }
@@ -999,7 +1121,7 @@ class AiViewModel(
         return ownerJob
     }
 
-    fun evaluateConditionalTwoStepAsync(
+    internal fun evaluateConditionalTwoStepAsync(
         firstPrompt: String,
         firstPhase: PromptPhase = PromptPhase.EVAL,
         firstSamplingProfile: SamplingProfile? = null,
@@ -1010,6 +1132,7 @@ class AiViewModel(
         buildSecondPrompt: (EvalResult) -> String,
         onFinished: (EvalResult, EvalResult?) -> Unit = { _, _ -> },
         repositoryTraceContextForRun: ((Long, PromptPhase) -> RepositoryTraceContext?)? = null,
+        twoStepChat: TwoStepChat? = null,
     ): Job {
         val p1 = firstPrompt.trim()
         if (p1.isEmpty()) {
@@ -1113,7 +1236,7 @@ class AiViewModel(
                 )
                 currentCoroutineContext().ensureActive()
                 synchronized(executionLock) {
-                    if (evalJobRef.get() === chainJob) onFinished(step1, step2)
+                    if (evalJobRef.get() === chainJob && chainJob.isActive) onFinished(step1, step2)
                 }
             } finally {
                 // Owner identity is critical here. An old cancelled chain must never clear the
@@ -1125,7 +1248,8 @@ class AiViewModel(
         val existing = installExecutionOrGetExisting(
             newJob = chainJob,
             initialRunId = runId1,
-            clearHistory = true
+            clearHistory = true,
+            twoStepChat = twoStepChat
         )
 
         if (existing != null) {
@@ -1162,6 +1286,7 @@ class AiViewModel(
             val job = evalJobRef.getAndSet(null)
             activeRunId.set(-1L)
             running.set(false)
+            clearTwoStepChatLocked()
 
             clearStepHistory()
             _score.value = null
@@ -1227,6 +1352,7 @@ class AiViewModel(
             val committed = commitIfActive(runId) {
                 lastStreamEmitLen = snapshot.length
                 _stream.value = snapshot
+                if (phase == PromptPhase.EVAL) publishTwoStepScoreStreamLocked(snapshot)
             }
             if (!committed) {
                 throw CancellationException("stale-run-stream")
@@ -1491,6 +1617,7 @@ class AiViewModel(
             val committed = commitIfActive(runId) {
                 _error.value = stepError
                 appendStepSnapshot(snapshot)
+                if (phase == PromptPhase.EVAL) commitTwoStepScoreLocked(snapshot)
 
                 if (commitToPrimaryState) {
                     _raw.value = rawText
@@ -1576,6 +1703,7 @@ class AiViewModel(
                 _stream.value = rawText
                 _error.value = msg
                 appendStepSnapshot(snapshot)
+                if (phase == PromptPhase.EVAL) commitTwoStepScoreLocked(snapshot)
 
                 if (commitToPrimaryState) {
                     _raw.value = rawText
@@ -1621,7 +1749,8 @@ class AiViewModel(
     private fun installExecutionOrGetExisting(
         newJob: Job,
         initialRunId: Long,
-        clearHistory: Boolean
+        clearHistory: Boolean,
+        twoStepChat: TwoStepChat? = null
     ): Job? = synchronized(executionLock) {
         val existing = evalJobRef.get()
 
@@ -1642,6 +1771,8 @@ class AiViewModel(
         evalJobRef.set(newJob)
         running.set(true)
         activeRunId.set(initialRunId)
+        activeTwoStepChat = twoStepChat
+        twoStepChat?.let(::startTwoStepChatLocked)
         prepareUiForNewChainLocked(clearHistory = clearHistory)
         null
     }
@@ -1655,6 +1786,8 @@ class AiViewModel(
                 return@synchronized false
             }
 
+            // The owned EVAL commit has already replaced its temporary row with the Score.
+            startTwoStepFollowupLocked(nextRunId)
             prepareUiForNextStepLocked()
             activeRunId.set(nextRunId)
             true
@@ -1690,6 +1823,7 @@ class AiViewModel(
             evalJobRef.set(null)
             activeRunId.set(0L)
             running.set(false)
+            clearTwoStepChatLocked()
             _loading.value = false
         }
     }
@@ -1705,6 +1839,7 @@ class AiViewModel(
 
             activeRunId.set(-1L)
             running.set(false)
+            clearTwoStepChatLocked()
             _loading.value = false
 
             if (setCancelledError) {
@@ -1739,6 +1874,7 @@ class AiViewModel(
             evalJobRef.set(null)
             activeRunId.set(-1L)
             running.set(false)
+            clearTwoStepChatLocked()
             _loading.value = false
 
             if (setCancelledError) {

@@ -157,7 +157,7 @@
 
     <application
         android:name=".SurveyApp"
-        android:allowBackup="true"
+        android:allowBackup="${allowAppBackup}"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="@xml/backup_rules"
         android:icon="@mipmap/ic_launcher"

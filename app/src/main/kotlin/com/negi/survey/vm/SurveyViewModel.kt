@@ -336,49 +336,52 @@ open class SurveyViewModel(
     val currentNodeId: String
         get() = _currentNode.value.id
 
-    /*
-     * TTS auto-play is a one-shot event for the currently displayed question.
-     *
-     * The SurveyViewModel survives Activity recreation, while the Compose
-     * LaunchedEffect that requests TTS is recreated. Keep the most recently
-     * auto-played node here so configuration changes do not replay the same
-     * question.
-     *
-     * This state is intentionally not persisted across process death.
-     */
-    private var lastAutoPlayedTtsNodeId: String? = null
-
-    @Synchronized
-    fun claimTtsAutoPlay(nodeId: String): Boolean {
-        val normalizedNodeId = nodeId.trim()
-        if (normalizedNodeId.isBlank()) return false
-
-        if (lastAutoPlayedTtsNodeId == normalizedNodeId) {
-            return false
-        }
-
-        lastAutoPlayedTtsNodeId = normalizedNodeId
-        return true
-    }
-
     // Navigation changes this value. Attaching a recreated Activity does not.
     private val _questionPresentation = MutableStateFlow(0L)
     internal val questionPresentation = _questionPresentation.asStateFlow()
-    private val aiAutoReadTargets = mutableSetOf<AiQuestionPlaybackTarget>()
+    private var lastAutoPlayedTtsNodeId: String? = null
+    private var queuedOrdinaryReplay: QuestionSpeechOwner? = null
+    private val aiAutoReadTargets = mutableSetOf<QuestionPlaybackTarget>()
 
     private fun beginQuestionPresentation() {
         aiAutoReadTargets.clear()
+        queuedOrdinaryReplay = null
         _questionPresentation.update { it + 1 }
     }
 
     @Synchronized
-    internal fun claimAiAutoRead(
-        presentation: Long,
-        session: Long,
-        nodeId: String,
-        target: AiQuestionPlaybackTarget
-    ): Boolean =
-        ownsAiPresentation(presentation, session, nodeId) && aiAutoReadTargets.add(target)
+    internal fun questionSpeechOwner(): QuestionSpeechOwner {
+        val node = currentNode.value
+        return QuestionSpeechOwner(questionPresentation.value, sessionId.value, node.id, node.type)
+    }
+
+    @Synchronized
+    internal fun ownsQuestionSpeech(owner: QuestionSpeechOwner): Boolean =
+        owner == questionSpeechOwner() && nav.lastOrNull() == navKeyFor(currentNode.value)
+
+    // Ordinary Replay can still use the speaker's pre-readiness queue.
+    @Synchronized
+    internal fun noteQueuedOrdinaryReplay(nodeId: String) {
+        val owner = questionSpeechOwner()
+        if (owner.nodeId == nodeId && ownsQuestionSpeech(owner)) {
+            queuedOrdinaryReplay = owner
+        }
+    }
+
+    @Synchronized
+    internal fun claimQuestionAutoRead(
+        owner: QuestionSpeechOwner,
+        target: QuestionPlaybackTarget
+    ): Boolean {
+        if (!ownsQuestionSpeech(owner)) return false
+        if (owner.nodeType == NodeType.AI) {
+            if (!aiAutoReadTargets.add(target)) return false
+        } else if (queuedOrdinaryReplay == owner || lastAutoPlayedTtsNodeId == owner.nodeId) {
+            return false
+        }
+        lastAutoPlayedTtsNodeId = owner.nodeId
+        return true
+    }
 
     internal fun ownsAiPresentation(presentation: Long, session: Long, nodeId: String): Boolean =
         questionPresentation.value == presentation && sessionId.value == session &&
@@ -1030,12 +1033,12 @@ open class SurveyViewModel(
     private fun push(node: Node) {
         _currentNode.value = node
         nodeStack.addLast(node.id)
-        beginQuestionPresentation()
 
         clearSelections()
         if (node.type == NodeType.SINGLE_CHOICE) _single.value = node.decomposeSingleChoiceAnswer(getAnswer(node.id)).selected
 
         nav.add(navKeyFor(node))
+        beginQuestionPresentation()
         updateCanGoBack()
 
         RuntimeLogStore.d(TAG, "push -> ${node.id}, navSize=${nav.size}, stackSize=${nodeStack.size}")
