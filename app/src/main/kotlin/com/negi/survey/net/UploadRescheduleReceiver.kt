@@ -60,6 +60,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.withTimeout
 
 class UploadRescheduleReceiver : BroadcastReceiver() {
@@ -115,6 +116,9 @@ class UploadRescheduleReceiver : BroadcastReceiver() {
                     rescheduleGitHub(contextsForScan, action)
                     // Also enqueue runtime logs bundle upload (best-effort).
                     rescheduleRuntimeLogsUpload(contextsForScan, action)
+                    if (unlocked && action != ACTION_LOCKED_BOOT_COMPLETED) {
+                        runInterruptible { V2SurveyJsonRecoveryTriggers.recover(ctxNormal, action) }
+                    }
                 }
             } catch (cancelled: CancellationException) {
                 throw cancelled

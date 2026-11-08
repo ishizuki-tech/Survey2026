@@ -29,6 +29,7 @@ import com.negi.survey.net.GitHubUploadWorker
 import com.negi.survey.net.GitHubUploader
 import com.negi.survey.net.RuntimeLogStore
 import com.negi.survey.net.SurveyUploadRescheduler
+import com.negi.survey.net.V2SurveyJsonRecoveryTriggers
 import com.negi.survey.runtime.HeavyRuntimeCoordinator
 import com.negi.survey.slm.LiteRtLM
 import com.negi.survey.whisper.WhisperEngine
@@ -496,6 +497,7 @@ class SurveyApp : Application(), Configuration.Provider {
         override fun launchIo(block: () -> Unit) {
             startupSurveyRecoveryScope.launch {
                 block()
+                V2SurveyJsonRecoveryTriggers.recover(appContext, "startup")
             }
         }
 

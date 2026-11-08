@@ -1,6 +1,11 @@
 package com.negi.survey.diagnostics
 
 import android.content.Context
+import com.negi.survey.net.V2DiagnosticCapture
+import com.negi.survey.net.V2DiagnosticRouteStore
+import com.negi.survey.net.V2DiagnosticStream
+import com.negi.survey.net.V2SurveyJsonDestination
+import com.negi.survey.utils.DeviceUploadTag
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.CoroutineScope
@@ -14,8 +19,11 @@ import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 
 /** Best-effort voice diagnostics sharing the survey answer transaction identity. */
-class WhisperTrace internal constructor(private val identity: TraceIdentity, private val writer: TraceWriter) {
+class WhisperTrace internal constructor(private val identity: TraceIdentity, private val writer: DiagnosticTraceWriter) {
     fun event(name: String, answerTraceId: String?, questionId: String?, fields: Map<String, Any?> = emptyMap()) = runCatching {
+        if (writer is V2DiagnosticTraceWriter) {
+            return@runCatching writer.event(identity, "whisper", name, answerTraceId, questionId, fields)
+        }
         writer.append(JSONObject().apply {
             put("traceVersion", 1); put("eventId", TraceIdentity.newEventId()); put("timestampUtc", java.time.Instant.now().toString())
             put("stream", "whisper"); put("event", name); put("surveyId", identity.surveyId); put("shortSurveyId", identity.shortSurveyId)
@@ -27,6 +35,21 @@ class WhisperTrace internal constructor(private val identity: TraceIdentity, pri
     }
     suspend fun finalizeTrace(): File? = withContext(Dispatchers.IO) { writer.finalizeToGzip() }
     companion object {
+        internal fun openV2(context: Context, surveyId: String, destination: V2SurveyJsonDestination): WhisperTrace =
+            openV2(TraceIdentity.forSurvey(context.applicationContext, surveyId),
+                V2DiagnosticRouteStore(context.filesDir), destination)
+
+        internal fun openV2(
+            identity: TraceIdentity,
+            store: V2DiagnosticRouteStore,
+            destination: V2SurveyJsonDestination
+        ): WhisperTrace {
+            val capture = V2DiagnosticCapture.create(
+                identity.surveyId, DeviceUploadTag(identity.deviceTag), destination, V2DiagnosticStream.WHISPER
+            )
+            return WhisperTrace(identity, V2DiagnosticTraceWriter(store, capture))
+        }
+
         fun open(context: Context, surveyId: String): WhisperTrace {
             val identity = TraceIdentity.forSurvey(context.applicationContext, surveyId)
             val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())

@@ -8,9 +8,15 @@ import java.nio.charset.StandardCharsets
 import java.util.concurrent.Executors
 import java.util.zip.GZIPOutputStream
 
-/** Serialized, best-effort NDJSON writer. Callers never wait for an individual event write. */
-internal class TraceWriter(private val openFile: File) {
+internal interface DiagnosticTraceWriter {
     val finalFileName: String
+    fun append(line: String)
+    fun finalizeToGzip(): File?
+}
+
+/** Serialized, best-effort NDJSON writer. Callers never wait for an individual event write. */
+internal class TraceWriter(private val openFile: File) : DiagnosticTraceWriter {
+    override val finalFileName: String
         get() = openFile.name.removeSuffix(".open").removeSuffix(".ndjson") + ".ndjson.gz"
     private val executor = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "SurveyTraceWriter").apply { isDaemon = true }
@@ -18,7 +24,7 @@ internal class TraceWriter(private val openFile: File) {
     @Volatile private var closed = false
 
     @Synchronized
-    fun append(line: String) {
+    override fun append(line: String) {
         if (closed) return
         runCatching {
             executor.execute {
@@ -35,7 +41,7 @@ internal class TraceWriter(private val openFile: File) {
 
     /** Runs only after queued writes, then atomically publishes the compressed trace where possible. */
     @Synchronized
-    fun finalizeToGzip(): File? {
+    override fun finalizeToGzip(): File? {
         if (closed) return null
         closed = true
         return runCatching {

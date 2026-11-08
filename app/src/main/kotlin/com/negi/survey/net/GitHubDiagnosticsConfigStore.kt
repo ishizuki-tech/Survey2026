@@ -163,6 +163,9 @@ object GitHubDiagnosticsConfigStore {
         prefs(context).edit().clear().apply()
     }
 
+    internal fun isUploadEnabled(context: Context): Boolean =
+        prefs(context).getBoolean(KEY_ENABLED, true)
+
     fun buildGitHubConfigOrNull(context: Context): GitHubUploader.GitHubConfig? {
         // APK build routing is authoritative. Preferences retain their credential role but cannot
         // split survey and diagnostics artifacts across different repositories.

@@ -78,10 +78,16 @@ import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 
-class GitHubUploadWorker(
+class GitHubUploadWorker internal constructor(
     appContext: Context,
-    params: WorkerParameters
+    params: WorkerParameters,
+    private val v2Delivery: (Context) -> V2SurveyJsonDelivery,
+    private val v2Retirement: (Context, UUID) -> V2SurveyJsonRetirement
 ) : CoroutineWorker(appContext, params) {
+    constructor(appContext: Context, params: WorkerParameters) : this(
+        appContext, params, ::V2SurveyJsonDelivery, ::V2SurveyJsonRetirement
+    )
+
     private var executionConfig: GitHubUploader.GitHubConfig? = null
 
     override suspend fun getForegroundInfo(): ForegroundInfo {
@@ -105,6 +111,18 @@ class GitHubUploadWorker(
     }
 
     override suspend fun doWork(): Result {
+        val metadata = inputData.keyValueMap
+        when (surveyWorkerProtocol(metadata)) {
+            SurveyWorkerProtocol.IMMUTABLE_V2 -> return withContext(Dispatchers.IO) {
+                if (DiagnosticUploadInstrumentationGate.isDisabled()) return@withContext Result.retry()
+                executeV2(metadata)
+            }
+            SurveyWorkerProtocol.UNSUPPORTED -> return Result.failure(
+                workDataOf(ERROR_MESSAGE to "Unsupported survey upload protocol.")
+            )
+            SurveyWorkerProtocol.CANONICAL_V1, SurveyWorkerProtocol.EXISTING_UNMARKED -> Unit
+        }
+
         val mode =
             inputData.getString(KEY_MODE)
                 ?.lowercase(Locale.US)
@@ -291,6 +309,37 @@ class GitHubUploadWorker(
                     )
             }
         }
+    }
+
+    private suspend fun executeV2(metadata: Map<String, Any?>): Result {
+        val surveyId = metadata[KEY_SURVEY_ID] as? String ?: return rejectV2("Missing V2 survey UUID")
+        return withV2SurveyExecution(surveyId) {
+            val retirement = v2Retirement(applicationContext, id)
+            val initial = retirement.retireWhileLocked(surveyId, metadata, resumePendingDelivery = true)
+            val outcome = if (initial == V2SurveyJsonRetirement.Result.PendingDelivery) {
+                when (val delivery = v2Delivery(applicationContext).executeWhileLocked(metadata)) {
+                    is V2SurveyJsonDelivery.Result.Confirmed -> retirement.retireWhileLocked(surveyId, metadata)
+                    is V2SurveyJsonDelivery.Result.Rejected -> return@withV2SurveyExecution rejectV2(delivery.reason)
+                    is V2SurveyJsonDelivery.Result.Retry -> return@withV2SurveyExecution retryV2(delivery.reason)
+                }
+            } else initial
+            when (outcome) {
+                is V2SurveyJsonRetirement.Result.Completed -> Result.success(
+                    workDataOf(OUT_MODE to MODE_FILE, OUT_REMOTE_PATH to outcome.remotePath)
+                )
+                is V2SurveyJsonRetirement.Result.Blocked -> rejectV2(outcome.reason)
+                is V2SurveyJsonRetirement.Result.Retry -> retryV2(outcome.reason)
+                V2SurveyJsonRetirement.Result.PendingDelivery -> error("Unexpected pending V2 retirement result")
+            }
+        }
+    }
+
+    private fun rejectV2(reason: String): Result =
+        Result.failure(workDataOf(ERROR_MESSAGE to reason, "v2.status" to "REJECTED"))
+
+    private fun retryV2(reason: String): Result {
+        Log.i(TAG, "V2 work deferred: $reason")
+        return Result.retry()
     }
 
     private fun notificationTitleForMode(mode: String): String =
@@ -491,6 +540,14 @@ class GitHubUploadWorker(
 
         val pendingFile = File(filePath)
         if (!pendingFile.exists()) return Result.failure(workDataOf(ERROR_MESSAGE to "Pending file not found: $filePath"))
+        val isV2File = try {
+            isV2StagedFile(applicationContext.filesDir, pendingFile)
+        } catch (_: IOException) {
+            return Result.failure(workDataOf(ERROR_MESSAGE to "Could not verify the staged file location."))
+        }
+        if (isV2File) {
+            return Result.failure(workDataOf(ERROR_MESSAGE to "V2 staging requires an explicit V2 artifact request."))
+        }
 
         val fileSize = pendingFile.length()
         if (fileSize <= 0L) return Result.failure(workDataOf(ERROR_MESSAGE to "Pending file is empty: $filePath"))

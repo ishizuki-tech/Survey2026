@@ -371,6 +371,21 @@ object GitHubUploader {
         maxRequestBytesHint = cfg.maxRequestBytesHint
     )
 
+    /** The request-size guard also applies when an existing blob would skip PUT. */
+    internal suspend fun uploadV2VoiceSnapshotAtPath(cfg: GitHubConfig, path: String, bytes: ByteArray): UploadResult {
+        val (prefix, suffix) = contentsEnvelope(DEFAULT_MESSAGE, cfg.branch, null)
+        try {
+            checkContentsSize(bytes.size.toLong(), prefix, suffix, cfg.maxRequestBytesHint)
+        } catch (limit: IOException) {
+            throw UploadSizeLimitException(requireNotNull(limit.message))
+        }
+        return uploadBytesAtPath(cfg, path, bytes)
+    }
+
+    internal fun fitsV2VoiceSizeBounds(size: Long, cfg: GitHubConfig): Boolean =
+        size in 1..cfg.maxRawBytesHint.toLong() &&
+            estimateBase64Length(size) + REQUEST_OVERHEAD_BYTES < cfg.maxRequestBytesHint.toLong()
+
     // ---------------------------------------------------------------------
     // Public APIs — Binary Upload (File streaming)
     // ---------------------------------------------------------------------
@@ -595,6 +610,8 @@ object GitHubUploader {
         throw IOException("Artifact conflict retries exhausted")
     }
 
+    internal class UploadSizeLimitException(message: String) : IOException(message)
+
     internal class ArtifactConflictException : IOException("Remote artifact contains different content.")
 
     internal fun conflictDelayMs(attempt: Int, random: Random = Random): Long {
@@ -627,6 +644,37 @@ object GitHubUploader {
         return UploadResult(fileUrl, commitSha)
     }
 
+    private fun contentsEnvelope(message: String, branch: String, sha: String?): Pair<ByteArray, ByteArray> {
+        val msgJson = JSONObject.quote(message.ifBlank { DEFAULT_MESSAGE })
+        val branchJson = JSONObject.quote(branch)
+        val shaJson = sha?.takeIf { it.isNotBlank() }?.let { JSONObject.quote(it) }
+
+        val prefix = "{\"message\":$msgJson,\"branch\":$branchJson,\"content\":\""
+        val suffix = if (shaJson != null) "\",\"sha\":$shaJson}" else "\"}"
+
+        return prefix.toByteArray(Charsets.UTF_8) to suffix.toByteArray(Charsets.UTF_8)
+    }
+
+    private fun checkContentsSize(
+        rawSize: Long,
+        prefixBytes: ByteArray,
+        suffixBytes: ByteArray,
+        maxRequestBytesHint: Int
+    ): Long {
+        val b64Len = estimateBase64Length(rawSize)
+        val totalLenLong = prefixBytes.size.toLong() + b64Len + suffixBytes.size.toLong()
+
+        val guardedTotalLen = totalLenLong + REQUEST_OVERHEAD_BYTES
+        if (guardedTotalLen > maxRequestBytesHint.toLong()) {
+            val msg =
+                "Request too large for upload guard " +
+                        "(requestBytes~$guardedTotalLen, limit=$maxRequestBytesHint). " +
+                        "ContentBytes=$rawSize; Base64 expands ~4/3."
+            throw IOException(msg)
+        }
+        return totalLenLong
+    }
+
     private suspend fun putContents(
         owner: String,
         repoName: String,
@@ -641,27 +689,8 @@ object GitHubUploader {
         onProgress: (Int) -> Unit,
         maxRequestBytesHint: Int
     ): HttpResponse {
-        val msgJson = JSONObject.quote(message.ifBlank { DEFAULT_MESSAGE })
-        val branchJson = JSONObject.quote(branch)
-        val shaJson = sha?.takeIf { it.isNotBlank() }?.let { JSONObject.quote(it) }
-
-        val prefix = "{\"message\":$msgJson,\"branch\":$branchJson,\"content\":\""
-        val suffix = if (shaJson != null) "\",\"sha\":$shaJson}" else "\"}"
-
-        val prefixBytes = prefix.toByteArray(Charsets.UTF_8)
-        val suffixBytes = suffix.toByteArray(Charsets.UTF_8)
-
-        val b64Len = estimateBase64Length(rawSize)
-        val totalLenLong = prefixBytes.size.toLong() + b64Len + suffixBytes.size.toLong()
-
-        val guardedTotalLen = totalLenLong + REQUEST_OVERHEAD_BYTES
-        if (guardedTotalLen > maxRequestBytesHint.toLong()) {
-            val msg =
-                "Request too large for upload guard " +
-                        "(requestBytes~$guardedTotalLen, limit=$maxRequestBytesHint). " +
-                        "ContentBytes=$rawSize; Base64 expands ~4/3."
-            throw IOException(msg)
-        }
+        val (prefixBytes, suffixBytes) = contentsEnvelope(message, branch, sha)
+        val totalLenLong = checkContentsSize(rawSize, prefixBytes, suffixBytes, maxRequestBytesHint)
 
         val url = URL("$API_BASE/repos/$owner/$repoName/contents/$encodedPath")
 

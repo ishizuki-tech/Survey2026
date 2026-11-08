@@ -739,7 +739,7 @@ internal object SurveyUploadWork {
         )
     }
 
-    private class AndroidWorkManagerOperations(private val workManager: WorkManager) : WorkManagerOperations {
+    internal class AndroidWorkManagerOperations(private val workManager: WorkManager) : WorkManagerOperations {
         override fun getWorkInfoById(id: UUID): WorkInfo? =
             workManager.getWorkInfoById(id).get(STATE_LOOKUP_TIMEOUT_MS, TimeUnit.MILLISECONDS)
 

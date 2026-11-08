@@ -195,6 +195,7 @@ class UploadStatusViewModel(app: Application) : AndroidViewModel(app) {
                             is SurveyUploadExecutionAuthority.Owner.VALID -> when (owner.protocol) {
                                 SurveyUploadExecutionAuthority.Protocol.LEGACY -> "BLOCKED_BY_LEGACY_AUTHORITY"
                                 SurveyUploadExecutionAuthority.Protocol.CANONICAL -> "BLOCKED_BY_CANONICAL_AUTHORITY"
+                                SurveyUploadExecutionAuthority.Protocol.IMMUTABLE_V2 -> "BLOCKED_BY_V2_AUTHORITY"
                             }
                             SurveyUploadExecutionAuthority.Owner.CORRUPT_OR_UNKNOWN ->
                                 "CORRUPT_OR_UNKNOWN_AUTHORITY"

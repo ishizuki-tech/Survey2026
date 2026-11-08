@@ -1,6 +1,11 @@
 package com.negi.survey.diagnostics
 
 import android.content.Context
+import com.negi.survey.net.V2DiagnosticCapture
+import com.negi.survey.net.V2DiagnosticRouteStore
+import com.negi.survey.net.V2DiagnosticStream
+import com.negi.survey.net.V2SurveyJsonDestination
+import com.negi.survey.utils.DeviceUploadTag
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
@@ -16,7 +21,7 @@ import kotlinx.coroutines.launch
 /** Best-effort, full-payload survey trace. It is deliberately independent of survey behavior. */
 class SurveyTrace private constructor(
     private val identity: TraceIdentity,
-    private val writer: TraceWriter
+    private val writer: DiagnosticTraceWriter
 ) {
     val finalizedFileName: String get() = writer.finalFileName
     fun event(name: String, answerTraceId: String? = null, questionId: String? = null, fields: Map<String, Any?> = emptyMap()) {
@@ -24,6 +29,10 @@ class SurveyTrace private constructor(
     }
 
     private fun eventUnsafe(name: String, answerTraceId: String?, questionId: String?, fields: Map<String, Any?>) {
+        if (writer is V2DiagnosticTraceWriter) {
+            writer.event(identity, "survey", name, answerTraceId, questionId, fields)
+            return
+        }
         val record = JSONObject().apply {
             put("traceVersion", 1)
             put("eventId", TraceIdentity.newEventId())
@@ -46,6 +55,21 @@ class SurveyTrace private constructor(
     suspend fun finalizeTrace(): File? = withContext(Dispatchers.IO) { writer.finalizeToGzip() }
 
     companion object {
+        internal fun openV2(context: Context, surveyId: String, destination: V2SurveyJsonDestination): SurveyTrace =
+            openV2(TraceIdentity.forSurvey(context.applicationContext, surveyId),
+                V2DiagnosticRouteStore(context.filesDir), destination)
+
+        internal fun openV2(
+            identity: TraceIdentity,
+            store: V2DiagnosticRouteStore,
+            destination: V2SurveyJsonDestination
+        ): SurveyTrace {
+            val capture = V2DiagnosticCapture.create(
+                identity.surveyId, DeviceUploadTag(identity.deviceTag), destination, V2DiagnosticStream.SURVEY
+            )
+            return SurveyTrace(identity, V2DiagnosticTraceWriter(store, capture))
+        }
+
         fun open(context: Context, surveyId: String): SurveyTrace {
             val identity = TraceIdentity.forSurvey(context.applicationContext, surveyId)
             val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
