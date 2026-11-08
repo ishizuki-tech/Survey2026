@@ -108,7 +108,8 @@ fun ReviewScreen(
     val reviewPresentations = remember(vm) {
         vm.questionPresentation.filter { vm.currentNode.value.type == NodeType.REVIEW }
     }
-    val presentation by reviewPresentations.collectAsState(initial = vm.questionPresentation.value)
+    val initialPresentation by vm.questionPresentation.collectAsState()
+    val presentation by reviewPresentations.collectAsState(initial = initialPresentation)
     val (listState, initialPlacement) = key(presentation) {
         val state = rememberLazyListState(initialFirstVisibleItemIndex = REVIEW_ACTIONS_INDEX)
         state to rememberInitialReviewPlacement(state)
