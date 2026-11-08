@@ -1,0 +1,12 @@
+{
+  "original_branch": "codex/issue-167-slm-navigation-lock",
+  "branch_slug": "codex-issue-167-slm-navigation-lock",
+  "commit_sha": "163c633c416f9bae4701671f94b1df2624183479",
+  "short_sha": "163c633",
+  "apk_name": "Survey2026-codex-issue-167-slm-navigation-lock-163c633.apk",
+  "apk_sha256": "cce2da06aeddef5f978e441b39886ada7b4c86d07a95c37ee9eed80bc6908dc2",
+  "apk_download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-codex-issue-167-slm-navigation-lock-163c633-run-203/Survey2026-codex-issue-167-slm-navigation-lock-163c633.apk",
+  "page_url": "https://ishizuki-tech.github.io/Survey2026/codex-issue-167-slm-navigation-lock/",
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/42451460985",
+  "generated_utc": "2026-11-08T05:42:30Z"
+}
