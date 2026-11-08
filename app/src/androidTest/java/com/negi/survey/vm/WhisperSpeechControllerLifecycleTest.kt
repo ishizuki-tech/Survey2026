@@ -10,6 +10,9 @@ import java.io.FileOutputStream
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.NonCancellable
@@ -41,7 +44,12 @@ class WhisperSpeechControllerLifecycleTest {
         controller.updateContext("survey-a", "Q8")
         controller.startRecording()
         waitUntil { recorder.started }
+        val lockedWhenCaptureEnded = async(Dispatchers.Unconfined, start = CoroutineStart.UNDISPATCHED) {
+            controller.isRecording.first { !it }
+            controller.isTranscribing.value
+        }
         controller.stopRecording()
+        assertTrue(withTimeout(5000) { lockedWhenCaptureEnded.await() })
         waitUntil { !controller.isTranscribing.value && controller.partialText.value == "recorded answer" }
 
         assertFalse(controller.isRecording.value)
@@ -133,6 +141,8 @@ class WhisperSpeechControllerLifecycleTest {
         waitUntil { recorder.started }
         controller.stopRecording()
         waitUntil { recorder.stopEntered.isCompleted && recorder.closeEntered.isCompleted }
+        withTimeout(5000) { controller.isTranscribing.first { !it } }
+        assertTrue(hasActiveSession(controller))
 
         controller.startRecording()
 
@@ -404,6 +414,7 @@ class WhisperSpeechControllerLifecycleTest {
         withTimeout(5000) { recorder.started.await() }
         controller.stopRecording()
         withTimeout(5000) { controller.errorMessage.first { it == "Recorder cleanup failed; restart the app before recording again" } }
+        withTimeout(5000) { controller.isTranscribing.first { !it } }
         controller.startRecording()
         assertEquals(1, recorder.closeCalls.get())
         assertTrue(hasActiveSession(controller))
@@ -464,8 +475,8 @@ class WhisperSpeechControllerLifecycleTest {
         recorder.allowClose.complete(Unit)
         withTimeout(5000) { gate.lock() }
         gate.unlock()
-        withTimeout(5000) { controller.isTranscribing.first { !it } }
-        assertEquals(null, controller.errorMessage.value)
+        withTimeout(5000) { controller.errorMessage.first { it == null } }
+        assertFalse(controller.isTranscribing.value)
         val nextRecorder = FakeRecorder()
         val next = WhisperSpeechController(
             appContext = context,

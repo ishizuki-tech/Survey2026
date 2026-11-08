@@ -187,7 +187,7 @@ fun DoneScreen(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
-                    SurveyActionButton(onClick = onRestart) {
+                    SurveyActionButton(onClick = onRestart, enabled = !LocalSurveyNavigationLocked.current) {
                         Text("Start New Survey")
                     }
                 }

@@ -267,6 +267,7 @@ fun ReviewScreen(
             // Bottom buttons (REVIEW_ACTIONS_INDEX).
             item {
                 val finishing = finalizationState is SurveyFinalizationState.Finishing
+                val navigationEnabled = !finishing && !LocalSurveyNavigationLocked.current
                 val error = (finalizationState as? SurveyFinalizationState.Error)?.message
                 FlowRow(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -277,7 +278,7 @@ fun ReviewScreen(
                 ) {
                     SurveyActionButton(
                         onClick = onBack,
-                        enabled = !finishing,
+                        enabled = navigationEnabled,
                         primary = false,
                         modifier = Modifier.weight(1f)
                     ) {
@@ -285,7 +286,7 @@ fun ReviewScreen(
                     }
                     SurveyActionButton(
                         onClick = onFinish,
-                        enabled = !finishing,
+                        enabled = navigationEnabled,
                         modifier = Modifier.weight(1f)
                     ) {
                         Text(if (finishing) "Finishing..." else "Finish")

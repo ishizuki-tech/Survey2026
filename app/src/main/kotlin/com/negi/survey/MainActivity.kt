@@ -25,9 +25,11 @@ import android.os.Bundle
 import android.os.SystemClock
 import android.provider.Settings
 import android.util.Log
+import androidx.activity.BackEventCompat
 import androidx.activity.ComponentActivity
+import androidx.activity.OnBackPressedCallback
 import androidx.activity.SystemBarStyle
-import androidx.activity.compose.BackHandler
+import androidx.activity.compose.LocalOnBackPressedDispatcherOwner
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -142,6 +144,7 @@ import com.negi.survey.screens.ConfigOptionUi
 import com.negi.survey.screens.ConsentScrollState
 import com.negi.survey.screens.DoneScreen
 import com.negi.survey.screens.IntroScreen
+import com.negi.survey.screens.LocalSurveyNavigationLocked
 import com.negi.survey.screens.ReviewScreen
 import com.negi.survey.screens.SpeechController
 import com.negi.survey.screens.rememberConsentScrollState
@@ -1297,7 +1300,7 @@ private class NoOpSpeechController(
 /* ───────────────────────────── Survey Nav Host ───────────────────────────── */
 
 @Composable
-fun SurveyNavHost(
+internal fun SurveyNavHost(
     vmSurvey: SurveyViewModel,
     vmAI: AiViewModel,
     backStack: NavBackStack<NavKey>,
@@ -1310,7 +1313,8 @@ fun SurveyNavHost(
     heavyRuntimeHandoff: HeavyRuntimeHandoff = NoOpHeavyRuntimeHandoff,
     uploadStatus: UploadStatus = UploadStatus(),
     onResolveUploadStatusDetails: suspend () -> UploadStatusDetails,
-    onClearCompletedSurveys: suspend (Set<String>) -> Unit
+    onClearCompletedSurveys: suspend (Set<String>) -> Unit,
+    speechControllerOverride: SpeechController? = null
 ) {
     val localContext = LocalContext.current
     val app = localContext.applicationContext as android.app.Application
@@ -1325,16 +1329,6 @@ fun SurveyNavHost(
     val finalizationState by finalizationVm.state.collectAsStateWithLifecycle()
     val finishTag = remember(appContext) { com.negi.survey.utils.DeviceUploadTagProvider.from(appContext) }
 
-    LaunchedEffect(finalizationState, vmSurvey.currentNodeId) {
-        if (
-            SurveyFinalizationStatePolicy.isAccepted(finalizationState) &&
-            vmSurvey.currentNode.value.type == NodeType.REVIEW
-        ) {
-            vmSurvey.advanceToNext()
-        }
-    }
-
-    val canGoBack by vmSurvey.canGoBack.collectAsStateWithLifecycle()
     val voiceEnabled = remember(whisperMeta.enabled) { whisperMeta.enabled ?: true }
     val latestNode by vmSurvey.currentNode.collectAsStateWithLifecycle()
     val latestNodeId = latestNode.id
@@ -1377,7 +1371,7 @@ fun SurveyNavHost(
     /** Keep the latest node id without forcing ViewModel recreation. */
     val latestNodeIdState = rememberUpdatedState(latestNodeId)
 
-    val speechController: SpeechController = if (voiceEnabled) {
+    val speechController: SpeechController = speechControllerOverride ?: if (voiceEnabled) {
         val factory = remember(appContext, assetPath, lang, vmSurvey) {
             WhisperSpeechController.provideFactory(
                 appContext = appContext,
@@ -1422,6 +1416,23 @@ fun SurveyNavHost(
     } else {
         remember {
             NoOpSpeechController("Voice input is disabled by configuration.")
+        }
+    }
+
+    val navigationLocked by speechController.isTranscribing.collectAsStateWithLifecycle()
+    SideEffect { vmSurvey.bindNavigationToTranscription(speechController.isTranscribing) }
+
+    fun guardedNavigation(action: () -> Unit): () -> Unit = {
+        if (!speechController.isTranscribing.value) action()
+    }
+
+    LaunchedEffect(finalizationState, vmSurvey.currentNodeId) {
+        if (
+            !speechController.isTranscribing.value &&
+            SurveyFinalizationStatePolicy.isAccepted(finalizationState) &&
+            vmSurvey.currentNode.value.type == NodeType.REVIEW
+        ) {
+            vmSurvey.advanceToNext()
         }
     }
 
@@ -1501,8 +1512,31 @@ fun SurveyNavHost(
         }
     }
 
-    Box(modifier = rootModifier) {
+    val nextQuestion = guardedNavigation {
+        runCatching { ttsController.stop() }
+        vmSurvey.advanceToNext()
+    }
+    val previousQuestion = guardedNavigation {
+        runCatching { ttsController.stop() }
+        vmSurvey.backToPrevious()
+    }
+
+    fun systemBack() {
+        if (speechController.isTranscribing.value || !vmSurvey.canGoBack.value) return
+        runCatching { speechController.stopRecording() }
+        // A Back press while recording can stop capture. A second press can leave once it settles.
+        if (speechController.isTranscribing.value) return
+        if (vmSurvey.currentNode.value.type == NodeType.AI) {
+            runCatching { ttsController.stop() }
+        }
+        vmAI.resetStates()
+        vmSurvey.backToPrevious()
+    }
+
+    CompositionLocalProvider(LocalSurveyNavigationLocked provides navigationLocked) {
         NavDisplay(
+            modifier = rootModifier,
+            onBack = ::systemBack,
             backStack = backStack,
             entryDecorators = listOf(rememberSaveableStateHolderNavEntryDecorator()),
             entryProvider = entryProvider {
@@ -1539,23 +1573,31 @@ fun SurveyNavHost(
                     }
 
                     suspend fun releaseSession() {
-                        if (BuildConfig.CROSS_SURVEY_REUSE && onEndSurveySession != null) {
-                            homeExit.exit(
-                                endSession = {
+                        fun requireUnlocked() {
+                            check(!speechController.isTranscribing.value)
+                        }
+
+                        homeExit.exit(
+                            endSession = {
+                                requireUnlocked()
+                                if (BuildConfig.CROSS_SURVEY_REUSE && onEndSurveySession != null) {
                                     ttsController.stop()
                                     speechController.stopRecording()
+                                    requireUnlocked()
                                     vmAI.resetStates()
                                     onEndSurveySession.invoke()
                                     heavyRuntimeHandoff.releaseWhisper()
-                                },
-                                onSuccess = onResetToSelector,
-                            )
-                        } else {
-                            runCatching { heavyRuntimeHandoff.releaseCurrent() }
-                                .onFailure { t -> Log.w(MainActivity.TAG, "Failed to release SLM on Home exit.", t) }
-                            vmAI.resetStates()
-                            onResetToSelector()
-                        }
+                                } else {
+                                    runCatching { heavyRuntimeHandoff.releaseCurrent() }
+                                        .onFailure { t -> Log.w(MainActivity.TAG, "Failed to release SLM on Home exit.", t) }
+                                    vmAI.resetStates()
+                                }
+                            },
+                            onSuccess = {
+                                requireUnlocked()
+                                onResetToSelector()
+                            },
+                        )
                     }
 
                     LaunchedEffect(exitAccepted) {
@@ -1579,7 +1621,7 @@ fun SurveyNavHost(
                         } else {
                             null
                         },
-                        onExit = {
+                        onExit = guardedNavigation {
                             if (exitAccepted) {
                                 homeExitScope.launch { releaseSession() }
                             } else if (vmSurvey.currentNode.value.type == NodeType.START) {
@@ -1591,7 +1633,7 @@ fun SurveyNavHost(
                                 )
                             }
                         },
-                        onNext = {
+                        onNext = guardedNavigation {
                             if (vmSurvey.currentNode.value.type == NodeType.START) {
                                 vmAI.resetStates(keepError = false)
                                 vmSurvey.advanceToNext()
@@ -1611,8 +1653,8 @@ fun SurveyNavHost(
                     InfoNodeScreen(
                         title = node.title,
                         text = node.question,
-                        onNext = { runCatching { ttsController.stop() }; vmSurvey.advanceToNext() },
-                        onBack = { runCatching { ttsController.stop() }; vmSurvey.backToPrevious() },
+                        onNext = nextQuestion,
+                        onBack = previousQuestion,
                         onReplay = { replayQuestion(node.id, node.question) },
                         isSpeaking = ttsSpeaking,
                     )
@@ -1624,7 +1666,7 @@ fun SurveyNavHost(
                     StopNodeScreen(
                         title = node.title,
                         message = node.question,
-                        onRestart = {
+                        onRestart = guardedNavigation {
                             Log.d(MainActivity.TAG, "Stop -> Start New Survey requested")
                             vmAI.resetStates()
                             vmSurvey.resetToStart()
@@ -1644,8 +1686,8 @@ fun SurveyNavHost(
                         question = node.question,
                         value = answers[node.id].orEmpty(),
                         onValueChange = { vmSurvey.setAnswer(it, node.id) },
-                        onNext = { runCatching { ttsController.stop() }; vmSurvey.advanceToNext() },
-                        onBack = { runCatching { ttsController.stop() }; vmSurvey.backToPrevious() },
+                        onNext = nextQuestion,
+                        onBack = previousQuestion,
                         onReplay = { replayQuestion(node.id, node.question) },
                         isSpeaking = ttsSpeaking
                     )
@@ -1665,14 +1707,15 @@ fun SurveyNavHost(
                         onSelect = { vmSurvey.setSingleChoice(it) },
                         otherTextOption = node.otherTextOption,
                         initialOtherText = node.decomposeSingleChoiceAnswer(answers[node.id]).otherText,
-                        onSubmit = { selection, otherText ->
+                        onSubmit = submit@{ selection, otherText ->
+                            if (speechController.isTranscribing.value) return@submit
                             node.composeSingleChoiceAnswer(selection, otherText)?.let { answer ->
                                 runCatching { ttsController.stop() }
                                 vmSurvey.setAnswer(answer, node.id)
                                 vmSurvey.advanceToNext()
                             }
                         },
-                        onBack = { runCatching { ttsController.stop() }; vmSurvey.backToPrevious() },
+                        onBack = previousQuestion,
                         onReplay = { replayQuestion(node.id, node.question) },
                         isSpeaking = ttsSpeaking,
                         consentScroll = consentScroll.takeIf { node.id == "Q00" }
@@ -1694,8 +1737,8 @@ fun SurveyNavHost(
                         onValueChange = { vmSurvey.setAnswer(it.filter(Char::isDigit), node.id) },
                         onSpecialSelect = { vmSurvey.setAnswer(it, node.id) },
                         canSubmit = node.isValidNumberAnswer(answer),
-                        onNext = { runCatching { ttsController.stop() }; vmSurvey.advanceToNext() },
-                        onBack = { runCatching { ttsController.stop() }; vmSurvey.backToPrevious() },
+                        onNext = nextQuestion,
+                        onBack = previousQuestion,
                         onReplay = { replayQuestion(node.id, node.question) },
                         isSpeaking = ttsSpeaking,
                     )
@@ -1712,13 +1755,13 @@ fun SurveyNavHost(
                         options = node.options,
                         selected = selected,
                         onToggle = { vmSurvey.toggleMultiChoice(it) },
-                        onNext = {
+                        onNext = guardedNavigation {
                             runCatching { ttsController.stop() }
                             val ans = selected.toList().sorted().joinToString(", ")
                             vmSurvey.setAnswer(ans, node.id)
                             vmSurvey.advanceToNext()
                         },
-                        onBack = { runCatching { ttsController.stop() }; vmSurvey.backToPrevious() },
+                        onBack = previousQuestion,
                         onReplay = { replayQuestion(node.id, node.question) },
                         isSpeaking = ttsSpeaking
                     )
@@ -1730,8 +1773,8 @@ fun SurveyNavHost(
                         nodeId = node.id,
                         vmSurvey = vmSurvey,
                         vmAI = vmAI,
-                        onNext = { runCatching { ttsController.stop() }; vmSurvey.advanceToNext() },
-                        onBack = { runCatching { ttsController.stop() }; vmSurvey.backToPrevious() },
+                        onNext = nextQuestion,
+                        onBack = previousQuestion,
                         speechController = speechController.takeIf { voiceEnabled },
                         ttsController = ttsController.takeIf { ttsEnabled },
                         playbackLifecycle = playbackLifecycle
@@ -1742,7 +1785,13 @@ fun SurveyNavHost(
                     ReviewScreen(
                         vm = vmSurvey,
                         finalizationState = finalizationState,
-                        onFinish = {
+                        onFinish = guardedNavigation {
+                            if (vmSurvey.currentNode.value.type != NodeType.REVIEW) return@guardedNavigation
+                            if (SurveyFinalizationStatePolicy.isAccepted(finalizationVm.state.value)) {
+                                // A fresh Finish can leave an already exported Review without staging twice.
+                                vmSurvey.advanceToNext()
+                                return@guardedNavigation
+                            }
                             val config = buildGitHubConfigOrNull()
                             val stamp = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.US).format(Date())
                             finalizationVm.finish(
@@ -1752,7 +1801,7 @@ fun SurveyNavHost(
                                 stamp = stamp
                             )
                         },
-                        onBack = { if (finalizationState !is SurveyFinalizationState.Finishing) vmSurvey.backToPrevious() }
+                        onBack = guardedNavigation { if (finalizationState !is SurveyFinalizationState.Finishing) vmSurvey.backToPrevious() }
                     )
                 }
 
@@ -1762,7 +1811,7 @@ fun SurveyNavHost(
                         uploadStatus = uploadStatus,
                         onResolveUploadStatusDetails = onResolveUploadStatusDetails,
                         onClearCompletedSurveys = onClearCompletedSurveys,
-                        onRestart = {
+                        onRestart = guardedNavigation {
                             Log.d(MainActivity.TAG, "Done -> Restart requested (return to selector)")
                             vmAI.resetStates()
                             vmSurvey.resetToStart()
@@ -1774,14 +1823,43 @@ fun SurveyNavHost(
         )
     }
 
-    BackHandler(enabled = canGoBack) {
-        Log.d(MainActivity.TAG, "BackHandler -> backToPrevious. session=$sessionId voice=$voiceEnabled")
-        if (vmSurvey.currentNode.value.type == NodeType.AI) {
-            runCatching { ttsController.stop() }
+    // Keep the callback registered at the root so Back cannot slip through before
+    // Compose observes the recording-to-transcription transition.
+    val backOwner = LocalOnBackPressedDispatcherOwner.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val latestBack by rememberUpdatedState<() -> Unit>(::systemBack)
+    DisposableEffect(backOwner, lifecycleOwner, speechController, vmSurvey) {
+        val dispatcher = backOwner?.onBackPressedDispatcher ?: return@DisposableEffect onDispose {}
+        val callback = object : OnBackPressedCallback(true) {
+            private var gestureStartedWhileLocked = false
+
+            override fun handleOnBackStarted(backEvent: BackEventCompat) {
+                gestureStartedWhileLocked = speechController.isTranscribing.value
+            }
+
+            override fun handleOnBackCancelled() {
+                gestureStartedWhileLocked = false
+            }
+
+            override fun handleOnBackPressed() {
+                val blocked = gestureStartedWhileLocked || speechController.isTranscribing.value
+                gestureStartedWhileLocked = false
+                if (blocked) return
+                if (vmSurvey.canGoBack.value) {
+                    latestBack()
+                } else {
+                    // Preserve the dispatcher's normal behavior at the unlocked root.
+                    isEnabled = false
+                    try {
+                        dispatcher.onBackPressed()
+                    } finally {
+                        isEnabled = true
+                    }
+                }
+            }
         }
-        runCatching { speechController.stopRecording() }
-        vmAI.resetStates()
-        vmSurvey.backToPrevious()
+        dispatcher.addCallback(lifecycleOwner, callback)
+        onDispose { callback.remove() }
     }
 }
 
@@ -1930,6 +2008,7 @@ private fun StopNodeScreen(
 
                 SurveyActionButton(
                     onClick = onRestart,
+                    enabled = !LocalSurveyNavigationLocked.current,
                     modifier = Modifier.fillMaxWidth(),
                 ) {
                     Text("Start New Survey")
@@ -2642,7 +2721,9 @@ private fun HomeScreen(
                     actionDeadlineMs > 0L &&
                     now >= actionDeadlineMs
 
-        if ((isRecording || isTranscribing) && !timedOut) {
+        if (isTranscribing || speechController.isTranscribing.value ||
+            (speechController.isRecording.value && !timedOut)
+        ) {
             return@LaunchedEffect
         }
 
@@ -2664,11 +2745,17 @@ private fun HomeScreen(
             delay(HOME_TRANSCRIPTION_SETTLE_GRACE_MS)
         }
 
+        // A stop may have started since the last collected state or during the grace period.
+        if (speechController.isTranscribing.value ||
+            (speechController.isRecording.value && !timedOut)
+        ) return@LaunchedEffect
+
         if (armCommit) {
-            if (utterance.isNotBlank()) {
+            val settledUtterance = speechController.partialText.value.trim()
+            if (settledUtterance.isNotBlank()) {
                 val merged = mergeFreeTextDraft(
-                    existing = freeText,
-                    utterance = utterance
+                    existing = vmSurvey.runFreeText.value,
+                    utterance = settledUtterance
                 )
                 vmSurvey.setRunFreeText(merged)
             }
@@ -2689,11 +2776,15 @@ private fun HomeScreen(
     }
 
     fun settleVoiceAndThen(action: SurveyNoteAction) {
-        if (pendingAction != null) return
-        runCatching { speechController.stopRecording() }
-        focusManager.clearFocus(force = true)
+        if (pendingAction != null || speechController.isTranscribing.value) return
+        if (speechController.isRecording.value) {
+            if (!prevRecording) partialAtRecordingStart = speechController.partialText.value.trim()
+            armCommit = true
+        }
         pendingAction = action
         actionDeadlineMs = SystemClock.elapsedRealtime() + HOME_ACTION_TIMEOUT_MS
+        runCatching { speechController.stopRecording() }
+        focusManager.clearFocus(force = true)
     }
 
     val speechStatusIsError = !speechError.isNullOrBlank()
@@ -2807,7 +2898,7 @@ private fun HomeScreen(
 /** Dedicated pseudo question id for Home screen free-text dictation context. */
 private const val HOME_FREE_TEXT_QID: String = "__home_free_text__"
 
-/** Maximum time a Survey Note action waits for an in-flight Home transcription. */
+/** Survey Note fallback deadline for settling outside active transcription. */
 private const val HOME_ACTION_TIMEOUT_MS: Long = 8_000L
 
 /** Small grace period for recording=false -> transcribing=true state transitions. */
