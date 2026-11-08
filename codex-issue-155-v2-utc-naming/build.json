@@ -1,0 +1,12 @@
+{
+  "original_branch": "codex/issue-155-v2-utc-naming",
+  "branch_slug": "codex-issue-155-v2-utc-naming",
+  "commit_sha": "c76431a28ee1b15081178a2b063dd8aa4b356bab",
+  "short_sha": "c76431a",
+  "apk_name": "Survey2026-codex-issue-155-v2-utc-naming-c76431a.apk",
+  "apk_sha256": "f956556f935a27fdf22c3243790aed8cefb256822d72486c5c16a04251d6c41e",
+  "apk_download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-codex-issue-155-v2-utc-naming-c76431a-run-209/Survey2026-codex-issue-155-v2-utc-naming-c76431a.apk",
+  "page_url": "https://ishizuki-tech.github.io/Survey2026/codex-issue-155-v2-utc-naming/",
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/42533655921",
+  "generated_utc": "2026-11-08T23:15:27Z"
+}
