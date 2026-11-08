@@ -50,11 +50,11 @@ internal fun SurveyQuestionAutoRead(
     val target = when (owner.nodeType) {
         NodeType.AI -> {
             val questions by survey.questions.collectAsState()
-            val answers by survey.answers.collectAsState()
+            val submittedOriginals by survey.submittedAiOriginals.collectAsState()
             val followups by survey.followups.collectAsState()
             val reasons by survey.aiReasons.collectAsState()
             resolveAiAutoReadTarget(
-                questions[owner.nodeId].orEmpty(), answers[owner.nodeId].orEmpty(),
+                questions[owner.nodeId].orEmpty(), owner.nodeId in submittedOriginals,
                 followups[owner.nodeId].orEmpty(), conversation?.collectAsState()?.value?.turnCompleted == true,
                 reasons[owner.nodeId]
             )
@@ -105,7 +105,7 @@ internal fun SurveyQuestionAutoRead(
             currentCoroutineContext().ensureActive()
             val currentTarget = if (isAi) {
                 resolveAiAutoReadTarget(
-                    survey.getQuestion(owner.nodeId), survey.getAnswer(owner.nodeId),
+                    survey.getQuestion(owner.nodeId), owner.nodeId in survey.submittedAiOriginals.value,
                     survey.followups.value[owner.nodeId].orEmpty(),
                     conversation?.value?.turnCompleted == true, survey.aiReasons.value[owner.nodeId]
                 )

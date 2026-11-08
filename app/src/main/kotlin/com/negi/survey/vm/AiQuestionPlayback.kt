@@ -17,13 +17,13 @@ internal fun pendingAiFollowup(entries: List<SurveyViewModel.FollowupEntry>) =
 
 internal fun resolveAiAutoReadTarget(
     rootQuestion: String,
-    originalAnswer: String,
+    originalSubmitted: Boolean,
     followups: List<SurveyViewModel.FollowupEntry>,
     completed: Boolean,
     reason: SurveyAiReason? = null
 ): QuestionPlaybackTarget? {
     if (completed || reason?.terminal == true || reason == SurveyAiReason.FAILURE) return null
     pendingAiFollowup(followups)?.let { return QuestionPlaybackTarget(it.question, it) }
-    return rootQuestion.takeIf { it.isNotBlank() && originalAnswer.isBlank() && followups.isEmpty() }
+    return rootQuestion.takeIf { it.isNotBlank() && !originalSubmitted && followups.isEmpty() }
         ?.let { QuestionPlaybackTarget(it) }
 }

@@ -4,8 +4,14 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.test.junit4.v2.createComposeRule
+import androidx.compose.ui.test.assertTextContains
+import androidx.compose.ui.test.hasSetTextAction
+import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollTo
+import androidx.compose.ui.test.performTextClearance
+import androidx.compose.ui.test.performTextReplacement
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewmodel.compose.LocalViewModelStoreOwner
 import androidx.navigation3.runtime.rememberNavBackStack
@@ -24,6 +30,7 @@ import com.negi.survey.vm.TtsController
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
 import org.junit.Assert.assertEquals
@@ -42,6 +49,7 @@ class SurveyQuestionAutoReadDeviceTest {
         val starts = MutableStateFlow(0)
         lateinit var survey: SurveyViewModel
         lateinit var controller: TtsController
+        lateinit var ai: AiViewModel
 
         rule.setContent {
             val context = LocalContext.current
@@ -54,11 +62,11 @@ class SurveyQuestionAutoReadDeviceTest {
                     setAnswer("3", "Q06")
                 }
             }
-            val ai = remember {
+            ai = remember {
                 AiViewModel(object : Repository {
                     override fun buildPrompt(userPrompt: String) = userPrompt
                     override suspend fun request(prompt: String, traceContext: RepositoryTraceContext?): Flow<String> =
-                        error("This playback fixture does not run inference")
+                        flowOf("""{"score":95,"missing_points":[],"followup_needed":false}""")
                 })
             }
             SurveyNavTheme {
@@ -86,19 +94,18 @@ class SurveyQuestionAutoReadDeviceTest {
             assertEquals(expected, starts.value)
         }
 
-        fun assertFailureReentryStaysSilent(route: String, expectedStarts: Int) {
+        fun assertStaysSilent(route: String, nodeId: String, expectedStarts: Int) {
             rule.runOnIdle {
                 assertTrue("$route requires a ready TTS engine", controller.isReady.value)
-                assertEquals("Q07", survey.currentNodeId)
-                assertEquals(SurveyAiReason.FAILURE, survey.aiReasons.value["Q07"])
+                assertEquals(nodeId, survey.currentNodeId)
             }
-            // Keep Q07 in view while the real engine has time to start any queued utterance.
+            // Allow the real engine time to start any queued utterance.
             val unexpectedStart = runBlocking {
                 withTimeoutOrNull(3_000) { starts.first { it != expectedStarts } }
             }
             assertNull("$route started TTS during the three-second observation window", unexpectedStart)
             rule.runOnIdle {
-                assertEquals("Q07", survey.currentNodeId)
+                assertEquals(nodeId, survey.currentNodeId)
                 assertEquals("$route must remain silent", expectedStarts, starts.value)
             }
         }
@@ -113,7 +120,7 @@ class SurveyQuestionAutoReadDeviceTest {
         }
         awaitUtterance(3) // Q06 again
         rule.onNodeWithText("Next").performClick()
-        assertFailureReentryStaysSilent("Q06 → Q07", expectedStarts = 3)
+        assertStaysSilent("Q06 → Q07 with FAILURE", "Q07", expectedStarts = 3)
         rule.runOnIdle {
             survey.setAnswer("Saved answer", "Q07")
             assertTrue(survey.addFollowupQuestion("Q07", "Historical follow-up?"))
@@ -124,13 +131,48 @@ class SurveyQuestionAutoReadDeviceTest {
             assertEquals("Q08", survey.currentNodeId)
             survey.backToPrevious()
         }
-        assertFailureReentryStaysSilent("Q08 → Q07", expectedStarts = 4)
+        assertStaysSilent("Q08 → Q07 with FAILURE", "Q07", expectedStarts = 4)
         rule.onNodeWithText("🔊").performClick()
         awaitUtterance(5) // Manual Replay on Failure
         rule.runOnIdle {
+            ai.beginValidationTurn("sid=${survey.sessionId.value}|nid=Q07")
             assertTrue(survey.addFollowupQuestion("Q07", "New follow-up after retry?"))
             survey.setAiReason("Q07", null)
         }
         awaitUtterance(6)
+
+        val editor = rule.onNode(hasSetTextAction())
+        val next = rule.onNodeWithText("Next")
+        val back = rule.onNodeWithText("Back")
+        editor.performTextReplacement("Unsent follow-up draft")
+        next.performScrollTo().performClick()
+        awaitUtterance(7) // Q08
+        back.performScrollTo().performClick()
+        awaitUtterance(8) // Q07 follow-up with draft
+        editor.assertTextContains("Unsent follow-up draft")
+        next.performScrollTo().performClick()
+        awaitUtterance(9) // Q08
+
+        editor.performTextReplacement("Three bags")
+        next.performScrollTo().performClick()
+        awaitUtterance(10) // Q09
+        back.performScrollTo().performClick()
+        awaitUtterance(11) // Q08 original with draft
+        editor.assertTextContains("Three bags")
+        editor.performTextReplacement("Four bags")
+        editor.performTextClearance()
+        assertStaysSilent("Editing and clearing the Q08 draft", "Q08", expectedStarts = 11)
+
+        editor.performTextReplacement("Three bags")
+        rule.onNodeWithContentDescription("Send").performClick()
+        rule.waitUntil(5_000) { "Q08" in survey.submittedAiOriginals.value && !ai.blocksNavigation() }
+        rule.runOnIdle {
+            assertEquals("Three bags", survey.getAnswer("Q08"))
+            assertTrue(survey.followups.value["Q08"].isNullOrEmpty())
+        }
+        next.performScrollTo().performClick()
+        awaitUtterance(12) // Q09
+        back.performScrollTo().performClick()
+        assertStaysSilent("Q09 → Q08 after Send", "Q08", expectedStarts = 12)
     }
 }

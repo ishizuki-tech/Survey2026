@@ -11,33 +11,35 @@ class AiQuestionPlaybackTest {
 
     @Test fun originalPlaysOnlyWhenUnansweredAndThereIsNoFollowupHistory() {
         assertEquals("Original?", select()?.text)
-        assertNull(select(answer = "Original answer"))
+        assertNull(select(submitted = true))
         assertNull(select(entries = listOf(first.copy(answer = "First answer"))))
-        assertNull(resolveAiAutoReadTarget(" ", "", emptyList(), completed = false))
+        assertNull(resolveAiAutoReadTarget(" ", false, emptyList(), completed = false))
     }
 
     @Test fun latestUnansweredFollowupTakesPriorityOverOriginalAndAnsweredEntries() {
         assertEquals(first, select(entries = listOf(first))?.followup)
         assertEquals(second, select(entries = listOf(first, second))?.followup)
-        assertEquals(second, select("Original answer", listOf(first.copy(answer = "First answer"), second))?.followup)
+        assertEquals(second, select(true, listOf(first.copy(answer = "First answer"), second))?.followup)
         assertEquals(first, select(entries = listOf(first, second.copy(answer = "Second answer")))?.followup)
     }
 
     @Test fun completionTakesPriorityOverAnyTarget() {
         assertNull(select(completed = true))
         assertNull(select(entries = listOf(first), completed = true))
+        assertNull(select(reason = SurveyAiReason.ACHIEVED))
+        assertNull(select(entries = listOf(first), reason = SurveyAiReason.ACHIEVED))
     }
 
     @Test fun failureSuppressesOriginalAndStaleFollowupUntilOutcomeClears() {
         assertNull(select(reason = SurveyAiReason.FAILURE))
-        assertNull(select("Original answer", listOf(first), reason = SurveyAiReason.FAILURE))
-        assertEquals(second, select("Original answer", listOf(first, second))?.followup)
+        assertNull(select(true, listOf(first), reason = SurveyAiReason.FAILURE))
+        assertEquals(second, select(true, listOf(first, second))?.followup)
     }
 
     private fun select(
-        answer: String = "",
+        submitted: Boolean = false,
         entries: List<FollowupEntry> = emptyList(),
         completed: Boolean = false,
         reason: SurveyAiReason? = null
-    ) = resolveAiAutoReadTarget("Original?", answer, entries, completed, reason)
+    ) = resolveAiAutoReadTarget("Original?", submitted, entries, completed, reason)
 }

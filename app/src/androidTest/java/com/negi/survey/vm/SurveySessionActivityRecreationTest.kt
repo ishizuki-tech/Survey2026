@@ -91,13 +91,12 @@ class SurveySessionActivityRecreationTest {
             survey = ViewModelProvider(owner, surveyFactory(NavBackStack<NavKey>(FlowHome)))["survey", SurveyViewModel::class.java]
 
             survey.advanceToNext()
-            survey.setAnswer("kept answer", "Q1")
-            survey.addFollowupQuestion("Q1", "Pending?")
+            survey.setAnswer("kept draft", "Q1")
             assertEquals("Q1", survey.currentNodeId)
             playbackOwner = survey.questionSpeechOwner()
             target = checkNotNull(resolveAiAutoReadTarget(
-                survey.getQuestion("Q1"), survey.getAnswer("Q1"),
-                survey.followups.value.getValue("Q1"), completed = false
+                survey.getQuestion("Q1"), "Q1" in survey.submittedAiOriginals.value,
+                emptyList(), completed = false
             ))
             assertTrue(survey.claimQuestionAutoRead(playbackOwner, target))
         }
@@ -112,7 +111,7 @@ class SurveySessionActivityRecreationTest {
             assertSame(firstOwnerStore, owner.viewModelStore)
             assertSame(survey, restoredSurvey)
             assertEquals("Q1", restoredSurvey.currentNodeId)
-            assertEquals("kept answer", restoredSurvey.getAnswer("Q1"))
+            assertEquals("kept draft", restoredSurvey.getAnswer("Q1"))
 
             val restoredNav = NavBackStack<NavKey>(FlowHome, FlowAI)
             restoredSurvey.attachNavigation(restoredNav)

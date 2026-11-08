@@ -898,7 +898,7 @@ fun AiScreen(
             speechController?.isTranscribing?.value == true
 
     fun acceptAnswer(input: String, role: AiViewModel.ComposerRole): Boolean {
-        if (input.isBlank()) return false
+        if (input.isBlank() || !ownsPresentation()) return false
         if (role == AiViewModel.ComposerRole.FOLLOWUP) {
             val pending = pendingAiFollowup(vmSurvey.followups.value[nid].orEmpty())
             if (pending?.question != conversation.value.activePromptQuestion) return false
@@ -910,7 +910,7 @@ fun AiScreen(
             if (isTwoStepNode && !vmSurvey.consumeAcceptedVoiceTransaction(nid)) {
                 vmSurvey.beginAnswerTransaction(nid, inputSource = "typed")
             }
-            vmSurvey.setAnswer(input, nid)
+            vmSurvey.acceptAiOriginalAnswer(nid, input)
         }
         submittedInPresentation = true
         vmAI.appendUserMessage(contextKey, input)
