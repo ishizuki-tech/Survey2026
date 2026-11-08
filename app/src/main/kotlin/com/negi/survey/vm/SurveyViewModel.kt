@@ -1086,14 +1086,20 @@ open class SurveyViewModel(
     }
 
     private var transcriptionState: StateFlow<Boolean>? = null
+    private var aiNavigationLocked: () -> Boolean = { false }
 
     /** Keep programmatic navigation on the same live state as the survey host. */
     @Synchronized
-    internal fun bindNavigationToTranscription(state: StateFlow<Boolean>) {
-        transcriptionState = state
+    internal fun bindNavigationToProcessing(
+        transcription: StateFlow<Boolean>,
+        aiLocked: () -> Boolean = { false },
+    ) {
+        transcriptionState = transcription
+        aiNavigationLocked = aiLocked
     }
 
-    private fun navigationLocked(): Boolean = transcriptionState?.value == true
+    @Synchronized
+    internal fun navigationLocked(): Boolean = transcriptionState?.value == true || aiNavigationLocked()
 
     @Synchronized
     fun goto(nodeId: String) {

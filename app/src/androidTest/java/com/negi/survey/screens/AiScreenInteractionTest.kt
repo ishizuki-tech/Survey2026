@@ -1,6 +1,9 @@
 package com.negi.survey.screens
 
+import androidx.activity.BackEventCompat
+import androidx.activity.OnBackPressedDispatcher
 import androidx.activity.compose.LocalActivity
+import androidx.activity.compose.LocalOnBackPressedDispatcherOwner
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
@@ -92,7 +95,9 @@ import android.content.ClipboardManager
 import android.view.KeyEvent
 import android.view.View
 import android.view.ViewConfiguration
+import android.view.Window
 import android.view.WindowManager
+import com.negi.survey.SurveyNavHost
 import com.negi.survey.config.NodeDTO
 import com.negi.survey.config.SurveyConfig
 import com.negi.survey.slm.Repository
@@ -131,6 +136,8 @@ class AiScreenInteractionTest {
     @get:Rule val rule = createComposeRule()
     private lateinit var survey: SurveyViewModel
     private lateinit var ai: AiViewModel
+    private lateinit var backDispatcher: OnBackPressedDispatcher
+    private lateinit var surveyWindow: Window
     private lateinit var hostView: View
     private lateinit var playbackLifecycle: LifecycleRegistry
     private val speech = FakeSpeech()
@@ -154,12 +161,14 @@ class AiScreenInteractionTest {
         constrainedHeight: Dp = 580.dp,
         restoration: StateRestorationTester? = null,
         useNavDisplay: Boolean = false,
+        useSurveyNavHost: Boolean = false,
+        aiTimeoutMs: Long? = null,
         initialNode: String = "Q8",
         productionImeInsets: Boolean = false,
         onKeyboardShow: (() -> Unit)? = null,
         seed: SurveyViewModel.() -> Unit = {}
     ) {
-        val content: @Composable () -> Unit = {
+        val content: @Composable () -> Unit = content@{
             hostView = LocalView.current
             val keyboard = LocalSoftwareKeyboardController.current
             val observedKeyboard = remember(keyboard, onKeyboardShow) {
@@ -192,7 +201,25 @@ class AiScreenInteractionTest {
                 }
             }
             ai = remember {
-                if (restoration != null && ::ai.isInitialized) ai else AiViewModel(repo)
+                if (restoration != null && ::ai.isInitialized) ai
+                else if (aiTimeoutMs != null) AiViewModel(repo, defaultTimeoutMs = aiTimeoutMs)
+                else AiViewModel(repo)
+            }
+            if (useSurveyNavHost) {
+                surveyWindow = checkNotNull(LocalActivity.current).window
+                backDispatcher = checkNotNull(LocalOnBackPressedDispatcherOwner.current).onBackPressedDispatcher
+                SurveyNavTheme {
+                    SurveyNavHost(
+                        vmSurvey = survey,
+                        vmAI = ai,
+                        backStack = stack,
+                        ttsMeta = SurveyConfig.TtsMeta(enabled = false),
+                        onResolveUploadStatusDetails = { error("Unused") },
+                        onClearCompletedSurveys = {},
+                        speechControllerOverride = speech,
+                    )
+                }
+                return@content
             }
             val node by survey.currentNode.collectAsState()
             // Read unrelated state to force an ordinary parent recomposition.
@@ -695,8 +722,10 @@ class AiScreenInteractionTest {
         rule.waitUntil(5_000) { repo.requests == 2 }
         val score = chatRows().single { it.json == NEEDS_FOLLOWUP }
         val slot = assertScorePrecedesPreparation(score)
+        rule.onNodeWithText("Back").performScrollTo().assertIsNotEnabled()
         failed.finish(IllegalStateException("generation failed"))
         assertUnavailableFollowup(score, slot)
+        assertEquals("Q07", survey.currentNodeId)
 
         scrollManuallyTo(chatRows().lastIndex)
         rule.onNodeWithText("Q07 original question").assertIsDisplayed()
@@ -717,59 +746,133 @@ class AiScreenInteractionTest {
         rule.onNodeWithTag("restored-outcome-Q07").assertDoesNotExist()
     }
 
-    @Test fun backDuringReviewingOrPreparingReturnsToTheLatestRetainedQ07Row() {
+    @Test fun navigationIsRejectedDuringSubmissionReviewAndFollowupPreparation() {
         val reviewing = ControlledResponse()
-        val retryEvaluation = ControlledResponse()
         val preparing = ControlledResponse()
-        repo.streamedResponses = listOf(reviewing, retryEvaluation, preparing)
-        host(twoStep = true, useNavDisplay = true, initialNode = "Q06")
+        repo.streamedResponses = listOf(reviewing, preparing)
+        host(twoStep = true, useSurveyNavHost = true, initialNode = "Q06")
         rule.runOnIdle { survey.advanceToNext() }
         assertQuestionFits("Q07 original question")
-        rule.runOnIdle {
-            repeat(14) { ai.appendUserMessage(contextKey, "Earlier survey context. ".repeat(24)) }
+        val key = contextKey
+        val uuid = survey.surveyUuid.value
+        val back = rule.onNodeWithText("Back")
+        val next = rule.onNodeWithText("Next")
+        val staleBack = clickAction(back.performScrollTo().assertIsEnabled())
+        val staleNext = clickAction(next.performScrollTo().assertIsEnabled())
+
+        fun rejectNavigation() {
+            val stops = speech.stopCalls
+            val answers = survey.answers.value
+            val followups = survey.followups.value
+            val conversation = ai.conversationStateFlow(key).value
+            val rows = ai.chatHistoryFlow(key).value
+            staleBack()
+            staleNext()
+            backDispatcher.onBackPressed()
+            survey.backToPrevious()
+            survey.advanceToNext()
+            survey.goto("Q08")
+            survey.replaceTo("Q08")
+            survey.resetToStart()
+            assertEquals("Q07", survey.currentNodeId)
+            assertEquals(uuid, survey.surveyUuid.value)
+            assertEquals(answers, survey.answers.value)
+            assertEquals(followups, survey.followups.value)
+            assertEquals(conversation, ai.conversationStateFlow(key).value)
+            assertEquals(rows, ai.chatHistoryFlow(key).value)
+            assertEquals(stops, speech.stopCalls)
         }
 
-        enterAndSend("main answer")
-        sendChunk(reviewing, NEEDS_FOLLOWUP.take(8), expected = NEEDS_FOLLOWUP.take(8))
-        val q07History = ai.chatHistoryFlow(contextKey)
-        val scan = q07History.value.last()
-        assertEquals(AiViewModel.EvaluationPresentation.REVIEWING, scan.evaluation)
-        rule.onNodeWithText("Reviewing your answer…").assertIsDisplayed()
-        assertLatestEdgeVisible(scan.id)
-        rule.onNodeWithText("Next").performScrollTo().assertIsNotEnabled()
+        fun startPredictiveBack() {
+            backDispatcher.dispatchOnBackStarted(BackEventCompat(0f, 250f, 0f, BackEventCompat.EDGE_LEFT))
+            backDispatcher.dispatchOnBackProgressed(BackEventCompat(80f, 250f, 0.5f, BackEventCompat.EDGE_LEFT))
+        }
 
-        fun returnFromExperience(cancelledId: String) {
-            rule.onNodeWithText("Back").performScrollTo().assertIsEnabled().performClick()
-            rule.onNodeWithText("Experience").assertIsDisplayed()
+        fun assertActiveNavigationLocked() {
+            back.performScrollTo().assertIsNotEnabled()
+            next.performScrollTo().assertIsNotEnabled()
             rule.runOnIdle {
-                assertEquals("Q06", survey.currentNodeId)
-                assertTrue(!ai.isRunning)
-                assertTrue(q07History.value.none { it.id == cancelledId })
-                survey.advanceToNext()
+                rejectNavigation()
+                assertTrue(ai.isRunning)
             }
-            rule.onNodeWithTag(cancelledId).assertDoesNotExist()
+            InstrumentationRegistry.getInstrumentation().sendKeyDownUpSync(KeyEvent.KEYCODE_BACK)
+            rule.runOnIdle {
+                assertEquals("Q07", survey.currentNodeId)
+                assertTrue(ai.isRunning)
+            }
         }
 
-        returnFromExperience(scan.id)
-        assertLatestEdgeVisible("restored-outcome-Q07")
-        rule.onNodeWithText("AI review unavailable").assertIsDisplayed()
-        runSavedAnswerEvaluation()
+        rule.onNodeWithText("Type").performClick()
+        rule.onNode(hasSetTextAction()).performTextInput("main answer")
+        val send = clickAction(rule.onNodeWithContentDescription("Send").assertIsEnabled())
+        rule.runOnIdle {
+            send()
+            assertTrue(ai.submissionPending.value)
+            assertTrue(!ai.isRunning)
+            rejectNavigation()
+            send()
+            assertEquals("main answer", survey.getAnswer("Q07"))
+            assertEquals(listOf("main answer"), userMessages())
+            WindowCompat.getInsetsController(surveyWindow, hostView)
+                .hide(WindowInsetsCompat.Type.ime())
+        }
+        waitForKeyboard(visible = false)
 
-        sendChunk(retryEvaluation, NEEDS_FOLLOWUP, expected = NEEDS_FOLLOWUP)
-        retryEvaluation.finish()
-        rule.waitUntil(5_000) { repo.requests == 3 }
-        val score = q07History.value.single { it.json == NEEDS_FOLLOWUP }
+        sendChunk(reviewing, NEEDS_FOLLOWUP, expected = NEEDS_FOLLOWUP)
+        val scan = chatRows().last()
+        assertEquals(AiViewModel.EvaluationPresentation.REVIEWING, scan.evaluation)
+        assertLatestEdgeVisible(scan.id)
+        assertActiveNavigationLocked()
+        rule.runOnIdle {
+            startPredictiveBack()
+            backDispatcher.onBackPressed()
+            assertEquals("Q07", survey.currentNodeId)
+            assertTrue(ai.isRunning)
+        }
+        reviewing.finish()
+
+        rule.waitUntil(5_000) { repo.requests == 2 }
+        val score = chatRows().single { it.json == NEEDS_FOLLOWUP }
         val slot = assertScorePrecedesPreparation(score)
         assertLatestEdgeVisible(slot.id)
+        assertActiveNavigationLocked()
+        rule.runOnIdle { startPredictiveBack() }
+        sendChunk(preparing, FIRST_FOLLOWUP, expected = FIRST_FOLLOWUP)
+        preparing.finish()
 
-        returnFromExperience(slot.id)
-        assertLatestEdgeVisible("restored-outcome-Q07")
-        rule.onNodeWithText("AI review unavailable").assertIsDisplayed()
-        assertTrue(score in q07History.value)
-        rule.onNodeWithText(PREPARING_FOLLOWUP).assertDoesNotExist()
+        rule.waitUntil(5_000) { !ai.blocksNavigation() }
+        next.performScrollTo().assertIsEnabled()
+        back.performScrollTo().assertIsEnabled()
+        rule.runOnIdle {
+            backDispatcher.onBackPressed()
+            assertEquals("Q07", survey.currentNodeId)
+            assertEquals(uuid, survey.surveyUuid.value)
+            assertEquals("main answer", survey.getAnswer("Q07"))
+            assertEquals(listOf("main answer"), userMessages())
+            assertEquals(2, repo.requests)
+        }
+        rule.onNodeWithText(FIRST_FOLLOWUP).assertExists()
+        back.performClick()
+        rule.runOnIdle { assertEquals("Q06", survey.currentNodeId) }
     }
 
-    @Test fun backDuringOneStepTypingReturnsToTheLatestRetainedAnswer() {
+    private fun clickAction(node: SemanticsNodeInteraction): () -> Boolean =
+        checkNotNull(node.fetchSemanticsNode().config[SemanticsActions.OnClick].action)
+
+    @Test fun evaluationTimeoutUnlocksWithoutNavigating() {
+        repo.streamedResponses = listOf(ControlledResponse())
+        host(twoStep = true, useSurveyNavHost = true, aiTimeoutMs = 3_000L)
+        rule.onNodeWithText("Type").performClick()
+        rule.onNode(hasSetTextAction()).performTextInput("main answer")
+        rule.onNodeWithContentDescription("Send").performClick()
+        rule.waitUntil(8_000) { repo.requests == 1 && !ai.blocksNavigation() }
+        assertEquals(SurveyAiReason.FAILURE, survey.aiReasons.value["Q8"])
+        assertEquals("Q8", survey.currentNodeId)
+        rule.onNodeWithText("Next").performScrollTo().assertIsEnabled().performClick()
+        rule.runOnIdle { assertEquals("Q9", survey.currentNodeId) }
+    }
+
+    @Test fun cancellingOneStepTypingUnlocksBackAndRetainsTheAnswer() {
         val typing = ControlledResponse()
         repo.streamedResponses = listOf(typing)
         host(useNavDisplay = true)
@@ -782,6 +885,10 @@ class AiScreenInteractionTest {
         assertTrue(typingRow.isTyping)
         assertLatestEdgeVisible(typingRow.id)
 
+        rule.onNodeWithText("Back").performScrollTo().assertIsNotEnabled()
+        rule.runOnIdle { ai.cancel() }
+        rule.waitUntil(5_000) { !ai.blocksNavigation() }
+        assertEquals("Q8", survey.currentNodeId)
         rule.onNodeWithText("Back").performScrollTo().assertIsEnabled().performClick()
         rule.onNodeWithText("Home").assertIsDisplayed()
         rule.waitUntil(5_000) { history.value.none { it.isTyping } }
