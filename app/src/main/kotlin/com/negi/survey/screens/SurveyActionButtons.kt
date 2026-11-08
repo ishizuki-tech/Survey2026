@@ -19,8 +19,11 @@ import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+
+internal val LocalSurveyNavigationLocked = compositionLocalOf { false }
 
 @Composable
 internal fun SurveyActionButton(
@@ -49,6 +52,7 @@ internal fun SurveyNavigationButtons(
     primaryEnabled: Boolean = true,
     secondaryEnabled: Boolean = true
 ) {
+    val navigationLocked = LocalSurveyNavigationLocked.current
     FlowRow(
         modifier = modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.SpaceBetween,
@@ -57,7 +61,7 @@ internal fun SurveyNavigationButtons(
         SurveyActionButton(
             onClick = onSecondary,
             modifier = Modifier.widthIn(min = 112.dp),
-            enabled = secondaryEnabled,
+            enabled = secondaryEnabled && !navigationLocked,
             primary = false
         ) {
             Icon(Icons.AutoMirrored.Outlined.NavigateBefore, secondaryLabel, Modifier.size(24.dp))
@@ -67,7 +71,7 @@ internal fun SurveyNavigationButtons(
         SurveyActionButton(
             onClick = onPrimary,
             modifier = Modifier.widthIn(min = 112.dp),
-            enabled = primaryEnabled
+            enabled = primaryEnabled && !navigationLocked
         ) {
             Text(primaryLabel, modifier = Modifier.weight(1f, fill = false))
             Spacer(Modifier.width(8.dp))

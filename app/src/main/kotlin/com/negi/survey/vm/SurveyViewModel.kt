@@ -1085,8 +1085,19 @@ open class SurveyViewModel(
         RuntimeLogStore.d(TAG, "attachNavigation -> navSize=${nav.size}")
     }
 
+    private var transcriptionState: StateFlow<Boolean>? = null
+
+    /** Keep programmatic navigation on the same live state as the survey host. */
+    @Synchronized
+    internal fun bindNavigationToTranscription(state: StateFlow<Boolean>) {
+        transcriptionState = state
+    }
+
+    private fun navigationLocked(): Boolean = transcriptionState?.value == true
+
     @Synchronized
     fun goto(nodeId: String) {
+        if (navigationLocked()) return
         val k = nodeId.trim()
         activateRunIfNeeded(reason = "goto:$k")
         val node = nodeOf(k)
@@ -1096,6 +1107,7 @@ open class SurveyViewModel(
 
     @Synchronized
     fun replaceTo(nodeId: String) {
+        if (navigationLocked()) return
         val k = nodeId.trim()
         activateRunIfNeeded(reason = "replaceTo:$k")
         val node = nodeOf(k)
@@ -1131,6 +1143,7 @@ open class SurveyViewModel(
      */
     @Synchronized
     fun resetToStart(preserveSessionFreeText: Boolean = false) {
+        if (navigationLocked()) return
         val keptDraft = if (preserveSessionFreeText) {
             normalizeRunFreeText(_runFreeText.value)
         } else {
@@ -1180,6 +1193,7 @@ open class SurveyViewModel(
 
     @Synchronized
     fun backToPrevious() {
+        if (navigationLocked()) return
         if (nodeStack.size <= 1) {
             RuntimeLogStore.d(TAG, "backToPrevious: at root (no-op)")
             return
@@ -1206,6 +1220,7 @@ open class SurveyViewModel(
 
     @Synchronized
     fun advanceToNext() {
+        if (navigationLocked()) return
         val cur = _currentNode.value
         val nextId = cur.resolveNextId(getAnswer(cur.id)).orEmpty().trim()
         if (nextId.isBlank()) {

@@ -228,8 +228,9 @@ class WhisperSpeechController(
             Log.d(TAG, "startRecording: busy, ignoring")
             return
         }
-        if (activeSession.get() != null) {
-            _error.value = "Previous recording is still finalizing"
+        val active = activeSession.get()
+        if (active != null) {
+            if (!active.poisoned) _error.value = "Previous recording is still finalizing"
             Log.w(TAG, "startRecording: active session is still finalizing, ignoring")
             return
         }
@@ -329,22 +330,24 @@ class WhisperSpeechController(
 
     override fun stopRecording() {
         val session = activeSession.get()
-        if (!_isRecording.value || session == null) {
+        if (session == null) {
             Log.d(TAG, "stopRecording: not recording, ignoring")
             return
         }
 
-        Log.d(TAG, "recording stop requested elapsedMs=${SystemClock.elapsedRealtime()} session=${session.id}")
         synchronized(session) {
+            if (!owns(session) || !_isRecording.value) return
+            Log.d(TAG, "recording stop requested elapsedMs=${SystemClock.elapsedRealtime()} session=${session.id}")
+            // Publish the lock before ending capture so observers never see an idle gap.
+            _isTranscribing.value = true
             _isRecording.value = false
             _isCaptureActive.value = false
-            _isTranscribing.value = true
         }
 
         session.workerJob = viewModelScope.launch(Dispatchers.IO, start = CoroutineStart.LAZY) {
             session.startupJob?.join()
             recordingMutex.withLock {
-                if (!owns(session)) return@withLock
+                if (!owns(session) || session.poisoned || session.recorderFailed) return@withLock
                 var localWav: File? = null
                 try {
                     val t0 = SystemClock.elapsedRealtime()
@@ -522,9 +525,10 @@ class WhisperSpeechController(
                             }
                     }
                     if (!session.poisoned) closeRecorderOrMonitor(session)
-                    if (owns(session) && !session.poisoned) {
+                    if (owns(session)) {
+                        // Transcription has ended even if a failed recorder must stay reserved.
+                        if (!session.poisoned) activeSession.compareAndSet(session, null)
                         _isTranscribing.value = false
-                        activeSession.compareAndSet(session, null)
                     }
                     deleteTempFileQuietly(localWav, reason = "stop_finally")
                 }
@@ -698,7 +702,6 @@ class WhisperSpeechController(
                 _error.value = e.message ?: "Recording error"
                 _isRecording.value = false
                 _isCaptureActive.value = false
-                _isTranscribing.value = false
             }
 
             cleanupScope.launch {
@@ -711,6 +714,7 @@ class WhisperSpeechController(
                             session.poisoned = true
                             closePoisonedSessionAsync(session)
                             runCatching { finishWhisperSession(session) }
+                            _isTranscribing.value = false
                         }
                     }
                 }

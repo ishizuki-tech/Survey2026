@@ -1301,8 +1301,8 @@ fun AiScreen(
                                     if (canAdvanceAiTurn(
                                             aiLoading = loading,
                                             mainSubmissionPending = submissionPending,
-                                            speechRecording = speechRecording,
-                                            speechTranscribing = speechTranscribing,
+                                            speechRecording = speechController?.isRecording?.value == true,
+                                            speechTranscribing = speechController?.isTranscribing?.value == true,
                                         )
                                     ) {
                                         keyboard?.hide()
@@ -1312,7 +1312,9 @@ fun AiScreen(
                                     }
                                 },
                                 secondaryLabel = "Back",
-                                onSecondary = {
+                                secondaryEnabled = !speechTranscribing,
+                                onSecondary = back@{
+                                    if (speechController?.isTranscribing?.value == true) return@back
                                     keyboard?.hide()
                                     focusManager.clearFocus(force = true)
                                     vmAI.resetStates()
