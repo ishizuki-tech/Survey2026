@@ -1,12 +1,12 @@
 {
   "original_branch": "fix/lint-compose-stateflow-observation",
   "branch_slug": "fix-lint-compose-stateflow-observation",
-  "commit_sha": "8223712744cb79ffc06fb206fa9d1c0b9619803b",
-  "short_sha": "8223712",
-  "apk_name": "Survey2026-fix-lint-compose-stateflow-observation-8223712.apk",
-  "apk_sha256": "c47c37251f7dae4b68072133930a74ae0b7e181b54fcdd26119e19f2e6c9ad16",
-  "apk_download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-fix-lint-compose-stateflow-observation-8223712-run-204/Survey2026-fix-lint-compose-stateflow-observation-8223712.apk",
+  "commit_sha": "f2b581c81f2b7cf188a7a2b0874555b6f58f44b1",
+  "short_sha": "f2b581c",
+  "apk_name": "Survey2026-fix-lint-compose-stateflow-observation-f2b581c.apk",
+  "apk_sha256": "7ab4a26c6d5ecade6938499641e5efdaeccc7ee0c8d77e550ff97801e70efd16",
+  "apk_download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-fix-lint-compose-stateflow-observation-f2b581c-run-206/Survey2026-fix-lint-compose-stateflow-observation-f2b581c.apk",
   "page_url": "https://ishizuki-tech.github.io/Survey2026/fix-lint-compose-stateflow-observation/",
-  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/42452852742",
-  "generated_utc": "2026-11-08T06:06:04Z"
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/42452856624",
+  "generated_utc": "2026-11-08T06:14:02Z"
 }
