@@ -9,6 +9,7 @@
 package com.negi.survey.vm
 
 import android.app.Application
+import androidx.annotation.MainThread
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
@@ -22,26 +23,37 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 sealed interface SurveyFinalizationState {
     data object Idle : SurveyFinalizationState
     data object Finishing : SurveyFinalizationState
     data object Queued : SurveyFinalizationState
     data object PendingUpload : SurveyFinalizationState
-    data class Error(val message: String) : SurveyFinalizationState
+    data class Error(val message: String, val staged: Boolean = false) : SurveyFinalizationState
 }
 
-/** Session-owned state holder for Review Finish finalization. */
+/** Session-owned state holder for survey finalization. */
 class SurveyFinalizationViewModel(app: Application) : AndroidViewModel(app) {
     private val finalizer = SurveyUploadFinalizer(app.applicationContext)
     private val _state = MutableStateFlow<SurveyFinalizationState>(SurveyFinalizationState.Idle)
     val state: StateFlow<SurveyFinalizationState> = _state.asStateFlow()
 
+    // Once staging succeeds, retries must keep the snapshot and timestamp of the immutable export.
+    private var stagedExit: Pair<SurveyFinalizationSnapshot, String>? = null
+
+    @MainThread
     fun finish(snapshot: SurveyFinalizationSnapshot, config: GitHubUploader.GitHubConfig?, tag: DeviceUploadTag, stamp: String) {
         if (!SurveyFinalizationStatePolicy.mayStart(_state.value)) return
         _state.value = SurveyFinalizationState.Finishing
-        viewModelScope.launch(Dispatchers.IO) {
-            val result = finalizer.finalize(snapshot, config, tag, stamp)
+        val (export, exportedAt) = stagedExit ?: (snapshot to stamp)
+        viewModelScope.launch {
+            val result = withContext(Dispatchers.IO) { finalizer.finalize(export, config, tag, exportedAt) }
+            if (export.status == SurveyCompletionStatus.INCOMPLETE &&
+                result is SurveyFinalizationResult.Failure && result.staged
+            ) {
+                stagedExit = export to exportedAt
+            }
             _state.value = SurveyFinalizationStatePolicy.complete(result)
         }
     }

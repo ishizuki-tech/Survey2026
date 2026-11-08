@@ -9,7 +9,10 @@
 package com.negi.survey.net
 
 import com.negi.survey.utils.DeviceUploadTag
+import com.negi.survey.vm.SurveyCompletionStatus
 import com.negi.survey.vm.SurveyFinalizationSnapshot
+import com.negi.survey.vm.SurveyFinalizationState
+import com.negi.survey.vm.SurveyFinalizationStatePolicy
 import java.io.File
 import java.nio.file.Files
 import java.util.concurrent.CountDownLatch
@@ -367,19 +370,39 @@ class SurveyUploadFinalizerTest {
     }
 
     @Test
-    fun finalize_retryAfterUnsafeReconciliationReusesStagedFile() = runBlocking {
+    fun incomplete_exitRetainsDataOnFailureAndReusesTheStagedFileOnRetry() = runBlocking {
         val operations = FakeOperations(directory).apply {
+            stageFailure = IllegalStateException("disk full")
             reconciliationResult = reconciliation(SurveyUploadWork.SurveyWorkAction.DEFER_ENQUEUE_FAILURE)
         }
         val finalizer = finalizer(operations)
+        val exit = snapshot().copy(
+            status = SurveyCompletionStatus.INCOMPLETE,
+            extraMeta = mapOf("session_free_text" to "Draft note")
+        )
 
-        val first = finalizer.finalize(snapshot(), config(), tag(), STAMP)
+        val diskError = SurveyFinalizationStatePolicy.complete(finalizer.finalize(exit, config(), tag(), STAMP))
+        assertEquals(SurveyFinalizationState.Error("disk full"), diskError)
+        assertFalse(SurveyFinalizationStatePolicy.isAccepted(diskError))
+        assertTrue(directory.listFiles().orEmpty().isEmpty())
+        assertEquals(0, operations.reconcileCalls.get())
+
+        operations.stageFailure = null
+        val queueError = SurveyFinalizationStatePolicy.complete(finalizer.finalize(exit, config(), tag(), STAMP))
+        assertTrue(queueError is SurveyFinalizationState.Error && queueError.staged)
+        assertFalse(SurveyFinalizationStatePolicy.isAccepted(queueError))
+        val staged = directory.listFiles().orEmpty().single()
+        assertEquals(exit.surveyId, PendingSurveyUploads.surveyIdFromFile(staged))
+        val payload = SurveyExportJsonBuilder.build(exit, STAMP)
+        assertEquals(payload, staged.readText())
+
         operations.reconciliationResult = reconciliation(SurveyUploadWork.SurveyWorkAction.ENQUEUE_NEW, enqueued = true)
-        val second = finalizer.finalize(snapshot(), config(), tag(), STAMP)
-
-        assertTrue(first is SurveyFinalizationResult.Failure)
-        assertTrue(second is SurveyFinalizationResult.Queued)
-        assertEquals(1, operations.stageCalls.get())
+        val result = finalizer.finalize(exit, config(), tag(), "different-stamp")
+        assertEquals(SurveyFinalizationResult.Queued(staged, reused = true), result)
+        assertTrue(SurveyFinalizationStatePolicy.isAccepted(SurveyFinalizationStatePolicy.complete(result)))
+        assertEquals(staged, directory.listFiles().orEmpty().single())
+        assertEquals(payload, staged.readText())
+        assertEquals(2, operations.stageCalls.get())
         assertEquals(2, operations.reconcileCalls.get())
     }
 

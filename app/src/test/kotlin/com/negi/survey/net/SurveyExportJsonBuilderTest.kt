@@ -9,6 +9,7 @@
 package com.negi.survey.net
 
 import com.negi.survey.BuildConfig
+import com.negi.survey.vm.SurveyCompletionStatus
 import com.negi.survey.vm.SurveyFinalizationSnapshot
 import com.negi.survey.vm.SurveyViewModel
 import kotlinx.serialization.json.Json
@@ -20,6 +21,26 @@ import org.junit.Assert.assertEquals
 import org.junit.Test
 
 class SurveyExportJsonBuilderTest {
+    @Test
+    fun build_incompleteDraftWithoutAnswersIsValidJson() {
+        val note = "Pasted draft\u000cwith a page break"
+        val snapshot = SurveyFinalizationSnapshot(
+            surveyId = "draft-id",
+            questions = emptyMap(),
+            answers = emptyMap(),
+            followups = emptyMap(),
+            audioRefs = emptyList(),
+            aiOutcomesJson = "{}",
+            extraMeta = mapOf("session_free_text" to note),
+            status = SurveyCompletionStatus.INCOMPLETE
+        )
+
+        val root = Json.parseToJsonElement(SurveyExportJsonBuilder.build(snapshot, "stamp")).jsonObject
+        assertEquals("incomplete", root.getValue("status").jsonPrimitive.content)
+        assertEquals(emptySet<String>(), root.getValue("answers").jsonObject.keys)
+        assertEquals(note, root.getValue("meta").jsonObject.getValue("session_free_text").jsonPrimitive.content)
+    }
+
     @Test
     fun build_preservesCompletedSurveyExportContract() {
         val surveyId = "1ab2b0d7-1005-4f13-a236-a9f361c72158"
@@ -58,6 +79,7 @@ class SurveyExportJsonBuilderTest {
 
         val root = Json.parseToJsonElement(output).jsonObject
         assertEquals(surveyId, root.getValue("survey_id").jsonPrimitive.content)
+        assertEquals("completed", root.getValue("status").jsonPrimitive.content)
         assertEquals(
             BuildConfig.GIT_COMMIT_SHA,
             root.getValue("build").jsonPrimitive.content

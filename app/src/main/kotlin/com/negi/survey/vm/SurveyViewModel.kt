@@ -220,7 +220,7 @@ open class SurveyViewModel(
 
     /**
      * Home draft note (editable on Home only).
-     * This is NOT exported directly.
+     * An incomplete exit can export this before run activation.
      */
     private val _homeDraftFreeText = MutableStateFlow("")
     val homeDraftFreeText: StateFlow<String> = _homeDraftFreeText.asStateFlow()
@@ -300,15 +300,19 @@ open class SurveyViewModel(
      * IMPORTANT:
      * - Export the RUN note only (not the draft).
      */
-    fun exportExtraMeta(): Map<String, String> {
-        val t = _runNoteFreeText.value.trim()
+    fun exportExtraMeta(): Map<String, String> = exportNote(_runNoteFreeText.value)
+
+    private fun exportNote(note: String): Map<String, String> {
+        val t = note.trim()
         if (t.isBlank()) return emptyMap()
         return linkedMapOf(EXPORT_META_SESSION_FREE_TEXT to t.take(SESSION_FREE_TEXT_MAX_CHARS))
     }
 
-    /** Captures immutable export data for a completed run without mutating survey state. */
+    /** Captures immutable export data without activating or mutating the survey. */
     @Synchronized
-    fun createFinalizationSnapshot(): SurveyFinalizationSnapshot {
+    fun createFinalizationSnapshot(
+        status: SurveyCompletionStatus = SurveyCompletionStatus.COMPLETED
+    ): SurveyFinalizationSnapshot {
         val surveyId = _surveyUuid.value
         val runAudioRefs = getAudioRefsForRunFlat(surveyId).toList()
         val snapshotQuestions = questions.value
@@ -327,7 +331,12 @@ open class SurveyViewModel(
             followups = followups.value.mapValues { (_, entries) -> entries.toList() },
             audioRefs = runAudioRefs,
             aiOutcomesJson = aiReasonsJson(),
-            extraMeta = exportExtraMeta().toMap()
+            extraMeta = if (status == SurveyCompletionStatus.INCOMPLETE) {
+                exportNote(_runFreeText.value)
+            } else {
+                exportExtraMeta()
+            },
+            status = status
         )
     }
 

@@ -8,6 +8,11 @@
  */
 package com.negi.survey.vm
 
+enum class SurveyCompletionStatus(val jsonValue: String) {
+    COMPLETED("completed"),
+    INCOMPLETE("incomplete")
+}
+
 /** Immutable survey data captured before finalization/navigation can reset a run. */
 data class SurveyFinalizationSnapshot(
     val surveyId: String,
@@ -16,5 +21,6 @@ data class SurveyFinalizationSnapshot(
     val followups: Map<String, List<SurveyViewModel.FollowupEntry>>,
     val audioRefs: List<SurveyViewModel.AudioRef>,
     val aiOutcomesJson: String,
-    val extraMeta: Map<String, String>
+    val extraMeta: Map<String, String>,
+    val status: SurveyCompletionStatus = SurveyCompletionStatus.COMPLETED
 )

@@ -63,8 +63,6 @@ import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Stop
-import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.TextButton
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
@@ -186,6 +184,7 @@ import com.negi.survey.vm.composeSingleChoiceAnswer
 import com.negi.survey.vm.isValidNumberAnswer
 import com.negi.survey.vm.shouldShowOtherDetails
 import com.negi.survey.vm.SurveySessionStore
+import com.negi.survey.vm.SurveyCompletionStatus
 import com.negi.survey.vm.SurveyFinalizationState
 import com.negi.survey.vm.SurveyFinalizationStatePolicy
 import com.negi.survey.vm.SurveyFinalizationViewModel
@@ -1314,20 +1313,21 @@ fun SurveyNavHost(
     onClearCompletedSurveys: suspend (Set<String>) -> Unit
 ) {
     val localContext = LocalContext.current
-    val appContext = localContext.applicationContext
+    val app = localContext.applicationContext as android.app.Application
+    val appContext = app.applicationContext
     val owner = sessionVmOwner ?: LocalViewModelStoreOwner.current
     ?: error("Missing ViewModelStoreOwner")
     val finalizationVm: SurveyFinalizationViewModel = viewModel(
         viewModelStoreOwner = owner,
         key = "SurveyFinalizationViewModel_$sessionId",
-        factory = SurveyFinalizationViewModel.factory(appContext as android.app.Application)
+        factory = SurveyFinalizationViewModel.factory(app)
     )
     val finalizationState by finalizationVm.state.collectAsStateWithLifecycle()
     val finishTag = remember(appContext) { com.negi.survey.utils.DeviceUploadTagProvider.from(appContext) }
 
     LaunchedEffect(finalizationState, vmSurvey.currentNodeId) {
         if (
-            SurveyFinalizationStatePolicy.shouldAdvanceToDone(finalizationState) &&
+            SurveyFinalizationStatePolicy.isAccepted(finalizationState) &&
             vmSurvey.currentNode.value.type == NodeType.REVIEW
         ) {
             vmSurvey.advanceToNext()
@@ -1522,36 +1522,44 @@ fun SurveyNavHost(
                         }
                     }
 
-                    val homeBackScope = rememberCoroutineScope()
+                    val exitVm: SurveyFinalizationViewModel = viewModel(
+                        viewModelStoreOwner = owner,
+                        key = "SurveyExitFinalizationViewModel_$sessionId",
+                        factory = SurveyFinalizationViewModel.factory(app)
+                    )
+                    val exitState by exitVm.state.collectAsStateWithLifecycle()
+                    val exitAccepted = SurveyFinalizationStatePolicy.isAccepted(exitState)
+                    val exitError = exitState as? SurveyFinalizationState.Error
+                    // A failed Review handoff can already own the immutable artifact for this ID.
+                    val reviewHasExport = !SurveyFinalizationStatePolicy.mayStart(finalizationState) ||
+                        (finalizationState as? SurveyFinalizationState.Error)?.staged == true
+                    val homeExitScope = rememberCoroutineScope()
                     val homeExit = rememberSaveable(sessionId, saver = HomeSurveyExitState.Saver) {
                         HomeSurveyExitState()
                     }
-                    fun retryHomeExit() {
-                        homeBackScope.launch {
+
+                    suspend fun releaseSession() {
+                        if (BuildConfig.CROSS_SURVEY_REUSE && onEndSurveySession != null) {
                             homeExit.exit(
                                 endSession = {
                                     ttsController.stop()
                                     speechController.stopRecording()
                                     vmAI.resetStates()
-                                    checkNotNull(onEndSurveySession).invoke()
+                                    onEndSurveySession.invoke()
                                     heavyRuntimeHandoff.releaseWhisper()
                                 },
                                 onSuccess = onResetToSelector,
                             )
+                        } else {
+                            runCatching { heavyRuntimeHandoff.releaseCurrent() }
+                                .onFailure { t -> Log.w(MainActivity.TAG, "Failed to release SLM on Home exit.", t) }
+                            vmAI.resetStates()
+                            onResetToSelector()
                         }
                     }
-                    homeExit.error?.let { message ->
-                        AlertDialog(
-                            onDismissRequest = homeExit::dismissError,
-                            title = { Text("Survey exit incomplete") },
-                            text = { Text(message) },
-                            confirmButton = {
-                                TextButton(
-                                    onClick = { retryHomeExit() },
-                                    colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.onSurface)
-                                ) { Text("Retry Back") }
-                            },
-                        )
+
+                    LaunchedEffect(exitAccepted) {
+                        if (exitAccepted) releaseSession()
                     }
 
                     HomeScreen(
@@ -1561,55 +1569,33 @@ fun SurveyNavHost(
                         speechEnabled = voiceEnabled,
                         title = node.title,
                         text = node.question,
-                        sessionOpen = homeExit.canStart,
-                        backEnabled = homeExit.canGoBack,
-                        onBack = onBack@{
-                            if (!homeExit.canGoBack) return@onBack
-                            Log.d(
-                                MainActivity.TAG,
-                                "Home -> Back requested; ending survey session=$sessionId reuse=${BuildConfig.CROSS_SURVEY_REUSE}"
-                            )
-                            if (BuildConfig.CROSS_SURVEY_REUSE && onEndSurveySession != null) {
-                                retryHomeExit()
-                            } else {
-                                homeBackScope.launch {
-                                    runCatching { heavyRuntimeHandoff.releaseCurrent() }
-                                        .onFailure { t -> Log.w(MainActivity.TAG, "Failed to release SLM on Home back.", t) }
-                                    vmAI.resetStates()
-                                    onResetToSelector()
-                                }
+                        sessionOpen = homeExit.canStart && !exitAccepted &&
+                            exitState !is SurveyFinalizationState.Finishing && exitError?.staged != true,
+                        exitEnabled = homeExit.canGoBack && !reviewHasExport &&
+                            (SurveyFinalizationStatePolicy.mayStart(exitState) || homeExit.error != null),
+                        exitInProgress = exitState is SurveyFinalizationState.Finishing || homeExit.running,
+                        exitError = homeExit.error ?: exitError?.message ?: if (reviewHasExport) {
+                            "Return to Review to finish the survey export."
+                        } else {
+                            null
+                        },
+                        onExit = {
+                            if (exitAccepted) {
+                                homeExitScope.launch { releaseSession() }
+                            } else if (vmSurvey.currentNode.value.type == NodeType.START) {
+                                exitVm.finish(
+                                    snapshot = vmSurvey.createFinalizationSnapshot(SurveyCompletionStatus.INCOMPLETE),
+                                    config = buildGitHubConfigOrNull(),
+                                    tag = finishTag,
+                                    stamp = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.US).format(Date())
+                                )
                             }
                         },
-                        onStart = onStart@{
-                            if (!homeExit.canStart) return@onStart
-                            /** Snapshot the home note text before resetting the run. */
-                            val homeNote = runFreeTextShadow
-
-                            /** Snapshot draft length before starting a new run. */
-                            val draftLen = homeNote.length
-                            Log.d(
-                                MainActivity.TAG,
-                                "Home -> Start survey. session=$sessionId freeTextDraftLen=$draftLen (run-scoped)"
-                            )
-
-                            // Creates a NEW run UUID.
-                            vmSurvey.resetToStart(preserveSessionFreeText = true)
-
-                            /** Restore the home note deterministically after reset (avoid losing text due to reset side-effects). */
-                            if (homeNote.isNotBlank()) {
-                                runFreeTextShadow = homeNote
-                                vmSurvey.setRunFreeText(homeNote)
+                        onNext = {
+                            if (vmSurvey.currentNode.value.type == NodeType.START) {
+                                vmAI.resetStates(keepError = false)
+                                vmSurvey.advanceToNext()
                             }
-
-                            /** After reset, verify the run note length. */
-                            val runLen = vmSurvey.runFreeText.value.length
-                            Log.d(
-                                MainActivity.TAG,
-                                "Home -> Start survey: runNoteLen=$runLen (restoredAfterReset)"
-                            )
-
-                            vmAI.resetStates(keepError = false)
-                            vmSurvey.advanceToNext()
                         },
                         onUpdateFreeText = { v ->
                             runFreeTextShadow = v
@@ -2418,15 +2404,16 @@ private fun HomeFreeTextComposer(
     value: String,
     onValueChange: (String) -> Unit,
     enabled: Boolean,
-    backEnabled: Boolean = enabled,
+    exitEnabled: Boolean = enabled,
     speechEnabled: Boolean,
     speechRecording: Boolean,
     speechTranscribing: Boolean,
     onToggleSpeech: (() -> Unit)?,
     onSend: () -> Unit,
-    onBack: () -> Unit,
+    onExit: () -> Unit,
     speechStatusText: String?,
     speechStatusIsError: Boolean,
+    exitError: String?,
     modifier: Modifier = Modifier
 ) {
     val cs = MaterialTheme.colorScheme
@@ -2516,16 +2503,23 @@ private fun HomeFreeTextComposer(
             )
         }
 
+        Spacer(Modifier.height(24.dp))
         SurveyNavigationButtons(
-            primaryLabel = "Start",
+            primaryLabel = "Next",
             onPrimary = onSend,
             primaryEnabled = enabled,
-            secondaryLabel = "Back",
-            onSecondary = onBack,
-            secondaryEnabled = backEnabled
+            secondaryLabel = "Exit",
+            onSecondary = onExit,
+            secondaryEnabled = exitEnabled
         )
+        if (!exitError.isNullOrBlank()) {
+            Spacer(Modifier.height(8.dp))
+            Text(exitError, style = MaterialTheme.typography.bodyMedium, color = cs.error)
+        }
     }
 }
+
+private enum class SurveyNoteAction { NEXT, EXIT }
 
 @Composable
 private fun HomeScreen(
@@ -2535,10 +2529,12 @@ private fun HomeScreen(
     speechEnabled: Boolean,
     title: String,
     text: String,
-    onStart: () -> Unit,
-    onBack: () -> Unit,
-    sessionOpen: Boolean = true,
-    backEnabled: Boolean = true,
+    onNext: () -> Unit,
+    onExit: () -> Unit,
+    sessionOpen: Boolean,
+    exitEnabled: Boolean,
+    exitInProgress: Boolean,
+    exitError: String?,
     onUpdateFreeText: (String) -> Unit
 ) {
     val backplate = outdoorBackplate()
@@ -2553,14 +2549,12 @@ private fun HomeScreen(
     val partialText by speechController.partialText.collectAsStateWithLifecycle()
     val speechError by speechController.errorMessage.collectAsStateWithLifecycle()
 
-    /** Latest onStart lambda reference for asynchronous completion. */
-    val latestOnStart = rememberUpdatedState(onStart)
-
-    /** User pressed Start and navigation is waiting for voice finalization. */
-    var pendingStart by remember(surveyUuid) { mutableStateOf(false) }
+    val latestOnNext by rememberUpdatedState(onNext)
+    val latestOnExit by rememberUpdatedState(onExit)
+    var pendingAction by remember(surveyUuid) { mutableStateOf<SurveyNoteAction?>(null) }
 
     /** Monotonic deadline used by the explicit timeout watchdog below. */
-    var startDeadlineMs by remember(surveyUuid) { mutableLongStateOf(0L) }
+    var actionDeadlineMs by remember(surveyUuid) { mutableLongStateOf(0L) }
 
     /** Incremented by the watchdog so the commit effect is re-evaluated at timeout. */
     var timeoutPulse by remember(surveyUuid) { mutableIntStateOf(0) }
@@ -2608,27 +2602,27 @@ private fun HomeScreen(
      * deadline. This coroutine explicitly sleeps until the deadline and then
      * bumps timeoutPulse to force re-evaluation.
      */
-    LaunchedEffect(pendingStart, startDeadlineMs) {
-        if (!pendingStart || startDeadlineMs <= 0L) {
+    LaunchedEffect(pendingAction, actionDeadlineMs) {
+        if (pendingAction == null || actionDeadlineMs <= 0L) {
             return@LaunchedEffect
         }
 
         val remainingMs =
-            (startDeadlineMs - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
+            (actionDeadlineMs - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
 
         if (remainingMs > 0L) {
             delay(remainingMs)
         }
 
-        if (pendingStart) {
+        if (pendingAction != null) {
             timeoutPulse += 1
         }
     }
 
-    /** Commit dictation when settled; if Start is pending, navigate afterwards. */
+    /** Settle the voice note before advancing or taking the exit snapshot. */
     LaunchedEffect(
-        pendingStart,
-        startDeadlineMs,
+        pendingAction,
+        actionDeadlineMs,
         timeoutPulse,
         armCommit,
         isRecording,
@@ -2638,15 +2632,15 @@ private fun HomeScreen(
         partialAtRecordingStart,
         sawTranscribingAfterStop
     ) {
-        if (!pendingStart && !armCommit) {
+        if (pendingAction == null && !armCommit) {
             return@LaunchedEffect
         }
 
         val now = SystemClock.elapsedRealtime()
         val timedOut =
-            pendingStart &&
-                    startDeadlineMs > 0L &&
-                    now >= startDeadlineMs
+            pendingAction != null &&
+                    actionDeadlineMs > 0L &&
+                    now >= actionDeadlineMs
 
         if ((isRecording || isTranscribing) && !timedOut) {
             return@LaunchedEffect
@@ -2683,18 +2677,32 @@ private fun HomeScreen(
             sawTranscribingAfterStop = false
         }
 
-        if (pendingStart) {
-            pendingStart = false
-            startDeadlineMs = 0L
-            latestOnStart.value.invoke()
+        val action = pendingAction
+        if (action != null) {
+            pendingAction = null
+            actionDeadlineMs = 0L
+            when (action) {
+                SurveyNoteAction.NEXT -> latestOnNext()
+                SurveyNoteAction.EXIT -> latestOnExit()
+            }
         }
+    }
+
+    fun settleVoiceAndThen(action: SurveyNoteAction) {
+        if (pendingAction != null) return
+        runCatching { speechController.stopRecording() }
+        focusManager.clearFocus(force = true)
+        pendingAction = action
+        actionDeadlineMs = SystemClock.elapsedRealtime() + HOME_ACTION_TIMEOUT_MS
     }
 
     val speechStatusIsError = !speechError.isNullOrBlank()
     val speechStatusText: String? = when {
         speechStatusIsError -> speechError
 
-        pendingStart -> {
+        exitInProgress -> "Saving survey…"
+
+        pendingAction != null -> {
             val live = partialText.trim()
             if (live.isNotBlank()) {
                 "Finalizing… $live"
@@ -2758,8 +2766,8 @@ private fun HomeScreen(
                 HomeFreeTextComposer(
                     value = freeText,
                     onValueChange = onUpdateFreeText,
-                    enabled = !pendingStart && sessionOpen,
-                    backEnabled = backEnabled && (!pendingStart || !sessionOpen),
+                    enabled = pendingAction == null && sessionOpen,
+                    exitEnabled = pendingAction == null && exitEnabled,
                     speechEnabled = speechEnabled,
                     speechRecording = isRecording,
                     speechTranscribing = isTranscribing,
@@ -2780,21 +2788,16 @@ private fun HomeScreen(
                         null
                     },
                     onSend = {
-                        // Stop recording first, then wait for transcription finalization.
-                        runCatching {
-                            speechController.stopRecording()
-                        }
-
-                        focusManager.clearFocus(force = true)
-
-                        pendingStart = true
-                        startDeadlineMs =
-                            SystemClock.elapsedRealtime() +
-                                    HOME_START_TIMEOUT_MS
+                        if (sessionOpen) settleVoiceAndThen(SurveyNoteAction.NEXT)
                     },
                     speechStatusText = speechStatusText,
                     speechStatusIsError = speechStatusIsError,
-                    onBack = onBack
+                    exitError = exitError,
+                    onExit = {
+                        if (exitEnabled) {
+                            if (sessionOpen) settleVoiceAndThen(SurveyNoteAction.EXIT) else onExit()
+                        }
+                    }
                 )
             }
         }
@@ -2804,8 +2807,8 @@ private fun HomeScreen(
 /** Dedicated pseudo question id for Home screen free-text dictation context. */
 private const val HOME_FREE_TEXT_QID: String = "__home_free_text__"
 
-/** Maximum time Start waits for an in-flight Home transcription. */
-private const val HOME_START_TIMEOUT_MS: Long = 8_000L
+/** Maximum time a Survey Note action waits for an in-flight Home transcription. */
+private const val HOME_ACTION_TIMEOUT_MS: Long = 8_000L
 
 /** Small grace period for recording=false -> transcribing=true state transitions. */
 private const val HOME_TRANSCRIPTION_SETTLE_GRACE_MS: Long = 350L
