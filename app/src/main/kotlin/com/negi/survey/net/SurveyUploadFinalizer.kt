@@ -15,6 +15,9 @@ import com.negi.survey.diagnostics.WhisperTraceRegistry
 import com.negi.survey.utils.buildSurveyFileName
 import com.negi.survey.vm.SurveyFinalizationSnapshot
 import java.io.File
+import java.io.FileOutputStream
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption.ATOMIC_MOVE
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.sync.Mutex
@@ -24,7 +27,7 @@ sealed interface SurveyFinalizationResult {
     data class Queued(val file: File, val reused: Boolean) : SurveyFinalizationResult
     data class StagedPending(val file: File, val reused: Boolean) : SurveyFinalizationResult
     data object AlreadyUploaded : SurveyFinalizationResult
-    data class Failure(val message: String) : SurveyFinalizationResult
+    data class Failure(val message: String, val staged: Boolean = false) : SurveyFinalizationResult
 }
 
 /** Narrow boundary around Android storage and WorkManager for finalization tests. */
@@ -78,11 +81,13 @@ class SurveyUploadFinalizer private constructor(
         SurveyTraceRegistry.finalizeAsync(surveyId)
         WhisperTraceRegistry.finalizeAsync(surveyId)
         return locks.getOrPut(surveyId) { Mutex() }.withLock {
+            var staged = false
             try {
                 if (operations.isUploaded(surveyId)) {
                     return@withLock SurveyFinalizationResult.AlreadyUploaded
                 }
                 val existing = operations.findPendingSurveyFile(surveyId)
+                staged = existing != null
                 if (existing != null && !operations.hasCanonicalSurveyRoute(surveyId)) {
                     // An upgraded process must not relabel a historical staged artifact.
                     return@withLock SurveyFinalizationResult.StagedPending(existing, reused = true)
@@ -95,6 +100,7 @@ class SurveyUploadFinalizer private constructor(
                     return@withLock SurveyFinalizationResult.StagedPending(pending, reused = existing != null)
                 }
                 val pending = existing ?: operations.stageSurveyJson(snapshot, deviceTag, exportedAtStamp)
+                staged = true
                 val reconciliation = operations.reconcileSurveyJson(config, pending, surveyId)
                 when (reconciliation.decision.action) {
                     SurveyUploadWork.SurveyWorkAction.SKIP_UPLOADED,
@@ -115,7 +121,7 @@ class SurveyUploadFinalizer private constructor(
                     SurveyUploadWork.SurveyWorkAction.RECOVER_NEW,
                     SurveyUploadWork.SurveyWorkAction.ENQUEUED_TRACKER_UNCONFIRMED -> {
                         if (!reconciliation.enqueued) {
-                            return@withLock SurveyFinalizationResult.Failure(reconciliation.decision.reason)
+                            return@withLock SurveyFinalizationResult.Failure(reconciliation.decision.reason, staged = true)
                         }
                     }
 
@@ -123,7 +129,7 @@ class SurveyUploadFinalizer private constructor(
                     SurveyUploadWork.SurveyWorkAction.KEEP_LEGACY,
                     SurveyUploadWork.SurveyWorkAction.ADOPT_LEGACY -> Unit
 
-                    else -> return@withLock SurveyFinalizationResult.Failure(reconciliation.decision.reason)
+                    else -> return@withLock SurveyFinalizationResult.Failure(reconciliation.decision.reason, staged = true)
                 }
                 try {
                     operations.scheduleVoiceArtifacts(config, surveyId, expectedVoiceFileNames(snapshot))
@@ -147,7 +153,7 @@ class SurveyUploadFinalizer private constructor(
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (exception: Exception) {
-                SurveyFinalizationResult.Failure(exception.message ?: "Could not queue survey upload.")
+                SurveyFinalizationResult.Failure(exception.message ?: "Could not queue survey upload.", staged)
             }
         }
     }
@@ -191,8 +197,18 @@ private class AndroidSurveyFinalizationOperations(context: Context) : SurveyFina
         }
         val target = File(directory, fileName)
         check(!target.exists()) { "A non-survey pending file already uses the final survey filename." }
-        target.writeText(SurveyExportJsonBuilder.build(snapshot, stamp), Charsets.UTF_8)
-        return target
+        val temporary = File.createTempFile(".survey-", ".tmp", directory)
+        try {
+            val bytes = SurveyExportJsonBuilder.build(snapshot, stamp).toByteArray(Charsets.UTF_8)
+            FileOutputStream(temporary).use { output ->
+                output.write(bytes)
+                output.fd.sync()
+            }
+            Files.move(temporary.toPath(), target.toPath(), ATOMIC_MOVE)
+            return target
+        } finally {
+            temporary.delete()
+        }
     }
 
     override fun reconcileSurveyJson(

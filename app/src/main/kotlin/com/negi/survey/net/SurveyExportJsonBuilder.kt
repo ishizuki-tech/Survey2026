@@ -28,6 +28,7 @@ object SurveyExportJsonBuilder {
 
         append("{\n")
         append("  \"survey_id\": \"").append(escape(snapshot.surveyId)).append("\",\n")
+        append("  \"status\": \"").append(snapshot.status.jsonValue).append("\",\n")
         append("  \"build\": \"").append(escape("${BuildConfig.GIT_COMMIT_SHA}")).append("\",\n")
         append("  \"exported_at\": \"").append(escape(exportedAt)).append("\",\n")
 
@@ -130,7 +131,11 @@ object SurveyExportJsonBuilder {
                 '\n' -> append("\\n")
                 '\r' -> append("\\r")
                 '\t' -> append("\\t")
-                else -> append(character)
+                else -> if (character < ' ') {
+                    append("\\u00").append(character.code.toString(16).padStart(2, '0'))
+                } else {
+                    append(character)
+                }
             }
         }
     }

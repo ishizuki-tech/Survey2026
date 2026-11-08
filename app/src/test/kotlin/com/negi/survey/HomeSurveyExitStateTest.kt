@@ -58,7 +58,6 @@ class HomeSurveyExitStateTest {
         assertTrue(ui.canGoBack)
         assertFalse(ui.canStart)
         assertNotNull(ui.error)
-        ui.dismissError()
         assertFalse(ui.canStart)
         assertTrue(runCatching { boundary.requireOpen() }.isFailure)
         ui.exit({ boundary.closeAndAwait {} }, { clears++ })

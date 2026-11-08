@@ -23,7 +23,6 @@ internal class HomeSurveyExitState(
     val canStart: Boolean get() = !admissionClosed
     val canGoBack: Boolean get() = !running && !completed
 
-    fun dismissError() { error = null }
 
     suspend fun exit(endSession: suspend () -> Unit, onSuccess: () -> Unit) {
         if (!canGoBack) return
@@ -50,7 +49,7 @@ internal class HomeSurveyExitState(
     }
 
     companion object {
-        private const val RETRY_MESSAGE = "Could not safely end the survey. Press Back to retry. Start is unavailable until exit completes."
+        private const val RETRY_MESSAGE = "Could not safely end the survey. Press Exit to try again."
         val Saver = listSaver<HomeSurveyExitState, Boolean>(
             save = { listOf(it.admissionClosed, it.completed) },
             restore = { values ->

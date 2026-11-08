@@ -9,7 +9,7 @@ graph:
     - id: Start
       type: START
       title: Survey Note
-      question: Add any general notes and press Start.
+      question: Add any general notes and press Next.
       read_aloud: false
       nextId: Pre1
 

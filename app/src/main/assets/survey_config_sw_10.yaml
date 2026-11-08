@@ -9,7 +9,7 @@ graph:
     - id: Start
       type: START
       title: Maelezo ya Utafiti
-      question: Andika maelezo yoyote ya jumla kisha bonyeza Anza.
+      question: Andika maelezo yoyote ya jumla kisha bonyeza kitufe cha Next.
       read_aloud: false
       nextId: Pre1
 

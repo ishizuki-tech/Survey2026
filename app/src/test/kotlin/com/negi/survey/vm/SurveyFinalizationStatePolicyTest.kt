@@ -32,9 +32,9 @@ class SurveyFinalizationStatePolicyTest {
             SurveyFinalizationState.PendingUpload,
             SurveyFinalizationStatePolicy.complete(SurveyFinalizationResult.StagedPending(File("pending.json"), false))
         )
-        assertTrue(SurveyFinalizationStatePolicy.shouldAdvanceToDone(SurveyFinalizationState.Queued))
-        assertTrue(SurveyFinalizationStatePolicy.shouldAdvanceToDone(SurveyFinalizationState.PendingUpload))
-        assertFalse(SurveyFinalizationStatePolicy.shouldAdvanceToDone(SurveyFinalizationState.Error("disk full")))
+        assertTrue(SurveyFinalizationStatePolicy.isAccepted(SurveyFinalizationState.Queued))
+        assertTrue(SurveyFinalizationStatePolicy.isAccepted(SurveyFinalizationState.PendingUpload))
+        assertFalse(SurveyFinalizationStatePolicy.isAccepted(SurveyFinalizationState.Error("disk full")))
     }
 
     @Test
