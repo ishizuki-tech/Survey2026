@@ -8,30 +8,30 @@
   <script id="release-metadata" type="application/json">{
   "repository": "ishizuki-tech/Survey2026",
   "stable_tag": "",
-  "source_commit_sha": "3a1f5f5a9a4e6f469403e0377a11676274b82138",
-  "release_tag": "build-154-3a1f5f5",
+  "source_commit_sha": "44284b1e754a4b500e3864dea32bba2714d5382f",
+  "release_tag": "build-161-44284b1",
   "branch": "main",
-  "release_url": "https://github.com/ishizuki-tech/Survey2026/releases/tag/build-154-3a1f5f5",
-  "download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/build-154-3a1f5f5/Survey2026-3a1f5f5-release.apk",
+  "release_url": "https://github.com/ishizuki-tech/Survey2026/releases/tag/build-161-44284b1",
+  "download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/build-161-44284b1/Survey2026-44284b1-release.apk",
   "config_files": {
     "english": {
-      "view_url": "https://github.com/ishizuki-tech/Survey2026/blob/3a1f5f5a9a4e6f469403e0377a11676274b82138/app/src/main/assets/survey_config10.yaml",
-      "download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/build-154-3a1f5f5/survey_config10.yaml",
-      "sha256": "2fe06c03a7794a3a3ee5f2c65b31587a624b7285ede7ae7376d5f1876a980287"
+      "view_url": "https://github.com/ishizuki-tech/Survey2026/blob/44284b1e754a4b500e3864dea32bba2714d5382f/app/src/main/assets/survey_config10.yaml",
+      "download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/build-161-44284b1/survey_config10.yaml",
+      "sha256": "49fbf540dcd2addb7f53cc7d8b98f33322fb2836aa64598e3d232c6c82eb0b22"
     },
     "swahili": {
-      "view_url": "https://github.com/ishizuki-tech/Survey2026/blob/3a1f5f5a9a4e6f469403e0377a11676274b82138/app/src/main/assets/survey_config_sw_10.yaml",
-      "download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/build-154-3a1f5f5/survey_config_sw_10.yaml",
-      "sha256": "0daafc936e9258fc5424bd8ae687d1ff91d68cb3e576cafa9b5eb0b850b9cf7f"
+      "view_url": "https://github.com/ishizuki-tech/Survey2026/blob/44284b1e754a4b500e3864dea32bba2714d5382f/app/src/main/assets/survey_config_sw_10.yaml",
+      "download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/build-161-44284b1/survey_config_sw_10.yaml",
+      "sha256": "fc20a8de359a6a78f48c98b3eeaa27c414fd8bed3d338948c8c2f9d42f0f3b3b"
     }
   },
-  "apk_name": "Survey2026-3a1f5f5-release.apk",
-  "apk_sha256": "aa35ff0ed077599469ae33d7e2e30cb4b471eb26e105b5f0de52dba0ad8352fb",
+  "apk_name": "Survey2026-44284b1-release.apk",
+  "apk_sha256": "f41cb8beb5b4abf7d64d5c806f0446d130e44274fc68b6082b1eba2e5c154a54",
   "signing_cert_sha256": "d6edef47ec6734a46122ab7fddb5e4f17d19d4d51ae3eaddfb32f309ee5036ea",
-  "short_sha": "3a1f5f5",
-  "run_id": "42126966204",
-  "run_number": "154",
-  "generated_utc": "2026-11-05T23:16:53Z",
+  "short_sha": "44284b1",
+  "run_id": "42453040684",
+  "run_number": "161",
+  "generated_utc": "2026-11-08T06:14:12Z",
   "deployment_status": "Field validated",
   "verified_device": {
     "model": "Samsung SM-S731U",
@@ -80,45 +80,52 @@
         <h2>Build provenance</h2>
         
         <p>
-        <strong>Source:</strong> <code>3a1f5f5a9a4e6f469403e0377a11676274b82138</code></p>
+        <strong>Source:</strong> <code>44284b1e754a4b500e3864dea32bba2714d5382f</code></p>
         <p><strong>Deployment status:</strong> <code>Field validated</code></p>
         <p><strong>Verified device:</strong> <code>Samsung SM-S731U, Android 16 (API 36)</code></p>
       </section>
-      <section class="config-files"><h2>What's New</h2><h3>fix(tts): stop background playback and refine survey UI</h3><pre class="whats-new-body">&lt;html&gt;&lt;head&gt;&lt;/head&gt;&lt;body&gt;&lt;h2&gt;&lt;span&gt;Summary&lt;/span&gt;&lt;/h2&gt;&lt;ul&gt;&lt;li&gt;&lt;p&gt;&lt;span&gt;Stop TTS playback when Survey2026 enters the background&lt;span&gt; (&lt;/span&gt;&lt;/span&gt;&lt;code&gt;&lt;span&gt;&lt;span&gt;ON_STOP&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;span&gt;&lt;span&gt;).&lt;/span&gt;&lt;/span&gt;&lt;/p&gt;&lt;/li&gt;&lt;li&gt;&lt;p&gt;&lt;span&gt;Prevent deferred TTS playback and unintended automatic resumption&lt;span&gt; when returning to the app.&lt;/span&gt;&lt;/span&gt;&lt;/p&gt;&lt;/li&gt;&lt;li&gt;&lt;p&gt;&lt;span&gt;Preserve manual Replay and normal &lt;span&gt;automatic read-aloud when advancing to the next question.&lt;/span&gt;&lt;/span&gt;&lt;/p&gt;&lt;/li&gt;&lt;li&gt;&lt;p&gt;&lt;span&gt;Standardize Back / Next controls with &lt;span&gt;a&lt;/span&gt; 48dp minimum height&lt;span&gt;,&lt;/span&gt; 112dp minimum width&lt;span&gt;, and consistent pill-shaped styling.&lt;/span&gt;&lt;/span&gt;&lt;/p&gt;&lt;/li&gt;&lt;li&gt;&lt;p&gt;&lt;span&gt;&lt;span&gt;Refine spacing, alignment, and responsive layouts across survey screens &lt;/span&gt;while preserving the &lt;span&gt;existing Material 3 Outdoor theme&lt;/span&gt; and Frank&#x27;s UI &lt;span&gt;design.&lt;/span&gt;&lt;/span&gt;&lt;/p&gt;&lt;/li&gt;&lt;li&gt;&lt;p&gt;&lt;span&gt;&lt;span&gt;Preserve existing survey navigation, answer persistence, recording, and AI functionality.&lt;/span&gt;&lt;/span&gt;&lt;/p&gt;&lt;/li&gt;&lt;/ul&gt;&lt;h2&gt;&lt;span&gt;Verification&lt;/span&gt;&lt;/h2&gt;&lt;h3&gt;&lt;span&gt;&lt;span&gt;Automated Tests&lt;/span&gt;&lt;/span&gt;&lt;/h3&gt;
-Test | Passed | Failed
--- | -- | --
-JVM unit tests (:app:testDebugUnitTest) | 411 | 0
-Pixel 10 emulator instrumentation | 46 | 0
+      <section class="config-files"><h2>What's New</h2><h3>fix(lint): observe StateFlow in Compose for Review and auto-read</h3><pre class="whats-new-body">## Problem
+Android Release APK run #42452283661 failed `:app:lintDebug` with two `StateFlowValueCalledInComposition` errors (and 82 warnings).
 
-&lt;p&gt;&lt;span&gt;&lt;span&gt;Additional checks:&lt;/span&gt;&lt;/span&gt;&lt;/p&gt;&lt;ul&gt;&lt;li&gt;&lt;span&gt;&lt;input&gt;&lt;/span&gt;&lt;div&gt;&lt;p&gt;&lt;code&gt;&lt;span&gt;&lt;span&gt;:app:assembleDebug&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;span&gt;&lt;span&gt; passed.&lt;/span&gt;&lt;/span&gt;&lt;/p&gt;&lt;/div&gt;&lt;/li&gt;&lt;li&gt;&lt;span&gt;&lt;input&gt;&lt;/span&gt;&lt;div&gt;&lt;p&gt;&lt;code&gt;&lt;span&gt;&lt;span&gt;:app:assembleDebugAndroidTest&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;span&gt;&lt;span&gt; passed.&lt;/span&gt;&lt;/span&gt;&lt;/p&gt;&lt;/div&gt;&lt;/li&gt;&lt;li&gt;&lt;span&gt;&lt;input&gt;&lt;/span&gt;&lt;div&gt;&lt;p&gt;&lt;code&gt;&lt;span&gt;&lt;span&gt;git diff --check&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;span&gt;&lt;span&gt; passed.&lt;/span&gt;&lt;/span&gt;&lt;/p&gt;&lt;/div&gt;&lt;/li&gt;&lt;/ul&gt;&lt;h3&gt;&lt;span&gt;&lt;span&gt;Physical Device — &lt;/span&gt;Galaxy S25 FE&lt;/span&gt;&lt;/h3&gt;&lt;ul&gt;&lt;li&gt;&lt;span&gt;&lt;input&gt;&lt;/span&gt;&lt;div&gt;&lt;p&gt;&lt;span&gt;&lt;span&gt;Pressing Home during TTS playback stops speech.&lt;/span&gt;&lt;/span&gt;&lt;/p&gt;&lt;/div&gt;&lt;/li&gt;&lt;li&gt;&lt;span&gt;&lt;input&gt;&lt;/span&gt;&lt;div&gt;&lt;p&gt;&lt;span&gt;&lt;span&gt;Returning to Survey2026&lt;/span&gt; does not automatically resume interrupted speech.&lt;/span&gt;&lt;/p&gt;&lt;/div&gt;&lt;/li&gt;&lt;li&gt;&lt;span&gt;&lt;input&gt;&lt;/span&gt;&lt;div&gt;&lt;p&gt;&lt;span&gt;Manual Replay works after returning.&lt;/span&gt;&lt;/p&gt;&lt;/div&gt;&lt;/li&gt;&lt;li&gt;&lt;span&gt;&lt;input&gt;&lt;/span&gt;&lt;div&gt;&lt;p&gt;&lt;span&gt;Next triggers normal automatic read-aloud for the next question.&lt;/span&gt;&lt;/p&gt;&lt;/div&gt;&lt;/li&gt;&lt;/ul&gt;&lt;p&gt;&lt;strong&gt;&lt;span&gt;&lt;span&gt;Result: 4/4 physical-device TTS checks passed.&lt;/span&gt;&lt;/span&gt;&lt;/strong&gt;&lt;/p&gt;&lt;h2&gt;&lt;span&gt;Scope&lt;/span&gt;&lt;/h2&gt;&lt;p&gt;&lt;span&gt;&lt;span&gt;This PR is limited to TTS lifecycle handling and minimal UI layout refinements.&lt;/span&gt;&lt;/span&gt;&lt;/p&gt;&lt;p&gt;&lt;span&gt;No intentional changes to&lt;span&gt;:&lt;/span&gt;&lt;/span&gt;&lt;/p&gt;&lt;ul&gt;&lt;li&gt;&lt;p&gt;&lt;span&gt;&lt;span&gt;Survey routing, configuration, or scoring.&lt;/span&gt;&lt;/span&gt;&lt;/p&gt;&lt;/li&gt;&lt;li&gt;&lt;p&gt;&lt;span&gt;&lt;span&gt;Answer persistence and session state.&lt;/span&gt;&lt;/span&gt;&lt;/p&gt;&lt;/li&gt;&lt;li&gt;&lt;p&gt;&lt;span&gt;&lt;span&gt;Whisper/STT or recording behavior.&lt;/span&gt;&lt;/span&gt;&lt;/p&gt;&lt;/li&gt;&lt;li&gt;&lt;p&gt;&lt;span&gt;&lt;span&gt;Gemma / LiteRT-LM runtime.&lt;/span&gt;&lt;/span&gt;&lt;/p&gt;&lt;/li&gt;&lt;li&gt;&lt;p&gt;&lt;span&gt;&lt;span&gt;Upload and recovery logic.&lt;/span&gt;&lt;/span&gt;&lt;/p&gt;&lt;/li&gt;&lt;li&gt;&lt;p&gt;&lt;span&gt;&lt;span&gt;Material 3 theme colors.&lt;/span&gt;&lt;/span&gt;&lt;/p&gt;&lt;/li&gt;&lt;/ul&gt;&lt;h2&gt;&lt;span&gt;Remaining Verification&lt;/span&gt;&lt;/h2&gt;&lt;ul&gt;&lt;li&gt;&lt;p&gt;&lt;span&gt;&lt;span&gt;The combined landscape orientation, open keyboard, and 200% font-scale scenario has not been physically verified.&lt;/span&gt;&lt;/span&gt;&lt;/p&gt;&lt;/li&gt;&lt;li&gt;&lt;p&gt;&lt;span&gt;&lt;span&gt;Final CI verification is required before merging.&lt;/span&gt;&lt;/span&gt;&lt;/p&gt;&lt;/li&gt;&lt;/ul&gt;&lt;/body&gt;&lt;/html&gt;</pre></section>
-      <a class="download" href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-154-3a1f5f5/Survey2026-3a1f5f5-release.apk">Download APK</a>
+## Changes
+- `ReviewScreen.kt`: observe `questionPresentation` for the `collectAsState(initial = …)` argument, keeping the filtered Review presentation flow and its initial scroll handling intact.
+- `SurveyQuestionAutoRead.kt`: collect the current node as Compose state; keep ownership, readiness, deduplication, and speech behavior unchanged.
+
+## Scope
+Only the two flagged Compose reads. No lint suppressions/baseline updates, navigation changes, or functional redesign.
+
+## Validation
+CI pending; please confirm `:app:lintDebug`, Review re-entry/Finish-button visibility (#156), and auto-read behavior (#160/#168) before merge. This PR has not been run locally.
+
+Related failed run: https://github.com/ishizuki-tech/Survey2026/actions/runs/42452283661</pre></section>
+      <a class="download" href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-161-44284b1/Survey2026-44284b1-release.apk">Download APK</a>
       <p class="note">Direct GitHub Release asset. No ZIP extraction is required.</p>
       <section class="config-files">
         <h2>Config files included in this APK</h2>
         <p class="note">These config files were extracted from the exact APK build shown on this page.</p>
-        <p><strong>English — survey_config10.yaml</strong><br><a href="https://github.com/ishizuki-tech/Survey2026/blob/3a1f5f5a9a4e6f469403e0377a11676274b82138/app/src/main/assets/survey_config10.yaml">View in browser</a> · <a href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-154-3a1f5f5/survey_config10.yaml">Download</a><br><code>SHA-256: 2fe06c03a7794a3a3ee5f2c65b31587a624b7285ede7ae7376d5f1876a980287</code></p>
-        <p><strong>Swahili — survey_config_sw_10.yaml</strong><br><a href="https://github.com/ishizuki-tech/Survey2026/blob/3a1f5f5a9a4e6f469403e0377a11676274b82138/app/src/main/assets/survey_config_sw_10.yaml">View in browser</a> · <a href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-154-3a1f5f5/survey_config_sw_10.yaml">Download</a><br><code>SHA-256: 0daafc936e9258fc5424bd8ae687d1ff91d68cb3e576cafa9b5eb0b850b9cf7f</code></p>
+        <p><strong>English — survey_config10.yaml</strong><br><a href="https://github.com/ishizuki-tech/Survey2026/blob/44284b1e754a4b500e3864dea32bba2714d5382f/app/src/main/assets/survey_config10.yaml">View in browser</a> · <a href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-161-44284b1/survey_config10.yaml">Download</a><br><code>SHA-256: 49fbf540dcd2addb7f53cc7d8b98f33322fb2836aa64598e3d232c6c82eb0b22</code></p>
+        <p><strong>Swahili — survey_config_sw_10.yaml</strong><br><a href="https://github.com/ishizuki-tech/Survey2026/blob/44284b1e754a4b500e3864dea32bba2714d5382f/app/src/main/assets/survey_config_sw_10.yaml">View in browser</a> · <a href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-161-44284b1/survey_config_sw_10.yaml">Download</a><br><code>SHA-256: fc20a8de359a6a78f48c98b3eeaa27c414fd8bed3d338948c8c2f9d42f0f3b3b</code></p>
       </section>
       <div class="qr-panel">
-        <div class="qr-box"><img src="qr.png" alt="QR code that downloads the Survey2026 APK for build-154-3a1f5f5" width="300" height="300"></div>
-        <div><h2>Scan with Android</h2><p class="subtitle">This QR code downloads the APK for this build (build-154-3a1f5f5).</p><code>https://github.com/ishizuki-tech/Survey2026/releases/download/build-154-3a1f5f5/Survey2026-3a1f5f5-release.apk</code></div>
+        <div class="qr-box"><img src="qr.png" alt="QR code that downloads the Survey2026 APK for build-161-44284b1" width="300" height="300"></div>
+        <div><h2>Scan with Android</h2><p class="subtitle">This QR code downloads the APK for this build (build-161-44284b1).</p><code>https://github.com/ishizuki-tech/Survey2026/releases/download/build-161-44284b1/Survey2026-44284b1-release.apk</code></div>
       </div>
       <div class="grid">
-        <div class="item"><span class="label">Release tag</span><code>build-154-3a1f5f5</code></div>
+        <div class="item"><span class="label">Release tag</span><code>build-161-44284b1</code></div>
         <div class="item"><span class="label">Branch</span><code>main</code></div>
-        <div class="item"><span class="label">Commit SHA</span><code>3a1f5f5</code></div>
-        <div class="item"><span class="label">APK filename</span><code>Survey2026-3a1f5f5-release.apk</code></div>
-        <div class="item"><span class="label">Workflow run number</span><code>154</code></div>
-        <div class="item"><span class="label">APK SHA-256</span><code>aa35ff0ed077599469ae33d7e2e30cb4b471eb26e105b5f0de52dba0ad8352fb</code></div>
+        <div class="item"><span class="label">Commit SHA</span><code>44284b1</code></div>
+        <div class="item"><span class="label">APK filename</span><code>Survey2026-44284b1-release.apk</code></div>
+        <div class="item"><span class="label">Workflow run number</span><code>161</code></div>
+        <div class="item"><span class="label">APK SHA-256</span><code>f41cb8beb5b4abf7d64d5c806f0446d130e44274fc68b6082b1eba2e5c154a54</code></div>
         <div class="item"><span class="label">Signing certificate SHA-256</span><code>d6edef47ec6734a46122ab7fddb5e4f17d19d4d51ae3eaddfb32f309ee5036ea</code></div>
-        <div class="item"><span class="label">Generated timestamp</span><code>2026-11-05T23:16:53Z</code></div>
+        <div class="item"><span class="label">Generated timestamp</span><code>2026-11-08T06:14:12Z</code></div>
       </div>
       <div class="links">
-        <a href="https://github.com/ishizuki-tech/Survey2026/releases/tag/build-154-3a1f5f5">GitHub Release</a>
-        <a href="https://github.com/ishizuki-tech/Survey2026/actions/runs/42126966204">GitHub Actions run</a>
+        <a href="https://github.com/ishizuki-tech/Survey2026/releases/tag/build-161-44284b1">GitHub Release</a>
+        <a href="https://github.com/ishizuki-tech/Survey2026/actions/runs/42453040684">GitHub Actions run</a>
         <a href="https://github.com/ishizuki-tech/Survey2026">Repository</a>
       </div>
-      <footer>Survey2026 release metadata generated 2026-11-05T23:16:53Z.</footer>
+      <footer>Survey2026 release metadata generated 2026-11-08T06:14:12Z.</footer>
     </section>
   </main>
 </body>
