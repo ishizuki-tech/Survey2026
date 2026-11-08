@@ -1419,11 +1419,19 @@ internal fun SurveyNavHost(
         }
     }
 
-    val navigationLocked by speechController.isTranscribing.collectAsStateWithLifecycle()
-    SideEffect { vmSurvey.bindNavigationToTranscription(speechController.isTranscribing) }
+    val speechTranscribing by speechController.isTranscribing.collectAsStateWithLifecycle()
+    val slmLoading by vmAI.loading.collectAsStateWithLifecycle()
+    val slmRunning by vmAI.executionRunning.collectAsStateWithLifecycle()
+    val submissionPending by vmAI.submissionPending.collectAsStateWithLifecycle()
+    val navigationLocked = speechTranscribing || slmLoading || slmRunning || submissionPending
+    SideEffect {
+        vmSurvey.bindNavigationToProcessing(speechController.isTranscribing, vmAI::blocksNavigation)
+    }
+
+    fun navigationLockedNow() = speechController.isTranscribing.value || vmAI.blocksNavigation()
 
     fun guardedNavigation(action: () -> Unit): () -> Unit = {
-        if (!speechController.isTranscribing.value) action()
+        if (!navigationLockedNow()) action()
     }
 
     LaunchedEffect(finalizationState, vmSurvey.currentNodeId) {
@@ -1522,10 +1530,10 @@ internal fun SurveyNavHost(
     }
 
     fun systemBack() {
-        if (speechController.isTranscribing.value || !vmSurvey.canGoBack.value) return
+        if (navigationLockedNow() || !vmSurvey.canGoBack.value) return
         runCatching { speechController.stopRecording() }
         // A Back press while recording can stop capture. A second press can leave once it settles.
-        if (speechController.isTranscribing.value) return
+        if (navigationLockedNow()) return
         if (vmSurvey.currentNode.value.type == NodeType.AI) {
             runCatching { ttsController.stop() }
         }
@@ -1708,7 +1716,7 @@ internal fun SurveyNavHost(
                         otherTextOption = node.otherTextOption,
                         initialOtherText = node.decomposeSingleChoiceAnswer(answers[node.id]).otherText,
                         onSubmit = submit@{ selection, otherText ->
-                            if (speechController.isTranscribing.value) return@submit
+                            if (navigationLockedNow()) return@submit
                             node.composeSingleChoiceAnswer(selection, otherText)?.let { answer ->
                                 runCatching { ttsController.stop() }
                                 vmSurvey.setAnswer(answer, node.id)
@@ -1828,13 +1836,13 @@ internal fun SurveyNavHost(
     val backOwner = LocalOnBackPressedDispatcherOwner.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val latestBack by rememberUpdatedState<() -> Unit>(::systemBack)
-    DisposableEffect(backOwner, lifecycleOwner, speechController, vmSurvey) {
+    DisposableEffect(backOwner, lifecycleOwner, speechController, vmSurvey, vmAI) {
         val dispatcher = backOwner?.onBackPressedDispatcher ?: return@DisposableEffect onDispose {}
         val callback = object : OnBackPressedCallback(true) {
             private var gestureStartedWhileLocked = false
 
             override fun handleOnBackStarted(backEvent: BackEventCompat) {
-                gestureStartedWhileLocked = speechController.isTranscribing.value
+                gestureStartedWhileLocked = navigationLockedNow()
             }
 
             override fun handleOnBackCancelled() {
@@ -1842,7 +1850,7 @@ internal fun SurveyNavHost(
             }
 
             override fun handleOnBackPressed() {
-                val blocked = gestureStartedWhileLocked || speechController.isTranscribing.value
+                val blocked = gestureStartedWhileLocked || navigationLockedNow()
                 gestureStartedWhileLocked = false
                 if (blocked) return
                 if (vmSurvey.canGoBack.value) {
@@ -2776,7 +2784,7 @@ private fun HomeScreen(
     }
 
     fun settleVoiceAndThen(action: SurveyNoteAction) {
-        if (pendingAction != null || speechController.isTranscribing.value) return
+        if (pendingAction != null || speechController.isTranscribing.value || vmSurvey.navigationLocked()) return
         if (speechController.isRecording.value) {
             if (!prevRecording) partialAtRecordingStart = speechController.partialText.value.trim()
             armCommit = true

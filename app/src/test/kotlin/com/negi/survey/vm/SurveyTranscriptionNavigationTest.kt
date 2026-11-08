@@ -26,7 +26,7 @@ class SurveyTranscriptionNavigationTest {
         ))
         val survey = SurveyViewModel(nav, config)
         val transcribing = MutableStateFlow(false)
-        survey.bindNavigationToTranscription(transcribing)
+        survey.bindNavigationToProcessing(transcribing)
         survey.advanceToNext()
         survey.setAnswer("Recorded answer", "Question")
         val id = survey.surveyUuid.value

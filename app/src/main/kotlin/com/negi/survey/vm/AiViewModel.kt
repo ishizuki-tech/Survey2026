@@ -31,7 +31,6 @@ import java.security.MessageDigest
 import java.util.ArrayDeque
 import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.min
@@ -221,6 +220,16 @@ class AiViewModel(
 
     /** True while an evaluation is in progress. */
     val loading: StateFlow<Boolean> = _loading.asStateFlow()
+
+    private val _submissionPending = MutableStateFlow(false)
+    internal val submissionPending: StateFlow<Boolean> = _submissionPending.asStateFlow()
+
+    internal fun setSubmissionPending(pending: Boolean) {
+        _submissionPending.value = pending
+    }
+
+    internal fun blocksNavigation(): Boolean =
+        submissionPending.value || isRunning || loading.value
 
     private val _score = MutableStateFlow<Int?>(null)
 
@@ -1002,13 +1011,14 @@ class AiViewModel(
     /** Current top-level single-run or chain job. Access is coordinated by [executionLock]. */
     private val evalJobRef = AtomicReference<Job?>(null)
 
-    private val running = AtomicBoolean(false)
+    private val running = MutableStateFlow(false)
+    internal val executionRunning: StateFlow<Boolean> = running.asStateFlow()
     private val runSeq = AtomicLong(0L)
     private val activeRunId = AtomicLong(0L)
 
     /** True when an evaluation coroutine is currently owned by this ViewModel. */
     val isRunning: Boolean
-        get() = running.get()
+        get() = running.value
 
     /**
      * Run-local immutable result for chaining.
@@ -1290,7 +1300,7 @@ class AiViewModel(
     }
 
     fun cancel() {
-        logI(TAG, "cancel: invoked (isRunning=${running.get()}, loading=${_loading.value})")
+        logI(TAG, "cancel: invoked (isRunning=${running.value}, loading=${_loading.value})")
         stopCurrentRunInternal(
             reason = "cancelled",
             emitCancelledEvent = true,
@@ -1309,7 +1319,7 @@ class AiViewModel(
         val owner = synchronized(executionLock) {
             val job = evalJobRef.getAndSet(null)
             activeRunId.set(-1L)
-            running.set(false)
+            running.value = false
             clearTwoStepChatLocked()
 
             clearStepHistory()
@@ -1778,22 +1788,22 @@ class AiViewModel(
     ): Job? = synchronized(executionLock) {
         val existing = evalJobRef.get()
 
-        if (running.get() && existing != null) {
+        if (running.value && existing != null) {
             return@synchronized existing
         }
 
         // Recover from a theoretically inconsistent state where running=true but the owner
         // reference was lost. There is no job left to serialize against, so repair the flags and
         // install the new owner instead of leaving the ViewModel permanently stuck as running.
-        if (running.get()) {
+        if (running.value) {
             logW(TAG, "installExecution: repairing running=true with missing owner job")
-            running.set(false)
+            running.value = false
             activeRunId.set(0L)
             _loading.value = false
         }
 
         evalJobRef.set(newJob)
-        running.set(true)
+        running.value = true
         activeRunId.set(initialRunId)
         activeTwoStepChat = twoStepChat
         twoStepChat?.let(::startTwoStepChatLocked)
@@ -1806,7 +1816,7 @@ class AiViewModel(
      */
     private fun activateNextRunIfOwner(ownerJob: Job, nextRunId: Long): Boolean {
         return synchronized(executionLock) {
-            if (evalJobRef.get() !== ownerJob || !running.get()) {
+            if (evalJobRef.get() !== ownerJob || !running.value) {
                 return@synchronized false
             }
 
@@ -1846,7 +1856,7 @@ class AiViewModel(
 
             evalJobRef.set(null)
             activeRunId.set(0L)
-            running.set(false)
+            running.value = false
             clearTwoStepChatLocked()
             _loading.value = false
         }
@@ -1862,7 +1872,7 @@ class AiViewModel(
             val job = evalJobRef.getAndSet(null)
 
             activeRunId.set(-1L)
-            running.set(false)
+            running.value = false
             clearTwoStepChatLocked()
             _loading.value = false
 
@@ -1897,7 +1907,7 @@ class AiViewModel(
 
             evalJobRef.set(null)
             activeRunId.set(-1L)
-            running.set(false)
+            running.value = false
             clearTwoStepChatLocked()
             _loading.value = false
 

@@ -448,7 +448,10 @@ fun AiScreen(
     val error by vmAI.error.collectAsState()
     val aiReasons by vmSurvey.aiReasons.collectAsState()
     val aiReason = aiReasons[nid]
-    var submissionPending by remember(contextKey) { mutableStateOf(false) }
+    val submissionPending by vmAI.submissionPending.collectAsState()
+    val executionRunning by vmAI.executionRunning.collectAsState()
+    val navigationLocked = LocalSurveyNavigationLocked.current ||
+        speechTranscribing || loading || executionRunning || submissionPending
 
     // ---------------------------------------------------------------------
     // Persistent chat + conversation state (B plan)
@@ -886,9 +889,12 @@ fun AiScreen(
             buildSecondPrompt = { prompt }
         )
 
+    fun navigationLockedNow(): Boolean =
+        vmAI.blocksNavigation() || speechController?.isTranscribing?.value == true ||
+            vmSurvey.navigationLocked()
+
     fun inputBlocked(): Boolean =
-        submissionPending || vmAI.loading.value || vmAI.isRunning ||
-            speechController?.isRecording?.value == true ||
+        vmAI.blocksNavigation() || speechController?.isRecording?.value == true ||
             speechController?.isTranscribing?.value == true
 
     fun acceptAnswer(input: String, role: AiViewModel.ComposerRole): Boolean {
@@ -896,6 +902,9 @@ fun AiScreen(
         if (role == AiViewModel.ComposerRole.FOLLOWUP) {
             val pending = pendingAiFollowup(vmSurvey.followups.value[nid].orEmpty())
             if (pending?.question != conversation.value.activePromptQuestion) return false
+        }
+        vmAI.setSubmissionPending(true)
+        if (role == AiViewModel.ComposerRole.FOLLOWUP) {
             vmSurvey.answerLastFollowup(nid, input)
         } else {
             if (isTwoStepNode && !vmSurvey.consumeAcceptedVoiceTransaction(nid)) {
@@ -903,12 +912,16 @@ fun AiScreen(
             }
             vmSurvey.setAnswer(input, nid)
         }
-        submissionPending = true
         submittedInPresentation = true
         vmAI.appendUserMessage(contextKey, input)
         vmAI.updateComposerDraft(contextKey, "")
         transcriptReady = false
         return true
+    }
+
+    fun launchSubmission(block: suspend () -> Unit) {
+        // Release even if the screen's scope is cancelled before the coroutine starts.
+        scope.launch { block() }.invokeOnCompletion { vmAI.setSubmissionPending(false) }
     }
 
     fun runTwoStep() {
@@ -917,7 +930,7 @@ fun AiScreen(
         if (current.turnCompleted || current.validationFailed ||
             !acceptAnswer(current.composerDraft.trim(), current.role)
         ) return
-        scope.launch {
+        launchSubmission {
             try {
                 vmAI.evaluateSurveyTwoStepAsync(vmSurvey, nid, contextKey, rootQuestion).join()
             } catch (e: CancellationException) {
@@ -927,8 +940,6 @@ fun AiScreen(
                     vmSurvey.setAiReason(nid, SurveyAiReason.FAILURE)
                     vmAI.failValidationTurn(contextKey)
                 }
-            } finally {
-                submissionPending = false
             }
         }
     }
@@ -945,7 +956,7 @@ fun AiScreen(
         vmAI.beginValidationTurn(contextKey)
 
         if (current.role == AiViewModel.ComposerRole.FOLLOWUP) {
-            scope.launch {
+            launchSubmission {
                 val runId = "ai-followup-${nid}-${SystemClock.uptimeMillis()}-${System.nanoTime()}"
                 val t0 = SystemClock.uptimeMillis()
                 try {
@@ -975,7 +986,6 @@ fun AiScreen(
                     snack.showSnackbar("Validation failed: ${err.message ?: "unknown error"}")
                     vmAI.removeTypingMessage(contextKey, nid)
                 } finally {
-                    submissionPending = false
                     RuntimeLogStore.i(
                         TAG,
                         "FOLLOWUP_REVALIDATE_END node=$nid runId=$runId " +
@@ -989,7 +999,7 @@ fun AiScreen(
         val questionForTurn = rootQuestion
         val answerForTurn = input
 
-        scope.launch {
+        launchSubmission {
             val runId = "ai-${nid}-${SystemClock.uptimeMillis()}-${System.nanoTime()}"
             val t0 = SystemClock.uptimeMillis()
 
@@ -1031,7 +1041,6 @@ fun AiScreen(
                 vmAI.removeTypingMessage(contextKey, nid)
                 vmAI.completeValidationTurn(contextKey, rootQuestion)
             } finally {
-                submissionPending = false
                 RuntimeLogStore.i(TAG, "Submit end runId=$runId node=$nid elapsed=${SystemClock.uptimeMillis() - t0}ms")
             }
         }
@@ -1292,29 +1301,24 @@ fun AiScreen(
                             SurveyNavigationButtons(
                                 primaryLabel = "Next",
                                 primaryEnabled = canAdvanceAiTurn(
-                                    aiLoading = loading,
+                                    aiLoading = loading || executionRunning,
                                     mainSubmissionPending = submissionPending,
                                     speechRecording = speechRecording,
                                     speechTranscribing = speechTranscribing,
                                 ),
-                                onPrimary = {
-                                    if (canAdvanceAiTurn(
-                                            aiLoading = loading,
-                                            mainSubmissionPending = submissionPending,
-                                            speechRecording = speechController?.isRecording?.value == true,
-                                            speechTranscribing = speechController?.isTranscribing?.value == true,
-                                        )
-                                    ) {
-                                        keyboard?.hide()
-                                        focusManager.clearFocus(force = true)
-                                        vmAI.resetStates()
-                                        onNext()
+                                onPrimary = next@{
+                                    if (navigationLockedNow() || speechController?.isRecording?.value == true) {
+                                        return@next
                                     }
+                                    keyboard?.hide()
+                                    focusManager.clearFocus(force = true)
+                                    vmAI.resetStates()
+                                    onNext()
                                 },
                                 secondaryLabel = "Back",
-                                secondaryEnabled = !speechTranscribing,
+                                secondaryEnabled = !navigationLocked,
                                 onSecondary = back@{
-                                    if (speechController?.isTranscribing?.value == true) return@back
+                                    if (navigationLockedNow()) return@back
                                     keyboard?.hide()
                                     focusManager.clearFocus(force = true)
                                     vmAI.resetStates()
