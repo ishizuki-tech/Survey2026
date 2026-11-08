@@ -37,7 +37,7 @@ internal fun SurveyQuestionAutoRead(
 
     val presentation by survey.questionPresentation.collectAsState()
     val owner = remember(survey, presentation) { survey.questionSpeechOwner() }
-    val node = survey.currentNode.value
+    val node by survey.currentNode.collectAsState()
     val isAi = owner.nodeType == NodeType.AI
     val conversation = if (isAi) {
         remember(ai, owner.session, owner.nodeId) {
