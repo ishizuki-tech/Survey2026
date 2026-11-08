@@ -1449,13 +1449,6 @@ internal fun SurveyNavHost(
         runCatching { speechController.updateContext(surveyUuid, latestNode.id) }
     }
 
-    DisposableEffect(speechController) {
-        onDispose {
-            // Best-effort: stop recording when leaving the host.
-            runCatching { speechController.stopRecording() }
-        }
-    }
-
     /* ───────────────────────── Text-to-speech (question read-aloud) ───────────────────────── */
 
     val ttsEnabled = remember(ttsMeta.enabled) { ttsMeta.enabled ?: true }

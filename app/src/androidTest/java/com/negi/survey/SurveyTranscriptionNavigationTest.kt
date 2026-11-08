@@ -5,17 +5,21 @@ import android.view.KeyEvent
 import androidx.activity.BackEventCompat
 import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
+import androidx.activity.compose.setContent
 import androidx.compose.runtime.remember
 import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.hasSetTextAction
 import androidx.compose.ui.test.junit4.v2.createAndroidComposeRule
+import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performImeAction
 import androidx.compose.ui.test.performTextReplacement
 import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.viewmodel.initializer
+import androidx.lifecycle.viewmodel.viewModelFactory
 import androidx.navigation3.runtime.rememberNavBackStack
 import androidx.test.platform.app.InstrumentationRegistry
 import com.negi.survey.config.NodeDTO
@@ -32,12 +36,14 @@ import com.negi.survey.vm.AiViewModel
 import com.negi.survey.vm.FlowHome
 import com.negi.survey.vm.SurveyFinalizationStatePolicy
 import com.negi.survey.vm.SurveyFinalizationViewModel
+import com.negi.survey.vm.SurveySessionStore
 import com.negi.survey.vm.SurveyViewModel
 import com.negi.survey.vm.WhisperSessionGate
 import com.negi.survey.vm.WhisperSpeechController
 import com.negi.survey.whisper.RecorderBackend
 import java.io.File
 import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -46,6 +52,7 @@ import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
@@ -74,6 +81,99 @@ class SurveyTranscriptionNavigationTest {
                 instrumentation.targetContext, survey.surveyUuid.value
             )?.delete()
         }
+    }
+
+    @Test
+    fun activeRecordingSurvivesRepeatedActivityRecreationUntilExplicitStop() {
+        val sessionKey = "recording-recreation"
+        val whisperMeta = SurveyConfig.WhisperMeta(assetModelPath = "rotation-fixture", language = "en")
+        val controllerKey = "WhisperSpeechController_${sessionKey}_rotation-fixture_en"
+        val scenario = rule.activityRule.scenario
+        val recorders = ConcurrentLinkedQueue<FixtureWavRecorder>()
+        val transcriptionCalls = AtomicInteger()
+        val factory = viewModelFactory {
+            initializer {
+                WhisperSpeechController(
+                    appContext = instrumentation.targetContext.applicationContext,
+                    recorderFactory = { _, _ -> FixtureWavRecorder().also { recorders.add(it) } },
+                    recorderSessionMutex = Mutex(),
+                    whisperSessionGate = WhisperSessionGate(),
+                    modelInitializer = {},
+                    whisperDetacher = {},
+                    onVoiceExported = { fixtureVoiceExports.add(it.fileName) },
+                    transcriber = { _, _ ->
+                        transcriptionCalls.incrementAndGet()
+                        Result.success("Recorded across recreation")
+                    }
+                )
+            }
+        }
+        val config = SurveyConfig(graph = SurveyConfig.Graph(
+            startId = "Start",
+            nodes = listOf(NodeDTO("Start", "START", title = "Survey Note", nextId = "Done"),
+                NodeDTO("Done", "DONE"))
+        ))
+
+        fun mountHost(): WhisperSpeechController {
+            lateinit var retainedController: WhisperSpeechController
+            scenario.onActivity { activity ->
+                val sessions = ViewModelProvider(activity)[SurveySessionStore::class.java]
+                val owner = sessions.ownerFor(sessionKey)
+                retainedController = ViewModelProvider(owner, factory)[controllerKey, WhisperSpeechController::class.java]
+                activity.setContent {
+                    val nav = rememberNavBackStack(FlowHome)
+                    val survey = remember { SurveyViewModel(nav, config) }
+                    val ai = remember { AiViewModel(UnusedRepository) }
+                    SurveyNavTheme {
+                        SurveyNavHost(
+                            vmSurvey = survey,
+                            vmAI = ai,
+                            backStack = nav,
+                            whisperMeta = whisperMeta,
+                            ttsMeta = SurveyConfig.TtsMeta(enabled = false),
+                            sessionId = sessionKey,
+                            sessionVmOwner = owner,
+                            onResolveUploadStatusDetails = { error("Unused") },
+                            onClearCompletedSurveys = {}
+                        )
+                    }
+                }
+            }
+            return retainedController
+        }
+
+        val controller = mountHost()
+        rule.onNodeWithContentDescription("Start recording").performClick()
+        rule.waitUntil(5_000L) { controller.isCaptureActive.value }
+        val recorder = recorders.single()
+
+        repeat(2) {
+            scenario.recreate()
+            assertSame(controller, mountHost())
+            rule.onNodeWithContentDescription("Stop recording").assertIsEnabled()
+            assertTrue(controller.isCaptureActive.value)
+            assertFalse(controller.isTranscribing.value)
+            assertSame(recorder, recorders.single())
+            assertEquals(0, recorder.stopCalls.get())
+            assertEquals(0, transcriptionCalls.get())
+        }
+
+        rule.onNodeWithContentDescription("Stop recording").performClick()
+        rule.waitUntil(10_000L) {
+            !controller.isTranscribing.value && controller.partialText.value == "Recorded across recreation"
+        }
+        assertEquals(1, recorder.stopCalls.get())
+        assertEquals(1, transcriptionCalls.get())
+
+        rule.onNodeWithContentDescription("Start recording").performClick()
+        rule.waitUntil(5_000L) { controller.isCaptureActive.value }
+        val recorderAtSessionEnd = recorders.last()
+        scenario.onActivity { activity ->
+            ViewModelProvider(activity)[SurveySessionStore::class.java].clearSession(sessionKey)
+        }
+        rule.waitUntil(5_000L) { recorderAtSessionEnd.closed.isCompleted }
+        assertEquals(0, recorderAtSessionEnd.stopCalls.get())
+        assertEquals(1, transcriptionCalls.get())
     }
 
     @Test
@@ -479,6 +579,8 @@ class SurveyTranscriptionNavigationTest {
     )
 
     private inner class FixtureWavRecorder : RecorderBackend {
+        val stopCalls = AtomicInteger()
+        val closed = CompletableDeferred<Unit>()
         private lateinit var output: File
         private var active = false
         private var onCaptureStarted: () -> Unit = {}
@@ -496,6 +598,7 @@ class SurveyTranscriptionNavigationTest {
         }
 
         override suspend fun stopRecording() {
+            stopCalls.incrementAndGet()
             active = false
             instrumentation.context.assets.open("whisper/jfk.wav").use { fixture ->
                 output.outputStream().use { fixture.copyTo(it) }
@@ -504,6 +607,7 @@ class SurveyTranscriptionNavigationTest {
 
         override fun close() {
             active = false
+            closed.complete(Unit)
         }
     }
 
