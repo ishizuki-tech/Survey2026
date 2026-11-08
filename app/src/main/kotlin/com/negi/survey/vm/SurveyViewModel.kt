@@ -439,6 +439,15 @@ open class SurveyViewModel(
     private val _answers = MutableStateFlow<Map<String, String>>(LinkedHashMap())
     val answers: StateFlow<Map<String, String>> = _answers.asStateFlow()
 
+    private val _submittedAiOriginals = MutableStateFlow<Set<String>>(emptySet())
+    internal val submittedAiOriginals = _submittedAiOriginals.asStateFlow()
+
+    /** Records acceptance before validation starts, independently of subsequent draft edits. */
+    internal fun acceptAiOriginalAnswer(nodeId: String, text: String) {
+        setAnswer(text, nodeId)
+        _submittedAiOriginals.update { it + nodeId.trim() }
+    }
+
     fun setAnswer(text: String, key: String) {
         _answers.update { old ->
             old.mutableLinked().apply { put(key.trim(), text) }
@@ -471,6 +480,7 @@ open class SurveyViewModel(
 
     fun resetAnswers() {
         _answers.value = LinkedHashMap()
+        _submittedAiOriginals.value = emptySet()
     }
 
     /* ───────────────────────────── Choice Selections ───────────────────────────── */

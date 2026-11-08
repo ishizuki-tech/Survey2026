@@ -39,6 +39,8 @@ import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.test.SemanticsNodeInteraction
 import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.click
+import androidx.compose.ui.test.assertTextContains
+import androidx.compose.ui.test.performTextClearance
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.SemanticsMatcher
@@ -867,6 +869,7 @@ class AiScreenInteractionTest {
         rule.onNodeWithContentDescription("Send").performClick()
         rule.waitUntil(8_000) { repo.requests == 1 && !ai.blocksNavigation() }
         assertEquals(SurveyAiReason.FAILURE, survey.aiReasons.value["Q8"])
+        assertEquals(setOf("Q8"), survey.submittedAiOriginals.value)
         assertEquals("Q8", survey.currentNodeId)
         rule.onNodeWithText("Next").performScrollTo().assertIsEnabled().performClick()
         rule.runOnIdle { assertEquals("Q9", survey.currentNodeId) }
@@ -2754,6 +2757,82 @@ class AiScreenInteractionTest {
         rule.onNodeWithContentDescription("Record answer").performScrollTo().assertIsDisplayed()
         rule.onNodeWithText("Next").performScrollTo().assertIsDisplayed().assertIsEnabled()
         rule.onNodeWithText("Back").performScrollTo().assertIsDisplayed().assertIsEnabled()
+    }
+
+    @Test fun originalReadsOncePerNavigationPresentationWithOrWithoutDraft() {
+        host(withSpeech = false, initialNode = "Q08")
+        val editor = rule.onNode(hasSetTextAction())
+        val original = "Q08 original question"
+        val nextQuestion = "Q09 original question"
+
+        rule.runOnIdle { assertEquals(listOf(original), speaker.spoken) }
+        editor.performTextReplacement("unsent draft")
+        rule.onNodeWithText("Next").performClick()
+        rule.onNodeWithText("Back").performClick()
+        editor.assertTextContains("unsent draft")
+        rule.runOnIdle {
+            assertEquals(listOf(original, nextQuestion, original), speaker.spoken)
+            assertEquals("unsent draft", survey.getAnswer("Q08"))
+        }
+
+        editor.performTextReplacement("edited draft")
+        editor.performTextClearance()
+        rule.runOnIdle { unrelated = true }
+        rule.runOnIdle { assertEquals(listOf(original, nextQuestion, original), speaker.spoken) }
+
+        rule.onNodeWithText("Next").performClick()
+        rule.onNodeWithText("Back").performClick()
+        rule.runOnIdle {
+            assertEquals(listOf(original, nextQuestion, original, nextQuestion, original), speaker.spoken)
+            assertEquals(3, speaker.ids.filter { "|nid=Q08|" in it }.distinct().size)
+        }
+    }
+
+    @Test fun acceptedOriginalCancelsPendingReadAndStaysSilentOnReturnUntilNewSurvey() {
+        speaker.isReady.value = false
+        host(withSpeech = false)
+        rule.runOnIdle { assertEquals(1, speaker.isReady.subscriptionCount.value) }
+        val editor = rule.onNode(hasSetTextAction())
+        editor.performTextReplacement("answer to send")
+        rule.runOnIdle { assertEquals(1, speaker.isReady.subscriptionCount.value) }
+        rule.onNodeWithContentDescription("Send").performClick()
+        rule.runOnIdle {
+            assertEquals(setOf("Q8"), survey.submittedAiOriginals.value)
+            speaker.isReady.value = true
+        }
+        rule.waitUntil(5_000) { repo.requests == 1 }
+        rule.runOnIdle { ai.cancel() }
+        rule.waitUntil(5_000) { !ai.blocksNavigation() }
+        rule.runOnIdle {
+            assertTrue(survey.followups.value["Q8"].isNullOrEmpty())
+            assertTrue(survey.aiReasons.value["Q8"] == null)
+            assertTrue(!ai.conversationStateFlow(contextKey).value.turnCompleted)
+            assertTrue(speaker.spoken.isEmpty())
+        }
+        rule.onNodeWithText("Next").performClick()
+        rule.onNodeWithText("Back").performClick()
+        rule.runOnIdle {
+            assertEquals(listOf("Other question"), speaker.spoken)
+            assertEquals(setOf("Q8"), survey.submittedAiOriginals.value)
+            survey.resetToStart()
+            survey.goto("Q8")
+        }
+        rule.runOnIdle {
+            assertTrue(survey.submittedAiOriginals.value.isEmpty())
+            assertEquals(listOf("Other question", "Question"), speaker.spoken)
+            assertTrue(speaker.ids.last().startsWith("sid=1|nid=Q8|"))
+        }
+    }
+
+    @Test fun acceptingFollowupDoesNotRecordAnOriginalSubmission() {
+        host(withSpeech = false) { addFollowupQuestion("Q8", "Pending follow-up?") }
+        rule.onNode(hasSetTextAction()).performTextReplacement("follow-up answer")
+        rule.onNodeWithContentDescription("Send").performClick()
+        rule.runOnIdle {
+            assertEquals("follow-up answer", survey.followups.value["Q8"]?.single()?.answer)
+            assertTrue(survey.submittedAiOriginals.value.isEmpty())
+            assertEquals(listOf("Pending follow-up?"), speaker.spoken)
+        }
     }
 
     @Test fun readinessPlaysOnceAndLaterReadinessOrEligibilityChangesDoNotReplay() {
