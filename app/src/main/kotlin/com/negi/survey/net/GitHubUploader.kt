@@ -126,7 +126,10 @@ object GitHubUploader {
     internal class SurveyUploadAmbiguousException(message: String) : IOException(message)
 
     /** The remote target was not proven to be the staged survey and must not be overwritten. */
-    internal class SurveyUploadValidationException(message: String) : IOException(message)
+    internal class SurveyUploadValidationException(
+        message: String,
+        val remoteConflict: Boolean = false,
+    ) : IOException(message)
 
     internal class ConflictRetriesExhaustedException : IOException("GitHub branch conflict retries exhausted (409).")
 
@@ -217,7 +220,9 @@ object GitHubUploader {
         expectedSurveyId: String,
         content: String,
         message: String = DEFAULT_MESSAGE,
-        onProgress: (Int) -> Unit = {}
+        onProgress: (Int) -> Unit = {},
+        verifyCreated: Boolean = false,
+        connect: (URL) -> HttpURLConnection = ::openHttpConnection,
     ): UploadResult = withContext(Dispatchers.IO) {
         require(path.isNotBlank()) { "Canonical survey path is blank." }
         val identity = SurveyUploadIdempotency.validateLocalPayload(expectedSurveyId, content)
@@ -229,9 +234,13 @@ object GitHubUploader {
         reconcileSurveyJsonUpload(
             identity = identity,
             content = content,
+            verifyCreated = verifyCreated,
             transport = object : SurveyContentsTransport {
                 override suspend fun getExisting(): SurveyRemoteRecord? =
-                    getExistingContents(cfg.owner, repoName, cfg.branch, encodedPath, cfg.token)?.let {
+                    getExistingContents(
+                        cfg.owner, repoName, cfg.branch, encodedPath, cfg.token,
+                        rawLimit = bytes.size.takeIf { verifyCreated }, connect = connect,
+                    )?.let {
                         SurveyRemoteRecord(it.content, it.fileUrl)
                     }
 
@@ -240,7 +249,9 @@ object GitHubUploader {
                         owner = cfg.owner, repoName = repoName, branch = cfg.branch, path = path,
                         encodedPath = encodedPath, token = cfg.token, rawSize = bytes.size.toLong(),
                         openStream = { bytes.inputStream() }, message = message, sha = null,
-                        onProgress = onProgress, maxRequestBytesHint = cfg.maxRequestBytesHint
+                        onProgress = onProgress, maxRequestBytesHint = cfg.maxRequestBytesHint,
+                        maxAttempts = if (verifyCreated) 1 else DEFAULT_MAX_ATTEMPTS,
+                        connect = connect,
                     )
                     SurveyCreateResult.Created(parseUploadResult(response.body))
                 } catch (failure: HttpFailureException) {
@@ -264,13 +275,14 @@ object GitHubUploader {
         identity: SurveyUploadIdempotency.LocalSurveyIdentity,
         content: String,
         transport: SurveyContentsTransport,
+        verifyCreated: Boolean = false,
         waitForConflict: suspend (Int) -> Unit = { delay(conflictDelayMs(it)) }
     ): UploadResult {
         fun matching(existing: SurveyRemoteRecord): UploadResult {
             if (SurveyUploadIdempotency.classifyExisting(identity, content, existing.content) !=
                 SurveyUploadIdempotency.ExistingRecord.MATCHING
             ) {
-                throw SurveyUploadValidationException("Canonical survey target contains conflicting content.")
+                throw SurveyUploadValidationException("Canonical survey target contains conflicting content.", remoteConflict = true)
             }
             return UploadResult(existing.fileUrl, null)
         }
@@ -278,7 +290,14 @@ object GitHubUploader {
         transport.getExisting()?.let { return matching(it) }
         for (attempt in 1..MAX_CONFLICT_ATTEMPTS) {
             when (val created = transport.createOnly()) {
-                is SurveyCreateResult.Created -> return created.upload
+                is SurveyCreateResult.Created -> {
+                    if (verifyCreated) {
+                        matching(transport.getExisting() ?: throw SurveyUploadAmbiguousException(
+                            "Created survey could not yet be verified."
+                        ))
+                    }
+                    return created.upload
+                }
                 is SurveyCreateResult.Reconcile -> {
                     transport.getExisting()?.let { return matching(it) }
                     if (created.statusCode == 422) {
@@ -414,7 +433,8 @@ object GitHubUploader {
         message: String = DEFAULT_MESSAGE,
         onProgress: (Int) -> Unit = {},
         maxRawBytesHint: Int = DEFAULT_MAX_RAW_BYTES,
-        maxRequestBytesHint: Int = DEFAULT_MAX_REQUEST_BYTES
+        maxRequestBytesHint: Int = DEFAULT_MAX_REQUEST_BYTES,
+        verifyCreated: Boolean = false,
     ): UploadResult {
         require(file.exists() && file.isFile) { "File does not exist: ${file.absolutePath}" }
         val rawSize = file.length().coerceAtLeast(0L)
@@ -429,7 +449,8 @@ object GitHubUploader {
             message = message,
             onProgress = onProgress,
             maxRawBytesHint = maxRawBytesHint,
-            maxRequestBytesHint = maxRequestBytesHint
+            maxRequestBytesHint = maxRequestBytesHint,
+            verifyCreated = verifyCreated,
         )
     }
 
@@ -441,7 +462,8 @@ object GitHubUploader {
         path: String,
         file: File,
         message: String = DEFAULT_MESSAGE,
-        onProgress: (Int) -> Unit = {}
+        onProgress: (Int) -> Unit = {},
+        verifyCreated: Boolean = false,
     ): UploadResult = uploadFile(
         owner = cfg.owner,
         repo = cfg.repo,
@@ -452,7 +474,8 @@ object GitHubUploader {
         message = message,
         onProgress = onProgress,
         maxRawBytesHint = cfg.maxRawBytesHint,
-        maxRequestBytesHint = cfg.maxRequestBytesHint
+        maxRequestBytesHint = cfg.maxRequestBytesHint,
+        verifyCreated = verifyCreated,
     )
 
     // ---------------------------------------------------------------------
@@ -510,7 +533,8 @@ object GitHubUploader {
         message: String,
         onProgress: (Int) -> Unit,
         maxRawBytesHint: Int,
-        maxRequestBytesHint: Int
+        maxRequestBytesHint: Int,
+        verifyCreated: Boolean = false,
     ): UploadResult = withContext(Dispatchers.IO) {
 
         require(owner.isNotBlank()) { "GitHub owner cannot be blank." }
@@ -554,11 +578,13 @@ object GitHubUploader {
         val localSha = digest.digest().joinToString("") { "%02x".format(it.toInt() and 0xff) }
         val result = createArtifactWithConflictRetry(
             localSha = localSha,
+            verifyCreated = verifyCreated,
             getExistingSha = { getExistingSha(owner, repoName, branch, encodedPath, token) },
             create = {
                 val response = putContents(
                     owner, repoName, branch, path, encodedPath, token, rawSize,
-                    openStream, message, null, onProgress, maxRequestBytesHint
+                    openStream, message, null, onProgress, maxRequestBytesHint,
+                    maxAttempts = if (verifyCreated) 1 else DEFAULT_MAX_ATTEMPTS,
                 )
                 parseUploadResult(response.body)
             }
@@ -572,7 +598,8 @@ object GitHubUploader {
         localSha: String,
         getExistingSha: suspend () -> String?,
         create: suspend () -> UploadResult,
-        waitForConflict: suspend (Int) -> Unit = { delay(conflictDelayMs(it)) }
+        waitForConflict: suspend (Int) -> Unit = { delay(conflictDelayMs(it)) },
+        verifyCreated: Boolean = false,
     ): UploadResult {
         fun checkRemote(sha: String?): UploadResult? {
             if (sha == null) return null
@@ -582,7 +609,12 @@ object GitHubUploader {
         checkRemote(getExistingSha())?.let { return it }
         for (attempt in 1..MAX_CONFLICT_ATTEMPTS) {
             try {
-                return create()
+                val result = create()
+                if (verifyCreated) {
+                    checkRemote(getExistingSha())
+                        ?: throw SurveyUploadAmbiguousException("Created artifact could not yet be verified.")
+                }
+                return result
             } catch (failure: HttpFailureException) {
                 if (failure.code != 409 && failure.code != 422) throw failure
                 checkRemote(getExistingSha())?.let { return it }
@@ -590,6 +622,10 @@ object GitHubUploader {
                 if (attempt == MAX_CONFLICT_ATTEMPTS) throw ConflictRetriesExhaustedException()
                 waitForConflict(attempt)
                 checkRemote(getExistingSha())?.let { return it }
+            } catch (failure: IOException) {
+                if (!verifyCreated || failure is ArtifactConflictException) throw failure
+                checkRemote(getExistingSha())?.let { return it }
+                throw failure
             }
         }
         throw IOException("Artifact conflict retries exhausted")
@@ -639,7 +675,9 @@ object GitHubUploader {
         message: String,
         sha: String?,
         onProgress: (Int) -> Unit,
-        maxRequestBytesHint: Int
+        maxRequestBytesHint: Int,
+        maxAttempts: Int = DEFAULT_MAX_ATTEMPTS,
+        connect: (URL) -> HttpURLConnection = ::openHttpConnection,
     ): HttpResponse {
         val msgJson = JSONObject.quote(message.ifBlank { DEFAULT_MESSAGE })
         val branchJson = JSONObject.quote(branch)
@@ -706,7 +744,9 @@ object GitHubUploader {
             method = "PUT",
             url = url,
             token = token,
-            writeBody = writeBody
+            writeBody = writeBody,
+            maxAttempts = maxAttempts,
+            connect = connect,
         )
     }
 
@@ -754,7 +794,9 @@ object GitHubUploader {
         connectTimeoutMs: Int = 20_000,
         readTimeoutMs: Int = 30_000,
         maxAttempts: Int = DEFAULT_MAX_ATTEMPTS,
-        allowNon2xxCodes: Set<Int> = emptySet()
+        allowNon2xxCodes: Set<Int> = emptySet(),
+        rawLimit: Int? = null,
+        connect: (URL) -> HttpURLConnection = ::openHttpConnection,
     ): HttpResponse {
         if (BuildConfig.ISSUE157_DA) throw IOException("GitHub uploads are disabled in Survey D+A.")
         var attempt = 0
@@ -763,7 +805,7 @@ object GitHubUploader {
         while (attempt < maxAttempts) {
             attempt++
 
-            val conn = (url.openConnection() as HttpURLConnection).apply {
+            val conn = connect(url).apply {
                 requestMethod = method
                 doInput = true
                 doOutput = (writeBody != null)
@@ -772,7 +814,7 @@ object GitHubUploader {
 
                 // GitHub REST docs commonly show "Bearer <token>".
                 setRequestProperty("Authorization", "Bearer ${token.trim()}")
-                setRequestProperty("Accept", "application/vnd.github+json")
+                setRequestProperty("Accept", if (rawLimit != null) "application/vnd.github.raw+json" else "application/vnd.github+json")
                 setRequestProperty("X-GitHub-Api-Version", API_VERSION)
                 setRequestProperty("User-Agent", USER_AGENT)
 
@@ -792,7 +834,11 @@ object GitHubUploader {
 
                 if (code in 200..299 || allowNon2xxCodes.contains(code)) {
                     val bodyStream = if (code in 200..299) conn.inputStream else conn.errorStream
-                    val body = bodyStream?.use(::readAll).orEmpty()
+                    val body = bodyStream?.use {
+                        if (rawLimit != null && code in 200..299) {
+                            readRawSurvey(it, rawLimit)
+                        } else readAll(it)
+                    }.orEmpty()
                     return HttpResponse(code, body, headers)
                 }
 
@@ -825,6 +871,8 @@ object GitHubUploader {
                 delay(delayMs)
 
             } catch (e: HttpFailureException) {
+                throw e
+            } catch (e: SurveyUploadValidationException) {
                 throw e
             } catch (e: IOException) {
                 lastError = e
@@ -1001,22 +1049,46 @@ object GitHubUploader {
         }
     }
 
+    private fun openHttpConnection(url: URL): HttpURLConnection = url.openConnection() as HttpURLConnection
+
+    /** Bound raw read-back by the local payload size. Larger or invalid UTF-8 bytes cannot match. */
+    private fun readRawSurvey(input: InputStream, limit: Int): String {
+        val bytes = java.io.ByteArrayOutputStream(minOf(limit, 8192))
+        val buffer = ByteArray(8192)
+        while (true) {
+            val count = input.read(buffer, 0, minOf(buffer.size, limit - bytes.size() + 1))
+            if (count < 0) break
+            if (count > limit - bytes.size()) {
+                throw SurveyUploadValidationException("Remote survey exceeds the staged size.", remoteConflict = true)
+            }
+            bytes.write(buffer, 0, count)
+        }
+        return try {
+            Charsets.UTF_8.newDecoder().decode(java.nio.ByteBuffer.wrap(bytes.toByteArray())).toString()
+        } catch (_: java.nio.charset.CharacterCodingException) {
+            throw SurveyUploadValidationException("Remote survey is invalid UTF-8.", remoteConflict = true)
+        }
+    }
+
     /** Reads the complete UTF-8 payload needed to validate an immutable survey target. */
     private suspend fun getExistingContents(
         owner: String,
         repo: String,
         branch: String,
         encodedPath: String,
-        token: String
+        token: String,
+        rawLimit: Int? = null,
+        connect: (URL) -> HttpURLConnection = ::openHttpConnection,
     ): ExistingContents? {
         val refEncoded = URLEncoder.encode(branch.trim(), "UTF-8").replace("+", "%20")
         val url = URL("$API_BASE/repos/$owner/$repo/contents/$encodedPath?ref=$refEncoded")
         val response = executeWithRetry(
             method = "GET", url = url, token = token, writeBody = null,
             connectTimeoutMs = 15_000, readTimeoutMs = 20_000,
-            maxAttempts = DEFAULT_MAX_ATTEMPTS, allowNon2xxCodes = setOf(404)
+            maxAttempts = DEFAULT_MAX_ATTEMPTS, allowNon2xxCodes = setOf(404), rawLimit = rawLimit, connect = connect
         )
         if (response.code == 404) return null
+        if (rawLimit != null) return ExistingContents(response.body, null)
         val json = try {
             JSONObject(response.body)
         } catch (error: JSONException) {

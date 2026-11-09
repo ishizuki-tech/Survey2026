@@ -104,191 +104,66 @@ class GitHubUploadWorker(
         )
     }
 
-    override suspend fun doWork(): Result {
-        val mode =
-            inputData.getString(KEY_MODE)
-                ?.lowercase(Locale.US)
-                ?: MODE_FILE
-
-        val issue86ProcessDeathSession = inputData.getString(Issue86ProcessDeathHarness.KEY_SESSION_ID)
-        if (DiagnosticUploadInstrumentationGate.isDisabled()) {
-            val permittedHarness = try {
-                Issue86ProcessDeathHarness.permitsWorkerThroughInstrumentationGate(issue86ProcessDeathSession)
-            } catch (invalidHarness: IllegalArgumentException) {
-                return Result.failure(workDataOf(ERROR_MESSAGE to "Invalid Issue #86 process-death session."))
-            } catch (invalidHarness: IllegalStateException) {
-                return Result.failure(workDataOf(ERROR_MESSAGE to "Invalid Issue #86 process-death harness state."))
-            }
-            if (!permittedHarness) {
-                when (DiagnosticUploadInstrumentationGate.classifyWorker(
-                    inputData.getString(KEY_UPLOAD_KIND), inputData.getString(KEY_SURVEY_ID)
-                )) {
-                    DiagnosticUploadInstrumentationGate.WorkerDisposition.SKIP_DIAGNOSTIC -> {
-                        Log.i(TAG, "doWork: external diagnostic upload skipped by instrumentation argument; mode=$mode")
-                        return Result.success()
-                    }
-                    DiagnosticUploadInstrumentationGate.WorkerDisposition.DEFER_SURVEY -> {
-                        // Survey WorkManager requests use exponential backoff. Retrying keeps the
-                        // request observable as pending without upload, ledger, authority, or cleanup effects.
-                        Log.i(TAG, "doWork: survey upload deferred by instrumentation diagnostic gate")
-                        return Result.retry()
-                    }
-                    DiagnosticUploadInstrumentationGate.WorkerDisposition.REJECT_MALFORMED_SURVEY -> {
-                        return Result.failure(workDataOf(ERROR_MESSAGE to "Malformed survey JSON Worker input."))
-                    }
-                }
-            }
+    override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
+        val mode = inputData.getString(KEY_MODE)
+        if (mode != V2ArtifactDelivery.MODE && mode != V2ArtifactDelivery.RECOVERY_MODE) {
+            return@withContext Result.failure(workDataOf(ERROR_MESSAGE to "Unknown or legacy export protocol."))
         }
-
-        val maxFileBytesHint =
-            inputData.getLong(
-                KEY_FILE_MAX_BYTES_HINT,
-                DEFAULT_MAX_RAW_BYTES_HINT
-            ).coerceAtLeast(1L)
-
-        val maxRawBytesHint =
-            maxFileBytesHint
-                .coerceAtMost(Int.MAX_VALUE.toLong())
-                .toInt()
-
-        val defaultRequestBytesHint =
-            estimateRequestBytesHint(maxRawBytesHint)
-
-        val maxRequestBytesHint =
-            inputData.getInt(
-                KEY_FILE_MAX_REQUEST_BYTES_HINT,
-                defaultRequestBytesHint
-            ).coerceAtLeast(1)
-
-        val cfg =
-            resolveGitHubConfig(
-                maxRawBytesHint = maxRawBytesHint,
-                maxRequestBytesHint = maxRequestBytesHint
-            )
-
-        if (cfg == null) {
-            return Result.failure(
-                workDataOf(
-                    ERROR_MESSAGE to
-                            "Invalid GitHub configuration. " +
-                            "No usable owner/repo/token could be resolved."
-                )
-            )
+        if (mode == V2ArtifactDelivery.RECOVERY_MODE) {
+            com.negi.survey.diagnostics.V2TraceArtifacts.recover(applicationContext)
+            val config = V2ArtifactDelivery.config(applicationContext)
+            if (config == null) {
+                V2ArtifactDelivery.recoverIndependent(applicationContext, null)
+                V2ArtifactDelivery.cleanupConfirmedSurveys(applicationContext)
+            } else {
+                SurveyUploadRescheduler.recoverPendingSurveyUploads(applicationContext, config)
+            }
+            return@withContext Result.success()
         }
-
-        executionConfig = cfg
-
+        val artifactId = inputData.getString(V2ArtifactDelivery.KEY_ARTIFACT)
+            ?.takeIf { it.matches(Regex("[a-z0-9-]{1,80}")) }
+            ?: return@withContext Result.failure(workDataOf(ERROR_MESSAGE to "Missing or invalid V2 artifact identity."))
+        val entry = V2ArtifactStore(applicationContext).read(artifactId)
+        if (entry == null || entry.routeFingerprint != inputData.getString(V2ArtifactDelivery.KEY_ROUTE)) {
+            return@withContext Result.failure(workDataOf(ERROR_MESSAGE to "Immutable V2 route evidence is missing or changed."))
+        }
+        if (DiagnosticUploadInstrumentationGate.isDisabled()) return@withContext Result.retry()
+        val cfg = V2ArtifactDelivery.config(applicationContext)
+            ?: return@withContext Result.failure(workDataOf(ERROR_MESSAGE to "V2 upload destination is disabled or has no credential."))
         try {
-            val retained = UploadConflictRecoveryStore(applicationContext.filesDir)
-                .get(UploadConflictRecoveryStore.key(inputData, id))
-            if (retained != null && (!inputData.getBoolean(UploadConflictRecoveryStore.RECOVERY, false) || retained.exhausted >= 2)) {
-                return Result.failure(workDataOf(ERROR_MESSAGE to "Upload deferred after conflict exhaustion; staged data retained."))
+            try {
+                setForeground(getForegroundInfo())
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                Log.w(TAG, "V2 upload foreground notification unavailable", failure)
             }
-        } catch (error: Exception) {
-            Log.e(TAG, "Cannot inspect upload conflict state; retaining staged data", error)
-            return Result.failure(workDataOf(ERROR_MESSAGE to "Cannot inspect durable conflict state."))
-        }
-
-        ensureChannel()
-
-        val notifTitleBase = notificationTitleForMode(mode)
-        val notifId = stableNotificationId(mode, id.toString())
-
-        try {
-            setForeground(
-                foregroundInfo(
-                    notificationId = notifId,
-                    pct = 0,
-                    title = "$notifTitleBase…"
-                )
-            )
-        } catch (ce: CancellationException) {
-            throw ce
-        } catch (t: Throwable) {
-            Log.w(
-                TAG,
-                "doWork: setForeground failed; continuing best-effort. err=${t.message}",
-                t
-            )
-        }
-
-        val lastPctRef = intArrayOf(-1)
-
-        val progressCallback: (Int) -> Unit =
-            progressCallback@{ pct ->
-                val clamped = pct.coerceIn(0, 100)
-
-                if (clamped == lastPctRef[0]) {
-                    return@progressCallback
-                }
-
-                lastPctRef[0] = clamped
-
-                setProgressAsync(
-                    workDataOf(
-                        PROGRESS_PCT to clamped,
-                        PROGRESS_MODE to mode
-                    )
-                )
-
-                runCatching {
-                    setForegroundAsync(
-                        foregroundInfo(
-                            notificationId = notifId,
-                            pct = clamped,
-                            title = "$notifTitleBase…"
-                        )
-                    )
-                }
+            V2ArtifactDelivery.deliver(applicationContext, entry, cfg) { pct ->
+                setProgressAsync(workDataOf(PROGRESS_PCT to pct, PROGRESS_MODE to mode))
             }
-
-        val currentPct: () -> Int = {
-            lastPctRef[0].coerceAtLeast(0)
-        }
-
-        /**
-         * CoroutineWorker defaults to Dispatchers.Default.
-         *
-         * This worker is dominated by network and file IO, so keep blocking
-         * uploader/file/process operations off the Default dispatcher.
-         */
-        return withContext(Dispatchers.IO) {
-            when (mode) {
-                MODE_LOGCAT ->
-                    doLogcatUpload(
-                        cfg,
-                        notifId,
-                        progressCallback,
-                        currentPct
-                    )
-
-                MODE_RUNTIME_LOGS,
-                MODE_STARTUP_RUNTIME_LOGS ->
-                    doRuntimeLogsUpload(
-                        mode,
-                        cfg,
-                        notifId,
-                        progressCallback,
-                        currentPct
-                    )
-
-                MODE_RING_LOGS,
-                MODE_STARTUP_RING_LOGS ->
-                    doRingLogsUpload(
-                        mode,
-                        cfg,
-                        notifId,
-                        progressCallback,
-                        currentPct
-                    )
-
-                else ->
-                    doFileUpload(
-                        cfg,
-                        notifId,
-                        progressCallback,
-                        currentPct
-                    )
+            Result.success(workDataOf(
+                OUT_MODE to mode, OUT_FILE_NAME to entry.route.basename, OUT_REMOTE_PATH to entry.route.path,
+            ))
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Exception) {
+            Log.w(TAG, "V2 artifact delivery deferred: ${failure.javaClass.simpleName}")
+            if (failure is GitHubUploader.ArtifactConflictException ||
+                (failure is GitHubUploader.SurveyUploadValidationException && failure.remoteConflict)
+            ) {
+                runCatching { entry.recordRemoteConflict() }
+                    .onFailure { Log.w(TAG, "Could not persist V2 conflict evidence", it) }
+            }
+            if (shouldRetry(failure) && runAttemptCount < 5) {
+                Result.retry()
+            } else {
+                val error = when (failure) {
+                    is GitHubUploader.HttpFailureException -> "GitHub request failed (${failure.code})."
+                    is GitHubUploader.ArtifactConflictException, is GitHubUploader.SurveyUploadValidationException ->
+                        "Remote content could not be verified."
+                    else -> "V2 delivery failed (${failure.javaClass.simpleName})."
+                }
+                Result.failure(workDataOf(ERROR_MESSAGE to error))
             }
         }
     }

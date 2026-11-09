@@ -21,6 +21,7 @@ package com.negi.survey.net
 import android.content.Context
 import android.content.SharedPreferences
 import java.util.Locale
+import java.util.IdentityHashMap
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -32,8 +33,13 @@ class UploadedSurveyStore internal constructor(
     private val prefs: SharedPreferences
 ) {
 
-    constructor(context: Context) : this(
-        context.applicationContext.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+    constructor(context: Context) : this(context, v2 = false)
+
+    internal constructor(context: Context, v2: Boolean) : this(
+        context.applicationContext.getSharedPreferences(
+            if (v2) "uploaded_survey_ledger_v2" else PREF_NAME,
+            Context.MODE_PRIVATE
+        )
     )
 
     /**
@@ -82,7 +88,12 @@ class UploadedSurveyStore internal constructor(
      * bytes sent to (or read back from) GitHub.  Historical ID-only entries are deliberately not
      * upgraded here: doing so could manufacture proof from a later local file.
      */
-    fun markConfirmedUploaded(surveyId: String, exportedAt: String?, payloadFingerprint: String) {
+    fun markConfirmedUploaded(
+        surveyId: String,
+        exportedAt: String?,
+        payloadFingerprint: String,
+        routeFingerprint: String? = null,
+    ) {
         val normalized = requireNotNull(normalize(surveyId)) { "Survey ID is blank." }
         require(SurveyUploadIdempotency.isPayloadFingerprint(payloadFingerprint)) {
             "Payload fingerprint must be a SHA-256 hex digest."
@@ -93,6 +104,14 @@ class UploadedSurveyStore internal constructor(
             val ids = prefs.getStringSet(KEY_SURVEY_IDS, emptySet()).orEmpty().toMutableSet()
             val fingerprints = readPayloadFingerprintMapLocked()
             val priorFingerprint = fingerprints[normalized]
+            val routes = readStringMapLocked(KEY_ROUTE_FINGERPRINT_JSON).toMutableMap()
+            check(!ids.contains(normalized) || routes[normalized] == routeFingerprint) {
+                "Existing uploaded survey record has no matching route fingerprint."
+            }
+            routeFingerprint?.let {
+                require(SurveyUploadIdempotency.isPayloadFingerprint(it))
+                routes[normalized] = it
+            }
             check(!ids.contains(normalized) || priorFingerprint == payloadFingerprint) {
                 "Existing uploaded survey record has no matching payload fingerprint."
             }
@@ -103,15 +122,27 @@ class UploadedSurveyStore internal constructor(
             val updatedFingerprints = fingerprints.toMutableMap().apply {
                 put(normalized, payloadFingerprint)
             }
-            check(
-                prefs.edit()
-                    .putStringSet(KEY_SURVEY_IDS, ids)
-                    .putString(KEY_EXPORTED_AT_JSON, encodeMap(exportedAtById))
-                    .putString(KEY_PAYLOAD_FINGERPRINT_JSON, encodeMap(updatedFingerprints))
-                    .commit()
-            ) { "Failed to persist confirmed uploaded survey ledger." }
+            // SharedPreferences applies changes in memory before its disk commit. Never treat
+            // the in-memory result of a failed commit as durable cleanup evidence.
+            val pending = unconfirmedWrites.getOrPut(prefs) { mutableSetOf() }
+            pending += normalized
+            val persisted = prefs.edit()
+                .putStringSet(KEY_SURVEY_IDS, ids)
+                .putString(KEY_EXPORTED_AT_JSON, encodeMap(exportedAtById))
+                .putString(KEY_PAYLOAD_FINGERPRINT_JSON, encodeMap(updatedFingerprints))
+                .putString(KEY_ROUTE_FINGERPRINT_JSON, encodeMap(routes))
+                .commit()
+            check(persisted) { "Failed to persist confirmed uploaded survey ledger." }
+            pending -= normalized
+            if (pending.isEmpty()) unconfirmedWrites.remove(prefs)
         }
     }
+
+    internal fun confirms(surveyId: String, payloadFingerprint: String, routeFingerprint: String): Boolean =
+        synchronized(LOCK) {
+            payloadFingerprintFor(surveyId) == payloadFingerprint &&
+                readStringMapLocked(KEY_ROUTE_FINGERPRINT_JSON)[normalize(surveyId)] == routeFingerprint
+        }
 
     /** Returns the recorded `exported_at` stamp for [surveyId], or null if none is known. */
     fun exportedAtFor(surveyId: String): String? {
@@ -123,19 +154,19 @@ class UploadedSurveyStore internal constructor(
     fun payloadFingerprintFor(surveyId: String): String? {
         val normalized = normalize(surveyId) ?: return null
         return synchronized(LOCK) {
-            if (!prefs.getStringSet(KEY_SURVEY_IDS, emptySet()).orEmpty().contains(normalized)) return@synchronized null
+            if (normalized !in durableIds()) return@synchronized null
             readPayloadFingerprintMapLocked()[normalized]
         }
     }
 
     /** Returns the number of unique survey UUIDs successfully recorded. */
     fun uploadedCount(): Int = synchronized(LOCK) {
-        prefs.getStringSet(KEY_SURVEY_IDS, emptySet()).orEmpty().size
+        durableIds().size
     }
 
     /** Returns a read-only snapshot of every survey UUID successfully recorded. */
     fun uploadedSurveyIds(): Set<String> = synchronized(LOCK) {
-        prefs.getStringSet(KEY_SURVEY_IDS, emptySet()).orEmpty().toSet()
+        durableIds().toSet()
     }
 
     /** One successfully uploaded survey, paired with its known export time (if any). */
@@ -147,7 +178,7 @@ class UploadedSurveyStore internal constructor(
 
     /** Read-only snapshot of every uploaded survey, each paired with its export time if known. */
     fun uploadedSurveyRecords(): List<UploadedSurveyRecord> = synchronized(LOCK) {
-        val ids = prefs.getStringSet(KEY_SURVEY_IDS, emptySet()).orEmpty()
+        val ids = durableIds()
         val exportedAtById = readExportedAtMapLocked()
         val fingerprints = readPayloadFingerprintMapLocked()
         ids.map { id -> UploadedSurveyRecord(id, exportedAtById[id], fingerprints[id]) }
@@ -156,10 +187,12 @@ class UploadedSurveyStore internal constructor(
     /** Returns true only when [surveyId] was previously recorded successfully. */
     fun isUploaded(surveyId: String): Boolean {
         val normalized = normalize(surveyId) ?: return false
-        return synchronized(LOCK) {
-            prefs.getStringSet(KEY_SURVEY_IDS, emptySet()).orEmpty().contains(normalized)
-        }
+        return synchronized(LOCK) { normalized in durableIds() }
     }
+
+    /** Must be called while holding [LOCK]. */
+    private fun durableIds(): Set<String> =
+        prefs.getStringSet(KEY_SURVEY_IDS, emptySet()).orEmpty() - unconfirmedWrites[prefs].orEmpty()
 
     private fun normalize(surveyId: String): String? =
         surveyId.trim()
@@ -198,7 +231,9 @@ class UploadedSurveyStore internal constructor(
         private const val PREF_NAME = "uploaded_survey_ledger_v1"
         private const val KEY_SURVEY_IDS = "survey_ids"
         private const val KEY_EXPORTED_AT_JSON = "exported_at_by_id"
+        private const val KEY_ROUTE_FINGERPRINT_JSON = "route_fingerprint_by_id"
         private const val KEY_PAYLOAD_FINGERPRINT_JSON = "payload_fingerprint_by_id"
         private val LOCK = Any()
+        private val unconfirmedWrites = IdentityHashMap<SharedPreferences, MutableSet<String>>()
     }
 }

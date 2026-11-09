@@ -714,7 +714,9 @@ class AiViewModel(
             },
             repositoryTraceContextForRun = { _, phase ->
                 answerTraceId?.let { traceId ->
+                    val slmTrace = survey.slmTrace(phase, nodeId, traceId)
                     RepositoryTraceContext(traceId, nodeId, phase) { event ->
+                        slmTrace?.invoke(event)
                         when (event) {
                             is RepositoryTraceEvent.Started -> survey.traceEvent(
                                 "AI_REPOSITORY_REQUEST", traceId, nodeId, mapOf(

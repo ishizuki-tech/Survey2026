@@ -48,7 +48,8 @@ internal object SurveyUploadWork {
     /** The remote-destination semantics persisted with newly-created survey work. */
     enum class SurveyUploadProtocol {
         LEGACY_DATED_V0,
-        CANONICAL_IMMUTABLE_V1
+        CANONICAL_IMMUTABLE_V1,
+        IMMUTABLE_V2
     }
 
     /** Minimal WorkManager seam used by reconciliation and JVM tests. */
@@ -217,6 +218,7 @@ internal object SurveyUploadWork {
         val remotePath = when (protocol) {
             SurveyUploadProtocol.LEGACY_DATED_V0 -> remoteRelativePath(canonicalFile.name)
             SurveyUploadProtocol.CANONICAL_IMMUTABLE_V1 -> canonicalRemotePath(surveyId)
+            SurveyUploadProtocol.IMMUTABLE_V2 -> error("V2 requests require immutable route evidence.")
         }
         val data = Data.Builder()
             .putString(GitHubUploadWorker.KEY_MODE, "file")
@@ -363,10 +365,11 @@ internal object SurveyUploadWork {
         expectedSurveyId: String,
         canonicalFile: File,
         protocol: SurveyUploadProtocol = SurveyUploadProtocol.CANONICAL_IMMUTABLE_V1,
-        allowNewEnqueue: Boolean = true
+        allowNewEnqueue: Boolean = true,
+        v2Entry: V2ArtifactStore.Entry? = null,
     ): SurveyWorkReconcileResult {
         val normalizedSurveyId = normalizeLogicalSurveyId(expectedSurveyId)
-        val logicalWorkName = normalizedSurveyId?.let(::logicalWorkName)
+        val logicalWorkName = v2Entry?.let(V2ArtifactDelivery::workName) ?: normalizedSurveyId?.let(::logicalWorkName)
         val legacyWorkName = legacyWorkName(canonicalFile)
         if (normalizedSurveyId == null || logicalWorkName == null) {
             return SurveyWorkReconcileResult(
@@ -397,7 +400,7 @@ internal object SurveyUploadWork {
                 SurveyWorkDecision(SurveyWorkAction.DEFER_UNKNOWN_STATE, "WorkManager is unavailable.")
             )
         }
-        val tracker = TrackerOperations(SurveyUploadWorkTracker(appContext))
+        val tracker = TrackerOperations(SurveyUploadWorkTracker(appContext, v2 = v2Entry != null))
         return reconcileInternal(
             config = config,
             normalizedSurveyId = normalizedSurveyId,
@@ -405,17 +408,34 @@ internal object SurveyUploadWork {
             legacyWorkName = legacyWorkName,
             canonicalFile = canonicalFile,
             tracker = tracker,
-            ledgerContainsSurveyId = { UploadedSurveyStore(appContext).isUploaded(normalizedSurveyId) },
-            artifactValidator = ::validateCanonicalArtifact,
+            ledgerContainsSurveyId = {
+                if (v2Entry == null) UploadedSurveyStore(appContext).isUploaded(normalizedSurveyId)
+                else V2ArtifactDelivery.confirmed(appContext, v2Entry)
+            },
+            artifactValidator = { file, surveyId ->
+                if (v2Entry != null && (v2Entry.route.kind != V2ArtifactStore.Kind.SURVEY ||
+                        v2Entry.route.surveyId != surveyId || v2Entry.payload != file ||
+                        !v2Entry.route.matches(config) || v2Entry.route.size > config.maxRawBytesHint ||
+                        !v2Entry.matchesPayload())) {
+                    SurveyArtifactValidation.Invalid("V2 survey route or payload is invalid.")
+                } else validateCanonicalArtifact(file, surveyId)
+            },
             requestBuilder = { cfg, file, id ->
-                val isConflictRecovery = UploadConflictRecoveryStore(appContext.filesDir)
-                    .get(UploadConflictRecoveryStore.surveyKey(id)) != null
-                buildSurveyJsonRequest(cfg, file, id, protocol, isConflictRecovery)
+                if (v2Entry != null) {
+                    V2ArtifactDelivery.request(v2Entry)
+                } else {
+                    val isConflictRecovery = UploadConflictRecoveryStore(appContext.filesDir)
+                        .get(UploadConflictRecoveryStore.surveyKey(id)) != null
+                    buildSurveyJsonRequest(cfg, file, id, protocol, isConflictRecovery)
+                }
             },
             operations = AndroidWorkManagerOperations(workManager),
             allowNewEnqueue = allowNewEnqueue,
+            v2Only = v2Entry != null,
             conflictDeferred = {
-                (UploadConflictRecoveryStore(appContext.filesDir).get(UploadConflictRecoveryStore.surveyKey(normalizedSurveyId))?.exhausted ?: 0) >= 2
+                if (v2Entry != null) v2Entry.hasRemoteConflict()
+                else (UploadConflictRecoveryStore(appContext.filesDir)
+                        .get(UploadConflictRecoveryStore.surveyKey(normalizedSurveyId))?.exhausted ?: 0) >= 2
             }
         )
     }
@@ -470,7 +490,8 @@ internal object SurveyUploadWork {
         requestBuilder: (GitHubUploader.GitHubConfig, File, String) -> OneTimeWorkRequest,
         operations: WorkManagerOperations,
         allowNewEnqueue: Boolean,
-        conflictDeferred: () -> Boolean = { false }
+        conflictDeferred: () -> Boolean = { false },
+        v2Only: Boolean = false,
     ): SurveyWorkReconcileResult = locks.computeIfAbsent(normalizedSurveyId) { ReentrantLock() }.withLock {
         when (val ledger = readLedger(ledgerContainsSurveyId)) {
             is LedgerRead.Failure -> return@withLock resultFor(
@@ -483,7 +504,7 @@ internal object SurveyUploadWork {
             LedgerRead.NotUploaded -> Unit
         }
 
-        val trackedWork = try {
+        var trackedWork = try {
             tracker.get(normalizedSurveyId)
         } catch (_: Exception) {
             return@withLock resultFor(
@@ -491,14 +512,29 @@ internal object SurveyUploadWork {
                 SurveyWorkDecision(SurveyWorkAction.DEFER_TRACKER_FAILURE, "Current work tracker could not be read.")
             )
         }
-        val trackedInspection = trackedWork?.let { tracked ->
+        var trackedInspection = trackedWork?.let { tracked ->
             inspectTrackedWork(operations, tracked.workRequestId)
         }
+        if (v2Only && trackedInspection?.workInfo == null && trackedInspection?.inspectionFailed != true) {
+            // A process may die between submit and tracker commit, or WorkManager may prune a
+            // previously enqueued request. Recheck the unique chain before recovering it.
+            val current = inspectLegacy(operations, logicalWorkName)
+            if (current.inspectionFailed || current.activeWorkIds.isNotEmpty()) {
+                val decision = if (current.inspectionFailed) {
+                    SurveyWorkDecision(SurveyWorkAction.DEFER_UNKNOWN_STATE, "V2 work state could not be inspected.")
+                } else {
+                    SurveyWorkDecision(SurveyWorkAction.KEEP_TRACKED, "V2 work is active.")
+                }
+                return@withLock resultFor(normalizedSurveyId, logicalWorkName, legacyWorkName, decision)
+            }
+            trackedWork = null
+            trackedInspection = null
+        }
         val trackedIsActive = trackedInspection?.workInfo?.state?.let(::isActive) == true
-        val legacyInspection = if (
+        val legacyInspection = if (!v2Only && (
             trackedWork == null ||
-            (trackedWork.identityKind != SurveyUploadWorkTracker.IdentityKind.LEGACY && trackedIsActive)
-        ) {
+                (trackedWork.identityKind != SurveyUploadWorkTracker.IdentityKind.LEGACY && trackedIsActive)
+        )) {
             inspectLegacy(operations, legacyWorkName)
         } else LegacyWorkInspection()
         val logicalInspection = if (trackedWork?.identityKind == SurveyUploadWorkTracker.IdentityKind.LEGACY) {

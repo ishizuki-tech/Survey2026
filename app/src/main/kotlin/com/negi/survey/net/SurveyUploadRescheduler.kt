@@ -64,11 +64,11 @@ internal object SurveyUploadRescheduler {
         config: GitHubUploader.GitHubConfig
     ): RecoverySummary {
         try {
-            SurveyArtifactUploadScheduler(context).recoverExhaustedConflicts(config)
+            V2ArtifactDelivery.recoverIndependent(context, config)
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (error: Exception) {
-            android.util.Log.w("SurveyUploadRecovery", "Conflict recovery scan failed; artifacts retained", error)
+            android.util.Log.w("SurveyUploadRecovery", "Independent artifact recovery failed; artifacts retained", error)
         }
         return recover(AndroidOperations(context, config))
     }
@@ -167,12 +167,26 @@ internal object SurveyUploadRescheduler {
         private val config: GitHubUploader.GitHubConfig
     ) : Operations {
         private val appContext = context.applicationContext ?: context
+        private val store = V2ArtifactStore(appContext)
 
-        override fun discover(): PendingSurveyUploads.PendingSurveyDiscovery =
-            PendingSurveyUploads.discoverPendingSurveys(appContext)
+        override fun discover(): PendingSurveyUploads.PendingSurveyDiscovery {
+            val candidates = mutableListOf<PendingSurveyUploads.PendingSurveyCandidate>()
+            val invalid = mutableListOf<File>()
+            store.artifactIds().filter { it.startsWith("survey-") }.forEach { key ->
+                val entry = store.read(key)
+                if (entry?.route?.surveyId == null) {
+                    invalid += File(appContext.noBackupFilesDir, "v2_artifacts/$key")
+                } else if (entry.payload.exists() || !V2ArtifactDelivery.confirmed(appContext, entry)) {
+                    candidates += PendingSurveyUploads.PendingSurveyCandidate(
+                        entry.route.surveyId, entry.payload, emptyList()
+                    )
+                }
+            }
+            return PendingSurveyUploads.PendingSurveyDiscovery(candidates, invalid)
+        }
 
-        override fun protocolFor(surveyId: String): SurveyUploadWork.SurveyUploadProtocol? =
-            SurveyUploadRouteStore(appContext).protocolFor(surveyId)
+        override fun protocolFor(surveyId: String): SurveyUploadWork.SurveyUploadProtocol =
+            SurveyUploadWork.SurveyUploadProtocol.IMMUTABLE_V2
 
         override fun reconcile(
             candidate: PendingSurveyUploads.PendingSurveyCandidate,
@@ -182,46 +196,23 @@ internal object SurveyUploadRescheduler {
             SurveyUploadWork.reconcile(
                 context = appContext,
                 config = config,
-                candidate = candidate,
-                protocol = protocol ?: SurveyUploadWork.SurveyUploadProtocol.LEGACY_DATED_V0,
-                allowNewEnqueue = allowNewEnqueue && !Issue86ProcessDeathHarness.suppressesRecoveryEnqueue()
+                expectedSurveyId = candidate.normalizedSurveyId,
+                canonicalFile = candidate.canonicalFile,
+                v2Entry = checkNotNull(store.read(V2ArtifactStore.surveyKey(candidate.normalizedSurveyId))),
             )
 
-        override fun recordLegacyOrphan(
-            candidate: PendingSurveyUploads.PendingSurveyCandidate,
-            reason: String
-        ) {
-            check(
-                LegacySurveyRecoveryStore(appContext).record(
-                    candidate.normalizedSurveyId,
-                    candidate.canonicalFile.name,
-                    reason
-                )
-            ) { "Could not persist legacy survey recovery record." }
-        }
-
-        override fun clearLegacyOrphan(surveyId: String) {
-            LegacySurveyRecoveryStore(appContext).clear(surveyId)
-        }
+        override fun recordLegacyOrphan(candidate: PendingSurveyUploads.PendingSurveyCandidate, reason: String) = Unit
+        override fun clearLegacyOrphan(surveyId: String) = Unit
 
         override fun cleanupRecordedArtifact(
             candidate: PendingSurveyUploads.PendingSurveyCandidate,
             protocol: SurveyUploadWork.SurveyUploadProtocol?
         ): SurveyUploadedArtifactCleanup.Outcome {
-            val outcomes = (listOf(candidate.canonicalFile) + candidate.duplicateFiles).map { file ->
-                SurveyUploadedArtifactCleanup.cleanup(appContext, candidate.normalizedSurveyId, file)
-            }
-            val failure = outcomes.firstOrNull {
-                it != SurveyUploadedArtifactCleanup.Outcome.CLEANED &&
-                    it != SurveyUploadedArtifactCleanup.Outcome.ALREADY_MISSING
-            }
-            if (failure != null) return failure
-            if (protocol == SurveyUploadWork.SurveyUploadProtocol.CANONICAL_IMMUTABLE_V1) {
-                if (!SurveyUploadRouteStore(appContext).clearCanonical(candidate.normalizedSurveyId)) {
-                    return SurveyUploadedArtifactCleanup.Outcome.RETRY_CLEANUP
-                }
-            }
-            return SurveyUploadedArtifactCleanup.Outcome.CLEANED
+            val entry = store.read(V2ArtifactStore.surveyKey(candidate.normalizedSurveyId))
+                ?: return SurveyUploadedArtifactCleanup.Outcome.DEFER_UNVERIFIED
+            return if (V2ArtifactDelivery.cleanupSurvey(appContext, entry)) {
+                SurveyUploadedArtifactCleanup.Outcome.CLEANED
+            } else SurveyUploadedArtifactCleanup.Outcome.RETRY_CLEANUP
         }
     }
 }

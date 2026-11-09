@@ -1,13 +1,11 @@
 package com.negi.survey.diagnostics
 
 import android.content.Context
+import com.negi.survey.net.V2ArtifactStore
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.File
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.SupervisorJob
@@ -48,9 +46,7 @@ class SurveyTrace private constructor(
     companion object {
         fun open(context: Context, surveyId: String): SurveyTrace {
             val identity = TraceIdentity.forSurvey(context.applicationContext, surveyId)
-            val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
-            val file = File(context.filesDir, "diagnostics/survey_traces/${stamp}_${identity.deviceTag}_${identity.shortSurveyId}_survey.ndjson.open")
-            return SurveyTrace(identity, TraceWriter(file))
+            return SurveyTrace(identity, V2TraceArtifacts.writer(context, surveyId, V2ArtifactStore.Kind.SURVEY_TRACE))
         }
     }
 }
@@ -61,10 +57,9 @@ object SurveyTraceRegistry {
     private val finalizationScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     fun start(context: Context, surveyId: String, configId: String? = null): SurveyTrace? = runCatching {
-        traces[surveyId] ?: run {
+        traces.computeIfAbsent(surveyId) {
             SurveyTrace.open(context, surveyId).also {
                 it.event("SURVEY_STARTED", fields = mapOf("configId" to configId))
-                traces.putIfAbsent(surveyId, it)?.let { existing -> return@run existing }
             }
         }
     }.getOrNull()

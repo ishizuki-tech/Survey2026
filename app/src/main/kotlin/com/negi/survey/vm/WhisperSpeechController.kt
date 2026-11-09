@@ -429,7 +429,7 @@ class WhisperSpeechController(
 
                     val exported = exportRecordedVoiceSafely(wav, session)
                     if (exported != null && owns(session)) {
-                        val checksum = runCatching { computeSha256(exported) }
+                        val checksum = runCatching { computeSha256(wav) }
                             .onFailure { e -> DiagnosticContentPolicy.logWarning(TAG, "computeSha256 failed", e) }
                             .getOrNull()
 
@@ -438,16 +438,16 @@ class WhisperSpeechController(
                                 surveyId = session.surveyId,
                                 questionId = session.questionId,
                                 fileName = exported.name,
-                                byteSize = exported.length(),
+                                byteSize = wav.length(),
                                 checksum = checksum
                             )
                         )
-                        WhisperTraceRegistry.event(session.surveyId, session.questionId, "AUDIO_EXPORTED", mapOf("fileName" to exported.name, "byteSize" to exported.length()))
+                        WhisperTraceRegistry.event(session.surveyId, session.questionId, "AUDIO_EXPORTED", mapOf("fileName" to exported.name, "byteSize" to wav.length()))
 
                         Log.d(
                             TAG,
                             "onVoiceExported -> file=${exported.name}, " +
-                                    "bytes=${exported.length()}, " +
+                                    "bytes=${wav.length()}, " +
                                     "qid=${session.questionId}, sid=${session.surveyId}, " +
                                     "checksum=${checksum?.take(12)}..."
                         )

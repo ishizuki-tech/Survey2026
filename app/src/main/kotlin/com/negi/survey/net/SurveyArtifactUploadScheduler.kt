@@ -9,282 +9,63 @@
 package com.negi.survey.net
 
 import android.content.Context
-import android.os.Build
 import android.os.Process
-import android.util.Log
-import androidx.work.BackoffPolicy
-import androidx.work.Constraints
-import androidx.work.Data
-import androidx.work.ExistingWorkPolicy
-import androidx.work.NetworkType
-import androidx.work.OneTimeWorkRequestBuilder
-import androidx.work.OutOfQuotaPolicy
-import androidx.work.WorkManager
-import com.negi.survey.BuildConfig
-import com.negi.survey.utils.ExportUtils
-import java.io.BufferedInputStream
-import java.io.File
-import java.io.FileOutputStream
-import java.io.IOException
-import java.util.concurrent.TimeUnit
-import java.util.zip.GZIPOutputStream
-import kotlinx.coroutines.CancellationException
+import com.negi.survey.CrashCapture
+import com.negi.survey.diagnostics.SurveyDiagnosticAttribution
+import com.negi.survey.diagnostics.V2DiagnosticLogs
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
+import java.util.Locale
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
-/** Schedules optional voice and diagnostic artifacts after survey JSON queueing succeeds. */
+/** Collects finalization logcat using the existing PID and fallback collection modes. */
 internal class SurveyArtifactUploadScheduler(context: Context) {
     private val appContext = context.applicationContext
 
-    suspend fun scheduleVoice(
-        config: GitHubUploader.GitHubConfig,
-        surveyId: String,
-        expectedVoiceFileNames: Set<String>
-    ) {
-        val staged = withContext(Dispatchers.IO) {
-            stageVoiceFilesToSharedPendingForRun(appContext, expectedVoiceFileNames, surveyId)
-        }
-        staged.forEach { stagedFile ->
-            val canGitHub = canUploadToGitHubContentsApi(stagedFile, config.maxRawBytesHint.toLong())
-            VoiceUploadCompletionStore.requireDestinations(appContext, stagedFile, canGitHub, false)
-            if (!canGitHub) {
-                Log.w(
-                    LOG_TAG,
-                    "Skip scheduling GitHub voice (outside configured size limit): name=" +
-                        stagedFile.name + " bytes=" + stagedFile.length() +
-                        " limit=" + config.maxRawBytesHint
-                )
-                return@forEach
-            }
-            runCatching {
-                enqueueGitHubWorkerFileUpload(
-                    context = appContext,
-                    config = config,
-                    localFile = stagedFile,
-                    remoteRelativePath = REMOTE_VOICE_DIR + "/" + stagedFile.name
-                )
-            }.onFailure { error ->
-                Log.e(LOG_TAG, "Failed to schedule GitHub voice: name=" + stagedFile.name, error)
-            }
-        }
-    }
-
-    suspend fun scheduleLog(
-        config: GitHubUploader.GitHubConfig,
-        surveyId: String,
-        exportedAtStamp: String
-    ) {
-        val pendingLog = withContext(Dispatchers.IO) {
-            captureSessionLogcatToPendingFile(appContext, surveyId, exportedAtStamp)
-        }
-        enqueueGitHubWorkerFileUpload(
-            context = appContext,
-            config = config,
-            localFile = pendingLog,
-            remoteRelativePath = REMOTE_LOG_DIR + "/" + pendingLog.name
-        )
-    }
-
-    /**
-     * Schedules finalized traces already published for this survey. A missing archive is normal:
-     * trace gzip finalization is asynchronous and startup recovery scans again later.
-     */
-    suspend fun scheduleDiagnosticTraces(
-        config: GitHubUploader.GitHubConfig,
-        surveyId: String
-    ) {
-        val candidates = withContext(Dispatchers.IO) {
-            DiagnosticTraceArtifacts.discover(appContext.filesDir, surveyId)
-        }
-        candidates.forEach { candidate ->
-            enqueueDiagnosticTrace(config, candidate)
-        }
-    }
-
-    /** Called by the existing restart/reconnect receiver for archives missed by the initial race. */
-    fun recoverDiagnosticTraces(config: GitHubUploader.GitHubConfig) {
-        DiagnosticTraceArtifacts.discover(appContext.filesDir).forEach { candidate ->
-            enqueueDiagnosticTrace(config, candidate)
-        }
-    }
-
-    private fun enqueueDiagnosticTrace(
-        config: GitHubUploader.GitHubConfig,
-        candidate: DiagnosticTraceArtifacts.Candidate
-    ) {
-        try {
-            enqueueGitHubWorkerFileUpload(
-                context = appContext,
-                config = config,
-                localFile = candidate.file,
-                remoteRelativePath = DiagnosticTraceArtifacts.remoteRelativePath(candidate)
-            )
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (exception: Exception) {
-            Log.w(LOG_TAG, "Failed to schedule diagnostic trace: " + candidate.file.name, exception)
-        }
-    }
-
-    /** One recovery request per exhausted artifact, preserving its input route and capture. */
-    fun recoverExhaustedConflicts(config: GitHubUploader.GitHubConfig) {
-        if (DiagnosticUploadInstrumentationGate.isDisabled()) return
-        val store = UploadConflictRecoveryStore(appContext.filesDir)
-        val manager = WorkManager.getInstance(appContext)
-        cleanupConfirmedCaptures(manager, store)
-        store.records().filter { !it.key.startsWith("survey:") }.forEach { record ->
-            if (record.exhausted >= 2 || record.dispatched) return@forEach
-            val input = record.input
-            // Never authorize a retained request with credentials for a different destination.
-            if (input.getString(GitHubUploadWorker.KEY_OWNER) != config.owner ||
-                normalizeRepoName(input.getString(GitHubUploadWorker.KEY_REPO).orEmpty()) != normalizeRepoName(config.repo) ||
-                input.getString(GitHubUploadWorker.KEY_BRANCH) != config.branch ||
-                input.getString(GitHubUploadWorker.KEY_PATH_PREFIX).orEmpty() != config.pathPrefix) return@forEach
-            store.recoverOnce(record,
-                alreadyExists = { manager.getWorkInfoById(it).get(2, TimeUnit.SECONDS) != null },
-                enqueue = { retained ->
-                    val request = OneTimeWorkRequestBuilder<GitHubUploadWorker>()
-                        .setId(retained.recoveryId)
-                        .setInputData(Data.Builder().putAll(input).putString(GitHubUploadWorker.KEY_TOKEN, config.token)
-                            .putBoolean(UploadConflictRecoveryStore.RECOVERY, true).build())
-                        .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
-                        .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
-                        .addTag(GitHubUploadWorker.TAG).build()
-                    manager.enqueueUniqueWork("gh_conflict_${retained.recoveryId}", ExistingWorkPolicy.KEEP, request)
-                        .result.get(2, TimeUnit.SECONDS)
-                }
-            )
-            Log.i(LOG_TAG, "Scheduled final conflict recovery batch: ${record.key}")
-        }
-    }
-
-    private fun cleanupConfirmedCaptures(manager: WorkManager, store: UploadConflictRecoveryStore) {
-        File(appContext.filesDir, "diagnostic_captures").listFiles().orEmpty().forEach { directory ->
-            val originalId = runCatching { java.util.UUID.fromString(directory.name) }.getOrNull() ?: return@forEach
-            val original = manager.getWorkInfoById(originalId).get(2, TimeUnit.SECONDS)
-            val recovery = store.get("capture:$originalId")
-            val confirmed = original?.state == androidx.work.WorkInfo.State.SUCCEEDED ||
-                (recovery != null && manager.getWorkInfoById(recovery.recoveryId).get(2, TimeUnit.SECONDS)?.state == androidx.work.WorkInfo.State.SUCCEEDED)
-            DiagnosticCaptureStore.cleanupConfirmed(directory, confirmed)
-        }
-    }
-
-    private fun stageVoiceFilesToSharedPendingForRun(
-        context: Context,
-        expectedNames: Set<String>,
-        surveyUuid: String
-    ): List<File> {
-        if (expectedNames.isEmpty()) return emptyList()
-        val safeSurvey = sanitizeWorkName(surveyUuid).ifBlank { "unknown" }
-        val directory = File(context.filesDir, PENDING_DIR_SHARED + "/voice/" + safeSurvey).apply { mkdirs() }
-        val expectedBase = expectedNames.map(::localFileName).filter { it.isNotBlank() }.toSet()
-        val voiceDirectory = ExportUtils.getVoiceExportDir(context)
-        if (!voiceDirectory.exists() || !voiceDirectory.isDirectory) return emptyList()
-
-        val staged = ArrayList<File>(expectedBase.size)
-        expectedBase.forEach { name ->
-            val destination = File(directory, stableVoiceFileName(name))
-            if (destination.exists() && destination.isFile && destination.length() > 0L) {
-                staged += destination
-                return@forEach
-            }
-            val source = File(voiceDirectory, name)
-            if (!source.exists() || !source.isFile || source.length() <= 0L) return@forEach
-            if (destination.exists()) runCatching { destination.delete() }
-            runCatching { deleteVoiceSidecars(source) }
-            if (source.renameTo(destination)) {
-                staged += destination
-                return@forEach
-            }
-            runCatching {
-                val sourceLength = source.length().coerceAtLeast(0L)
-                source.copyTo(destination, overwrite = true)
-                if (destination.exists() && destination.length() == sourceLength) {
-                    runCatching { source.delete() }
-                }
-            }.getOrElse { error ->
-                throw IOException(
-                    "Failed to stage voice: " + source.absolutePath + " -> " +
-                        destination.absolutePath + ": " + error.message,
-                    error
-                )
-            }
-            staged += destination
-        }
-        return staged.sortedByDescending { it.lastModified() }
-    }
-
-    private fun captureSessionLogcatToPendingFile(
-        context: Context,
-        surveyUuid: String,
-        exportedAtStamp: String
-    ): File {
+    suspend fun stageV2Logcat(triggerSurveyId: String) = withContext(Dispatchers.IO) {
         val pid = Process.myPid()
-        val shortId = surveyUuid.take(8).ifBlank { "unknown" }
-        val fileName = sanitizeFileName("logcat_" + exportedAtStamp + "_pid" + pid + "_" + shortId + ".log.gz")
-        val directory = File(context.filesDir, PENDING_DIR_GH).apply { mkdirs() }
-        val output = uniqueIfExists(File(directory, fileName))
-        val header = buildString {
-            appendLine("=== Session Log Snapshot ===")
-            appendLine("time_local=" + exportedAtStamp)
-            appendLine("survey_id=" + surveyUuid)
-            appendLine("pid=" + pid)
-            appendLine("sdk=" + Build.VERSION.SDK_INT)
-            appendLine("device=" + Build.MANUFACTURER + " " + Build.MODEL)
-            appendLine("appId=" + BuildConfig.APPLICATION_ID)
-            appendLine("versionName=" + BuildConfig.VERSION_NAME)
-            appendLine("versionCode=" + BuildConfig.VERSION_CODE)
-            appendLine("tags=" + LOGCAT_TAG_FILTERS.joinToString(","))
-            appendLine()
-            appendLine("=== Logcat (best-effort) ===")
-        }.toByteArray(Charsets.UTF_8)
-        val logBytes = collectLogcatBytesBestEffort(pid, MAX_LOGCAT_BYTES)
-        FileOutputStream(output).use { stream ->
-            GZIPOutputStream(stream).use { gzip ->
-                gzip.write(header)
-                gzip.write(logBytes)
-                gzip.flush()
-            }
+        val started = Instant.now()
+        val activeStart = SurveyDiagnosticAttribution.activeStart()
+        val scoped = activeStart?.let { start ->
+            runCatching {
+                val marker = DateTimeFormatter.ofPattern("uuuu-MM-dd HH:mm:ss.SSS", Locale.US)
+                    .withZone(ZoneId.systemDefault()).format(start)
+                execAndReadCapped(
+                    arrayOf("logcat", "-d", "--pid=$pid", "-T", marker, "-v", "epoch", "-s", *LOGCAT_TAG_FILTERS),
+                    MAX_LOGCAT_BYTES
+                )
+            }.getOrNull()
         }
-        Log.d(LOG_TAG, "Captured logcat snapshot: " + output.absolutePath + " (" + output.length() + " bytes gz)")
-        return output
+        val interval = scoped?.let { logcatInterval(it, pid) }
+        val bytes = if (interval == null) collectLogcatBytesBestEffort(pid, MAX_LOGCAT_BYTES) else checkNotNull(scoped)
+        val ended = Instant.now()
+        val evidence = interval?.takeIf { it.second <= ended }?.let {
+            SurveyDiagnosticAttribution.currentProcessEvidence(it.first, it.second)
+        }
+        V2DiagnosticLogs.stage(
+            appContext, V2ArtifactStore.Kind.LOGCAT, V2ArtifactStore.newId(), started,
+            interval?.first ?: started, interval?.second ?: ended,
+            if (interval != null) "verified_pid_epoch_logcat" else "best_effort_logcat",
+            evidence,
+            relatedSurveyIds = setOf(triggerSurveyId),
+        ) { it.write(bytes) }
     }
 
-    private fun enqueueGitHubWorkerFileUpload(
-        context: Context,
-        config: GitHubUploader.GitHubConfig,
-        localFile: File,
-        remoteRelativePath: String
-    ) {
-        if (UploadConflictRecoveryStore(context.filesDir).get(UploadConflictRecoveryStore.fileKey(localFile)) != null) {
-            Log.w(LOG_TAG, "Conflict-deferred artifact retained: ${localFile.name}")
-            return
+    private fun logcatInterval(bytes: ByteArray, expectedPid: Int): Pair<Instant, Instant>? {
+        if (bytes.isEmpty() || bytes.last() != '\n'.code.toByte()) return null
+        val entry = Regex("^([0-9]+)\\.([0-9]{3,6})\\s+([0-9]+)\\s+[0-9]+\\s+[VDIWEFAS]\\s+.*$")
+        val events = mutableListOf<Instant>()
+        for (line in bytes.toString(Charsets.UTF_8).lineSequence()) {
+            if (line.isBlank() || line.startsWith("---------")) continue
+            val parsed = entry.matchEntire(line) ?: return null
+            if (parsed.groupValues[3].toIntOrNull() != expectedPid) return null
+            val seconds = parsed.groupValues[1].toLongOrNull() ?: return null
+            val nanos = parsed.groupValues[2].padEnd(9, '0').toLong()
+            events += Instant.ofEpochSecond(seconds, nanos)
         }
-        val input = Data.Builder()
-            .putString(GitHubUploadWorker.KEY_MODE, "file")
-            .putString(GitHubUploadWorker.KEY_OWNER, config.owner)
-            .putString(GitHubUploadWorker.KEY_REPO, normalizeRepoName(config.repo))
-            .putString(GitHubUploadWorker.KEY_TOKEN, config.token)
-            .putString(GitHubUploadWorker.KEY_BRANCH, config.branch)
-            .putString(GitHubUploadWorker.KEY_PATH_PREFIX, config.pathPrefix)
-            .putString(GitHubUploadWorker.KEY_FILE_PATH, localFile.absolutePath)
-            .putString(GitHubUploadWorker.KEY_FILE_NAME, remoteRelativePath)
-            .putLong(GitHubUploadWorker.KEY_FILE_MAX_BYTES_HINT, config.maxRawBytesHint.toLong())
-            .putInt(GitHubUploadWorker.KEY_FILE_MAX_REQUEST_BYTES_HINT, config.maxRequestBytesHint)
-            .build()
-        val request = OneTimeWorkRequestBuilder<GitHubUploadWorker>()
-            .setInputData(input)
-            .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
-            .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
-            .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
-            .addTag(GitHubUploadWorker.TAG)
-            .addTag(GitHubUploadWorker.TAG + ":file:" + SurveyUploadWork.safeWorkNameSegment(remoteRelativePath))
-            .build()
-        WorkManager.getInstance(context).enqueueUniqueWork(
-            SurveyUploadWork.uniqueWorkName(remoteRelativePath),
-            ExistingWorkPolicy.REPLACE,
-            request
-        )
+        return (events.minOrNull() ?: return null) to (events.maxOrNull() ?: return null)
     }
 
     private fun collectLogcatBytesBestEffort(pid: Int, maxBytes: Int): ByteArray {
@@ -304,75 +85,11 @@ internal class SurveyArtifactUploadScheduler(context: Context) {
     }
 
     private fun execAndReadCapped(command: Array<String>, maxBytes: Int): ByteArray {
-        val process = Runtime.getRuntime().exec(command)
-        val input = BufferedInputStream(process.inputStream)
-        val output = ByteArray(maxBytes)
-        var total = 0
-        while (total < maxBytes) {
-            val read = input.read(output, total, maxBytes - total)
-            if (read <= 0) break
-            total += read
-        }
-        runCatching { input.close() }
-        runCatching { process.destroy() }
-        return if (total == output.size) output else output.copyOf(total)
-    }
-
-    private fun canUploadToGitHubContentsApi(file: File, maxRawBytes: Long): Boolean {
-        val length = runCatching { file.length() }.getOrDefault(0L)
-        return maxRawBytes > 0L && length in 1L..maxRawBytes
-    }
-
-    private fun deleteVoiceSidecars(wavFile: File) {
-        val directory = wavFile.parentFile ?: return
-        val base = wavFile.name.substringBeforeLast('.', wavFile.name)
-        val metadata = File(directory, base + ".meta.json")
-        if (metadata.exists()) runCatching { metadata.delete() }
-    }
-
-    private fun localFileName(reference: String): String {
-        val trimmed = reference.trim()
-        if (trimmed.isBlank()) return ""
-        val separator = maxOf(trimmed.lastIndexOf('/'), trimmed.lastIndexOf('\\'))
-        return if (separator >= 0 && separator + 1 < trimmed.length) trimmed.substring(separator + 1) else trimmed
-    }
-
-    private fun stableVoiceFileName(name: String): String {
-        val localName = localFileName(name).trim()
-        if (localName.isBlank()) return "unknown.wav"
-        return if (localName.contains('/') || localName.contains('\\')) sanitizeFileName(localName) else localName
-    }
-
-    private fun sanitizeFileName(name: String): String =
-        name.replace("/", "_").replace(Regex("""[^\w\-.]"""), "_")
-
-    private fun sanitizeWorkName(value: String): String =
-        value.trim().replace(Regex("""[^\w\-.]+"""), "_").take(120)
-
-    private fun uniqueIfExists(file: File): File {
-        if (!file.exists()) return file
-        val base = file.nameWithoutExtension
-        val extension = file.extension.takeIf { it.isNotEmpty() }?.let { "." + it }.orEmpty()
-        var index = 1
-        while (true) {
-            val candidate = File(file.parentFile, base + "_" + index + extension)
-            if (!candidate.exists()) return candidate
-            index++
-        }
-    }
-
-    private fun normalizeRepoName(repo: String): String {
-        val trimmed = repo.trim()
-        return if (trimmed.contains('/')) trimmed.substringAfterLast('/').trim() else trimmed
+        return CrashCapture.execAndReadCapped(command.toList(), maxBytes, 600L)
     }
 
     private companion object {
-        const val LOG_TAG = "SurveyArtifactUpload"
-        const val REMOTE_VOICE_DIR = "voice"
-        const val REMOTE_LOG_DIR = "diagnostics/logcat"
         const val MAX_LOGCAT_BYTES = 850_000
-        const val PENDING_DIR_GH = "pending_uploads"
-        const val PENDING_DIR_SHARED = "pending_uploads_shared"
         val LOGCAT_TAG_FILTERS = arrayOf(
             "WhisperEngine",
             "MainActivity",

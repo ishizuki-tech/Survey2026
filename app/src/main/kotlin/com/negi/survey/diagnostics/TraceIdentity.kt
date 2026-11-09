@@ -2,7 +2,7 @@ package com.negi.survey.diagnostics
 
 import android.content.Context
 import android.os.Process
-import com.negi.survey.utils.DeviceUploadTagProvider
+import com.negi.survey.net.V2ArtifactStore
 import java.util.UUID
 
 /** Values shared by all records in one survey diagnostic stream. */
@@ -16,7 +16,7 @@ data class TraceIdentity(
     companion object {
         fun forSurvey(context: Context, surveyId: String): TraceIdentity = TraceIdentity(
             surveyId = surveyId,
-            deviceTag = DeviceUploadTagProvider.from(context).value,
+            deviceTag = V2ArtifactStore(context).frozenDeviceTag(context, surveyId, persist = false).value,
             processId = Process.myPid(),
             appVersion = runCatching {
                 context.packageManager.getPackageInfo(context.packageName, 0).versionName

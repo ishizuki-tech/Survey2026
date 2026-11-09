@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.SharedPreferences
 import java.security.MessageDigest
 import java.util.Locale
+import java.util.IdentityHashMap
 
 /**
  * Durable protocol authority at the survey-worker remote-write boundary.
@@ -21,6 +22,7 @@ internal class SurveyUploadExecutionAuthority internal constructor(private val p
     enum class Protocol {
         LEGACY,
         CANONICAL,
+        V2,
     }
 
     sealed interface Claim {
@@ -46,8 +48,11 @@ internal class SurveyUploadExecutionAuthority internal constructor(private val p
             when (val owner = ownerForKey(key)) {
                 Owner.NONE -> if (prefs.edit().putString(key, protocol.name).commit()) Claim.AUTHORIZED
                 else Claim.PERSISTENCE_FAILURE
-                is Owner.VALID -> if (owner.protocol == protocol) Claim.AUTHORIZED
-                else Claim.BLOCKED_BY_OTHER_PROTOCOL(owner.protocol)
+                is Owner.VALID -> when {
+                    owner.protocol != protocol -> Claim.BLOCKED_BY_OTHER_PROTOCOL(owner.protocol)
+                    protocol != Protocol.V2 || prefs.edit().putString(key, protocol.name).commit() -> Claim.AUTHORIZED
+                    else -> Claim.PERSISTENCE_FAILURE
+                }
                 Owner.CORRUPT_OR_UNKNOWN -> Claim.CORRUPT_OR_UNKNOWN_OWNER
             }
         }
@@ -68,15 +73,24 @@ internal class SurveyUploadExecutionAuthority internal constructor(private val p
         return synchronized(LOCK) {
             val key = keyFor(normalized)
             if (ownerForKey(key) != Owner.VALID(owner)) return false
-            prefs.edit().remove(key).commit()
+            if (owner != Protocol.V2) return@synchronized prefs.edit().remove(key).commit()
+            val pending = pendingV2Releases.getOrPut(prefs) { mutableSetOf() }
+            pending += key
+            val persisted = prefs.edit().remove(key).commit()
+            if (persisted) {
+                pending -= key
+                if (pending.isEmpty()) pendingV2Releases.remove(prefs)
+            }
+            persisted
         }
     }
 
     private fun ownerForKey(key: String): Owner = try {
         when (val value = prefs.getString(key, null)) {
-            null -> Owner.NONE
+            null -> if (key in pendingV2Releases[prefs].orEmpty()) Owner.VALID(Protocol.V2) else Owner.NONE
             Protocol.LEGACY.name -> Owner.VALID(Protocol.LEGACY)
             Protocol.CANONICAL.name -> Owner.VALID(Protocol.CANONICAL)
+            Protocol.V2.name -> Owner.VALID(Protocol.V2)
             else -> Owner.CORRUPT_OR_UNKNOWN
         }
     } catch (_: RuntimeException) {
@@ -91,5 +105,6 @@ internal class SurveyUploadExecutionAuthority internal constructor(private val p
         const val PREF_NAME = "survey_upload_execution_authority_v1"
         const val KEY_PREFIX = "survey:"
         val LOCK = Any()
+        val pendingV2Releases = IdentityHashMap<SharedPreferences, MutableSet<String>>()
     }
 }

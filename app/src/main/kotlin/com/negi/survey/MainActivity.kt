@@ -134,7 +134,6 @@ import androidx.navigation3.runtime.rememberSaveableStateHolderNavEntryDecorator
 import androidx.navigation3.ui.NavDisplay
 import com.negi.survey.config.SurveyConfig
 import com.negi.survey.config.SurveyConfigLoader
-import com.negi.survey.net.GitHubUploadTargetPolicy
 import com.negi.survey.net.GitHubUploader
 import com.negi.survey.screens.SurveyActionButton
 import com.negi.survey.screens.SurveyNavigationButtons
@@ -234,8 +233,6 @@ private const val DEFAULT_WHISPER_LANGUAGE: String = "en"
 private const val DEFAULT_TTS_LANGUAGE: String = "en"
 
 /** Bounded upload policy for internal GitHub Contents API uploads. */
-private const val INTERNAL_GH_MAX_RAW_BYTES = 10 * 1024 * 1024
-private const val INTERNAL_GH_MAX_REQUEST_BYTES = 16 * 1024 * 1024
 
 class MainActivity : ComponentActivity() {
 
@@ -1628,7 +1625,7 @@ internal fun SurveyNavHost(
                             } else if (vmSurvey.currentNode.value.type == NodeType.START) {
                                 exitVm.finish(
                                     snapshot = vmSurvey.createFinalizationSnapshot(SurveyCompletionStatus.INCOMPLETE),
-                                    config = buildGitHubConfigOrNull(),
+                                    config = buildGitHubConfigOrNull(appContext),
                                     tag = finishTag,
                                     stamp = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.US).format(Date())
                                 )
@@ -1793,7 +1790,7 @@ internal fun SurveyNavHost(
                                 vmSurvey.advanceToNext()
                                 return@guardedNavigation
                             }
-                            val config = buildGitHubConfigOrNull()
+                            val config = buildGitHubConfigOrNull(appContext)
                             val stamp = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.US).format(Date())
                             finalizationVm.finish(
                                 snapshot = vmSurvey.createFinalizationSnapshot(),
@@ -1871,27 +1868,8 @@ internal fun SurveyNavHost(
  * - Accept either "repo" or "owner/repo" in GH_REPO and normalize to "repo".
  * - Trim pathPrefix slashes for consistent remote paths.
  */
-private fun buildGitHubConfigOrNull(): GitHubUploader.GitHubConfig? {
-    /*
-     * BuildConfig values are embedded in the APK. Do not treat GH_TOKEN as a
-     * secret credential in a distributed production app; prefer a backend or
-     * short-lived scoped credential for production uploads.
-     */
-    return GitHubUploadTargetPolicy.resolve(
-        buildTarget =
-            GitHubUploadTargetPolicy.BuildTarget(
-                localBuild = BuildConfig.GH_UPLOAD_MODE == "local",
-                owner = BuildConfig.GH_OWNER,
-                repo = BuildConfig.GH_REPO,
-                branch = BuildConfig.GH_BRANCH,
-                pathPrefix = BuildConfig.GH_PATH_PREFIX,
-                token = BuildConfig.GH_TOKEN,
-            ),
-    )?.copy(
-        maxRawBytesHint = INTERNAL_GH_MAX_RAW_BYTES,
-        maxRequestBytesHint = INTERNAL_GH_MAX_REQUEST_BYTES,
-    )
-}
+private fun buildGitHubConfigOrNull(context: Context): GitHubUploader.GitHubConfig? =
+    com.negi.survey.net.V2ArtifactDelivery.config(context)
 
 /* ───────────────────────────── Minimal Node Screens ───────────────────────────── */
 

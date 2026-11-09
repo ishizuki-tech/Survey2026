@@ -22,6 +22,8 @@ import com.negi.survey.net.SurveyUploadIdempotency
 import com.negi.survey.net.SurveyUploadRouteStore
 import com.negi.survey.net.SurveyUploadWork
 import com.negi.survey.net.UploadedSurveyStore
+import com.negi.survey.net.V2ArtifactStore
+import com.negi.survey.utils.newTimeOrderedSurveyId
 import com.negi.survey.vm.UploadStatus
 import com.negi.survey.vm.UploadStatusDetails
 import com.negi.survey.vm.UploadStatusEntry
@@ -47,20 +49,21 @@ class UploadStatusClearListTest {
 
     @Test fun clearButtonPreservesLedgerPendingLegacyAuthorityAndCanonicalTotal() = runBlocking {
         val app = scopedApp()
-        val ledger = UploadedSurveyStore(app)
+        val ledger = UploadedSurveyStore(app, v2 = true)
         confirm(ledger, "confirmed")
         ledger.markUploaded("historical", "2026-11-03")
-        val pendingId = "issue122-pending-${UUID.randomUUID()}"
-        val pending = File(app.filesDir, "pending_uploads/pending.json").apply {
-            parentFile!!.mkdirs()
-            writeText("""{"survey_id":"$pendingId","exported_at":"2026-11-03"}""")
-        }
+        val pendingId = newTimeOrderedSurveyId()
+        val store = V2ArtifactStore(app)
+        val pending = store.stage(
+            V2ArtifactStore.surveyKey(pendingId), V2ArtifactStore.Kind.SURVEY, pendingId, V2ArtifactStore.profile,
+            store.paths(app, pendingId).surveyJson(),
+        ) { it.write("""{"survey_id":"$pendingId","exported_at":"2026-11-03"}""".toByteArray()) }.payload
         assertTrue(LegacySurveyRecoveryStore(app).record(pendingId, pending.name, "MANUAL_REVIEW"))
         assertTrue(SurveyUploadRouteStore(app).reserveCanonical(pendingId))
         val authority = SurveyUploadExecutionAuthority(app)
         assertEquals(SurveyUploadExecutionAuthority.Claim.AUTHORIZED,
             authority.claim(pendingId, SurveyUploadExecutionAuthority.Protocol.LEGACY))
-        val ledgerBefore = app.getSharedPreferences("uploaded_survey_ledger_v1", Context.MODE_PRIVATE).all
+        val ledgerBefore = app.getSharedPreferences("uploaded_survey_ledger_v2", Context.MODE_PRIVATE).all
         val vm = viewModel(app)
         val before = vm.loadDetails()
         val manager = WorkManager.getInstance(app)
@@ -78,7 +81,7 @@ class UploadStatusClearListTest {
         assertEquals(before.pending, after.pending)
         assertEquals(before.deferredLegacyRecovery, after.deferredLegacyRecovery)
         assertTrue(pending.exists())
-        assertEquals(ledgerBefore, app.getSharedPreferences("uploaded_survey_ledger_v1", Context.MODE_PRIVATE).all)
+        assertEquals(ledgerBefore, app.getSharedPreferences("uploaded_survey_ledger_v2", Context.MODE_PRIVATE).all)
         assertEquals(SurveyUploadExecutionAuthority.Owner.VALID(SurveyUploadExecutionAuthority.Protocol.LEGACY), authority.ownerFor(pendingId))
         assertEquals(SurveyUploadWork.SurveyUploadProtocol.CANONICAL_IMMUTABLE_V1, SurveyUploadRouteStore(app).protocolFor(pendingId))
         assertEquals(workBefore, manager.getWorkInfosForUniqueWork(workName).get().map { it.id to it.state })
@@ -100,7 +103,7 @@ class UploadStatusClearListTest {
 
     @Test fun dialogSnapshotDoesNotHideCompletionThatArrivesBeforeClearClick() = runBlocking {
         val app = scopedApp()
-        val ledger = UploadedSurveyStore(app)
+        val ledger = UploadedSurveyStore(app, v2 = true)
         confirm(ledger, "shown")
         val vm = viewModel(app)
         show(vm)
@@ -133,7 +136,7 @@ class UploadStatusClearListTest {
 
     @Test fun processRestart_writeHiddenState() = runBlocking {
         val app = restartApp()
-        val ledger = UploadedSurveyStore(app)
+        val ledger = UploadedSurveyStore(app, v2 = true)
         confirm(ledger, "persisted-confirmed")
         ledger.markUploaded("persisted-historical", "2026-11-03")
         val vm = viewModel(app)
@@ -148,7 +151,7 @@ class UploadStatusClearListTest {
         val priorPid = app.getSharedPreferences("restart_probe", Context.MODE_PRIVATE).getInt("writer_pid", -1)
         assertTrue("Run the write phase first", priorPid > 0)
         assertNotEquals("Read phase must use another process", priorPid, Process.myPid())
-        val ledger = UploadedSurveyStore(app)
+        val ledger = UploadedSurveyStore(app, v2 = true)
         val vm = viewModel(app)
         assertTrue(vm.loadDetails().completed.isEmpty())
         assertEquals(2, ledger.uploadedCount())
@@ -201,6 +204,7 @@ class UploadStatusClearListTest {
     private class ScopedApplication(private val base: Context, private val namespace: String) : Application() {
         init { attachBaseContext(base) }
         override fun getApplicationContext(): Context = this
+        override fun getNoBackupFilesDir(): File = File(filesDir, "no_backup").apply { mkdirs() }
         override fun getFilesDir(): File = File(base.filesDir, "issue122_$namespace").apply { mkdirs() }
         override fun getSharedPreferences(name: String, mode: Int): SharedPreferences =
             base.getSharedPreferences("issue122_${namespace}_$name", mode)
