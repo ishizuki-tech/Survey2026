@@ -35,6 +35,7 @@ import com.negi.survey.slm.PromptPhase
 import com.negi.survey.slm.SamplingProfile
 import com.negi.survey.diagnostics.SurveyTrace
 import com.negi.survey.diagnostics.SurveyTraceRegistry
+import com.negi.survey.diagnostics.SurveyDiagnosticAttribution
 import com.negi.survey.diagnostics.TraceIdentity
 import com.negi.survey.diagnostics.AnswerTraceTransactions
 import com.negi.survey.net.RuntimeLogStore
@@ -339,6 +340,24 @@ open class SurveyViewModel(
             status = status
         )
     }
+
+    private fun closeDiagnosticInterval() {
+        traceContext?.let { SurveyDiagnosticAttribution.end(it, _surveyUuid.value) }
+    }
+
+    override fun onCleared() {
+        closeDiagnosticInterval()
+        super.onCleared()
+    }
+
+    internal fun slmTrace(
+        phase: com.negi.survey.slm.PromptPhase,
+        questionId: String,
+        answerTraceId: String,
+    ): ((com.negi.survey.slm.RepositoryTraceEvent) -> Unit)? =
+        traceContext?.let {
+            com.negi.survey.diagnostics.V2SlmTrace.observer(it, _surveyUuid.value, phase, questionId, answerTraceId)
+        }
 
     private fun regenerateSurveyUuid() {
         _surveyUuid.value = newTimeOrderedSurveyId()
@@ -1048,6 +1067,10 @@ open class SurveyViewModel(
         _homeDraftFreeText.value = ""
         _runFreeText.value = snap
         _isRunActive.value = true
+        traceContext?.let {
+            SurveyDiagnosticAttribution.begin(it, _surveyUuid.value)
+            RuntimeLogStore.rotate("survey_started")
+        }
 
         RuntimeLogStore.d(
             TAG,
@@ -1166,6 +1189,7 @@ open class SurveyViewModel(
             ""
         }
 
+        closeDiagnosticInterval()
         regenerateSurveyUuid()
         answerTraceIds.clear()
         trace = traceContext?.let { SurveyTraceRegistry.start(it, _surveyUuid.value) }

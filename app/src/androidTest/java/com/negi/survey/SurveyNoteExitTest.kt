@@ -23,7 +23,7 @@ import androidx.work.WorkManager
 import com.negi.survey.config.NodeDTO
 import com.negi.survey.config.SurveyConfig
 import com.negi.survey.net.GitHubUploader
-import com.negi.survey.net.PendingSurveyUploads
+import com.negi.survey.net.V2ArtifactStore
 import com.negi.survey.net.SurveyFinalizationResult
 import com.negi.survey.net.SurveyUploadFinalizer
 import com.negi.survey.net.SurveyUploadWork
@@ -72,9 +72,8 @@ class SurveyNoteExitTest {
 
     @After
     fun removeTestExports() {
-        File(context.filesDir, "pending_uploads").listFiles().orEmpty()
-            .filter { PendingSurveyUploads.surveyIdFromFile(it) in surveyIds }
-            .forEach { it.delete() }
+        val store = V2ArtifactStore(context)
+        surveyIds.map(V2ArtifactStore::surveyKey).mapNotNull(store::read).forEach { it.directory.deleteRecursively() }
     }
 
     @Test
@@ -120,7 +119,7 @@ class SurveyNoteExitTest {
             assertEquals(id, survey.surveyUuid.value)
             assertEquals("First answer", survey.getAnswer("Q1"))
         }
-        assertNull(PendingSurveyUploads.findPendingSurveyFile(context, id))
+        assertNull(V2ArtifactStore(context).read(V2ArtifactStore.surveyKey(id)))
         rule.onNode(hasSetTextAction()).performTextReplacement("Updated note")
         rule.onNodeWithText("Exit").performClick()
         waitForSelector()
@@ -270,9 +269,8 @@ class SurveyNoteExitTest {
     }
 
     private fun pendingExport(id: String): JsonObject {
-        val candidates = File(context.filesDir, "pending_uploads").listFiles().orEmpty()
-            .filter { PendingSurveyUploads.surveyIdFromFile(it) == id }
-        return Json.parseToJsonElement(candidates.single().readText()).jsonObject.also {
+        val entry = checkNotNull(V2ArtifactStore(context).read(V2ArtifactStore.surveyKey(id)))
+        return Json.parseToJsonElement(entry.payload.readText()).jsonObject.also {
             assertEquals(id, it.string("survey_id"))
         }
     }

@@ -12,12 +12,8 @@ import android.content.Context
 import com.negi.survey.utils.DeviceUploadTag
 import com.negi.survey.diagnostics.SurveyTraceRegistry
 import com.negi.survey.diagnostics.WhisperTraceRegistry
-import com.negi.survey.utils.buildSurveyFileName
 import com.negi.survey.vm.SurveyFinalizationSnapshot
 import java.io.File
-import java.io.FileOutputStream
-import java.nio.file.Files
-import java.nio.file.StandardCopyOption.ATOMIC_MOVE
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.sync.Mutex
@@ -32,6 +28,8 @@ sealed interface SurveyFinalizationResult {
 
 /** Narrow boundary around Android storage and WorkManager for finalization tests. */
 internal interface SurveyFinalizationOperations {
+    fun acceptsSurveyId(surveyId: String): Boolean = surveyId.isNotBlank()
+    suspend fun collectFinalizationDiagnostics(surveyId: String) = Unit
     fun isUploaded(surveyId: String): Boolean
     fun findPendingSurveyFile(surveyId: String): File?
     fun reserveCanonicalSurveyRoute(surveyId: String): Boolean
@@ -77,7 +75,7 @@ class SurveyUploadFinalizer private constructor(
         exportedAtStamp: String
     ): SurveyFinalizationResult {
         val surveyId = snapshot.surveyId.trim()
-        if (surveyId.isBlank()) return SurveyFinalizationResult.Failure("Survey ID is missing.")
+        if (!operations.acceptsSurveyId(surveyId)) return SurveyFinalizationResult.Failure("Survey ID is invalid.")
         SurveyTraceRegistry.finalizeAsync(surveyId)
         WhisperTraceRegistry.finalizeAsync(surveyId)
         return locks.getOrPut(surveyId) { Mutex() }.withLock {
@@ -95,12 +93,12 @@ class SurveyUploadFinalizer private constructor(
                 if (existing == null && !operations.reserveCanonicalSurveyRoute(surveyId)) {
                     return@withLock SurveyFinalizationResult.Failure("Could not reserve survey upload route.")
                 }
-                if (config == null) {
-                    val pending = existing ?: operations.stageSurveyJson(snapshot, deviceTag, exportedAtStamp)
-                    return@withLock SurveyFinalizationResult.StagedPending(pending, reused = existing != null)
-                }
                 val pending = existing ?: operations.stageSurveyJson(snapshot, deviceTag, exportedAtStamp)
                 staged = true
+                if (existing == null) operations.collectFinalizationDiagnostics(surveyId)
+                if (config == null) {
+                    return@withLock SurveyFinalizationResult.StagedPending(pending, reused = existing != null)
+                }
                 val reconciliation = operations.reconcileSurveyJson(config, pending, surveyId)
                 when (reconciliation.decision.action) {
                     SurveyUploadWork.SurveyWorkAction.SKIP_UPLOADED,
@@ -171,44 +169,39 @@ class SurveyUploadFinalizer private constructor(
 
 private class AndroidSurveyFinalizationOperations(context: Context) : SurveyFinalizationOperations {
     private val appContext = context.applicationContext
-    private val artifactScheduler = SurveyArtifactUploadScheduler(appContext)
+    private val artifacts = V2ArtifactStore(appContext)
+
+    override fun acceptsSurveyId(surveyId: String): Boolean = runCatching {
+        com.negi.survey.utils.V2ArtifactPaths(surveyId, DeviceUploadTag("validation"))
+    }.isSuccess
+
+    private fun entry(surveyId: String): V2ArtifactStore.Entry? =
+        artifacts.recoverAndRead(V2ArtifactStore.surveyKey(surveyId))
 
     override fun isUploaded(surveyId: String): Boolean =
-        UploadedSurveyStore(appContext).isUploaded(surveyId)
+        entry(surveyId)?.let { V2ArtifactDelivery.confirmed(appContext, it) } == true
 
-    override fun findPendingSurveyFile(surveyId: String): File? =
-        PendingSurveyUploads.findPendingSurveyFile(appContext, surveyId)
+    override fun findPendingSurveyFile(surveyId: String): File? = entry(surveyId)?.let {
+        check(it.matchesPayload()) { "The staged survey is missing or does not match its immutable route." }
+        it.payload
+    }
 
     override fun reserveCanonicalSurveyRoute(surveyId: String): Boolean =
-        SurveyUploadRouteStore(appContext).reserveCanonical(surveyId)
+        !artifacts.hasReservedRoute(V2ArtifactStore.surveyKey(surveyId)) &&
+            !V2ArtifactDelivery.ledger(appContext).isUploaded(surveyId)
 
-    override fun hasCanonicalSurveyRoute(surveyId: String): Boolean =
-        SurveyUploadRouteStore(appContext).protocolFor(surveyId) ==
-            SurveyUploadWork.SurveyUploadProtocol.CANONICAL_IMMUTABLE_V1
+    override fun hasCanonicalSurveyRoute(surveyId: String): Boolean = entry(surveyId) != null
 
     override fun stageSurveyJson(
         snapshot: SurveyFinalizationSnapshot,
         tag: DeviceUploadTag,
         stamp: String
     ): File {
-        val fileName = buildSurveyFileName(snapshot.surveyId, tag, stamp = stamp)
-        val directory = File(appContext.filesDir, PENDING_DIR).apply {
-            check(exists() || mkdirs()) { "Could not create pending upload directory." }
-        }
-        val target = File(directory, fileName)
-        check(!target.exists()) { "A non-survey pending file already uses the final survey filename." }
-        val temporary = File.createTempFile(".survey-", ".tmp", directory)
-        try {
-            val bytes = SurveyExportJsonBuilder.build(snapshot, stamp).toByteArray(Charsets.UTF_8)
-            FileOutputStream(temporary).use { output ->
-                output.write(bytes)
-                output.fd.sync()
-            }
-            Files.move(temporary.toPath(), target.toPath(), ATOMIC_MOVE)
-            return target
-        } finally {
-            temporary.delete()
-        }
+        val paths = artifacts.paths(appContext, snapshot.surveyId, tag)
+        return artifacts.stage(
+            V2ArtifactStore.surveyKey(paths.surveyUuid), V2ArtifactStore.Kind.SURVEY,
+            paths.surveyUuid, V2ArtifactStore.profile, paths.surveyJson(),
+        ) { output -> output.write(SurveyExportJsonBuilder.build(snapshot, stamp).toByteArray(Charsets.UTF_8)) }.payload
     }
 
     override fun reconcileSurveyJson(
@@ -219,39 +212,47 @@ private class AndroidSurveyFinalizationOperations(context: Context) : SurveyFina
         context = appContext,
         config = config,
         expectedSurveyId = surveyId,
-        canonicalFile = file
+        canonicalFile = file,
+        v2Entry = checkNotNull(entry(surveyId)),
     )
 
     override fun cleanupUploadedSurveyArtifact(
         surveyId: String,
         file: File
-    ): SurveyUploadedArtifactCleanup.Outcome =
-        SurveyUploadedArtifactCleanup.cleanup(appContext, surveyId, file)
+    ): SurveyUploadedArtifactCleanup.Outcome {
+        val entry = entry(surveyId) ?: return SurveyUploadedArtifactCleanup.Outcome.DEFER_UNVERIFIED
+        return if (V2ArtifactDelivery.cleanupSurvey(appContext, entry)) {
+            SurveyUploadedArtifactCleanup.Outcome.CLEANED
+        } else SurveyUploadedArtifactCleanup.Outcome.RETRY_CLEANUP
+    }
+
+    override suspend fun collectFinalizationDiagnostics(surveyId: String) {
+        try {
+            RuntimeLogStore.sealV2SurveySegment()
+            SurveyArtifactUploadScheduler(appContext).stageV2Logcat(surveyId)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Exception) {
+            com.negi.survey.diagnostics.DiagnosticContentPolicy.logWarning("SurveyFinalizer", "Logcat staging failed", failure)
+        } finally {
+            com.negi.survey.diagnostics.SurveyDiagnosticAttribution.end(appContext, surveyId)
+        }
+    }
 
     override suspend fun scheduleVoiceArtifacts(
         config: GitHubUploader.GitHubConfig,
         surveyId: String,
         expectedVoiceFileNames: Set<String>
-    ) {
-        artifactScheduler.scheduleVoice(config, surveyId, expectedVoiceFileNames)
-    }
+    ) = V2ArtifactDelivery.recoverIndependent(appContext, config)
 
     override suspend fun scheduleLogArtifact(
         config: GitHubUploader.GitHubConfig,
         surveyId: String,
         exportedAtStamp: String
-    ) {
-        artifactScheduler.scheduleLog(config, surveyId, exportedAtStamp)
-    }
+    ) = Unit
 
     override suspend fun scheduleDiagnosticTraceArtifacts(
         config: GitHubUploader.GitHubConfig,
         surveyId: String
-    ) {
-        artifactScheduler.scheduleDiagnosticTraces(config, surveyId)
-    }
-
-    private companion object {
-        const val PENDING_DIR = "pending_uploads"
-    }
+    ) = Unit
 }

@@ -162,7 +162,10 @@ class SurveyUploadWorkTest {
     @Test
     fun buildSurveyJsonRequest_recoveryPreservesAllInputAndSchedulingConfiguration() {
         val file = validFile()
-        SurveyUploadWork.SurveyUploadProtocol.entries.forEach { protocol ->
+        listOf(
+            SurveyUploadWork.SurveyUploadProtocol.LEGACY_DATED_V0,
+            SurveyUploadWork.SurveyUploadProtocol.CANONICAL_IMMUTABLE_V1,
+        ).forEach { protocol ->
             val normal = SurveyUploadWork.buildSurveyJsonRequest(config(), file, "survey", protocol)
             val recovery = SurveyUploadWork.buildSurveyJsonRequest(
                 config(), file, "survey", protocol, isConflictRecovery = true

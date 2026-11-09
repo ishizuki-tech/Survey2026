@@ -628,6 +628,12 @@ private fun UploadStatusDetailsDialog(
                             Text(message, color = MaterialTheme.colorScheme.error)
                         }
 
+                        if (s.details.artifactStatus.isNotEmpty()) {
+                            Spacer(Modifier.padding(top = 14.dp))
+                            Text("Artifact delivery", style = MaterialTheme.typography.titleSmall)
+                            s.details.artifactStatus.forEach { Text(it) }
+                        }
+
                         if (s.details.deferredLegacyRecovery.isNotEmpty()) {
                             Spacer(Modifier.padding(top = 14.dp))
                             DeferredLegacyRecoverySection(

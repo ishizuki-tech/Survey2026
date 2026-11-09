@@ -1,13 +1,9 @@
-<?xml version="1.0" encoding="utf-8"?><!--
-   Sample backup rules file; uncomment and customize as necessary.
-   See https://developer.android.com/guide/topics/data/autobackup
-   for details.
-   Note: This file is ignored for devices older than API 31
-   See https://developer.android.com/about/versions/12/backup-restore
--->
+<?xml version="1.0" encoding="utf-8"?>
 <full-backup-content>
-    <!--
-   <include domain="sharedpref" path="."/>
-   <exclude domain="sharedpref" path="device.xml"/>
--->
+    <!-- Artifact payloads and routes live in noBackupFilesDir. Their delivery evidence must stay with them. -->
+    <exclude domain="sharedpref" path="uploaded_survey_ledger_v2.xml" />
+    <exclude domain="sharedpref" path="survey_upload_work_tracker_v2.xml" />
+    <exclude domain="sharedpref" path="crash_capture_state_v2_artifacts.xml" />
+    <exclude domain="sharedpref" path="survey_upload_execution_authority_v1.xml" />
+    <exclude domain="file" path="pending_uploads/" />
 </full-backup-content>

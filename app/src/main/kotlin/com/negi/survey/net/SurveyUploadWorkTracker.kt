@@ -19,8 +19,10 @@ internal class SurveyUploadWorkTracker internal constructor(
     private val prefs: SharedPreferences,
     private val nowEpochMs: () -> Long = System::currentTimeMillis
 ) {
-    constructor(context: Context) : this(
-        context.applicationContext.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+    constructor(context: Context, v2: Boolean = false) : this(
+        context.applicationContext.getSharedPreferences(
+            if (v2) "survey_upload_work_tracker_v2" else PREF_NAME, Context.MODE_PRIVATE
+        )
     )
 
     enum class Phase {

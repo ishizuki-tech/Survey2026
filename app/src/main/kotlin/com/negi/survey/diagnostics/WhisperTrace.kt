@@ -1,6 +1,7 @@
 package com.negi.survey.diagnostics
 
 import android.content.Context
+import com.negi.survey.net.V2ArtifactStore
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.CoroutineScope
@@ -8,9 +9,6 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import org.json.JSONObject
 import java.io.File
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 
 /** Best-effort voice diagnostics sharing the survey answer transaction identity. */
@@ -29,9 +27,7 @@ class WhisperTrace internal constructor(private val identity: TraceIdentity, pri
     companion object {
         fun open(context: Context, surveyId: String): WhisperTrace {
             val identity = TraceIdentity.forSurvey(context.applicationContext, surveyId)
-            val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
-            val open = File(context.filesDir, "diagnostics/whisper_trace/${stamp}_${identity.deviceTag}_${identity.shortSurveyId}_whisper.ndjson.open")
-            return WhisperTrace(identity, TraceWriter(open))
+            return WhisperTrace(identity, V2TraceArtifacts.writer(context, surveyId, V2ArtifactStore.Kind.WHISPER_TRACE))
         }
     }
 }
@@ -40,7 +36,7 @@ object WhisperTraceRegistry {
     private val active = ConcurrentHashMap<String, WhisperTrace>()
     private val answerIds = ConcurrentHashMap<String, String>()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    fun start(context: Context, surveyId: String): WhisperTrace? = runCatching { active.getOrPut(surveyId) { WhisperTrace.open(context, surveyId) } }.getOrNull()
+    fun start(context: Context, surveyId: String): WhisperTrace? = runCatching { active.computeIfAbsent(surveyId) { WhisperTrace.open(context, surveyId) } }.getOrNull()
     fun beginVoiceTransaction(context: Context, surveyId: String, questionId: String, answerTraceId: String) {
         answerIds["$surveyId|$questionId"] = answerTraceId
         start(context, surveyId)?.event("MIC_TRANSACTION_STARTED", answerTraceId, questionId, mapOf("inputSource" to "voice"))

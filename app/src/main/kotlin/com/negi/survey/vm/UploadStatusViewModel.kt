@@ -20,11 +20,11 @@ import androidx.lifecycle.viewModelScope
 import androidx.work.WorkManager
 import com.negi.survey.net.CompletedSurveyVisibilityStore
 import com.negi.survey.net.GitHubUploadWorker
-import com.negi.survey.net.LegacySurveyRecoveryObservation
-import com.negi.survey.net.LegacySurveyRecoveryStore
 import com.negi.survey.net.PendingSurveyUploads
-import com.negi.survey.net.SurveyUploadExecutionAuthority
-import com.negi.survey.net.UploadedSurveyStore
+import com.negi.survey.net.V2ArtifactStore
+import com.negi.survey.net.V2ArtifactDelivery
+import androidx.work.WorkInfo
+import java.util.concurrent.TimeUnit
 import com.negi.survey.utils.DeviceUploadTagProvider
 import com.negi.survey.utils.formatSurveyExportStamp
 import com.negi.survey.utils.formatSurveyTimestamp
@@ -101,14 +101,16 @@ data class UploadStatusDetails(
     val deferredLegacyRecovery: List<DeferredLegacyRecoveryEntry> = emptyList(),
     /** Opaque IDs for the exact completed snapshot; passed back to Clear List, never rendered. */
     val completedSurveyIds: Set<String> = emptySet(),
+    /** Counts by artifact category and local delivery state. */
+    val artifactStatus: List<String> = emptyList(),
 )
 
 /** Activity-scoped owner of upload-status reads and refresh triggers. */
 class UploadStatusViewModel(app: Application) : AndroidViewModel(app) {
     private val appContext = app.applicationContext
-    private val uploadedSurveyStore = UploadedSurveyStore(appContext)
+    private val artifacts = V2ArtifactStore(appContext)
+    private val uploadedSurveyStore = V2ArtifactDelivery.ledger(appContext)
     private val completedVisibilityStore = CompletedSurveyVisibilityStore(appContext)
-    private val legacyRecoveryStore = LegacySurveyRecoveryStore(appContext)
     private val deviceTag = DeviceUploadTagProvider.from(appContext).value
     private val refreshMutex = Mutex()
     private val _status = MutableStateFlow(UploadStatus(deviceTag = deviceTag))
@@ -134,8 +136,7 @@ class UploadStatusViewModel(app: Application) : AndroidViewModel(app) {
     private suspend fun refreshNow() {
         refreshMutex.withLock {
             val uploadedCount = uploadedSurveyStore.uploadedCount()
-            val pendingCount = PendingSurveyUploads.pendingSurveyIds(appContext)
-                .count { surveyId -> !uploadedSurveyStore.isUploaded(surveyId) }
+            val pendingCount = pendingSurveys().size
             _status.value = UploadStatus(
                 deviceTag = deviceTag,
                 uploadedCount = uploadedCount,
@@ -155,18 +156,14 @@ class UploadStatusViewModel(app: Application) : AndroidViewModel(app) {
     /** Loads the pending/completed detail lists for the upload status dialog. */
     suspend fun loadDetails(): UploadStatusDetails = withContext(Dispatchers.IO) {
         refreshMutex.withLock {
-            val pending = PendingSurveyUploads.pendingSurveyIds(appContext)
-                .filterNot { surveyId -> uploadedSurveyStore.isUploaded(surveyId) }
-                .map { surveyId ->
-                    val exportedAtRaw = PendingSurveyUploads.findPendingSurveyFile(appContext, surveyId)
-                        ?.let(PendingSurveyUploads::exportedAtFromFile)
-                    UploadStatusEntry(
-                        idPrefix = uuidFirstSegment(surveyId),
-                        exportedAt = exportedAtRaw?.let(::formatSurveyExportStamp),
-                        timestampMillis = surveyIdTimestampMillis(surveyId)
-                    )
-                }
-                .sortedWith(newestFirstComparator)
+            val pending = pendingSurveys().map { entry ->
+                val surveyId = checkNotNull(entry.route.surveyId)
+                UploadStatusEntry(
+                    idPrefix = uuidFirstSegment(surveyId),
+                    exportedAt = PendingSurveyUploads.exportedAtFromFile(entry.payload)?.let(::formatSurveyExportStamp),
+                    timestampMillis = surveyIdTimestampMillis(surveyId)
+                )
+            }.sortedWith(newestFirstComparator)
 
             val visibleCompleted = completedVisibilityStore.visibleRecords(uploadedSurveyStore.uploadedSurveyRecords())
             val completed = visibleCompleted
@@ -179,55 +176,60 @@ class UploadStatusViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 .sortedWith(newestFirstComparator)
 
-            val legacyRecords = legacyRecoveryStore.records()
-            val deferredLegacyRecovery = legacyRecords.map { record ->
-                LegacySurveyRecoveryObservation.observe(appContext, record).toUiEntry()
-            }.toMutableList()
-            // A valid or corrupt authority pin is independently discoverable from pending survey
-            // artifacts, even when it was never a markerless legacy-orphan record.
-            val orphanIds = legacyRecords.mapTo(mutableSetOf()) { it.normalizedSurveyId }
-            PendingSurveyUploads.discoverPendingSurveys(appContext).candidates
-                .filterNot { it.normalizedSurveyId in orphanIds }
-                .forEach { candidate ->
-                    val owner = SurveyUploadExecutionAuthority(appContext).ownerFor(candidate.normalizedSurveyId)
-                    if (owner != SurveyUploadExecutionAuthority.Owner.NONE) {
-                        val reason = when (owner) {
-                            is SurveyUploadExecutionAuthority.Owner.VALID -> when (owner.protocol) {
-                                SurveyUploadExecutionAuthority.Protocol.LEGACY -> "BLOCKED_BY_LEGACY_AUTHORITY"
-                                SurveyUploadExecutionAuthority.Protocol.CANONICAL -> "BLOCKED_BY_CANONICAL_AUTHORITY"
-                            }
-                            SurveyUploadExecutionAuthority.Owner.CORRUPT_OR_UNKNOWN ->
-                                "CORRUPT_OR_UNKNOWN_AUTHORITY"
-                            SurveyUploadExecutionAuthority.Owner.NONE -> error("filtered above")
-                        }
-                        val record = LegacySurveyRecoveryStore.Record(
-                            candidate.normalizedSurveyId, candidate.canonicalFile.name, reason
-                        )
-                        deferredLegacyRecovery += LegacySurveyRecoveryObservation.observe(appContext, record).toUiEntry()
-                    }
-                }
             UploadStatusDetails(
                 pending = pending,
                 completed = completed,
-                deferredLegacyRecovery = deferredLegacyRecovery,
                 completedSurveyIds = visibleCompleted.mapTo(mutableSetOf()) { it.surveyId },
+                artifactStatus = artifactStatus(),
             )
         }
     }
 
-    private fun LegacySurveyRecoveryObservation.Snapshot.toUiEntry(): DeferredLegacyRecoveryEntry =
-        DeferredLegacyRecoveryEntry(
-            surveyId = record.normalizedSurveyId,
-            fileName = record.fileName,
-            reason = record.reason,
-            localStatus = LegacyRecoveryLocalStatus.valueOf(status.name),
-            operatorReviewRequired = operatorReviewRequired,
-            executionAuthority = when (val owner = executionAuthority) {
-                is SurveyUploadExecutionAuthority.Owner.VALID -> owner.protocol.name
-                SurveyUploadExecutionAuthority.Owner.CORRUPT_OR_UNKNOWN -> "CORRUPT_OR_UNKNOWN"
-                else -> null
-            },
-        )
+    private fun pendingSurveys() = artifacts.artifactIds()
+        .filter { it.startsWith("survey-") }
+        .mapNotNull(artifacts::read)
+        .filterNot { V2ArtifactDelivery.confirmed(appContext, it) }
+
+    private fun artifactStatus(): List<String> {
+        val config = V2ArtifactDelivery.config(appContext)
+        val work = runCatching {
+            WorkManager.getInstance(appContext).getWorkInfosByTag(GitHubUploadWorker.TAG)
+                .get(350, TimeUnit.MILLISECONDS)
+        }.getOrDefault(emptyList()).flatMap { info ->
+            info.tags.filter { it.startsWith("v2-artifact:") }.map { it.substringAfter(':') to info }
+        }.groupBy({ it.first }, { it.second })
+        val counts = artifacts.artifactIds().map { id ->
+            val entry = artifacts.read(id)
+            if (entry == null) return@map "Unknown artifact · invalid route"
+            val label = entry.route.kind.name.lowercase().replace('_', ' ')
+            val states = work[id].orEmpty()
+            val conflict = runCatching { entry.hasRemoteConflict() }.getOrNull()
+            val confirmed = runCatching { V2ArtifactDelivery.confirmed(appContext, entry) }.getOrNull()
+            val state = when {
+                confirmed == null -> "invalid delivery evidence"
+                confirmed && entry.payload.exists() -> "delivered, cleanup pending"
+                confirmed -> "delivered"
+                !entry.payload.isFile -> "missing staged payload"
+                conflict == null -> "invalid conflict evidence"
+                conflict -> "remote conflict, payload retained"
+                !runCatching { entry.matchesPayload() }.getOrDefault(false) -> "payload does not match route"
+                entry.route.profile != V2ArtifactStore.profile -> "held for original destination"
+                entry.route.size > V2ArtifactDelivery.MAX_RAW_BYTES -> "over upload size limit"
+                !runCatching { V2ArtifactDelivery.isEligible(appContext, entry) }.getOrDefault(false) ->
+                    "held without finalized survey reference"
+                config == null -> "upload disabled or credential unavailable"
+                states.any { it.state == WorkInfo.State.RUNNING } -> "uploading"
+                states.any { !it.state.isFinished && it.runAttemptCount > 0 } -> "retry pending"
+                states.any { !it.state.isFinished } -> "queued"
+                states.any { it.state == WorkInfo.State.FAILED } -> "failed, payload retained"
+                else -> "staged"
+            }
+            "$label · $state"
+        }.groupingBy { it }.eachCount()
+        val interrupted = artifacts.interruptedIds().size
+        return counts.toSortedMap().map { (state, count) -> "$state ($count)" } +
+            listOfNotNull("Interrupted staging ($interrupted)".takeIf { interrupted > 0 })
+    }
 
     companion object {
         /** Entries with no recoverable timestamp (legacy IDs) sort last. */

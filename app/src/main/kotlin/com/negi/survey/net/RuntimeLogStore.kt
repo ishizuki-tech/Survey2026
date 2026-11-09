@@ -230,6 +230,9 @@ object RuntimeLogStore {
     private val fileLock = Any()
 
     private var activeFile: File? = null
+    private var activeOpenedAt: Instant? = null
+    // V1's rolling retention can prune originals only after the V2 staging copy exists.
+    private val unstagedV2Sources = mutableSetOf<File>()
     private var activeWriter: BufferedWriter? = null
     private var activeStream: FileOutputStream? = null
     private var activeBytes: Long = 0L
@@ -266,6 +269,7 @@ object RuntimeLogStore {
 
         scope.launch {
             runCatching {
+                recoverV2Segments(ctx, dir)
                 openWriterIfNeededLocked("start")
                 writeHeaderLocked()
                 writeLineLocked(
@@ -620,6 +624,10 @@ object RuntimeLogStore {
         return excludeName
     }
 
+    internal suspend fun sealV2SurveySegment() {
+        if (started.get()) snapshotRotateForPlainUpload("survey_finalized")
+    }
+
     private suspend fun snapshotRotateForPlainUpload(reason: String): String? {
         if (!started.get() || !actorLaunched.get()) return null
         val ack = CompletableDeferred<String?>()
@@ -650,6 +658,8 @@ object RuntimeLogStore {
             val w = BufferedWriter(OutputStreamWriter(os, UTF8), 32 * 1024)
 
             activeFile = f
+            unstagedV2Sources += f
+            activeOpenedAt = Instant.now()
             activeStream = os
             activeWriter = w
             activeBytes = f.length().coerceAtLeast(0L)
@@ -667,7 +677,9 @@ object RuntimeLogStore {
             val w = activeWriter ?: return
             val header = buildString {
                 appendLine("=== RuntimeLogStore Header ===")
-                appendLine("ts=${utcIso8601()}")
+                appendLine("ts=${activeOpenedAt ?: Instant.now()}")
+                appendLine("v2_process_session=${com.negi.survey.diagnostics.SurveyDiagnosticAttribution.processSession}")
+                appendLine("v2_profile=${V2ArtifactStore.profile.name}")
                 appendLine("fileNameFormat=$fileNameFormat")
                 appendLine("appId=${BuildConfig.APPLICATION_ID}")
                 appendLine("versionName=${BuildConfig.VERSION_NAME}")
@@ -718,7 +730,9 @@ object RuntimeLogStore {
     }
 
     private fun rotateLocked(reason: String) {
-        synchronized(fileLock) {
+        val closed = synchronized(fileLock) {
+            val segment = activeFile
+            val openedAt = activeOpenedAt
             runCatching { activeWriter?.flush() }
             runCatching { activeStream?.fd?.sync() }
             runCatching { activeWriter?.close() }
@@ -727,11 +741,20 @@ object RuntimeLogStore {
             activeWriter = null
             activeStream = null
             activeFile = null
+            activeOpenedAt = null
             activeBytes = 0L
             lastSoftFlushUptimeMs = 0L
             lastSoftFlushBytes = 0L
+            if (segment != null && openedAt != null) segment to openedAt else null
         }
 
+        val ctx = appContext
+        if (ctx != null && closed != null) {
+            val (file, openedAt) = closed
+            val end = Instant.now()
+            val session = com.negi.survey.diagnostics.SurveyDiagnosticAttribution.processSession
+            stageV2Segment(ctx, file, session, V2ArtifactStore.profile, openedAt, end, recovered = false)
+        }
         openWriterIfNeededLocked("rotate:$reason")
         runCatching { writeHeaderLocked() }
 
@@ -750,11 +773,73 @@ object RuntimeLogStore {
         enforceRetentionLocked("rotate:$reason")
     }
 
+    private fun recoverV2Segments(context: Context, directory: File) {
+        directory.listFiles().orEmpty().filter { it.isFile && it.extension == "log" }.forEach { file ->
+            runCatching {
+                val headers = file.bufferedReader().use { reader ->
+                    (1..4).mapNotNull { reader.readLine() }
+                }
+                val start = headers.getOrNull(1)?.takeIf { it.startsWith("ts=") }
+                    ?.substringAfter('=')?.let(Instant::parse) ?: return@runCatching
+                val session = headers.getOrNull(2)?.takeIf { it.startsWith("v2_process_session=") }
+                    ?.substringAfter('=') ?: return@runCatching
+                val profile = headers.getOrNull(3)?.takeIf { it.startsWith("v2_profile=") }
+                    ?.substringAfter('=')?.let(V2ArtifactStore.Profile::valueOf) ?: return@runCatching
+                val end = Instant.ofEpochMilli(file.lastModified()).coerceAtLeast(start)
+                stageV2Segment(context, file, session, profile, start, end, recovered = true)
+            }.onFailure { DiagnosticContentPolicy.logWarning(TAG, "Interrupted runtime segment retained", it) }
+        }
+    }
+
+    private fun stageV2Segment(
+        context: Context,
+        file: File,
+        session: String,
+        profile: V2ArtifactStore.Profile,
+        start: Instant,
+        end: Instant,
+        recovered: Boolean,
+    ) {
+        if (file.length() <= 0L) {
+            unstagedV2Sources -= file
+            return
+        }
+        unstagedV2Sources += file
+        runCatching {
+            val bounds = if (recovered) null else captureBounds(file, start, end)
+            val evidence = bounds?.let { (first, last) ->
+                com.negi.survey.diagnostics.SurveyDiagnosticAttribution.currentProcessEvidence(first, last)
+            }
+            com.negi.survey.diagnostics.V2DiagnosticLogs.stage(
+                context, V2ArtifactStore.Kind.RUNTIME, V2ArtifactStore.stableId("runtime|$session|${file.name}"),
+                start, bounds?.first ?: start, bounds?.second ?: end,
+                if (recovered) "previous_process_runtime_segment" else "process_runtime_segment",
+                evidence, profile,
+            ) { output -> file.inputStream().use { it.copyTo(output) } }
+        }.onSuccess { unstagedV2Sources -= file }
+            .onFailure { DiagnosticContentPolicy.logWarning(TAG, "Runtime segment staging failed", it) }
+    }
+
+    private fun captureBounds(file: File, opened: Instant, closed: Instant): Pair<Instant, Instant>? {
+        var earliest = opened
+        var latest = closed
+        file.useLines { lines ->
+            for (line in lines) {
+                // A pre-rotation event can arrive late from another logging thread.
+                if (line.getOrNull(10) != 'T' || line.getOrNull(23) != 'Z' || line.getOrNull(24) != ' ') continue
+                val event = runCatching { Instant.parse(line.take(24)) }.getOrNull() ?: return null
+                earliest = minOf(earliest, event)
+                latest = maxOf(latest, event)
+            }
+        }
+        return earliest to latest
+    }
+
     private fun enforceRetentionLocked(why: String) {
         synchronized(fileLock) {
             val dir = rootDir ?: return
             val files = dir.listFiles()
-                ?.filter { it.isFile && it.name.endsWith(".log", ignoreCase = true) }
+                ?.filter { it.isFile && it.name.endsWith(".log", ignoreCase = true) && it !in unstagedV2Sources }
                 ?.sortedByDescending { it.lastModified() }
                 .orEmpty()
 

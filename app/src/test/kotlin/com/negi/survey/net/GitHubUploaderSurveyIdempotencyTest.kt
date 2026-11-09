@@ -11,6 +11,26 @@ class GitHubUploaderSurveyIdempotencyTest {
     private val identity = requireNotNull(SurveyUploadIdempotency.validateLocalPayload("survey-uuid", payload))
 
     @Test
+    fun v2SuccessfulCreateRequiresMatchingReadBack() = runBlocking {
+        val created = GitHubUploader.SurveyCreateResult.Created(GitHubUploader.UploadResult(null, "commit"))
+        val matching = FakeTransport(listOf(null, record(payload)), created)
+        GitHubUploader.reconcileSurveyJsonUpload(identity, payload, matching, verifyCreated = true)
+        assertEquals(1, matching.createCalls)
+
+        val conflicting = FakeTransport(listOf(null, record(payload + " ")), created)
+        val mismatch = runCatching {
+            GitHubUploader.reconcileSurveyJsonUpload(identity, payload, conflicting, verifyCreated = true)
+        }.exceptionOrNull()
+        assertTrue((mismatch as GitHubUploader.SurveyUploadValidationException).remoteConflict)
+
+        val invisible = FakeTransport(listOf(null, null), created)
+        val ambiguous = runCatching {
+            GitHubUploader.reconcileSurveyJsonUpload(identity, payload, invisible, verifyCreated = true)
+        }.exceptionOrNull()
+        assertTrue(ambiguous is GitHubUploader.SurveyUploadAmbiguousException)
+    }
+
+    @Test
     fun matchingRemote_isRecoveredWithoutCreate() = runBlocking {
         val transport = FakeTransport(listOf(record(payload)))
 
@@ -59,7 +79,7 @@ class GitHubUploaderSurveyIdempotencyTest {
         )
         val error = runCatching { GitHubUploader.reconcileSurveyJsonUpload(identity, payload, transport) }.exceptionOrNull()
 
-        assertTrue(error is GitHubUploader.SurveyUploadValidationException)
+        assertTrue(!(error as GitHubUploader.SurveyUploadValidationException).remoteConflict)
     }
 
     @Test

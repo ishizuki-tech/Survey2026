@@ -83,6 +83,7 @@ object DiagnosticContentPolicy {
         }
 
     private val TRACE_RAW_CONTENT_FIELDS = setOf(
+        "answer",
         "transcript",
         "prompt",
         "finalPrompt",

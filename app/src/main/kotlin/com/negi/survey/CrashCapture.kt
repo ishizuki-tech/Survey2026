@@ -16,6 +16,10 @@ import android.app.ActivityManager
 import android.app.Application
 import android.app.ApplicationExitInfo
 import android.content.Context
+import com.negi.survey.diagnostics.SurveyDiagnosticAttribution
+import com.negi.survey.diagnostics.V2DiagnosticLogs
+import com.negi.survey.net.V2ArtifactStore
+import java.time.Instant
 import android.os.Build
 import android.os.Bundle
 import android.os.Looper
@@ -24,21 +28,8 @@ import android.os.SystemClock
 import android.util.Log
 import com.negi.survey.diagnostics.DiagnosticContentPolicy
 import androidx.annotation.RequiresApi
-import androidx.work.BackoffPolicy
-import androidx.work.Constraints
-import androidx.work.ExistingWorkPolicy
-import androidx.work.NetworkType
-import androidx.work.OneTimeWorkRequest
-import androidx.work.OneTimeWorkRequestBuilder
-import androidx.work.OutOfQuotaPolicy
-import androidx.work.WorkManager
-import androidx.work.workDataOf
-import com.negi.survey.net.GitHubDiagnosticsConfigStore
-import com.negi.survey.net.GitHubUploadWorker
-import com.negi.survey.net.GitHubUploader
 import java.io.ByteArrayOutputStream
 import java.io.File
-import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.InputStream
 import java.text.SimpleDateFormat
@@ -52,6 +43,8 @@ import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.min
 import kotlin.system.exitProcess
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
 
 object CrashCapture {
 
@@ -60,12 +53,6 @@ object CrashCapture {
     /** Local directory for staged crash artifacts (.log). */
     private const val CRASH_DIR_REL = "diagnostics/crash"
 
-    /** Local directory for GitHub mirror copies (Supabase may delete originals). */
-    private const val CRASH_GH_MIRROR_DIR_REL = "diagnostics/crash_github_mirror"
-
-    /** Remote subdir name for uploading AppRingLogStore "raw ring body". */
-    private const val REMOTE_RING_SUBDIR = "ring_store"
-
     private const val MAX_LOGCAT_BYTES = 1_400_000
     private const val LOGCAT_MAX_MS = 900L
 
@@ -73,25 +60,12 @@ object CrashCapture {
     private const val LOGCAT_TAIL_LINES_SINCE = "12000"
 
     private const val MAX_FILES_TO_KEEP = 120
-    private const val MAX_FILES_TO_ENQUEUE = 30
 
     /** Maximum number of new ApplicationExitInfo records staged per launch. */
     private const val MAX_EXIT_INFOS_TO_STAGE = 16
 
     /** Preserve only a bounded amount of system-provided trace data per exit. */
     private const val MAX_EXIT_TRACE_BYTES = 768 * 1024
-
-    /**
-     * Limit ring uploads to avoid enqueue storms.
-     * Increase if your ring is intentionally large.
-     */
-    private const val MAX_RING_FILES_TO_ENQUEUE = 300
-
-    /**
-     * Hard cap for ring total bytes uploaded per enqueue call.
-     * This prevents a runaway directory from generating hundreds of MB of uploads.
-     */
-    private const val MAX_RING_TOTAL_BYTES_TO_ENQUEUE = 90_000_000L // 90MB
 
     /** Prevent re-enqueue storms on rapid app restarts / multiple entry points. */
     private const val ENQUEUE_COOLDOWN_MS = 1200L
@@ -103,7 +77,7 @@ object CrashCapture {
     private const val ENSURE_COOLDOWN_MS = 800L
 
     /** SharedPreferences for previous-session staging state. */
-    private const val STATE_PREF_NAME = "crash_capture_state_v3"
+    private const val STATE_PREF_NAME = "crash_capture_state_v2_artifacts"
     private const val KEY_LAST_EXIT_TS = "last_exit_ts"
     private const val KEY_LAST_EXIT_PID = "last_exit_pid"
     private const val KEY_LAST_LOGCAT_MARKER = "last_logcat_marker"
@@ -111,7 +85,6 @@ object CrashCapture {
     /** Stage guards (once per current process). */
     private val stagedPrevSessionThisProcess = AtomicBoolean(false)
     private val stagedExitInfoThisProcess = AtomicBoolean(false)
-    private val stagedRingUploadThisProcess = AtomicBoolean(false)
 
     private val capturing = AtomicBoolean(false)
     private val enqueueing = AtomicBoolean(false)
@@ -236,40 +209,15 @@ object CrashCapture {
         installInternal(context = context, where = where.ifBlank { "ensureInstalled(custom)" })
     }
 
-    /**
-     * Enqueue pending crash artifacts for upload.
-     *
-     * Strategy:
-     * - Stage previous-process exit info (API30+) into crash dir (native crash / signaled).
-     * - Stage previous-session logcat into crash dir using `logcat -T <marker>`.
-     * - Then enqueue all files under crash dir to GitHub (mirror-first).
-     * - Additionally: upload the raw AppRingLogStore ring directory ("ring body") as-is (files),
-     *   placed under a timestamped remote directory to avoid WorkManager unique-name collisions.
-     *
-     * IMPORTANT:
-     * - This method touches WorkManager. Call it only after WorkManager is initialized
-     *   (typically from Application.onCreate or later).
-     *
-     * HARDENING:
-     * - If called on the main thread, offload to a dedicated background thread to avoid startup jank / ANR.
-     */
-    fun enqueuePendingCrashUploadsIfPossible(context: Context) {
-        enqueuePendingCrashUploadsIfPossible(context = context, where = "enqueue(legacy)")
-    }
-
-    /**
-     * Enqueue with a caller label for debug.
-     *
-     * This is the key hook to identify who is calling enqueue twice within cooldown.
-     */
-    fun enqueuePendingCrashUploadsIfPossible(context: Context, where: String) {
+    /** Collects previous-process crashes and logcat on a background thread. */
+    fun stagePreviousProcessDiagnostics(context: Context, where: String) {
         // Offload heavy staging (logcat / IO) from main thread.
         if (Looper.myLooper() == Looper.getMainLooper()) {
             val appCtx = safeAppContext(context)
             val label = where.ifBlank { "enqueue(main_offload)" }
             Thread(
                 {
-                    runCatching { enqueuePendingCrashUploadsIfPossible(appCtx, "$label:bg") }
+                    runCatching { stagePreviousProcessDiagnostics(appCtx, "$label:bg") }
                         .onFailure { e -> DiagnosticContentPolicy.logWarning(TAG, "enqueue offload failed where=$label", e) }
                 },
                 "CrashCapture-Enqueue"
@@ -279,12 +227,12 @@ object CrashCapture {
 
         val root = filesDirRoot ?: runCatching { context.filesDir }.getOrNull()
         if (root == null) {
-            Log.w(TAG, "enqueuePendingCrashUploadsIfPossible: filesDir unavailable; skipping. where=$where")
+            Log.w(TAG, "stagePreviousProcessDiagnostics: filesDir unavailable; skipping. where=$where")
             return
         }
 
         if (!enqueueing.compareAndSet(false, true)) {
-            Log.d(TAG, "enqueuePendingCrashUploadsIfPossible skipped (already running). where=$where")
+            Log.d(TAG, "stagePreviousProcessDiagnostics skipped (already running). where=$where")
             return
         }
 
@@ -295,7 +243,7 @@ object CrashCapture {
             if (prev != 0L && dt in 0 until ENQUEUE_COOLDOWN_MS) {
                 Log.d(
                     TAG,
-                    "enqueuePendingCrashUploadsIfPossible skipped (cooldown). dt=${dt}ms where=$where " +
+                    "stagePreviousProcessDiagnostics skipped (cooldown). dt=${dt}ms where=$where " +
                             "thread=${Thread.currentThread().name}"
                 )
                 return
@@ -306,93 +254,25 @@ object CrashCapture {
 
             Log.d(
                 TAG,
-                "enqueuePendingCrashUploadsIfPossible enter where=$where pid=${Process.myPid()} " +
+                "stagePreviousProcessDiagnostics enter where=$where pid=${Process.myPid()} " +
                         "thread=${Thread.currentThread().name}"
             )
 
-            // 0) Stage previous-run artifacts BEFORE scanning the crash dir (no WorkManager dependency).
+            recoverJavaCrashCaptures(appCtx)
+
+            // Stage previous-run artifacts without a WorkManager dependency.
             val stagedExitPid = runCatching { stageLastExitInfoIfNeeded(appCtx, root) }
                 .onFailure { e -> DiagnosticContentPolicy.logWarning(TAG, "stageLastExitInfoIfNeeded failed", e) }
                 .getOrNull()
 
-            runCatching { stagePreviousSessionLogcatIfNeeded(appCtx, root, stagedExitPid) }
-                .onFailure { e -> DiagnosticContentPolicy.logWarning(TAG, "stagePreviousSessionLogcatIfNeeded failed", e) }
-
-            // Always persist marker for the NEXT run (after staging).
-            runCatching { persistCurrentLogcatMarker(appCtx) }
-                .onFailure { e -> DiagnosticContentPolicy.logWarning(TAG, "persistCurrentLogcatMarker failed", e) }
-
-            // 1) WorkManager availability check.
-            val wmOk = runCatching { WorkManager.getInstance(appCtx) }
-                .onFailure { e ->
-                    Log.w(
-                        TAG,
-                        "WorkManager not available yet; will retry on next enqueue call. where=$where err=${DiagnosticContentPolicy.errorDescription(e)}"
-                    )
-                }
-                .isSuccess
-            if (!wmOk) return
-
-            val dir = crashDir(root)
-            val ghMirrorDir = crashGitHubMirrorDir(root)
-
-            ensureDirectory(dir)
-            ensureDirectory(ghMirrorDir)
-
-            purgeOldFiles(dir, MAX_FILES_TO_KEEP)
-
-            val files = dir.listFiles { f ->
-                f.isFile && f.length() > 0L && !f.name.startsWith(".")
-            }?.toList().orEmpty()
-
-            if (files.isEmpty()) {
-                Log.d(TAG, "No crash artifacts found; skipping enqueue. where=$where")
-                return
+            runCatching {
+                stagePreviousSessionLogcatIfNeeded(appCtx, root, stagedExitPid)
+                persistCurrentLogcatMarker(appCtx)
+            }.onFailure { error ->
+                // Preserve the previous collection window so a later launch can retry it.
+                stagedPrevSessionThisProcess.set(false)
+                DiagnosticContentPolicy.logWarning(TAG, "Previous-session logcat staging deferred", error)
             }
-
-            val ghCfg = buildCrashGitHubConfigOrNull(appCtx)
-            if (ghCfg == null) {
-                Log.d(TAG, "No upload config found; crash artifacts will remain local. where=$where")
-                return
-            }
-
-            Log.d(
-                TAG,
-                "GitHub hints: owner=${BuildConfig.GH_OWNER} repo=${BuildConfig.GH_REPO} " +
-                        "branch=${BuildConfig.GH_BRANCH} pathPrefix=${ghCfg.pathPrefix}"
-            )
-
-            val targets = files
-                .sortedByDescending { it.lastModified() }
-                .take(MAX_FILES_TO_ENQUEUE)
-
-            Log.d(TAG, "Enqueuing GitHub crash uploads… (mirror-first) where=$where")
-            targets.forEach { file ->
-                val mirror = runCatching { makeGitHubMirrorCopy(file, ghMirrorDir) }
-                    .onFailure { e -> DiagnosticContentPolicy.logWarning(TAG, "GitHub mirror copy failed: ${file.name}", e) }
-                    .getOrNull()
-
-                if (mirror != null) {
-                    val remoteRelativePath = mirror.name
-                    Log.d(
-                        TAG,
-                        "GitHub enqueue(crash file): name=${mirror.name} bytes=${mirror.length()} remote=$remoteRelativePath where=$where"
-                    )
-
-                    enqueueGitHubWorkerFileUpload(
-                        context = appCtx,
-                        cfg = ghCfg,
-                        localFile = mirror,
-                        remoteRelativePath = remoteRelativePath,
-                        kindTag = "crash"
-                    )
-                }
-            }
-
-            // 2) Additionally upload raw ring body (AppRingLogStore directory) under a timestamped remote dir.
-            //    This avoids WorkManager unique-name collisions because ring segment filenames are usually stable.
-            runCatching { stageAndEnqueueRingStoreUploads(appCtx, root, ghMirrorDir, ghCfg, where) }
-                .onFailure { e -> DiagnosticContentPolicy.logWarning(TAG, "Ring store upload staging failed", e) }
 
         } finally {
             enqueueing.set(false)
@@ -415,6 +295,7 @@ object CrashCapture {
         // Create one stable handler instance for the lifetime of the process.
         val h = handler ?: synchronized(this) {
             handler ?: CrashHandler(
+                context = context,
                 filesDir = root,
                 capturing = capturing,
                 onHardKill = { hardKill() }
@@ -558,6 +439,7 @@ object CrashCapture {
 
             for (info in diagnosticRecords) {
                 stageApplicationExitInfo(
+                    context = appCtx,
                     info = info,
                     dir = dir
                 )
@@ -612,6 +494,7 @@ object CrashCapture {
      */
     @RequiresApi(Build.VERSION_CODES.R)
     private fun stageApplicationExitInfo(
+        context: Context,
         info: ApplicationExitInfo,
         dir: File
     ) {
@@ -675,11 +558,49 @@ object CrashCapture {
             bytes = text
         )
 
+        val summary = info.processStateSummary
+        val profile = SurveyDiagnosticAttribution.exitProfile(summary)
+        if (profile != null && exitTs > 0L && info.processName == context.packageName) {
+            val event = Instant.ofEpochMilli(exitTs)
+            stageV2ExitRecord(
+                context, dir, reason, info.status, pid, event, profile,
+                SurveyDiagnosticAttribution.exitEvidence(context, summary, pid, event),
+            ) { output ->
+                output.write(text)
+                traceResult?.let {
+                    output.write("\n=== Encoded system trace ===\n".toByteArray())
+                    val base64 = android.util.Base64OutputStream(output, android.util.Base64.NO_CLOSE)
+                    base64.use { encoded -> it.file.inputStream().use { input -> input.copyTo(encoded) } }
+                }
+            }
+        }
+
         Log.d(
             TAG,
             "Staged exit info: ${outFile.absolutePath} " +
                     "bytes=${outFile.length()} reason=$reason pid=$pid"
         )
+    }
+
+    internal fun stageV2ExitRecord(
+        context: Context, directory: File, reason: Int, status: Int, pid: Int, event: Instant,
+        profile: V2ArtifactStore.Profile, evidence: SurveyDiagnosticAttribution.Interval?,
+        write: (java.io.OutputStream) -> Unit,
+    ) {
+        if (!isDiagnosticExitReason(reason)) return
+        val id = V2ArtifactStore.stableId("exit|${event.toEpochMilli()}|$pid|$reason")
+        V2DiagnosticLogs.stage(
+            context, V2ArtifactStore.Kind.CRASH, id, event, event, event,
+            "application_exit_record", evidence, profile, write = write,
+        )
+        if (!isCrashExit(reason, status)) return
+        // The next-launch snapshot can span processes, so it has no exclusive survey attribution.
+        AppRingLogStore.stageSnapshotForCrash(directory, "applog_exit")?.takeIf { it.length() > 0 }?.let { snapshot ->
+            V2DiagnosticLogs.stage(
+                context, V2ArtifactStore.Kind.CRASH, V2ArtifactStore.stableId("exit-ring|$id"),
+                event, event, Instant.now().coerceAtLeast(event), "cross_process_crash_ring_snapshot", null, profile,
+            ) { output -> snapshot.inputStream().use { it.copyTo(output) } }
+        }
     }
 
     private data class StagedTrace(
@@ -801,7 +722,17 @@ object CrashCapture {
         )
     }
 
-    private fun isDiagnosticExitReason(reason: Int): Boolean {
+    internal fun isCrashExit(reason: Int, status: Int): Boolean = when (reason) {
+        ApplicationExitInfo.REASON_CRASH, ApplicationExitInfo.REASON_CRASH_NATIVE -> true
+        ApplicationExitInfo.REASON_SIGNALED -> status in setOf(
+            android.system.OsConstants.SIGILL, android.system.OsConstants.SIGTRAP,
+            android.system.OsConstants.SIGABRT, android.system.OsConstants.SIGBUS,
+            android.system.OsConstants.SIGFPE, android.system.OsConstants.SIGSEGV,
+        )
+        else -> false
+    }
+
+    internal fun isDiagnosticExitReason(reason: Int): Boolean {
         return reason == ApplicationExitInfo.REASON_CRASH ||
                 reason == ApplicationExitInfo.REASON_CRASH_NATIVE ||
                 reason == ApplicationExitInfo.REASON_SIGNALED ||
@@ -893,6 +824,11 @@ object CrashCapture {
             bytes = payload
         )
 
+        V2DiagnosticLogs.stage(
+            appCtx, V2ArtifactStore.Kind.LOGCAT, V2ArtifactStore.stableId("previous-logcat|$marker"),
+            now.toInstant(), now.toInstant(), Instant.now(), "previous_process_logcat_since_marker", null,
+        ) { it.write(payload) }
+
         Log.d(TAG, "Staged prev session logcat: ${outFile.absolutePath} bytes=${outFile.length()} marker=$marker pid=${pid ?: -1}")
     }
 
@@ -916,264 +852,8 @@ object CrashCapture {
         Log.d(TAG, "Persisted logcat marker for next run: $marker")
     }
 
-    // -----------------------------------------------------------------------------
-    // Ring store upload (raw directory)
-    // -----------------------------------------------------------------------------
-
-    /**
-     * Upload the raw AppRingLogStore segment files.
-     *
-     * The ring store is part of this application module, so use its typed API
-     * directly instead of reflection. A per-capture remote directory keeps
-     * concurrently unfinished unique WorkManager jobs from colliding on stable
-     * segment names.
-     */
-    private fun stageAndEnqueueRingStoreUploads(
+    internal fun captureCrashToFile(
         context: Context,
-        filesDir: File,
-        ghMirrorDir: File,
-        cfg: GitHubUploader.GitHubConfig,
-        where: String
-    ) {
-        if (!stagedRingUploadThisProcess.compareAndSet(false, true)) {
-            Log.d(
-                TAG,
-                "Ring store upload already staged in this process; skipping. where=$where"
-            )
-            return
-        }
-
-        try {
-            val ringDir =
-                runCatching {
-                    AppRingLogStore.ringDir(context)
-                }.getOrElse {
-                    File(filesDir, "diagnostics/applog_ring")
-                }
-
-            if (!ringDir.isDirectory) {
-                stagedRingUploadThisProcess.set(false)
-                Log.d(
-                    TAG,
-                    "Ring store dir not found; skipping ring upload. where=$where"
-                )
-                return
-            }
-
-            val all =
-                listFilesRecursively(ringDir)
-                    .filter {
-                        it.isFile &&
-                                it.length() > 0L &&
-                                !it.name.startsWith(".")
-                    }
-
-            if (all.isEmpty()) {
-                /**
-                 * The logger may have been installed but its first async write may
-                 * not have reached disk yet. Allow a later enqueue call to retry.
-                 */
-                stagedRingUploadThisProcess.set(false)
-                Log.d(
-                    TAG,
-                    "Ring store dir empty; retry allowed. " +
-                            "dir=${ringDir.absolutePath} where=$where"
-                )
-                return
-            }
-
-            val sorted =
-                all.sortedByDescending { it.lastModified() }
-
-            val stampUtc =
-                formatFileTimestampUtc(Date())
-
-            val remoteCaptureId =
-                "${stampUtc}_pid${Process.myPid()}_" +
-                        "u${SystemClock.elapsedRealtime() % 1_000_000L}"
-
-            val remoteBase =
-                "${REMOTE_RING_SUBDIR}/${remoteCaptureId}"
-
-            val mirrorBaseDir =
-                File(ghMirrorDir, remoteBase)
-
-            ensureDirectory(mirrorBaseDir)
-
-            var enqueuedCount = 0
-            var enqueuedBytes = 0L
-
-            for (src in sorted) {
-                if (enqueuedCount >= MAX_RING_FILES_TO_ENQUEUE) {
-                    break
-                }
-
-                if (enqueuedBytes >= MAX_RING_TOTAL_BYTES_TO_ENQUEUE) {
-                    break
-                }
-
-                val rel =
-                    safeRelativePathOrNull(
-                        root = ringDir,
-                        file = src
-                    ) ?: continue
-
-                val relNorm =
-                    rel.replace('\\', '/')
-                        .trimStart('/')
-
-                if (relNorm.isBlank()) {
-                    continue
-                }
-
-                val mirror =
-                    runCatching {
-                        mirrorCopyPreserveRelPath(
-                            src = src,
-                            mirrorBaseDir = mirrorBaseDir,
-                            relNorm = relNorm
-                        )
-                    }.onFailure { e ->
-                        DiagnosticContentPolicy.logWarning(TAG, "Ring mirror copy failed: ${src.name}", e)
-                    }.getOrNull() ?: continue
-
-                val remoteRelativePath =
-                    "${remoteBase}/${relNorm}"
-
-                Log.d(
-                    TAG,
-                    "GitHub enqueue(ring file): bytes=${mirror.length()} " +
-                            "remote=$remoteRelativePath src=${src.name} where=$where"
-                )
-
-                enqueueGitHubWorkerFileUpload(
-                    context = context,
-                    cfg = cfg,
-                    localFile = mirror,
-                    remoteRelativePath = remoteRelativePath,
-                    kindTag = "ring"
-                )
-
-                enqueuedCount++
-                enqueuedBytes += mirror.length()
-            }
-
-            Log.d(
-                TAG,
-                "Ring store enqueue done. dir=${ringDir.absolutePath} " +
-                        "files=$enqueuedCount bytes=$enqueuedBytes " +
-                        "capFiles=$MAX_RING_FILES_TO_ENQUEUE " +
-                        "capBytes=$MAX_RING_TOTAL_BYTES_TO_ENQUEUE where=$where"
-            )
-        } catch (t: Throwable) {
-            stagedRingUploadThisProcess.set(false)
-            throw t
-        }
-    }
-
-    private fun listFilesRecursively(dir: File): List<File> {
-        val out = ArrayList<File>(64)
-        val stack = ArrayDeque<File>()
-        stack.add(dir)
-
-        while (stack.isNotEmpty()) {
-            val cur = stack.removeLast()
-            val children = cur.listFiles() ?: continue
-            for (c in children) {
-                if (c.isDirectory) stack.add(c) else out.add(c)
-            }
-        }
-        return out
-    }
-
-    private fun safeRelativePathOrNull(root: File, file: File): String? {
-        return runCatching {
-            val rootPath = root.canonicalFile.toPath()
-            val filePath = file.canonicalFile.toPath()
-            if (!filePath.startsWith(rootPath)) return null
-            rootPath.relativize(filePath).toString()
-        }.getOrNull()
-    }
-
-    private fun mirrorCopyPreserveRelPath(src: File, mirrorBaseDir: File, relNorm: String): File {
-        val dst = File(mirrorBaseDir, relNorm)
-        dst.parentFile?.let(::ensureDirectory)
-
-        // Reuse existing mirror if identical.
-        if (dst.exists() && dst.length() == src.length() && dst.lastModified() == src.lastModified()) {
-            return dst
-        }
-
-        FileInputStream(src).use { input ->
-            FileOutputStream(dst).use { output ->
-                val buf = ByteArray(64 * 1024)
-                while (true) {
-                    val n = input.read(buf)
-                    if (n <= 0) break
-                    output.write(buf, 0, n)
-                }
-                output.flush()
-            }
-        }
-
-        dst.setLastModified(src.lastModified())
-        return dst
-    }
-
-    // -----------------------------------------------------------------------------
-    // Mirror / file utils
-    // -----------------------------------------------------------------------------
-
-    private fun makeGitHubMirrorCopy(src: File, mirrorDir: File): File {
-        ensureDirectory(mirrorDir)
-
-        val dst = File(mirrorDir, src.name)
-
-        // Reuse existing mirror if identical.
-        if (dst.exists() && dst.length() == src.length() && dst.lastModified() == src.lastModified()) {
-            return dst
-        }
-
-        // If name exists but differs, create a unique suffixed name.
-        val target = if (!dst.exists()) dst else makeUniqueLike(srcName = src.name, dir = mirrorDir)
-
-        FileInputStream(src).use { input ->
-            FileOutputStream(target).use { output ->
-                val buf = ByteArray(64 * 1024)
-                while (true) {
-                    val n = input.read(buf)
-                    if (n <= 0) break
-                    output.write(buf, 0, n)
-                }
-                output.flush()
-            }
-        }
-
-        target.setLastModified(src.lastModified())
-        return target
-    }
-
-    private fun makeUniqueLike(srcName: String, dir: File): File {
-        if (srcName.endsWith(".log")) {
-            val base = srcName.removeSuffix(".log")
-            var index = 2
-            while (true) {
-                val candidate = File(dir, "$base-$index.log")
-                if (!candidate.exists()) return candidate
-                index++
-            }
-        }
-
-        val base = srcName
-        var index = 2
-        while (true) {
-            val candidate = File(dir, "$base-$index")
-            if (!candidate.exists()) return candidate
-            index++
-        }
-    }
-
-    private fun captureCrashToFile(
         filesDir: File,
         thread: Thread,
         throwable: Throwable
@@ -1198,7 +878,12 @@ object CrashCapture {
         val name =
             "crash_${stampUtc}_pid${pid}_tid${tid}_u${uptimeTail}.log"
 
-        val outFile = File(dir, name)
+        val event = now.toInstant()
+        val session = SurveyDiagnosticAttribution.processSession
+        val crashId = V2ArtifactStore.stableId("java-crash|$session|$name")
+        val captureDirectory = File(javaCrashRoot(context), crashId)
+        ensureDirectory(captureDirectory)
+        val outFile = File(captureDirectory, name)
 
         /**
          * Put the uncaught exception itself into the app-owned ring first. The
@@ -1221,7 +906,7 @@ object CrashCapture {
         val ringSnapshot =
             runCatching {
                 AppRingLogStore.stageSnapshotForCrash(
-                    crashDir = dir,
+                    crashDir = captureDirectory,
                     prefix = "applog"
                 )
             }.onFailure { e ->
@@ -1263,19 +948,94 @@ object CrashCapture {
         FileOutputStream(outFile).use { fos ->
             fos.write(header)
             fos.write(logBytes)
-            fos.flush()
-
-            runCatching {
-                fos.fd.sync()
-            }
+            fos.fd.sync()
         }
+
+        val capture = JavaCrashCapture(
+            event.toEpochMilli(), System.currentTimeMillis(), session, pid, V2ArtifactStore.profile,
+            name, header.size, ringSnapshot?.takeIf { it.length() > 0L }?.name,
+            SurveyDiagnosticAttribution.currentProcessEvidence(event, event),
+        )
+        V2ArtifactStore.writeAtomically(File(captureDirectory, "capture"), Json.encodeToString(JavaCrashCapture.serializer(), capture))
+        V2ArtifactStore.syncDirectory(captureDirectory.parentFile!!)
+        V2ArtifactStore.syncDirectory(context.noBackupFilesDir)
+        runCatching { stageJavaCrashCapture(context, captureDirectory, capture) }
+            .onFailure { DiagnosticContentPolicy.logWarning(TAG, "V2 crash artifact staging failed", it) }
 
         return outFile
     }
 
+    @Serializable
+    private data class JavaCrashCapture(
+        val eventMillis: Long,
+        val capturedMillis: Long,
+        val processSession: String,
+        val pid: Int,
+        val profile: V2ArtifactStore.Profile,
+        val reportName: String,
+        val headerSize: Int,
+        val ringName: String?,
+        val evidence: SurveyDiagnosticAttribution.Interval?,
+    )
+
+    private fun javaCrashRoot(context: Context) = File(context.noBackupFilesDir, "v2_java_crashes").canonicalFile
+
+    internal fun recoverJavaCrashCaptures(context: Context) {
+        javaCrashRoot(context).listFiles().orEmpty().filter(File::isDirectory).forEach { directory ->
+            runCatching {
+                val manifest = File(directory, "capture")
+                if (!manifest.isFile) return@runCatching
+                val capture = Json.decodeFromString(JavaCrashCapture.serializer(), manifest.readText())
+                if (capture.processSession != SurveyDiagnosticAttribution.processSession) {
+                    stageJavaCrashCapture(context, directory, capture)
+                }
+            }.onFailure { DiagnosticContentPolicy.logWarning(TAG, "Original crash capture retained", it) }
+        }
+    }
+
+    private fun stageJavaCrashCapture(context: Context, directory: File, capture: JavaCrashCapture) {
+        val crashId = V2ArtifactStore.stableId("java-crash|${capture.processSession}|${capture.reportName}")
+        check(directory.name == crashId && directory.canonicalFile == directory.absoluteFile) {
+            "Invalid Java crash capture directory."
+        }
+        val report = crashSource(directory, capture.reportName).readBytes()
+        val ring = capture.ringName?.let { crashSource(directory, it) }
+        check(capture.headerSize in 1..report.size)
+        val event = Instant.ofEpochMilli(capture.eventMillis)
+        val captured = Instant.ofEpochMilli(capture.capturedMillis).coerceAtLeast(event)
+        V2DiagnosticLogs.stage(
+            context, V2ArtifactStore.Kind.CRASH, crashId, event, event, event,
+            "uncaught_exception_record", capture.evidence, capture.profile,
+            collectorSession = capture.processSession, collectorPid = capture.pid,
+        ) { it.write(report, 0, capture.headerSize) }
+        if (report.size > capture.headerSize) {
+            V2DiagnosticLogs.stage(
+                context, V2ArtifactStore.Kind.LOGCAT, V2ArtifactStore.stableId("crash-logcat|$crashId"),
+                event, event, captured, "crash_logcat_unbounded_buffer", null, capture.profile,
+                collectorSession = capture.processSession, collectorPid = capture.pid,
+            ) { it.write(report, capture.headerSize, report.size - capture.headerSize) }
+        }
+        if (ring != null) {
+            V2DiagnosticLogs.stage(
+                context, V2ArtifactStore.Kind.CRASH, V2ArtifactStore.stableId("crash-ring|$crashId"),
+                event, event, captured, "crash_ring_snapshot_unbounded_history", null, capture.profile,
+                collectorSession = capture.processSession, collectorPid = capture.pid,
+            ) { output -> ring.inputStream().use { it.copyTo(output) } }
+        }
+
+        // The staged copies now own delivery. Retire the replay marker before the source files.
+        check(File(directory, "capture").delete())
+        V2ArtifactStore.syncDirectory(directory)
+        directory.deleteRecursively()
+    }
+
+    private fun crashSource(directory: File, name: String): File {
+        check(name == File(name).name && name.endsWith(".log"))
+        return File(directory, name).also { check(it.isFile && it.canonicalFile == it.absoluteFile) }
+    }
+
     private fun crashDir(filesDir: File): File = File(filesDir, CRASH_DIR_REL)
 
-    private fun crashGitHubMirrorDir(filesDir: File): File = File(filesDir, CRASH_GH_MIRROR_DIR_REL)
 
     private fun purgeOldFiles(dir: File, maxKeep: Int) {
         val all = dir.listFiles { f -> f.isFile && f.length() > 0L && !f.name.startsWith(".") }?.toList().orEmpty()
@@ -1406,7 +1166,7 @@ object CrashCapture {
      * indefinitely. Reading on a daemon thread lets the caller enforce a hard
      * wait bound and terminate the subprocess when necessary.
      */
-    private fun execAndReadCapped(
+    internal fun execAndReadCapped(
         cmd: List<String>,
         maxBytes: Int,
         maxMs: Long
@@ -1551,179 +1311,6 @@ object CrashCapture {
         return this
     }
 
-    // -----------------------------------------------------------------------------
-    // GitHub enqueue
-    // -----------------------------------------------------------------------------
-
-    /**
-     * Build GitHub config for crash uploads.
-     *
-     * Priority:
-     *  1) GitHubDiagnosticsConfigStore (user-configured token/prefs)
-     *  2) BuildConfig (gradle-injected secrets/config)
-     */
-    private fun buildCrashGitHubConfigOrNull(
-        context: Context
-    ): GitHubUploader.GitHubConfig? {
-        val fromStore =
-            runCatching {
-                GitHubDiagnosticsConfigStore
-                    .buildGitHubConfigOrNull(context)
-            }.getOrNull()
-
-        val base =
-            fromStore
-                ?: runCatching {
-                    buildCrashGitHubConfigFromBuildConfig()
-                }.getOrNull()
-                ?: return null
-
-        return normalizeCrashGitHubConfig(base)
-    }
-
-    private fun normalizeCrashGitHubConfig(
-        cfg: GitHubUploader.GitHubConfig
-    ): GitHubUploader.GitHubConfig? {
-        var owner = cfg.owner.trim()
-        var repo = cfg.repo.trim()
-        val token = cfg.token.trim()
-        val branch = cfg.branch.trim().ifBlank { "main" }
-
-        if (repo.contains('/')) {
-            val inferredOwner =
-                repo.substringBefore('/').trim()
-
-            val inferredRepo =
-                repo.substringAfterLast('/').trim()
-
-            if (owner.isBlank()) {
-                owner = inferredOwner
-            }
-
-            repo = inferredRepo
-        }
-
-        if (
-            owner.isBlank() ||
-            repo.isBlank() ||
-            token.isBlank()
-        ) {
-            return null
-        }
-
-        if (
-            owner.any(Char::isWhitespace) ||
-            repo.any(Char::isWhitespace)
-        ) {
-            return null
-        }
-
-        return cfg.copy(
-            owner = owner,
-            repo = repo,
-            token = token,
-            branch = branch,
-            pathPrefix = computeCrashPrefix(cfg.pathPrefix)
-        )
-    }
-
-    private fun computeCrashPrefix(basePrefix: String): String {
-        val p = basePrefix.trim('/')
-        if (p.endsWith("diagnostics/crash")) return p
-        if (p.endsWith("diagnostics")) return listOf(p, "crash").filter { it.isNotBlank() }.joinToString("/")
-        return listOf(p, "diagnostics/crash").filter { it.isNotBlank() }.joinToString("/")
-    }
-
-    private fun buildCrashGitHubConfigFromBuildConfig(): GitHubUploader.GitHubConfig? {
-        val token = BuildConfig.GH_TOKEN.trim()
-        val rawRepo = BuildConfig.GH_REPO.trim()
-
-        if (token.isBlank() || rawRepo.isBlank()) {
-            return null
-        }
-
-        var owner = BuildConfig.GH_OWNER.trim()
-        var repo = rawRepo
-
-        if (rawRepo.contains('/')) {
-            if (owner.isBlank()) {
-                owner = rawRepo.substringBefore('/').trim()
-            }
-
-            repo = rawRepo.substringAfterLast('/').trim()
-        }
-
-        if (owner.isBlank() || repo.isBlank()) {
-            return null
-        }
-
-        return GitHubUploader.GitHubConfig(
-            owner = owner,
-            repo = repo,
-            branch = BuildConfig.GH_BRANCH.trim().ifBlank { "main" },
-            pathPrefix = BuildConfig.GH_PATH_PREFIX.trim().trim('/'),
-            token = token
-        )
-    }
-
-    private fun enqueueGitHubWorkerFileUpload(
-        context: Context,
-        cfg: GitHubUploader.GitHubConfig,
-        localFile: File,
-        remoteRelativePath: String,
-        kindTag: String
-    ) {
-        val safeUnique = sanitizeWorkName("${cfg.pathPrefix}/$remoteRelativePath")
-        val uniqueName = "gh_upload_$safeUnique"
-
-        val req: OneTimeWorkRequest =
-            OneTimeWorkRequestBuilder<GitHubUploadWorker>()
-                .setInputData(
-                    workDataOf(
-                        GitHubUploadWorker.KEY_MODE to "file",
-                        GitHubUploadWorker.KEY_OWNER to cfg.owner,
-                        GitHubUploadWorker.KEY_REPO to cfg.repo,
-                        GitHubUploadWorker.KEY_BRANCH to cfg.branch,
-                        GitHubUploadWorker.KEY_PATH_PREFIX to cfg.pathPrefix,
-                        GitHubUploadWorker.KEY_FILE_PATH to localFile.absolutePath,
-                        // IMPORTANT: allow path separators in "file name" so worker can upload into subdirs.
-                        GitHubUploadWorker.KEY_FILE_NAME to remoteRelativePath
-                    )
-                )
-                .setConstraints(
-                    Constraints.Builder()
-                        .setRequiredNetworkType(NetworkType.CONNECTED)
-                        .build()
-                )
-                .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
-                .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
-                .addTag(GitHubUploadWorker.TAG)
-                .addTag("${GitHubUploadWorker.TAG}:$kindTag:$safeUnique")
-                .build()
-
-        WorkManager.getInstance(context)
-            .enqueueUniqueWork(uniqueName, ExistingWorkPolicy.KEEP, req)
-    }
-
-    private fun sanitizeWorkName(value: String): String {
-        val raw = value.trim()
-
-        val hash =
-            Integer.toHexString(raw.hashCode())
-
-        val stem =
-            raw.replace(
-                Regex("""[^\w\-.]+"""),
-                "_"
-            )
-                .trim('_')
-                .take(96)
-                .ifBlank { "work" }
-
-        return "${stem}_$hash"
-            .take(120)
-    }
-
     private fun formatFileTimestampUtc(date: Date): String {
         return synchronized(timestampLock) {
             fileTsUtc.format(date)
@@ -1860,6 +1447,7 @@ object CrashCapture {
     // -----------------------------------------------------------------------------
 
     private class CrashHandler(
+        private val context: Context,
         private val filesDir: File,
         private val capturing: AtomicBoolean,
         private val onHardKill: () -> Unit
@@ -1903,6 +1491,7 @@ object CrashCapture {
                 val file =
                     runCatching {
                         captureCrashToFile(
+                            context = context,
                             filesDir = filesDir,
                             thread = thread,
                             throwable = throwable
@@ -1914,8 +1503,7 @@ object CrashCapture {
                 if (file != null) {
                     Log.e(
                         TAG,
-                        "Crash captured: ${file.absolutePath} " +
-                                "bytes=${file.length()}"
+                        "Crash captured: ${file.name}"
                     )
                 }
             } catch (t: Throwable) {

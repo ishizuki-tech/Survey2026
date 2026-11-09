@@ -75,6 +75,20 @@ class UploadedSurveyStoreTest {
     }
 
     @Test
+    fun failedV2CommitCannotAuthorizeCleanupEvenWhenPreferencesChangedInMemory() {
+        val preferences = InMemoryPreferences(commitSucceeds = false, updateMemoryOnFailedCommit = true)
+        val store = UploadedSurveyStore(preferences.sharedPreferences)
+        val payload = "a".repeat(64)
+        val route = "b".repeat(64)
+        val failure = runCatching { store.markConfirmedUploaded("survey", null, payload, route) }.exceptionOrNull()
+        assertTrue(failure is IllegalStateException)
+        assertTrue(preferences.sharedPreferences.all.isNotEmpty())
+        assertFalse(UploadedSurveyStore(preferences.sharedPreferences).confirms("survey", payload, route))
+        assertFalse(store.isUploaded("survey"))
+        assertEquals(0, store.uploadedCount())
+    }
+
+    @Test
     fun clearListHidesRecordsWithoutChangingAnyCanonicalEvidence() {
         val ledgerPrefs = InMemoryPreferences()
         val displayPrefs = InMemoryPreferences()

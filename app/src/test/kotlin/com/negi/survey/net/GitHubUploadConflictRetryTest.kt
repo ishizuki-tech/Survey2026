@@ -11,6 +11,23 @@ import org.junit.Test
 class GitHubUploadConflictRetryTest {
     private val success = GitHubUploader.UploadResult("url", "commit")
 
+    @Test fun v2BinaryReadBackVerifiesAmbiguousAndSuccessfulWrites() = runBlocking {
+        var reads = 0
+        val recovered = GitHubUploader.createArtifactWithConflictRetry(
+            "local", { if (reads++ == 0) null else "local" },
+            { throw IOException("connection lost after create") }, verifyCreated = true,
+        )
+        assertEquals(GitHubUploader.UploadResult(null, null), recovered)
+
+        reads = 0
+        val mismatch = runCatching {
+            GitHubUploader.createArtifactWithConflictRetry(
+                "local", { if (reads++ == 0) null else "other" }, { success }, verifyCreated = true,
+            )
+        }.exceptionOrNull()
+        assertTrue(mismatch is GitHubUploader.ArtifactConflictException)
+    }
+
     @Test fun conflictsThenSuccess() = runBlocking {
         for (conflicts in listOf(1, 3)) {
             var calls = 0
