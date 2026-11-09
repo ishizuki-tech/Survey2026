@@ -1,12 +1,12 @@
 {
   "original_branch": "codex/issue-155-v1-based-v2",
   "branch_slug": "codex-issue-155-v1-based-v2",
-  "commit_sha": "84f666c805f6dc17c65bdc3cdd209d247f63209e",
-  "short_sha": "84f666c",
-  "apk_name": "Survey2026-codex-issue-155-v1-based-v2-84f666c.apk",
-  "apk_sha256": "263aecb988b204925115971fff59177de250ddd595e5d8bc520e46a3c21fa535",
-  "apk_download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-codex-issue-155-v1-based-v2-84f666c-run-210/Survey2026-codex-issue-155-v1-based-v2-84f666c.apk",
+  "commit_sha": "caf491f84a055d6b584c2a1fed894c9ca97e48bb",
+  "short_sha": "caf491f",
+  "apk_name": "Survey2026-codex-issue-155-v1-based-v2-caf491f.apk",
+  "apk_sha256": "91a05ac9b0f62d5e4a1e8e98f74873c9c915654e8b86c038080ac15b47b9ed6b",
+  "apk_download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-codex-issue-155-v1-based-v2-caf491f-run-211/Survey2026-codex-issue-155-v1-based-v2-caf491f.apk",
   "page_url": "https://ishizuki-tech.github.io/Survey2026/codex-issue-155-v1-based-v2/",
-  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/42696689592",
-  "generated_utc": "2026-11-09T20:57:23Z"
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/42699689020",
+  "generated_utc": "2026-11-09T21:16:13Z"
 }
