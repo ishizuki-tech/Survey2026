@@ -206,6 +206,29 @@ internal class StartupSurveyRecoveryCoordinator(
     }
 }
 
+internal fun runStartupV2Recovery(
+    recoverTraces: () -> Unit,
+    stageDiagnostics: () -> Unit,
+    recoverIndependentArtifacts: () -> Unit,
+    cleanupConfirmedSurveys: () -> Unit,
+    logWarning: (String, Exception) -> Unit,
+) {
+    fun recover(operation: String, action: () -> Unit) {
+        try {
+            action()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (exception: Exception) {
+            logWarning("Startup V2 recovery failed during $operation", exception)
+        }
+    }
+
+    recover("V2TraceArtifacts.recover", recoverTraces)
+    recover("CrashCapture.stagePreviousProcessDiagnostics", stageDiagnostics)
+    recover("V2ArtifactDelivery.recoverIndependent", recoverIndependentArtifacts)
+    recover("V2ArtifactDelivery.cleanupConfirmedSurveys", cleanupConfirmedSurveys)
+}
+
 /**
  * Application bootstrap:
  * - Install CrashCapture early (attachBaseContext) to catch crashes during Application startup.
@@ -366,10 +389,13 @@ class SurveyApp : Application(), Configuration.Provider {
 
         // Local recovery does not require a connection or upload credentials.
         startupSurveyRecoveryScope.launch {
-            V2TraceArtifacts.recover(appCtx)
-            CrashCapture.stagePreviousProcessDiagnostics(appCtx, "SurveyApp:onCreate")
-            V2ArtifactDelivery.recoverIndependent(appCtx, null)
-            V2ArtifactDelivery.cleanupConfirmedSurveys(appCtx)
+            runStartupV2Recovery(
+                recoverTraces = { V2TraceArtifacts.recover(appCtx) },
+                stageDiagnostics = { CrashCapture.stagePreviousProcessDiagnostics(appCtx, "SurveyApp:onCreate") },
+                recoverIndependentArtifacts = { V2ArtifactDelivery.recoverIndependent(appCtx, null) },
+                cleanupConfirmedSurveys = { V2ArtifactDelivery.cleanupConfirmedSurveys(appCtx) },
+                logWarning = { message, exception -> RuntimeLogStore.w(TAG, message, exception) },
+            )
         }
         scheduleStartupSurveyRecoveryOnce(appCtx)
 
