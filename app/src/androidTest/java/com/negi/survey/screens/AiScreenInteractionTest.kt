@@ -2526,6 +2526,39 @@ class AiScreenInteractionTest {
         rule.runOnIdle { assertEquals("Question", speaker.spoken.last()) }
     }
 
+    @Test fun consecutiveAcceptedFollowupsEachAutoplayOnceInTheSamePresentation() {
+        repo.responses = listOf(NEEDS_FOLLOWUP, FIRST_FOLLOWUP, NEEDS_FOLLOWUP, SECOND_FOLLOWUP)
+        host(twoStep = true)
+        val presentation = rule.runOnIdle { survey.questionSpeechOwner() }
+
+        enterAndSend("main answer")
+        repo.release.complete(Unit)
+        waitForFollowup(FIRST_FOLLOWUP)
+        rule.runOnIdle {
+            assertEquals(listOf("Question", FIRST_FOLLOWUP), speaker.spoken)
+            unrelated = true
+        }
+
+        rule.onNode(hasSetTextAction()).performTextInput("two bags")
+        rule.onNodeWithContentDescription("Send").performClick()
+        waitForFollowup(SECOND_FOLLOWUP)
+        val expectedAutoplay = listOf("Question", FIRST_FOLLOWUP, SECOND_FOLLOWUP)
+        rule.runOnIdle {
+            assertEquals(presentation, survey.questionSpeechOwner())
+            val entries = survey.followups.value.getValue(presentation.nodeId)
+            assertEquals(listOf(FIRST_FOLLOWUP, SECOND_FOLLOWUP), entries.map { it.question })
+            assertEquals(listOf("two bags", null), entries.map { it.answer })
+            assertEquals(expectedAutoplay, speaker.spoken)
+            unrelated = false
+            autoplay = false
+        }
+        rule.runOnIdle { autoplay = true }
+        rule.runOnIdle { assertEquals(expectedAutoplay, speaker.spoken) }
+
+        rule.onNodeWithText("🔊").performClick()
+        rule.runOnIdle { assertEquals(expectedAutoplay + SECOND_FOLLOWUP, speaker.spoken) }
+    }
+
     @Test fun failureQ07StaysSilentFromQ06AndQ08AndCanBeReplayed() {
         host(initialNode = "Q06") { setAiReason("Q07", SurveyAiReason.FAILURE) }
         rule.runOnIdle {
