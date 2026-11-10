@@ -72,6 +72,7 @@ import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.MutatePriority
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -165,6 +166,7 @@ import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
 import androidx.compose.ui.input.nestedscroll.NestedScrollSource
@@ -176,7 +178,9 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.TextRange
@@ -192,6 +196,7 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.compose.currentStateAsState
 import com.negi.survey.BuildConfig
 import com.negi.survey.net.RuntimeLogStore
 import com.negi.survey.diagnostics.DiagnosticContentPolicy
@@ -210,6 +215,9 @@ import com.negi.survey.vm.toggleQuestionSpeaker
 import java.security.MessageDigest
 import java.util.Locale
 import kotlin.collections.ArrayDeque
+import kotlin.math.PI
+import kotlin.math.abs
+import kotlin.math.cos
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
@@ -433,7 +441,7 @@ fun AiScreen(
 
     val speechStatusText: String? = when {
         speechError != null -> speechError
-        speechController != null && speechTranscribing -> "Transcribing…"
+        speechController != null && speechTranscribing -> TRANSCRIBING_LABEL
         speechController != null && speechRecording && captureActive -> "Listening…"
         speechController != null && speechRecording -> "Starting microphone…"
         else -> null
@@ -1188,7 +1196,7 @@ fun AiScreen(
                                 )
                                 AnswerModeOption(
                                     label = "Speak",
-                                    icon = Icons.Filled.Mic,
+                                    icon = if (speechTranscribing) null else Icons.Filled.Mic,
                                     selected = !typeSelected,
                                     onClick = {
                                         if (composerEnabled && !inputBlocked() && ownsPresentation()) {
@@ -1274,23 +1282,28 @@ fun AiScreen(
                                         )
                                     }
                                 }
-                                if (!typeSelected && onToggleSpeech != null) {
+                                if (!speechTranscribing && !typeSelected && onToggleSpeech != null) {
                                     VoiceRecordingAction(
                                         recordAgain = transcriptReady,
                                         enabled = composerEnabled,
                                         onRecord = onToggleSpeech
                                     )
                                 }
-                                if (speechStatusText != null) {
-                                    Text(
-                                        text = speechStatusText,
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = if (speechStatusIsError) MaterialTheme.colorScheme.error
-                                        else MaterialTheme.colorScheme.onSurfaceVariant,
-                                        modifier = Modifier.align(Alignment.CenterHorizontally)
-                                            .padding(horizontal = 12.dp, vertical = 4.dp)
-                                    )
-                                }
+                            }
+                            if (speechTranscribing && !speechRecording) {
+                                TranscriptionIndicator()
+                            }
+                            if (speechStatusText != null &&
+                                (speechStatusIsError || !speechTranscribing)
+                            ) {
+                                Text(
+                                    text = speechStatusText,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = if (speechStatusIsError) MaterialTheme.colorScheme.error
+                                    else MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.align(Alignment.CenterHorizontally)
+                                        .padding(horizontal = 12.dp, vertical = 4.dp)
+                                )
                             }
 
                             HorizontalDivider(
@@ -1857,7 +1870,7 @@ private fun JsonBubbleMono(
 @Composable
 private fun AnswerModeOption(
     label: String,
-    icon: ImageVector,
+    icon: ImageVector?,
     selected: Boolean,
     enabled: Boolean,
     onClick: () -> Unit
@@ -1890,7 +1903,11 @@ private fun AnswerModeOption(
             horizontalArrangement = Arrangement.spacedBy(4.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Icon(icon, contentDescription = null, modifier = Modifier.size(16.dp), tint = contentColor)
+            if (icon != null) {
+                Icon(icon, contentDescription = null, modifier = Modifier.size(16.dp), tint = contentColor)
+            } else {
+                Spacer(Modifier.size(16.dp))
+            }
             Text(label, color = contentColor, style = MaterialTheme.typography.labelMedium)
         }
     }
@@ -1971,6 +1988,63 @@ private fun ChatComposer(
                 )
             }
         }
+    }
+}
+
+private const val TRANSCRIBING_LABEL = "Transcribing…"
+
+@Composable
+private fun TranscriptionIndicator() {
+    val colors = MaterialTheme.colorScheme
+    val lifecycle by LocalLifecycleOwner.current.lifecycle.currentStateAsState()
+    val phase = if (lifecycle.isAtLeast(Lifecycle.State.STARTED)) {
+        rememberInfiniteTransition(label = "Transcription waveform").animateFloat(
+            initialValue = 0f,
+            targetValue = 1f,
+            animationSpec = infiniteRepeatable(tween(durationMillis = 1600, easing = LinearEasing)),
+            label = "Waveform phase"
+        )
+    } else null
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            // Match the resting voice action height at default font scale.
+            .heightIn(min = 144.dp)
+            .padding(horizontal = 12.dp, vertical = 8.dp)
+            .semantics(mergeDescendants = true) { liveRegion = LiveRegionMode.Polite },
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        Canvas(Modifier.size(width = 72.dp, height = 28.dp)) {
+            // Compose pauses the loop at zero motion scale. Read it only in the draw phase.
+            val cycle = phase?.value ?: 0f
+            for (bar in -3..3) {
+                val pulse = cos(2 * PI * (cycle - bar * 0.14)).toFloat()
+                val halfHeight = (10f - abs(bar) * 2f + pulse * 2f).dp.toPx()
+                val x = center.x + bar * 9.dp.toPx()
+                drawLine(
+                    color = colors.primary,
+                    start = Offset(x, center.y - halfHeight),
+                    end = Offset(x, center.y + halfHeight),
+                    strokeWidth = 3.dp.toPx(),
+                    cap = StrokeCap.Round
+                )
+            }
+        }
+        Spacer(Modifier.height(6.dp))
+        Text(
+            text = TRANSCRIBING_LABEL,
+            style = MaterialTheme.typography.titleMedium,
+            color = colors.onSurface,
+            textAlign = TextAlign.Center
+        )
+        Text(
+            text = "Converting speech to text",
+            style = MaterialTheme.typography.bodySmall,
+            color = colors.onSurfaceVariant,
+            textAlign = TextAlign.Center
+        )
     }
 }
 

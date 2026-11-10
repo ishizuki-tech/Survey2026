@@ -313,14 +313,21 @@ class SurveyTranscriptionNavigationTest {
             back()
         }
         assertDisabled("Back", "Next")
-        rule.onNodeWithText("Transcribing…").assertExists()
+        val status = rule.onNodeWithText("Transcribing…")
+        val details = rule.onNodeWithText("Converting speech to text")
+        status.assertExists()
+        details.assertExists()
+        rule.onNodeWithContentDescription("Record answer").assertDoesNotExist()
         pressSystemBack()
         rule.runOnIdle {
             assertEquals("AI", survey.currentNodeId)
             assertEquals(1, speech.stops)
             speech.complete(error = "Whisper failed")
         }
+        status.assertDoesNotExist()
+        details.assertDoesNotExist()
         rule.onNodeWithText("Whisper failed").assertExists()
+        rule.onNodeWithContentDescription("Record answer").assertIsEnabled()
         assertEnabled("Back", "Next")
         rule.runOnIdle { assertEquals("AI", survey.currentNodeId) }
         pressSystemBack()
@@ -384,6 +391,7 @@ class SurveyTranscriptionNavigationTest {
             rule.waitUntil(5_000L) { cleanupEntered.isCompleted }
 
             rule.onNodeWithText(failure).assertExists()
+            rule.onNodeWithText("Transcribing…").assertExists()
             assertDisabled("Back", "Next")
             rule.runOnIdle {
                 assertEquals(failure, controller.errorMessage.value)
