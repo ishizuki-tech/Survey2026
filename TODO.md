@@ -1,134 +1,98 @@
-# Survey2026 TODO
+# Survey2026 TODO — Unfinished Work
 
-This file contains **unfinished work only**.
+This document contains **concrete unfinished work only**. It is a documentation snapshot, **not** a second source of live Issue Status, Priority, or Area. For current ownership and execution fields use the Survey2026 Roadmap GitHub Project #2 when accessible; for active definitions and acceptance criteria use [GitHub Issues](https://github.com/ishizuki-tech/Survey2026/issues?q=is%3Aissue+is%3Aopen). Verify both before selecting work.
 
-Planning layers:
-- `ROADMAP.md` — baseline, strategic direction, and workstream boundaries
-- GitHub Project #2 — live Priority / Area / Status
-- `TODO.md` — concrete remaining checklist
+`ROADMAP.md` records stable architecture, validated historical milestones, and direction. Do not retain completed Issues as active checklists. Historical Issues #1–#8 are outside the Roadmap Project scope.
 
-Do not copy completed baseline work back into this file. Issues #1-#8 are intentionally outside Project #2 and are not managed here.
+## Survey correctness and lifecycle
 
-## P0 — Field Deployment Readiness
+### [#119 — Remove unreachable Q14b survey data](https://github.com/ishizuki-tech/Survey2026/issues/119)
 
-### #37 — Stable release provenance and distribution
+- [ ] On the current `main`, confirm and test the Q14a **Yes → No** route change and every persisted Q14b data owner (answers, AI state, follow-ups and audio references).
+- [ ] Remove only now-unreachable Q14b survey data on the changed route, preserving data on the still-valid path and preventing stale export entries.
+- [ ] Cover back navigation, repeated changes, unfinished survey save and final JSON export with focused regression tests.
 
-- [ ] Add verified-device / deployment-status information.
-- [ ] Add an automated consistency check between the rendered Download Page, GitHub Release, and `latest.json`.
+### [#118 — Release Whisper runtime on session exit](https://github.com/ishizuki-tech/Survey2026/issues/118)
 
-### #39 — Microphone-denial product behavior
+- [ ] Verify heavy-runtime ownership across explicit **Stop → Selector** and **Done → Restart → Selector** versus other exits.
+- [ ] Apply only an evidenced lifecycle fix that releases the session-owned native runtime without interfering with active/new survey work.
+- [ ] Validate cancellation, re-entry, model switching and relevant real-device resource behavior.
 
-- [ ] Decide and document whether microphone denial permits text-only completion or whether microphone access is mandatory.
-- [ ] Implement the selected behavior.
-- [ ] Test the selected behavior.
-- [ ] Document the user-visible behavior.
+### [#124 — Typed completion after microphone denial](https://github.com/ishizuki-tech/Survey2026/issues/124)
 
-### #40 — Data-handling contract
+- [ ] Implement the approved [#39](https://github.com/ishizuki-tech/Survey2026/issues/39) policy: deny `RECORD_AUDIO` without blocking typed answers, review, finalization or upload.
+- [ ] Provide safe permission retry/settings access and restoration after regrant without losing survey data.
+- [ ] Add automated and target-device permission denial/regrant coverage. Keep this independent from [#121](https://github.com/ishizuki-tech/Survey2026/issues/121) TTS behavior.
 
-- [ ] Document survey JSON storage, upload destination, retention, deletion, recovery identity, and operator access.
-- [ ] Document WAV recording storage, upload destination, retention, deletion, and operator access.
-- [ ] Document runtime log / diagnostic storage, upload destination, retention, deletion, and operator access.
-- [ ] Document model storage/discovery and retention expectations.
-- [ ] Document hashed device-tag purpose and handling.
+### [#121 — Continue Without Voice session behavior](https://github.com/ishizuki-tech/Survey2026/issues/121)
 
-## P1 — Quality
+- [ ] Make **Continue Without Voice** reliably disable TTS playback for the current session, without suppressing typed input or changing recording permission semantics.
+- [ ] Verify new-session reset and navigation/re-entry behavior with targeted tests.
 
-### #41 — AI follow-up quality and semantic acceptance
+## Model acquisition and language quality
 
-- [ ] Create English Q7-Q16 prompt/config review fixtures for the Kiambu questionnaire.
-- [ ] Create Swahili Q7-Q16 prompt/config review fixtures for the Kiambu questionnaire.
-- [ ] Define expected missing-information targets per question.
-- [ ] Define expected follow-up intent per question.
-- [ ] Define prohibited duplicate/rephrase follow-ups per question.
-- [ ] Reconfirm component-ID mappings after questionnaire renumbering.
-- [ ] Build a controlled real-model semantic acceptance matrix.
-- [ ] Measure valid evaluation rate.
-- [ ] Measure unexpected no-follow-up rate.
-- [ ] Measure unnecessary follow-up rate.
-- [ ] Measure follow-up relevance.
-- [ ] Measure duplicate follow-up rate.
-- [ ] Measure timeout/recovery behavior.
-- [ ] Measure English/Swahili parity.
+### [#120 — Validate manually selected LiteRT-LM models](https://github.com/ishizuki-tech/Survey2026/issues/120)
 
-### #42 — Speech recognition quality benchmark
+- [ ] Validate candidate identity/format and integrity **before** replacing a usable private model, persisting selection or reporting success.
+- [ ] Preserve the known-good model and retry path on failed validation; test invalid/partial inputs.
 
-- [ ] Build a reproducible CER harness.
-- [ ] Build a reproducible WER harness.
-- [ ] Create immutable reference transcripts.
-- [ ] Define speaker/device/noise/distance/speech-rate test matrix.
-- [ ] Run English target-device benchmark.
-- [ ] Run Swahili target-device benchmark.
-- [ ] Select a production Swahili model only from target-device evidence on the current production baseline.
+### [#123 — Prevent concurrent manual model-import races](https://github.com/ishizuki-tech/Survey2026/issues/123)
 
-### #43 — Voice and microphone UX validation
+- [ ] Verify the shared temporary path / destination race under overlapping picker imports.
+- [ ] Serialize or isolate file writes and cancellation cleanup without overwriting a newer valid selection.
+- [ ] Add deterministic overlapping-import and failure tests.
 
-- [ ] Document microphone capture -> WAV -> Whisper -> answer text -> SLM -> TTS ownership.
-- [ ] Verify user-visible recording state.
-- [ ] Verify user-visible transcribing state.
-- [ ] Verify failure/retry states.
-- [ ] Verify transcription results remain owned by the correct survey/node across lifecycle changes.
-- [ ] Align permission-denial behavior with #39.
-- [ ] Validate TTS interaction with recording/transcription and lifecycle states on target device.
+### [#98 — Q14/Q15 component-ID omissions](https://github.com/ishizuki-tech/Survey2026/issues/98)
 
-### #51 — Galaxy S25 LiteRT-LM memory pressure / lifecycle tradeoff
+- [ ] Reproduce the missing required-component identification failures on the current model/config/device baseline.
+- [ ] Analyze trace outputs and propose the smallest evidence-backed correction while preserving the component catalog.
 
-- [ ] Gather target-device evidence for the large GPU-resident LiteRT-LM
-  footprint with one runtime.
-- [ ] Evaluate lower-memory/runtime/lifecycle options without unrelated
-  refactoring or blindly switching production inference to CPU.
-- [ ] Define the acceptable memory, reliability, and latency tradeoff from
-  evidence before changing the production path.
+### [#99 — Q12/Q13 semantic mismatches](https://github.com/ishizuki-tech/Survey2026/issues/99)
 
-## P2 — Reliability / Compatibility / CI
+- [ ] Reproduce incomplete-answer / follow-up decision mismatches with controlled fixtures.
+- [ ] Distinguish prompt/model semantic errors from deterministic parsing/guard errors before changing behavior.
 
-### #44 — Reliability and lifecycle soak testing
+### [#100 — Swahili FOLLOWUP quality](https://github.com/ishizuki-tech/Survey2026/issues/100)
 
-- [ ] Soak-test cancellation.
-- [ ] Soak-test rotation.
-- [ ] Soak-test background/foreground transitions.
-- [ ] Soak-test process restart.
-- [ ] Soak-test app update.
-- [ ] Soak-test network flapping.
-- [ ] Soak-test low-storage behavior.
-- [ ] Run long-session soak testing.
+- [ ] Complete human-reviewed Swahili fluency, semantic accuracy and respondent-usability acceptance using repeatable real-model samples.
 
-### #45 — Supported-device and ABI compatibility
+### [#101 — English follow-up quality and parity](https://github.com/ishizuki-tech/Survey2026/issues/101)
 
-- [ ] Define supported-device policy.
-- [ ] Define supported-ABI policy.
-- [ ] Record the supported device/ABI matrix.
-- [ ] Validate Samsung Galaxy S25 after the matrix is defined.
+- [ ] Run English Q7–Q16 semantic acceptance fixtures on the approved hardware/model baseline.
+- [ ] Compare English/Swahili outcomes without treating structurally valid EVAL/FOLLOWUP responses as semantic acceptance.
 
-Release/Page/`latest.json` parity and verified-device metadata are owned by P0 issue #37.
+## Acceptance, compatibility, and documentation
 
-### #69 — Survey2026 UI/UX redesign
+### [#43 — Voice and microphone UX validation](https://github.com/ishizuki-tech/Survey2026/issues/43)
 
-- [ ] Define the redesigned survey screens, navigation, interaction states,
-  and English/Swahili layout requirements.
-- [ ] Keep design and implementation work isolated from SLM/LiteRT-LM and
-  ASR/Whisper engine behavior.
-- [ ] Track any required non-UI behavior change separately.
+- [ ] Document the exact capture → WAV → Whisper → answer text → SLM → TTS lifecycle/ownership flow, including introduction/consent playback.
+- [ ] Record end-to-end target-device evidence for the current capture/transcribe/recording and follow-up UI states, including exact audio/question/transcript ownership.
+- [ ] Verify recording/transcribing/failure/retry presentation, ownership and permissions without duplicating the focused fixes above.
 
-## P3 — Documentation / Toolchain / Maintenance
+### [#44 — Reliability and lifecycle soak testing](https://github.com/ishizuki-tech/Survey2026/issues/44)
 
-### #47 — Documentation, toolchain, and repository maintenance
+- [ ] Execute a documented, repeatable acceptance matrix for rotation, cancellation, long sessions, app/process restart, background/foreground, network flapping, update and low storage.
+- [ ] Record exact APK/source/model/device provenance for failures and create focused follow-up Issues when reproducible.
 
-- [ ] Document the actual CMake path and current `WHISPER_DIR` wiring.
-- [ ] Document current ABI configuration.
-- [ ] Document pinned NDK/CMake versions and CI/local ownership.
-- [ ] Document prompt resolver APIs and current ONE_STEP / TWO_STEP behavior.
-- [ ] Document model-run isolation, cancellation, terminal-result invariants, and context/token behavior.
-- [ ] Document LiteRT-LM model loading, storage, discovery, and integrity behavior.
-- [ ] Document exact whisper.cpp integration.
-- [ ] Document audio format, WAV/raw behavior, JNI ownership, and threading.
-- [ ] Document Whisper model location, naming, discovery, and integrity behavior.
-- [ ] Document exact manifest/runtime permissions.
-- [ ] Document application storage for survey state, recordings, models, logs, and crash diagnostics.
-- [ ] Document log locations, retention, crash capture, and diagnostic upload behavior.
-- [ ] Document diagnostic configuration handling without exposing secrets.
-- [ ] Document SurveyConfig schema, validation rules, selection flow, INFO/STOP nodes, and new-language/config process.
-- [ ] Document JVM, instrumentation, real-model, and real-device test tiers.
-- [ ] Define policy for which real-model tests, if any, run automatically in CI.
-- [ ] Periodically verify README architecture descriptions remain aligned with the repository after the current refresh.
-- [ ] Keep generated outputs and model binaries out of Git unless intentionally distributed.
-- [ ] Verify release keystores, API tokens, and other credentials are never committed.
+### [#45 — Supported-device and ABI compatibility](https://github.com/ishizuki-tech/Survey2026/issues/45)
+
+- [ ] Define the supported Android API, device, ABI and runtime-capability policy separately from current `arm64-v8a` build configuration.
+- [ ] Collect representative target-device evidence before making a production support claim.
+
+### [#47 — Documentation, toolchain and repository maintenance](https://github.com/ishizuki-tech/Survey2026/issues/47)
+
+- [ ] Audit current model storage/discovery/integrity and model-file ownership, and distinguish development binaries from intentionally shipped assets.
+- [ ] Audit exact whisper.cpp integration, `WHISPER_DIR`/JNI/CMake entry points, WAV/raw audio format, native-thread ownership and cleanup.
+- [ ] Audit ONE_STEP/TWO_STEP prompt resolver, schema/config validation, INFO/STOP routing and new-language configuration process.
+- [ ] Audit app-private survey, WAV, model, log/crash/diagnostic storage, retrieval, retention/deletion and operator access; distinguish policy approvals from actual code behavior.
+- [ ] Document unit/instrumentation/real-model/field-device test tiers and decide which real-model tests may run in CI.
+- [ ] Validate README links and build instructions and close any remaining confirmed coverage gaps with focused documentation changes.
+- [ ] Check NDK/CMake/ABI and CI ownership, release signing, generated-output exclusions and secret-handling documentation for regressions without disclosing credentials.
+- [ ] Distinguish completed documentation refresh from outstanding audits; keep #47 open until its acceptance criteria are met.
+
+## Planning maintenance rules
+
+- The issue links above were **open** in the GitHub check against `main` `31fd8c9a9deffedccadc8798ced84401610e178e` on November 9, 2026 (US Pacific time). This is an evidence snapshot, not a claim that these will remain open.
+- Do **not** copy Issue label priority into this file as live Project Priority; Project #2 was not readable in this review.
+- Completed #37, #39, #40, #41, #42, #51, #69, #86, #128, #138, #139, #155 and the recently closed navigation/UI Issues do not belong in this unfinished checklist.
+- If Issue and Project fields conflict, report the difference and use the Project as authority for live Priority/Status/Area.
