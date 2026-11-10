@@ -51,6 +51,7 @@ import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.wrapContentWidth
@@ -113,6 +114,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.core.graphics.toColorInt
 import androidx.core.view.WindowCompat
@@ -144,6 +146,7 @@ import com.negi.survey.screens.ConsentScrollState
 import com.negi.survey.screens.DoneScreen
 import com.negi.survey.screens.IntroScreen
 import com.negi.survey.screens.LocalSurveyNavigationLocked
+import com.negi.survey.screens.QuestionPlaybackButton
 import com.negi.survey.screens.ReviewScreen
 import com.negi.survey.screens.SpeechController
 import com.negi.survey.screens.rememberConsentScrollState
@@ -1906,9 +1909,7 @@ private fun InfoNodeScreen(
                         style = MaterialTheme.typography.bodyLarge,
                         modifier = Modifier.weight(1f),
                     )
-                    IconButton(onClick = onReplay) {
-                        Text(if (isSpeaking) "\u23F9" else "\uD83D\uDD0A")
-                    }
+                    QuestionPlaybackButton(onReplay, isSpeaking)
                 }
 
                 Spacer(Modifier.height(10.dp))
@@ -2032,9 +2033,7 @@ internal fun TextNodeScreen(
                         style = MaterialTheme.typography.bodyLarge,
                         modifier = Modifier.weight(1f)
                     )
-                    IconButton(onClick = onReplay) {
-                        Text(if (isSpeaking) "\u23F9" else "\uD83D\uDD0A")
-                    }
+                    QuestionPlaybackButton(onReplay, isSpeaking)
                 }
 
                 SurveyQuestionTextField(
@@ -2074,6 +2073,7 @@ internal fun SingleChoiceNodeScreen(
     isSpeaking: Boolean = false,
     consentScroll: ConsentScrollState? = null
 ) {
+    val isConsent = consentScroll != null
     val backplate = outdoorBackplate()
     val scroll = consentScroll?.scroll ?: rememberScrollState()
     val scrollInteraction = consentScroll?.scrollInteraction() ?: Modifier
@@ -2085,7 +2085,12 @@ internal fun SingleChoiceNodeScreen(
             .imePadding()
             .navigationBarsPadding()
             .background(backplate)
-            .padding(24.dp),
+            .then(if (isConsent) Modifier.statusBarsPadding() else Modifier)
+            .padding(
+                start = 24.dp, end = 24.dp,
+                top = if (isConsent) 18.dp else 24.dp,
+                bottom = if (isConsent) 12.dp else 24.dp
+            ),
         contentAlignment = Alignment.Center
     ) {
         Surface(
@@ -2101,9 +2106,14 @@ internal fun SingleChoiceNodeScreen(
         ) {
             Column(
                 modifier = Modifier
-                    .padding(horizontal = 24.dp, vertical = 20.dp)
+                    .padding(horizontal = 24.dp)
+                    .padding(
+                        top = if (isConsent) 0.dp else 20.dp,
+                        bottom = if (isConsent) 8.dp else 20.dp
+                    )
                     .then(scrollInteraction)
-                    .verticalScroll(scroll),
+                    .verticalScroll(scroll)
+                    .padding(top = if (isConsent) 20.dp else 0.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 Row(
@@ -2113,20 +2123,21 @@ internal fun SingleChoiceNodeScreen(
                     if (title.isNotBlank()) {
                         Text(
                             text = title,
-                            style = MaterialTheme.typography.titleLarge,
+                            style = if (isConsent) MaterialTheme.typography.titleLarge.copy(fontSize = 19.sp)
+                            else MaterialTheme.typography.titleLarge,
+                            color = if (isConsent) MaterialTheme.colorScheme.onSurface else Color.Unspecified,
                             modifier = Modifier.weight(1f)
                         )
                     } else {
                         Spacer(Modifier.weight(1f))
                     }
-                    IconButton(onClick = onReplay) {
-                        Text(if (isSpeaking) "\u23F9" else "\uD83D\uDD0A")
-                    }
+                    QuestionPlaybackButton(onReplay, isSpeaking)
                 }
 
                 Text(
                     text = question.ifBlank { "(no question text)" },
                     style = MaterialTheme.typography.bodyLarge,
+                    color = if (isConsent) MaterialTheme.colorScheme.onSurface else Color.Unspecified,
                     modifier = Modifier.fillMaxWidth()
                 )
 
@@ -2229,7 +2240,7 @@ internal fun NumberNodeScreen(
                         style = MaterialTheme.typography.bodyLarge,
                         modifier = Modifier.weight(1f),
                     )
-                    IconButton(onClick = onReplay) { Text(if (isSpeaking) "\u23F9" else "\uD83D\uDD0A") }
+                    QuestionPlaybackButton(onReplay, isSpeaking)
                 }
 
                 SurveyQuestionTextField(
@@ -2317,9 +2328,7 @@ internal fun MultiChoiceNodeScreen(
                         style = MaterialTheme.typography.bodyLarge,
                         modifier = Modifier.weight(1f)
                     )
-                    IconButton(onClick = onReplay) {
-                        Text(if (isSpeaking) "\u23F9" else "\uD83D\uDD0A")
-                    }
+                    QuestionPlaybackButton(onReplay, isSpeaking)
                 }
 
                 Spacer(Modifier.height(8.dp))

@@ -3,15 +3,20 @@ import com.android.build.api.dsl.ApplicationExtension
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.security.SecureRandom
+import java.time.LocalDate
 import java.time.OffsetDateTime
+import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
 import java.util.Base64
+import java.util.Locale
 import java.util.Properties
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
 import org.gradle.api.GradleException
+import org.gradle.api.provider.ValueSource
+import org.gradle.api.provider.ValueSourceParameters
 import org.gradle.api.tasks.Exec
 import org.gradle.kotlin.dsl.configure
 import org.gradle.kotlin.dsl.getByType
@@ -29,6 +34,13 @@ plugins {
 /* ============================================================================
  * Shared helpers
  * ========================================================================== */
+
+// UTC keeps the packaged test label independent of the builder's local timezone.
+// A configuration input makes the label update even with Gradle configuration caching.
+abstract class UiTestBuildDate : ValueSource<String, ValueSourceParameters.None> {
+    override fun obtain(): String =
+        LocalDate.now(ZoneOffset.UTC).format(DateTimeFormatter.ofPattern("uu-MM-dd", Locale.ROOT))
+}
 
 /** True when running under CI. */
 val isCi: Boolean =
@@ -680,6 +692,7 @@ extensions.configure<ApplicationExtension> {
             testApplicationId = issue86TestApplicationId
         }
         manifestPlaceholders["appLabel"] = appLabelResource
+        manifestPlaceholders["appIcon"] = "@mipmap/ic_launcher"
         manifestPlaceholders["allowAppBackup"] = (!issue157Da).toString()
         buildConfigField("boolean", "ISSUE157_DA", issue157Da.toString())
         minSdk = 26
@@ -772,7 +785,14 @@ extensions.configure<ApplicationExtension> {
 
     buildTypes {
         debug {
-            // Keep the applicationId stable so MediaStore ownership remains stable.
+            // Keep the default applicationId stable for MediaStore ownership.
+            applicationIdSuffix = providers.gradleProperty("app.applicationIdSuffix").orNull
+            if (applicationIdSuffix == ".uitest") {
+                sourceSets.getByName("debug").res.srcDir("src/uiTestLauncher/res")
+                val buildDate = providers.of(UiTestBuildDate::class.java) {}.get()
+                manifestPlaceholders["appLabel"] = "Survey UI $buildDate"
+                manifestPlaceholders["appIcon"] = "@mipmap/ic_launcher_ui_test"
+            }
 
             buildConfigField(
                 "String",

@@ -79,12 +79,14 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsFocusedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -100,6 +102,7 @@ import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyLayoutScrollScope
 import androidx.compose.foundation.lazy.LazyListLayoutInfo
@@ -113,8 +116,10 @@ import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.text.selection.LocalTextSelectionColors
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -131,7 +136,6 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
@@ -139,6 +143,7 @@ import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
@@ -166,6 +171,7 @@ import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
@@ -188,6 +194,8 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.TextFieldValue
+import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
@@ -483,6 +491,7 @@ fun AiScreen(
     val savedFollowups by vmSurvey.followups.collectAsState()
     val followups = savedFollowups[nid].orEmpty()
     val pendingQuestion = pendingAiFollowup(followups)?.question
+    val submittedOriginals by vmSurvey.submittedAiOriginals.collectAsState()
     var submittedInPresentation by key(contextKey, presentation) {
         rememberSaveable { mutableStateOf(false) }
     }
@@ -1117,11 +1126,12 @@ fun AiScreen(
                         keyboard?.hide()
                     }
                 }
-                .padding(horizontal = 16.dp, vertical = 8.dp)
+                .padding(vertical = 8.dp)
         ) {
             // Reserve space for the question as well as the scrollable composer when the
             // keyboard leaves a short viewport. Include the gap between the two regions.
-            val conversationGap = 10.dp
+            val conversationGap = 6.dp
+            val showModeSelector = !inputClosed && speechController != null
             // Below this height, let the selector scroll with the footer so the
             // selector, editor and conversation can each remain reachable.
             val pinModeSelector = speechController != null && maxHeight >= 180.dp
@@ -1155,6 +1165,22 @@ fun AiScreen(
                         if (isTwoStepNode && hasTemporaryOutput &&
                             pendingQuestion != null && followups.lastOrNull()?.answer == null
                         ) followups.dropLast(1) else followups
+                    val awaitingAnswer = !processing && !executionRunning &&
+                        !inputClosed && !conv.turnCompleted && !conv.validationFailed
+                    val activeQuestionId = when {
+                        !awaitingAnswer -> null
+                        conv.role == AiViewModel.ComposerRole.MAIN &&
+                            followups.isEmpty() && nid !in submittedOriginals -> "qroot-$nid"
+                        conv.role == AiViewModel.ComposerRole.FOLLOWUP &&
+                            pendingQuestion == conv.activePromptQuestion -> {
+                            val pending = pendingAiFollowup(visibleFollowups)?.takeIf { it.question == pendingQuestion }
+                            pending?.let { entry ->
+                                chatItems.lastOrNull { it.isFollowupQuestion && it.text == entry.question }?.id
+                                    ?: "restored-followup-$nid-${visibleFollowups.indexOf(entry)}-${entry.askedAt}"
+                            }
+                        }
+                        else -> null
+                    }
                     AiConversation(
                         nodeId = nid,
                         presentation = presentation,
@@ -1164,8 +1190,11 @@ fun AiScreen(
                         followOutput = followOutput,
                         fieldEvaluation = isTwoStepNode,
                         fallbackOutcome = fallbackOutcome,
+                        visualActiveQuestionId = activeQuestionId,
+                        muteAnsweredQuestions = !awaitingAnswer ||
+                            (conv.role == AiViewModel.ComposerRole.MAIN && nid in submittedOriginals),
                         snack = snack,
-                        modifier = Modifier.weight(1f).fillMaxWidth()
+                        modifier = Modifier.weight(1f).fillMaxWidth().padding(horizontal = 10.dp)
                     )
                 }
 
@@ -1175,6 +1204,7 @@ fun AiScreen(
                     shadowElevation = 8.dp,
                     modifier = Modifier
                         .fillMaxWidth()
+                        .padding(horizontal = 16.dp)
                         .heightIn(max = footerMaxHeight)
                         .navigationBarsPadding()
                         .neutralEdge(alpha = 0.14f, corner = 16.dp, stroke = 1.dp)
@@ -1183,9 +1213,9 @@ fun AiScreen(
                         modifier = Modifier
                             .fillMaxWidth()
                             .then(if (pinModeSelector) Modifier else Modifier.verticalScroll(footerScrollState))
-                            .padding(top = 6.dp)
+                            .padding(top = if (showModeSelector) 2.dp else 6.dp)
                     ) {
-                        if (!inputClosed && speechController != null) {
+                        if (showModeSelector) {
                             Row(
                                 modifier = Modifier
                                     .align(Alignment.End)
@@ -1195,7 +1225,7 @@ fun AiScreen(
                                     .padding(horizontal = 3.dp)
                             ) {
                                 AnswerModeOption(
-                                    label = "Type",
+                                    label = "Text",
                                     icon = Icons.Outlined.Keyboard,
                                     selected = typeSelected,
                                     onClick = {
@@ -1212,7 +1242,7 @@ fun AiScreen(
                                     enabled = composerEnabled
                                 )
                                 AnswerModeOption(
-                                    label = "Speak",
+                                    label = "Voice",
                                     icon = if (speechTranscribing) null else Icons.Filled.Mic,
                                     selected = !typeSelected,
                                     onClick = {
@@ -1289,6 +1319,7 @@ fun AiScreen(
                                             onSend = onSendAnswer,
                                             enabled = composerEnabled,
                                             textFieldEnabled = textFieldEnabled,
+                                            topPadding = if (showModeSelector) 2.dp else 6.dp,
                                             sendModifier = Modifier.bringIntoViewRequester(sendButtonRequester),
                                             editorModifier = Modifier
                                                 .focusRequester(focusRequester)
@@ -1310,6 +1341,7 @@ fun AiScreen(
                                     VoiceRecordingAction(
                                         recordAgain = transcriptReady,
                                         enabled = composerEnabled,
+                                        topPadding = if (showModeSelector && !showTextComposer) 0.dp else 4.dp,
                                         onRecord = onToggleSpeech
                                     )
                                 }
@@ -1518,13 +1550,12 @@ private fun CompactTopBar(
                 modifier = Modifier.weight(1f)
             )
             if (onReplay != null) {
-                IconButton(onClick = onReplay) {
-                    Text(
-                        text = if (isSpeaking) "\u23F9" else "\uD83D\uDD0A",
-                        color = cs.onSurface,
-                        style = MaterialTheme.typography.titleSmall
-                    )
-                }
+                QuestionPlaybackButton(
+                    onClick = onReplay,
+                    isSpeaking = isSpeaking,
+                    speakerColor = cs.onSurface,
+                    speakerStyle = MaterialTheme.typography.titleSmall
+                )
             }
         }
     }
@@ -1555,7 +1586,9 @@ internal fun AiConversation(
     modifier: Modifier,
     followOutput: Boolean = loading,
     fieldEvaluation: Boolean = false,
-    fallbackOutcome: AiTurnOutcome? = null
+    fallbackOutcome: AiTurnOutcome? = null,
+    visualActiveQuestionId: String? = null,
+    muteAnsweredQuestions: Boolean = false
 ) {
     val rootId = "qroot-$nodeId"
     val latestPublishedId = chatItems.lastOrNull { it.isFollowupQuestion }?.id
@@ -1707,17 +1740,36 @@ internal fun AiConversation(
         }
     }
 
+    val muteHistory = muteAnsweredQuestions ||
+        (visualActiveQuestionId != null && newestFirst.any { it.id == visualActiveQuestionId })
     LazyColumn(
         modifier = modifier.nestedScroll(readingGesture).testTag("AI conversation"),
         state = scroll,
         reverseLayout = true,
-        verticalArrangement = Arrangement.spacedBy(10.dp, Alignment.Top)
+        verticalArrangement = Arrangement.spacedBy(2.dp, Alignment.Top)
     ) {
         items(newestFirst, key = { it.id }) { item ->
             val isAi = item.sender == AiViewModel.ChatSender.AI
+            val isEvaluationStatus = item.evaluation != null &&
+                item.evaluation != AiViewModel.EvaluationPresentation.REVIEWING
+            val isQuestion = item.id == rootId || item.isFollowupQuestion ||
+                item.id.startsWith("restored-followup-$nodeId-")
+            val isActive = isQuestion && item.id == visualActiveQuestionId
+            val isHistorical = isQuestion && !isActive && muteHistory
             androidx.compose.foundation.layout.Row(
-                modifier = Modifier.fillMaxWidth().testTag(item.id),
-                horizontalArrangement = if (isAi) Arrangement.Start else Arrangement.End
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag(item.id)
+                    .padding(top = if (isActive) 1.dp else 0.dp)
+                    .offset(
+                        y = if (isActive && isQuestion && item.id != rootId) {
+                            (-16).dp
+                        } else {
+                            0.dp
+                        }
+                    ),
+                horizontalArrangement = if (!isAi || isEvaluationStatus)
+                    Arrangement.End else Arrangement.Start
             ) {
                 when {
                     item.evaluation == AiViewModel.EvaluationPresentation.REVIEWING ||
@@ -1740,7 +1792,10 @@ internal fun AiConversation(
                         nextFollowupNumber = followups.size + 1
                     )
                     item.json != null -> JsonBubbleMono(pretty = item.json, snack = snack)
-                    else -> FieldMessage(text = item.text.orEmpty(), isAi = isAi, typing = item.isTyping)
+                    else -> FieldMessage(
+                        text = item.text.orEmpty(), isAi = isAi, typing = item.isTyping,
+                        active = isActive, historical = isHistorical
+                    )
                 }
             }
         }
@@ -1923,7 +1978,7 @@ private fun AnswerModeOption(
                     if (selected) colors.secondaryContainer else Color.Transparent,
                     CircleShape
                 )
-                .padding(horizontal = 10.dp, vertical = 6.dp),
+                .padding(horizontal = 10.dp, vertical = 3.dp),
             horizontalArrangement = Arrangement.spacedBy(4.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
@@ -1944,6 +1999,7 @@ private fun ChatComposer(
     onSend: () -> Unit,
     enabled: Boolean,
     textFieldEnabled: Boolean,
+    topPadding: Dp,
     sendModifier: Modifier,
     editorModifier: Modifier
 ) {
@@ -1952,13 +2008,13 @@ private fun ChatComposer(
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 12.dp, vertical = 8.dp)
+            .padding(start = 12.dp, end = 12.dp, top = topPadding, bottom = 6.dp)
     ) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .testTag("ai-answer-field")
-                .shadow(elevation = 8.dp, shape = CircleShape, clip = false)
+                .shadow(elevation = 8.dp, shape = RoundedCornerShape(18.dp), clip = false)
                 .background(
                     brush = Brush.linearGradient(
                         listOf(
@@ -1966,49 +2022,88 @@ private fun ChatComposer(
                             cs.surface.copy(alpha = 0.65f)
                         )
                     ),
-                    shape = CircleShape
+                    shape = RoundedCornerShape(18.dp)
                 )
-                .neutralEdge(alpha = 0.14f, corner = 999.dp, stroke = 1.dp)
-                .padding(start = 12.dp, end = 6.dp, top = 6.dp, bottom = 6.dp),
+                .neutralEdge(alpha = 0.14f, corner = 18.dp, stroke = 1.dp)
+                .padding(start = 12.dp, end = 6.dp, top = 2.dp, bottom = 2.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            OutlinedTextField(
-                value = value,
-                onValueChange = onValueChange,
-                modifier = Modifier
-                    .weight(1f)
-                    .then(editorModifier)
-                    .semantics {
-                        if (!enabled) stateDescription = "Answer input inactive"
-                    },
-                placeholder = { Text(if (enabled) "Type your answer…" else "Answer input inactive") },
-                minLines = 1,
-                maxLines = 5,
-                // Keep the input session alive while Send and draft changes are gated.
-                enabled = textFieldEnabled,
-                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
-                keyboardActions = KeyboardActions(onSend = { onSend() }),
-                colors = OutlinedTextFieldDefaults.colors(
-                    cursorColor = if (enabled) cs.onSurface else Color.Transparent,
-                    focusedPlaceholderColor = if (enabled) cs.onSurfaceVariant else cs.onSurface.copy(alpha = 0.38f),
-                    unfocusedPlaceholderColor = if (enabled) cs.onSurfaceVariant else cs.onSurface.copy(alpha = 0.38f),
-                    unfocusedContainerColor = Color.Transparent,
-                    focusedContainerColor = Color.Transparent,
-                    disabledContainerColor = Color.Transparent,
-                    focusedBorderColor = Color.Transparent,
-                    unfocusedBorderColor = Color.Transparent
-                ),
-                textStyle = MaterialTheme.typography.bodyMedium
+            val interactionSource = remember { MutableInteractionSource() }
+            val focused by interactionSource.collectIsFocusedAsState()
+            val colors = OutlinedTextFieldDefaults.colors(
+                cursorColor = if (enabled) cs.onSurface else Color.Transparent,
+                focusedPlaceholderColor = if (enabled) cs.onSurfaceVariant else cs.onSurface.copy(alpha = 0.38f),
+                unfocusedPlaceholderColor = if (enabled) cs.onSurfaceVariant else cs.onSurface.copy(alpha = 0.38f),
+                unfocusedContainerColor = Color.Transparent,
+                focusedContainerColor = Color.Transparent,
+                disabledContainerColor = Color.Transparent,
+                focusedBorderColor = Color.Transparent,
+                unfocusedBorderColor = Color.Transparent
             )
+            val textColor = when {
+                !textFieldEnabled -> colors.disabledTextColor
+                focused -> colors.focusedTextColor
+                else -> colors.unfocusedTextColor
+            }
+            CompositionLocalProvider(LocalTextSelectionColors provides colors.textSelectionColors) {
+                BasicTextField(
+                    value = value,
+                    onValueChange = onValueChange,
+                    modifier = Modifier
+                        .weight(1f)
+                        .then(editorModifier)
+                        .semantics {
+                            if (!enabled) stateDescription = "Answer input inactive"
+                        }
+                        .defaultMinSize(minHeight = 48.dp),
+                    // Keep the input session alive while Send and draft changes are gated.
+                    enabled = textFieldEnabled,
+                    textStyle = MaterialTheme.typography.bodyMedium.copy(
+                        fontSize = 16.sp,
+                        color = textColor
+                    ),
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+                    keyboardActions = KeyboardActions(onSend = { onSend() }),
+                    minLines = 1,
+                    maxLines = 5,
+                    interactionSource = interactionSource,
+                    cursorBrush = SolidColor(colors.cursorColor),
+                    decorationBox = { innerTextField ->
+                        OutlinedTextFieldDefaults.DecorationBox(
+                            value = value.text,
+                            innerTextField = innerTextField,
+                            enabled = textFieldEnabled,
+                            singleLine = false,
+                            visualTransformation = VisualTransformation.None,
+                            interactionSource = interactionSource,
+                            placeholder = {
+                                Text(
+                                    text = if (enabled) "Type your answer…" else "Answer input inactive",
+                                    style = MaterialTheme.typography.bodyMedium.copy(fontSize = 12.sp)
+                                )
+                            },
+                            colors = colors,
+                            contentPadding = OutlinedTextFieldDefaults.contentPadding(
+                                start = 8.dp,
+                                end = 8.dp,
+                                top = 7.dp,
+                                bottom = 3.dp
+                            )
+                        )
+                    }
+                )
+            }
 
             SurveyActionButton(
                 onClick = onSend,
                 modifier = sendModifier,
-                enabled = enabled && value.text.isNotBlank()
+                enabled = enabled && value.text.isNotBlank(),
+                compactIcon = true
             ) {
                 Icon(
                     imageVector = Icons.AutoMirrored.Outlined.Send,
-                    contentDescription = "Send"
+                    contentDescription = "Send",
+                    modifier = Modifier.size(20.dp)
                 )
             }
         }
@@ -2034,7 +2129,7 @@ private fun TranscriptionIndicator() {
         modifier = Modifier
             .fillMaxWidth()
             // Match the resting voice action height at default font scale.
-            .heightIn(min = 144.dp)
+            .heightIn(min = 132.dp)
             .padding(horizontal = 12.dp, vertical = 8.dp)
             .semantics(mergeDescendants = true) { liveRegion = LiveRegionMode.Polite },
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -2072,16 +2167,18 @@ private fun TranscriptionIndicator() {
     }
 }
 
-/** Centered recording action shared by initial Speak and transcript editing. */
+/** Centered recording action shared by initial Voice mode and transcript editing. */
 @Composable
 internal fun VoiceRecordingAction(
     recordAgain: Boolean,
     enabled: Boolean,
+    topPadding: Dp = 4.dp,
     onRecord: () -> Unit
 ) {
     val cs = MaterialTheme.colorScheme
     Box(
-        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
+        modifier = Modifier.fillMaxWidth()
+            .padding(start = 12.dp, end = 12.dp, top = topPadding, bottom = 4.dp),
         contentAlignment = Alignment.Center
     ) {
         Column(
@@ -2102,7 +2199,7 @@ internal fun VoiceRecordingAction(
                     )
                 }
             }
-            Spacer(Modifier.height(8.dp))
+            Spacer(Modifier.height(4.dp))
             Text(
                 text = if (recordAgain) "Record again" else "Tap to answer",
                 textAlign = TextAlign.Center,
