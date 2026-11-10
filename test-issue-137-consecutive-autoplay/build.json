@@ -1,0 +1,12 @@
+{
+  "original_branch": "test/issue-137-consecutive-autoplay",
+  "branch_slug": "test-issue-137-consecutive-autoplay",
+  "commit_sha": "d2c8853f5d0504790c064a36b0ac6bd054b9af72",
+  "short_sha": "d2c8853",
+  "apk_name": "Survey2026-test-issue-137-consecutive-autoplay-d2c8853.apk",
+  "apk_sha256": "906e2dcd3c0afdae7df867a5c306f729dc22e7484f87cd4ed3153de1a4ec4844",
+  "apk_download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-test-issue-137-consecutive-autoplay-d2c8853-run-212/Survey2026-test-issue-137-consecutive-autoplay-d2c8853.apk",
+  "page_url": "https://ishizuki-tech.github.io/Survey2026/test-issue-137-consecutive-autoplay/",
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/42724514132",
+  "generated_utc": "2026-11-10T00:04:54Z"
+}
