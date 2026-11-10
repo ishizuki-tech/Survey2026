@@ -10,9 +10,12 @@ package com.negi.survey.net
 
 import android.content.Context
 import com.negi.survey.utils.DeviceUploadTag
+import com.negi.survey.utils.DeviceUploadTagProvider
 import com.negi.survey.diagnostics.SurveyTraceRegistry
 import com.negi.survey.diagnostics.WhisperTraceRegistry
 import com.negi.survey.vm.SurveyFinalizationSnapshot
+import com.negi.survey.vm.SurveyCompletionStatus
+import java.time.Instant
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CancellationException
@@ -44,11 +47,7 @@ internal interface SurveyFinalizationOperations {
         surveyId: String,
         file: File
     ): SurveyUploadedArtifactCleanup.Outcome
-    suspend fun scheduleVoiceArtifacts(
-        config: GitHubUploader.GitHubConfig,
-        surveyId: String,
-        expectedVoiceFileNames: Set<String>
-    )
+    suspend fun scheduleVoiceArtifacts(config: GitHubUploader.GitHubConfig)
     suspend fun scheduleLogArtifact(
         config: GitHubUploader.GitHubConfig,
         surveyId: String,
@@ -72,12 +71,18 @@ class SurveyUploadFinalizer private constructor(
         snapshot: SurveyFinalizationSnapshot,
         config: GitHubUploader.GitHubConfig?,
         deviceTag: DeviceUploadTag,
-        exportedAtStamp: String
+        exportedAtStamp: String,
+    ): SurveyFinalizationResult = finalize(snapshot, config, deviceTag, exportedAtStamp, abandoned = false)
+
+    private suspend fun finalize(
+        snapshot: SurveyFinalizationSnapshot,
+        config: GitHubUploader.GitHubConfig?,
+        deviceTag: DeviceUploadTag,
+        exportedAtStamp: String,
+        abandoned: Boolean,
     ): SurveyFinalizationResult {
         val surveyId = snapshot.surveyId.trim()
         if (!operations.acceptsSurveyId(surveyId)) return SurveyFinalizationResult.Failure("Survey ID is invalid.")
-        SurveyTraceRegistry.finalizeAsync(surveyId)
-        WhisperTraceRegistry.finalizeAsync(surveyId)
         return locks.getOrPut(surveyId) { Mutex() }.withLock {
             var staged = false
             try {
@@ -90,12 +95,25 @@ class SurveyUploadFinalizer private constructor(
                     // An upgraded process must not relabel a historical staged artifact.
                     return@withLock SurveyFinalizationResult.StagedPending(existing, reused = true)
                 }
-                if (existing == null && !operations.reserveCanonicalSurveyRoute(surveyId)) {
-                    return@withLock SurveyFinalizationResult.Failure("Could not reserve survey upload route.")
+                val pending = existing ?: run {
+                    if (!SurveyRecordingGate.beginFinalization(surveyId)) {
+                        return@withLock SurveyFinalizationResult.Failure("Wait for the recording to finish saving, then retry.")
+                    }
+                    try {
+                        if (!operations.reserveCanonicalSurveyRoute(surveyId)) {
+                            return@withLock SurveyFinalizationResult.Failure("Could not reserve survey upload route.")
+                        }
+                        operations.stageSurveyJson(snapshot, deviceTag, exportedAtStamp)
+                    } finally {
+                        SurveyRecordingGate.endFinalization(surveyId)
+                    }
                 }
-                val pending = existing ?: operations.stageSurveyJson(snapshot, deviceTag, exportedAtStamp)
                 staged = true
-                if (existing == null) operations.collectFinalizationDiagnostics(surveyId)
+                if (existing == null && !abandoned) {
+                    SurveyTraceRegistry.finalizeAsync(surveyId)
+                    WhisperTraceRegistry.finalizeAsync(surveyId)
+                    operations.collectFinalizationDiagnostics(surveyId)
+                }
                 if (config == null) {
                     return@withLock SurveyFinalizationResult.StagedPending(pending, reused = existing != null)
                 }
@@ -130,7 +148,7 @@ class SurveyUploadFinalizer private constructor(
                     else -> return@withLock SurveyFinalizationResult.Failure(reconciliation.decision.reason, staged = true)
                 }
                 try {
-                    operations.scheduleVoiceArtifacts(config, surveyId, expectedVoiceFileNames(snapshot))
+                    operations.scheduleVoiceArtifacts(config)
                 } catch (cancelled: CancellationException) {
                     throw cancelled
                 } catch (_: Exception) {
@@ -156,11 +174,27 @@ class SurveyUploadFinalizer private constructor(
         }
     }
 
-    private fun expectedVoiceFileNames(snapshot: SurveyFinalizationSnapshot): Set<String> =
-        snapshot.audioRefs
-            .map { it.fileName.substringAfterLast('/') }
-            .filter { it.isNotBlank() }
-            .toSet()
+    /** Recover only voice packages owned by a prior main process. This path has no live answers. */
+    internal suspend fun recoverAbandonedRecordings(context: Context) {
+        val store = V2ArtifactStore(context)
+        val abandoned = SurveyRecordings(store).abandonedSurveyIds()
+        if (abandoned.isEmpty()) return
+        val tag = DeviceUploadTagProvider.from(context)
+        for (surveyId in abandoned) {
+            val snapshot = SurveyFinalizationSnapshot(
+                surveyId = surveyId, questions = emptyMap(), answers = emptyMap(),
+                followups = emptyMap(), audioRefs = emptyList(), aiOutcomesJson = "{}",
+                extraMeta = emptyMap(), status = SurveyCompletionStatus.INCOMPLETE,
+            )
+            val result = finalize(
+                snapshot, null, tag,
+                Instant.now().toString(), abandoned = true,
+            )
+            if (result is SurveyFinalizationResult.Failure) {
+                RuntimeLogStore.w("SurveyFinalizer", "Prior-process recordings retained for $surveyId: ${result.message}")
+            }
+        }
+    }
 
     private companion object {
         val locks = ConcurrentHashMap<String, Mutex>()
@@ -201,7 +235,22 @@ private class AndroidSurveyFinalizationOperations(context: Context) : SurveyFina
         return artifacts.stage(
             V2ArtifactStore.surveyKey(paths.surveyUuid), V2ArtifactStore.Kind.SURVEY,
             paths.surveyUuid, V2ArtifactStore.profile, paths.surveyJson(),
-        ) { output -> output.write(SurveyExportJsonBuilder.build(snapshot, stamp).toByteArray(Charsets.UTF_8)) }.payload
+        ) { output ->
+            val recordings = try {
+                SurveyRecordings(artifacts).inventory(paths, V2ArtifactStore.profile).also { inventory ->
+                    val files = inventory.associateBy { it.file }
+                    check(snapshot.audioRefs.all { ref ->
+                        files[ref.fileName]?.identity?.prompt?.questionId == ref.questionId
+                    })
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                throw IllegalStateException("Recording data could not be verified. The survey has been kept for retry.", failure)
+            }
+            val json = SurveyExportJsonBuilder.build(snapshot, stamp, recordings)
+            output.write(json.toByteArray(Charsets.UTF_8))
+        }.payload
     }
 
     override fun reconcileSurveyJson(
@@ -239,11 +288,8 @@ private class AndroidSurveyFinalizationOperations(context: Context) : SurveyFina
         }
     }
 
-    override suspend fun scheduleVoiceArtifacts(
-        config: GitHubUploader.GitHubConfig,
-        surveyId: String,
-        expectedVoiceFileNames: Set<String>
-    ) = V2ArtifactDelivery.recoverIndependent(appContext, config)
+    override suspend fun scheduleVoiceArtifacts(config: GitHubUploader.GitHubConfig) =
+        V2ArtifactDelivery.recoverIndependent(appContext, config)
 
     override suspend fun scheduleLogArtifact(
         config: GitHubUploader.GitHubConfig,

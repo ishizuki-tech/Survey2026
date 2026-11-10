@@ -210,6 +210,8 @@ import com.negi.survey.vm.AiViewModel
 import com.negi.survey.vm.QuestionSpeaker
 import com.negi.survey.vm.SurveyViewModel
 import com.negi.survey.vm.SurveyAiReason
+import com.negi.survey.vm.RecordingPrompt
+import com.negi.survey.vm.aiRecordingPrompt
 import com.negi.survey.vm.pendingAiFollowup
 import com.negi.survey.vm.toggleQuestionSpeaker
 import java.security.MessageDigest
@@ -310,6 +312,9 @@ interface SpeechController {
     /** True while the captured audio is being transcribed. */
     val isTranscribing: StateFlow<Boolean>
 
+    /** Frozen context of the current or last utterance, if supplied by the controller. */
+    val recordingPrompt: RecordingPrompt? get() = null
+
     /** Latest recognized text (partial or final). */
     val partialText: StateFlow<String>
 
@@ -329,6 +334,12 @@ interface SpeechController {
     /** Start capturing audio and producing partial or final text. */
     fun startRecording()
 
+    /** Starts a recording bound to the prompt at the time of the tap. */
+    fun startRecording(prompt: RecordingPrompt) {
+        updateContext(prompt.surveyId, prompt.questionId)
+        startRecording()
+    }
+
     /** Stop capturing audio and finalize the current utterance. */
     fun stopRecording()
 
@@ -347,13 +358,14 @@ interface SpeechController {
  */
 internal fun toggleSpeechRecordingWithTtsInterlock(
     speechController: SpeechController,
-    ttsController: QuestionSpeaker?
+    ttsController: QuestionSpeaker?,
+    prompt: RecordingPrompt? = null,
 ) {
     if (speechController.isRecording.value) {
         speechController.stopRecording()
     } else if (!speechController.isTranscribing.value) {
         ttsController?.stop()
-        speechController.startRecording()
+        if (prompt != null) speechController.startRecording(prompt) else speechController.startRecording()
     }
 }
 
@@ -818,7 +830,12 @@ fun AiScreen(
 
     LaunchedEffect(speechRecording, speechTranscribing, speechPartial, inputClosed) {
         if (speechController == null) return@LaunchedEffect
-        if (inputClosed) {
+        val captured = speechController.recordingPrompt
+        val matchesPrompt = captured == null || captured == aiRecordingPrompt(
+            vmSurvey.surveyUuid.value, nid, vmSurvey.getQuestion(nid),
+            conversation.value, vmSurvey.followups.value[nid].orEmpty(),
+        )
+        if (inputClosed || !ownsPresentation() || !matchesPrompt) {
             wasRecording = false
             wasTranscribing = false
             return@LaunchedEffect
@@ -1215,14 +1232,21 @@ fun AiScreen(
                                 .then(if (pinModeSelector) Modifier.verticalScroll(footerScrollState) else Modifier)
                         ) {
                             val onToggleSpeech: (() -> Unit)? = speechController?.let { sc ->
-                                {
-                                    if (!sc.isRecording.value) {
-                                        keyboard?.hide()
-                                        focusManager.clearFocus(force = true)
-                                        val traceId = vmSurvey.beginAnswerTransaction(nid, "voice")
-                                        WhisperTraceRegistry.beginVoiceTransaction(localContext, surveyUuid, nid, traceId)
+                                toggle@{
+                                    if (sc.isRecording.value) {
+                                        sc.stopRecording()
+                                        return@toggle
                                     }
-                                    toggleSpeechRecordingWithTtsInterlock(sc, ttsController)
+                                    if (!ownsPresentation() || inputBlocked()) return@toggle
+                                    val prompt = aiRecordingPrompt(
+                                        vmSurvey.surveyUuid.value, nid, vmSurvey.getQuestion(nid),
+                                        conversation.value, vmSurvey.followups.value[nid].orEmpty(),
+                                    ) ?: return@toggle
+                                    keyboard?.hide()
+                                    focusManager.clearFocus(force = true)
+                                    val traceId = vmSurvey.beginAnswerTransaction(nid, "voice")
+                                    WhisperTraceRegistry.beginVoiceTransaction(localContext, prompt.surveyId, nid, traceId)
+                                    toggleSpeechRecordingWithTtsInterlock(sc, ttsController, prompt)
                                 }
                             }
                             val onSendAnswer: () -> Unit = {

@@ -22,6 +22,7 @@ import com.negi.survey.net.SurveyUploadIdempotency
 import com.negi.survey.net.SurveyUploadRouteStore
 import com.negi.survey.net.SurveyUploadWork
 import com.negi.survey.net.UploadedSurveyStore
+import com.negi.survey.net.V2ArtifactDelivery
 import com.negi.survey.net.V2ArtifactStore
 import com.negi.survey.utils.newTimeOrderedSurveyId
 import com.negi.survey.vm.UploadStatus
@@ -162,6 +163,69 @@ class UploadStatusClearListTest {
         confirm(ledger, "new-after-process-restart")
         assertEquals(setOf("new-after-process-restart"), vm.loadDetails().completedSurveyIds)
         assertEquals(3, ledger.uploadedCount())
+    }
+
+    @Test fun artifactDetailsDistinguishVoiceBlockersAndRequireAnIndividualReceipt() = runBlocking {
+        val app = scopedApp()
+        val store = V2ArtifactStore(app)
+        val profile = V2ArtifactStore.profile
+        val surveyId = newTimeOrderedSurveyId()
+        val paths = store.paths(app, surveyId)
+        fun voice(id: String, size: Long = 64) =
+            store.stage(id, V2ArtifactStore.Kind.VOICE, surveyId, profile, paths.voiceWav("Q8", id), "{}") {
+                it.channel.position(size - 1)
+                it.write(0)
+            }
+        val referenced = voice("referenced")
+        val omitted = voice("omitted")
+        voice("oversized", V2ArtifactDelivery.MAX_RAW_BYTES.toLong() + 1)
+        val damagedPayload = voice("damaged-payload")
+        damagedPayload.payload.appendText("invalid")
+        val damagedRoute = voice("damaged-route")
+        File(damagedRoute.directory, "route").appendText("invalid")
+
+        val vm = viewModel(app)
+        suspend fun details() = vm.loadDetails().artifactStatus
+        assertTrue("voice · held without finalized survey reference (2)" in details())
+
+        val survey = store.stage(
+            V2ArtifactStore.surveyKey(surveyId), V2ArtifactStore.Kind.SURVEY, surveyId, profile, paths.surveyJson(),
+        ) {
+            it.write("""{"survey_id":"$surveyId","voice_files":[{"file":"${referenced.route.basename}"}]}""".toByteArray())
+        }
+        V2ArtifactDelivery.ledger(app).markConfirmedUploaded(
+            surveyId, "2026-11-09", survey.route.fingerprint, survey.routeFingerprint,
+        )
+        assertTrue(V2ArtifactDelivery.cleanupSurvey(app, survey))
+        assertFalse(survey.payload.exists())
+        assertFalse(referenced.hasReceipt())
+        assertFalse(V2ArtifactDelivery.isEligible(app, omitted))
+
+        val pending = details()
+        assertTrue("survey · delivered (1)" in pending)
+        assertTrue("voice · upload disabled or credential unavailable (1)" in pending)
+        assertTrue("voice · held without finalized survey reference (1)" in pending)
+        assertTrue("voice · over upload size limit (1)" in pending)
+        assertTrue("voice · payload does not match route (1)" in pending)
+        assertTrue("Unknown artifact · invalid route (1)" in pending)
+
+        // The finalized Survey has already been delivered and its index is the remaining evidence.
+        val index = File(survey.directory, "voice.references")
+        val validIndex = index.readText()
+        index.appendText("invalid")
+        val invalid = details()
+        assertTrue("survey · delivered (1)" in invalid)
+        assertTrue("voice · invalid finalized survey reference, payload retained (2)" in invalid)
+        assertFalse(invalid.any { it.startsWith("voice · delivered") })
+        assertTrue(referenced.matchesPayload())
+
+        index.writeText(validIndex)
+        referenced.recordReceipt()
+        assertTrue("voice · delivered, cleanup pending (1)" in details())
+        assertTrue(referenced.cleanup())
+        assertTrue("voice · delivered (1)" in details())
+        assertFalse(omitted.hasReceipt())
+        assertTrue(omitted.matchesPayload())
     }
 
     private fun waitForText(text: String) {

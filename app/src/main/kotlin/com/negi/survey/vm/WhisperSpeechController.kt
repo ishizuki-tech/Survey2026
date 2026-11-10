@@ -28,6 +28,11 @@
 
 package com.negi.survey.vm
 
+import com.negi.survey.net.RecordingIdentity
+import com.negi.survey.net.SurveyRecordingGate
+import com.negi.survey.net.SurveyRecordings
+import com.negi.survey.net.TranscriptionOutcome
+import com.negi.survey.net.V2ArtifactStore
 import android.content.Context
 import android.os.SystemClock
 import android.util.Log
@@ -47,7 +52,6 @@ import com.negi.survey.whisper.InitTiming
 import java.io.File
 import java.io.FileInputStream
 import java.io.RandomAccessFile
-import java.security.MessageDigest
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
@@ -147,8 +151,8 @@ class WhisperSpeechController(
      * Minimal export event payload.
      */
     data class ExportedVoice(
-        val surveyId: String?,
-        val questionId: String?,
+        val surveyId: String,
+        val questionId: String,
         val fileName: String,
         val byteSize: Long,
         val checksum: String? = null
@@ -158,15 +162,17 @@ class WhisperSpeechController(
     // Dependencies
     // ---------------------------------------------------------------------
 
-    private var currentSurveyId: String? = null
-    private var currentQuestionId: String? = null
+    @Volatile
+    override var recordingPrompt: RecordingPrompt? = null
+        private set
 
     /** All mutable recording resources belong to exactly one recording session. */
     private class RecordingSession(
         val id: Long,
-        val surveyId: String?,
-        val questionId: String?
+        val recording: RecordingIdentity,
     ) {
+        val surveyId get() = recording.prompt.surveyId
+        val questionId get() = recording.prompt.questionId
         var recorder: RecorderBackend? = null
         var outputFile: File? = null
         var workerJob: Job? = null
@@ -213,8 +219,6 @@ class WhisperSpeechController(
             .ifBlank { DEFAULT_LANGUAGE }
 
     override fun updateContext(surveyId: String?, questionId: String?) {
-        currentSurveyId = surveyId
-        currentQuestionId = questionId
         Log.d(TAG, "updateContext: surveyId=$surveyId, questionId=$questionId")
         WhisperTraceRegistry.event(surveyId, questionId, "WHISPER_CONTEXT_UPDATED")
     }
@@ -224,6 +228,10 @@ class WhisperSpeechController(
     // ---------------------------------------------------------------------
 
     override fun startRecording() {
+        _error.value = "The recording needs a survey prompt."
+    }
+
+    override fun startRecording(prompt: RecordingPrompt) {
         if (_isRecording.value || _isTranscribing.value) {
             Log.d(TAG, "startRecording: busy, ignoring")
             return
@@ -235,17 +243,31 @@ class WhisperSpeechController(
             return
         }
 
+        val recording = RecordingIdentity(V2ArtifactStore.newId(), prompt)
+        if (!SurveyRecordingGate.begin(recording)) {
+            _error.value = "Wait for the survey export or previous recording to finish."
+            return
+        }
         val session = RecordingSession(
             id = nextSessionId.incrementAndGet(),
-            surveyId = currentSurveyId,
-            questionId = currentQuestionId
+            recording = recording,
         )
         if (!activeSession.compareAndSet(null, session)) {
+            SurveyRecordingGate.end(recording)
             _error.value = "Previous recording is still finalizing"
             Log.w(TAG, "startRecording: active session changed, ignoring")
             return
         }
-        session.recorder = newRecorder(session)
+        try {
+            session.recorder = newRecorder(session)
+        } catch (failure: Exception) {
+            activeSession.compareAndSet(session, null)
+            SurveyRecordingGate.end(recording)
+            if (failure is CancellationException) throw failure
+            DiagnosticContentPolicy.logError(TAG, "Recorder creation failed", failure)
+            _error.value = "Could not start the microphone."
+            return
+        }
         session.recorderClose = SharedClose(cleanupScope) {
             session.recorder?.close()
             if (session.ownsRecorderSession) {
@@ -254,6 +276,7 @@ class WhisperSpeechController(
             }
         }
 
+        recordingPrompt = prompt
         Log.d(TAG, "microphone requested elapsedMs=${SystemClock.elapsedRealtime()} session=${session.id}")
         WhisperTraceRegistry.event(session.surveyId, session.questionId, "RECORDING_START_REQUESTED", mapOf("whisperRecordingId" to session.id))
         _error.value = null
@@ -273,6 +296,9 @@ class WhisperSpeechController(
             recordingMutex.withLock {
                 try {
                     ensureActive()
+                    check(!V2ArtifactStore(appContext).hasReservedRoute(V2ArtifactStore.surveyKey(session.surveyId))) {
+                        "The survey already has an immutable export."
+                    }
                     check(recorderSessionMutex.tryLock()) { "Previous recorder is still closing; restart required if cleanup failed" }
                     session.ownsRecorderSession = true
 
@@ -310,6 +336,7 @@ class WhisperSpeechController(
                     deleteTempFileQuietly(tmp, reason = "start_cancelled")
                     finishWhisperSession(session)
                     if (!session.recorderFailed) activeSession.compareAndSet(session, null)
+                    SurveyRecordingGate.end(recording)
                 } catch (t: Throwable) {
                     DiagnosticContentPolicy.logError(TAG, "startRecording: failed", t)
                     if (!owns(session)) return@withLock
@@ -322,6 +349,7 @@ class WhisperSpeechController(
                     deleteTempFileQuietly(tmp, reason = "start_failed")
                     finishWhisperSession(session)
                     if (closeRecorderOrMonitor(session)) activeSession.compareAndSet(session, null)
+                    SurveyRecordingGate.end(recording)
                 }
             }
         }
@@ -427,43 +455,47 @@ class WhisperSpeechController(
                         }
                     }
 
-                    val exported = exportRecordedVoiceSafely(wav, session)
-                    if (exported != null && owns(session)) {
-                        val checksum = runCatching { computeSha256(wav) }
-                            .onFailure { e -> DiagnosticContentPolicy.logWarning(TAG, "computeSha256 failed", e) }
-                            .getOrNull()
-
-                        onVoiceExported?.invoke(
-                            ExportedVoice(
+                    val recording = session.recording
+                    val staged = try {
+                        check(info != null && info.dataBytes > 0 && info.dataOffset + info.dataBytes <= wav.length()) {
+                            "Recording has an invalid WAV header or incomplete audio."
+                        }
+                        ExportUtils.exportRecordedVoice(appContext, wav, recording)
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (failure: Exception) {
+                        DiagnosticContentPolicy.logWarning(TAG, "WAV staging failed", failure)
+                        if (owns(session)) _error.value = "Could not save this recording."
+                        null
+                    }
+                    if (staged != null && owns(session)) {
+                        val route = staged.route
+                        try {
+                            onVoiceExported?.invoke(ExportedVoice(
                                 surveyId = session.surveyId,
                                 questionId = session.questionId,
-                                fileName = exported.name,
-                                byteSize = wav.length(),
-                                checksum = checksum
-                            )
-                        )
-                        WhisperTraceRegistry.event(session.surveyId, session.questionId, "AUDIO_EXPORTED", mapOf("fileName" to exported.name, "byteSize" to wav.length()))
-
-                        Log.d(
-                            TAG,
-                            "onVoiceExported -> file=${exported.name}, " +
-                                    "bytes=${wav.length()}, " +
-                                    "qid=${session.questionId}, sid=${session.surveyId}, " +
-                                    "checksum=${checksum?.take(12)}..."
-                        )
-                    } else {
-                        Log.w(TAG, "stopRecording: export skipped or failed")
+                                fileName = route.basename,
+                                byteSize = route.size,
+                                checksum = route.fingerprint,
+                            ))
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (failure: Exception) {
+                            DiagnosticContentPolicy.logWarning(TAG, "WAV export observer failed", failure)
+                        }
+                        WhisperTraceRegistry.event(session.surveyId, session.questionId, "AUDIO_EXPORTED",
+                            mapOf("fileName" to route.basename, "byteSize" to route.size))
                     }
 
                     if (!owns(session)) return@withLock
-                    _isTranscribing.value = true
-                    session.initJob?.await() ?: error("Whisper initialization was not scheduled")
-                    if (!owns(session)) return@withLock
-                    Log.d(TAG, "transcription started elapsedMs=${SystemClock.elapsedRealtime()} session=${session.id}")
-                    WhisperTraceRegistry.event(session.surveyId, session.questionId, "TRANSCRIPTION_STARTED", mapOf("language" to normalizedLanguage))
+                    val result = try {
+                        session.initJob?.await() ?: error("Whisper initialization was not scheduled")
+                        if (!owns(session)) return@withLock
+                        Log.d(TAG, "transcription started elapsedMs=${SystemClock.elapsedRealtime()} session=${session.id}")
+                        WhisperTraceRegistry.event(session.surveyId, session.questionId, "TRANSCRIPTION_STARTED",
+                            mapOf("language" to normalizedLanguage))
 
-                    val result = transcriber?.invoke(wav, normalizedLanguage)
-                        ?: WhisperEngine.transcribeWaveFile(
+                        transcriber?.invoke(wav, normalizedLanguage) ?: WhisperEngine.transcribeWaveFile(
                             file = wav,
                             lang = normalizedLanguage,
                             translate = false,
@@ -477,6 +509,19 @@ class WhisperSpeechController(
                                 ))
                             }
                         )
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (failure: Exception) {
+                        Result.failure(failure)
+                    }
+                    (result.exceptionOrNull() as? CancellationException)?.let { throw it }
+                    ensureActive()
+                    if (!owns(session)) return@withLock
+                    if (staged != null) {
+                        SurveyRecordings(V2ArtifactStore(appContext)).persistOutcome(
+                            staged, recording, TranscriptionOutcome.from(result),
+                        )
+                    }
 
                     result
                         .onSuccess { text ->
@@ -486,11 +531,7 @@ class WhisperSpeechController(
                                 Log.w(TAG, "Transcription produced empty text (qid=${session.questionId})")
                                 _error.value = buildEmptyTranscriptionReason(wav)
                             } else {
-                                if (DiagnosticContentPolicy.permitsRawRespondentContent) {
-                                    Log.d(TAG, "Transcription success: ${trimmed.take(80)}")
-                                } else {
-                                    Log.d(TAG, "Transcription success: transcriptLength=${trimmed.length}")
-                                }
+                                Log.d(TAG, "Transcription success: transcriptLength=${trimmed.length}")
                                 WhisperTraceRegistry.event(session.surveyId, session.questionId, "TRANSCRIPTION_FINISHED", mapOf(
                                     "transcript" to DiagnosticContentPolicy.rawOrNull(trimmed),
                                     "transcriptLength" to trimmed.length,
@@ -511,6 +552,7 @@ class WhisperSpeechController(
                         }
                 } catch (ce: CancellationException) {
                     Log.d(TAG, "stopRecording: cancelled")
+                    throw ce
                 } catch (t: Throwable) {
                     DiagnosticContentPolicy.logError(TAG, "stopRecording: failed", t)
                     if (owns(session)) _error.value = t.message ?: "Speech recognition failed"
@@ -525,6 +567,7 @@ class WhisperSpeechController(
                             }
                     }
                     if (!session.poisoned) closeRecorderOrMonitor(session)
+                    SurveyRecordingGate.end(session.recording)
                     if (owns(session)) {
                         // Transcription has ended even if a failed recorder must stay reserved.
                         if (!session.poisoned) activeSession.compareAndSet(session, null)
@@ -533,6 +576,9 @@ class WhisperSpeechController(
                     deleteTempFileQuietly(localWav, reason = "stop_finally")
                 }
             }
+        }
+        session.workerJob?.invokeOnCompletion {
+            SurveyRecordingGate.end(session.recording)
         }
         session.workerJob?.start()
     }
@@ -636,38 +682,6 @@ class WhisperSpeechController(
     // Export / checksum
     // ---------------------------------------------------------------------
 
-    private suspend fun exportRecordedVoiceSafely(
-        wav: File,
-        session: RecordingSession
-    ): File? =
-        withContext(Dispatchers.IO) {
-            runCatching {
-                ExportUtils.exportRecordedVoice(
-                    context = appContext,
-                    source = wav,
-                    surveyId = session.surveyId,
-                    questionId = session.questionId
-                )
-            }.onFailure { e ->
-                DiagnosticContentPolicy.logWarning(TAG, "exportRecordedVoice failed", e)
-            }.getOrNull()
-        }
-
-    private fun computeSha256(file: File): String {
-        val digest = MessageDigest.getInstance("SHA-256")
-        FileInputStream(file).use { fis ->
-            val buffer = ByteArray(1024 * 32)
-            while (true) {
-                val read = fis.read(buffer)
-                if (read <= 0) break
-                digest.update(buffer, 0, read)
-            }
-        }
-        return digest.digest().joinToString("") { b ->
-            "%02x".format(b.toInt() and 0xff)
-        }
-    }
-
     private fun deleteTempFileQuietly(file: File?, reason: String) {
         if (file == null) return
         runCatching {
@@ -714,6 +728,7 @@ class WhisperSpeechController(
                             session.poisoned = true
                             closePoisonedSessionAsync(session)
                             runCatching { finishWhisperSession(session) }
+                            SurveyRecordingGate.end(session.recording)
                             _isTranscribing.value = false
                         }
                     }
@@ -976,6 +991,7 @@ class WhisperSpeechController(
             withContext(NonCancellable) {
                 session?.startupJob?.join()
                 session?.workerJob?.join()
+                session?.let { SurveyRecordingGate.end(it.recording) }
                 val close = session?.recorderClose?.request()
                 session?.let { runCatching { finishWhisperSession(it) }
                     .onFailure { e -> DiagnosticContentPolicy.logWarning(TAG, "WhisperEngine.release failed", e) } }

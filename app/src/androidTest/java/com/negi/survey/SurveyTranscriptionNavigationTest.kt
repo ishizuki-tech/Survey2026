@@ -22,16 +22,18 @@ import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import androidx.navigation3.runtime.rememberNavBackStack
 import androidx.test.platform.app.InstrumentationRegistry
+import com.negi.survey.net.V2ArtifactStore
+import com.negi.survey.net.SurveyRecordings
+import com.negi.survey.net.TranscriptionOutcome
+import com.negi.survey.vm.RecordingPrompt
 import com.negi.survey.config.NodeDTO
 import com.negi.survey.config.SurveyConfig
-import com.negi.survey.net.PendingSurveyUploads
 import com.negi.survey.runtime.HeavyRuntimeHandoff
 import com.negi.survey.runtime.NoOpHeavyRuntimeHandoff
 import com.negi.survey.screens.SpeechController
 import com.negi.survey.slm.Repository
 import com.negi.survey.slm.RepositoryTraceContext
 import com.negi.survey.ui.theme.SurveyNavTheme
-import com.negi.survey.utils.ExportUtils
 import com.negi.survey.vm.AiViewModel
 import com.negi.survey.vm.FlowHome
 import com.negi.survey.vm.SurveyFinalizationStatePolicy
@@ -69,17 +71,12 @@ class SurveyTranscriptionNavigationTest {
 
     @After
     fun removeFixtureExports() {
-        if (fixtureVoiceExports.isNotEmpty()) {
-            val voiceDir = ExportUtils.getVoiceExportDir(instrumentation.targetContext)
-            fixtureVoiceExports.forEach { name ->
-                File(voiceDir, name).delete()
-                File(voiceDir, name.substringBeforeLast('.') + ".meta.json").delete()
-            }
-        }
+        val store = V2ArtifactStore(instrumentation.targetContext)
+        store.artifactIds().mapNotNull(store::read)
+            .filter { it.route.basename in fixtureVoiceExports }
+            .forEach { it.directory.deleteRecursively() }
         if (::survey.isInitialized) {
-            PendingSurveyUploads.findPendingSurveyFile(
-                instrumentation.targetContext, survey.surveyUuid.value
-            )?.delete()
+            pendingExport()?.parentFile?.deleteRecursively()
         }
     }
 
@@ -368,7 +365,11 @@ class SurveyTranscriptionNavigationTest {
             showSurvey(startAt = "AI", speechController = controller)
             val staleBack = clickAction("Back")
             val staleNext = clickAction("Next")
-            rule.runOnIdle { controller.startRecording() }
+            rule.runOnIdle {
+                controller.startRecording(RecordingPrompt(
+                    survey.surveyUuid.value, "AI", RecordingPrompt.Kind.ORIGINAL, "Tell me more",
+                ))
+            }
             rule.waitUntil(5_000L) { controller.isCaptureActive.value }
             rule.runOnIdle { controller.stopRecording() }
             rule.waitUntil(5_000L) { transcriberEntered.isCompleted }
@@ -416,7 +417,11 @@ class SurveyTranscriptionNavigationTest {
 
             rule.runOnIdle { survey.goto("AI") }
             assertEnabled("Next")
-            rule.runOnIdle { controller.startRecording() }
+            rule.runOnIdle {
+                controller.startRecording(RecordingPrompt(
+                    survey.surveyUuid.value, "AI", RecordingPrompt.Kind.ORIGINAL, "Tell me more",
+                ))
+            }
             rule.waitUntil(5_000L) { controller.isCaptureActive.value }
             rule.runOnIdle {
                 assertTrue(controller.isRecording.value)
@@ -428,6 +433,13 @@ class SurveyTranscriptionNavigationTest {
                 !controller.isTranscribing.value && controller.partialText.value == "Recovered answer"
             }
             assertEnabled("Back", "Next")
+            val id = survey.surveyUuid.value
+            val store = V2ArtifactStore(instrumentation.targetContext)
+            val recordings = SurveyRecordings(store).inventory(store.paths(instrumentation.targetContext, id), V2ArtifactStore.profile)
+            assertEquals(2, recordings.size)
+            assertEquals(setOf(TranscriptionOutcome.Status.FAILED, TranscriptionOutcome.Status.SUCCESS),
+                recordings.map { it.outcome.status }.toSet())
+            assertTrue(recordings.all { it.identity.prompt.text == "Tell me more" })
         } finally {
             failTranscription.complete(Unit)
             finishCleanup.complete(Unit)
@@ -582,9 +594,8 @@ class SurveyTranscriptionNavigationTest {
         rule.waitForIdle()
     }
 
-    private fun pendingExport() = PendingSurveyUploads.findPendingSurveyFile(
-        instrumentation.targetContext, survey.surveyUuid.value
-    )
+    private fun pendingExport() = V2ArtifactStore(instrumentation.targetContext)
+        .read(V2ArtifactStore.surveyKey(survey.surveyUuid.value))?.payload
 
     private inner class FixtureWavRecorder : RecorderBackend {
         val stopCalls = AtomicInteger()

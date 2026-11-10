@@ -672,10 +672,12 @@ open class SurveyViewModel(
         fileName: String,
         byteSize: Long? = null,
         checksum: String? = null,
-        dedupByFileName: Boolean = true
+        dedupByFileName: Boolean = true,
+        expectedSurveyId: String = surveyUuid.value,
     ) {
         val qid = questionId.trim()
-        val sid = surveyUuid.value
+        val sid = expectedSurveyId
+        if (sid != surveyUuid.value) return
 
         _recordedAudioRefs.update { old ->
             val mutable = old.mutableLinkedLists<AudioRef>()
@@ -779,21 +781,6 @@ open class SurveyViewModel(
 
     fun hasAudioRef(questionId: String, surveyId: String = surveyUuid.value): Boolean {
         return getAudioRefs(questionId).any { it.surveyId == surveyId }
-    }
-
-    fun onVoiceExported(
-        questionId: String,
-        fileName: String,
-        byteSize: Long? = null,
-        checksum: String? = null,
-        replace: Boolean = false
-    ) {
-        if (replace) {
-            replaceAudioRef(questionId, fileName, byteSize, checksum)
-        } else {
-            addAudioRef(questionId, fileName, byteSize, checksum, dedupByFileName = true)
-        }
-        RuntimeLogStore.d(TAG, "onVoiceExported -> q=${questionId.trim()}, file=$fileName, replace=$replace")
     }
 
     /* ───────────────────────────── Prompt Helpers ───────────────────────────── */

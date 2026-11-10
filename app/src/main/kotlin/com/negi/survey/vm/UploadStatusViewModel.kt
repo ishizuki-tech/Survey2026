@@ -205,6 +205,9 @@ class UploadStatusViewModel(app: Application) : AndroidViewModel(app) {
             val states = work[id].orEmpty()
             val conflict = runCatching { entry.hasRemoteConflict() }.getOrNull()
             val confirmed = runCatching { V2ArtifactDelivery.confirmed(appContext, entry) }.getOrNull()
+            val eligibility by lazy(LazyThreadSafetyMode.NONE) {
+                runCatching { V2ArtifactDelivery.isEligible(appContext, entry) }.getOrNull()
+            }
             val state = when {
                 confirmed == null -> "invalid delivery evidence"
                 confirmed && entry.payload.exists() -> "delivered, cleanup pending"
@@ -215,8 +218,8 @@ class UploadStatusViewModel(app: Application) : AndroidViewModel(app) {
                 !runCatching { entry.matchesPayload() }.getOrDefault(false) -> "payload does not match route"
                 entry.route.profile != V2ArtifactStore.profile -> "held for original destination"
                 entry.route.size > V2ArtifactDelivery.MAX_RAW_BYTES -> "over upload size limit"
-                !runCatching { V2ArtifactDelivery.isEligible(appContext, entry) }.getOrDefault(false) ->
-                    "held without finalized survey reference"
+                eligibility == null -> "invalid finalized survey reference, payload retained"
+                eligibility == false -> "held without finalized survey reference"
                 config == null -> "upload disabled or credential unavailable"
                 states.any { it.state == WorkInfo.State.RUNNING } -> "uploading"
                 states.any { !it.state.isFinished && it.runAttemptCount > 0 } -> "retry pending"

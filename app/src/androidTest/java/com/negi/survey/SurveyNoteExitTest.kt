@@ -24,6 +24,9 @@ import com.negi.survey.config.NodeDTO
 import com.negi.survey.config.SurveyConfig
 import com.negi.survey.net.GitHubUploader
 import com.negi.survey.net.V2ArtifactStore
+import com.negi.survey.net.RecordingIdentity
+import com.negi.survey.vm.RecordingPrompt
+import com.negi.survey.vm.HOME_FREE_TEXT_QID
 import com.negi.survey.net.SurveyFinalizationResult
 import com.negi.survey.net.SurveyUploadFinalizer
 import com.negi.survey.net.SurveyUploadWork
@@ -73,7 +76,8 @@ class SurveyNoteExitTest {
     @After
     fun removeTestExports() {
         val store = V2ArtifactStore(context)
-        surveyIds.map(V2ArtifactStore::surveyKey).mapNotNull(store::read).forEach { it.directory.deleteRecursively() }
+        store.artifactIds().mapNotNull(store::read).filter { it.route.surveyId in surveyIds }
+            .forEach { it.directory.deleteRecursively() }
     }
 
     @Test
@@ -104,7 +108,18 @@ class SurveyNoteExitTest {
         showSurveySelector()
         val id = startSurvey()
         rule.onNode(hasSetTextAction()).performTextReplacement("Original note")
-        rule.runOnIdle { survey.addAudioRef("__home_free_text__", "home-note.wav") }
+        val store = V2ArtifactStore(context)
+        val recording = RecordingIdentity(V2ArtifactStore.newId(),
+            RecordingPrompt(id, HOME_FREE_TEXT_QID, RecordingPrompt.Kind.SURVEY_NOTE, "Survey Note"))
+        val source = File.createTempFile("issue138-note", ".wav", context.cacheDir)
+        val voice = try {
+            InstrumentationRegistry.getInstrumentation().context.assets.open("whisper/jfk.wav").use { input ->
+                source.outputStream().use { input.copyTo(it) }
+            }
+            com.negi.survey.utils.ExportUtils.exportRecordedVoice(context, source, recording)
+        } finally {
+            source.delete()
+        }
         rule.onNodeWithText("Next").performClick()
         rule.onNode(hasSetTextAction()).performTextReplacement("First answer")
         rule.runOnIdle {
@@ -133,7 +148,9 @@ class SurveyNoteExitTest {
         assertEquals("A follow-up?", followup.string("question"))
         val audio = record.getValue("voice_files").jsonArray.single().jsonObject
         assertEquals(id, audio.string("survey_id"))
-        assertEquals("home-note.wav", audio.string("file"))
+        assertEquals(voice.route.basename, audio.string("file"))
+        assertEquals("survey_note", audio.string("prompt_kind"))
+        assertEquals("Survey Note", audio.string("prompt_text"))
     }
 
     @Test

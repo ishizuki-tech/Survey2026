@@ -10,6 +10,10 @@ package com.negi.survey.net
 
 import com.negi.survey.BuildConfig
 import com.negi.survey.vm.SurveyFinalizationSnapshot
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 
 /**
  * The single authoritative serializer for the survey JSON export contract.
@@ -18,8 +22,12 @@ import com.negi.survey.vm.SurveyFinalizationSnapshot
  * live UI or ViewModel state while an export is being staged.
  */
 object SurveyExportJsonBuilder {
-    fun build(snapshot: SurveyFinalizationSnapshot, exportedAt: String): String = buildString {
-        val audioByQuestion = snapshot.audioRefs.groupBy { it.questionId }
+    internal fun build(
+        snapshot: SurveyFinalizationSnapshot,
+        exportedAt: String,
+        recordings: List<SurveyRecording> = emptyList(),
+    ): String = buildString {
+        val audioByQuestion = recordings.groupBy { it.identity.prompt.questionId }
         val answerOwnerIds = linkedSetOf<String>().apply {
             addAll(snapshot.questions.keys)
             addAll(snapshot.answers.keys)
@@ -46,7 +54,7 @@ object SurveyExportJsonBuilder {
                 append(",\n      \"audio\": [\n")
                 audioRefs.forEachIndexed { audioIndex, ref ->
                     append("        { \"file\": \"")
-                        .append(escape(localFileName(ref.fileName)))
+                        .append(escape(ref.file))
                         .append("\" }")
                     if (audioIndex != audioRefs.lastIndex) append(',')
                     append('\n')
@@ -80,16 +88,21 @@ object SurveyExportJsonBuilder {
         append("  },\n")
 
         append("  \"voice_files\": [\n")
-        snapshot.audioRefs.forEachIndexed { index, ref ->
-            val questionId = ref.questionId
-            append("    {\n")
-            append("      \"file\": \"").append(escape(localFileName(ref.fileName))).append("\",\n")
-            append("      \"survey_id\": \"").append(escape(snapshot.surveyId)).append("\",\n")
-            append("      \"question_id\": \"").append(escape(questionId)).append("\",\n")
-            append("      \"question\": \"").append(escape(snapshot.questions[questionId].orEmpty())).append("\",\n")
-            append("      \"answer\": \"").append(escape(snapshot.answers[questionId].orEmpty())).append("\"\n")
-            append("    }")
-            if (index != snapshot.audioRefs.lastIndex) append(',')
+        recordings.forEachIndexed { index, recording ->
+            val prompt = Json.encodeToJsonElement(
+                com.negi.survey.vm.RecordingPrompt.serializer(), recording.identity.prompt,
+            ) as JsonObject
+            val entry = buildJsonObject {
+                put("file", recording.file)
+                put("recording_id", recording.identity.id)
+                prompt.forEach { (field, value) -> put(field, value) }
+                put("transcription_status", Json.encodeToJsonElement(
+                    TranscriptionOutcome.Status.serializer(), recording.outcome.status,
+                ))
+                recording.outcome.transcript?.let { put("transcript", it) }
+            }
+            append("    ").append(entry)
+            if (index != recordings.lastIndex) append(',')
             append('\n')
         }
         append("  ]\n")
@@ -110,17 +123,6 @@ object SurveyExportJsonBuilder {
             append('\n')
         }
         append(indent).append('}')
-    }
-
-    private fun localFileName(reference: String): String {
-        val trimmed = reference.trim()
-        if (trimmed.isBlank()) return ""
-        val separator = maxOf(trimmed.lastIndexOf('/'), trimmed.lastIndexOf('\\'))
-        return if (separator >= 0 && separator + 1 < trimmed.length) {
-            trimmed.substring(separator + 1)
-        } else {
-            trimmed
-        }
     }
 
     private fun escape(value: String): String = buildString(value.length + 8) {

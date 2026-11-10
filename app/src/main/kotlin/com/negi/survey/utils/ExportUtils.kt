@@ -16,7 +16,8 @@ import android.util.Log
 import java.io.File
 import java.io.IOException
 import com.negi.survey.net.V2ArtifactStore
-import kotlinx.serialization.json.put
+import com.negi.survey.net.RecordingIdentity
+import kotlinx.serialization.json.Json
 
 /** Export helpers. Finalized WAVs and their metadata are published together in the V2 store. */
 object ExportUtils {
@@ -58,12 +59,11 @@ object ExportUtils {
 
     /** Copies an actual recording once and returns its immutable JSON-reference basename. */
     @Throws(IOException::class)
-    fun exportRecordedVoice(
+    internal fun exportRecordedVoice(
         context: Context,
         source: File,
-        surveyId: String? = null,
-        questionId: String? = null
-    ): File {
+        recording: RecordingIdentity,
+    ): V2ArtifactStore.Entry {
         if (!source.exists() || !source.isFile) {
             val msg = "Source audio file does not exist: ${source.absolutePath}"
             Log.e(TAG, msg)
@@ -77,22 +77,13 @@ object ExportUtils {
             throw IOException(msg)
         }
 
-        val id = V2ArtifactStore.newId()
         val store = V2ArtifactStore(context)
-        val paths = store.paths(context, requireNotNull(surveyId))
-        val question = requireNotNull(questionId)
-        val path = paths.voiceWav(question, id)
-        val metadata = kotlinx.serialization.json.buildJsonObject {
-            put("file_name", path.basename)
-            put("survey_id", paths.surveyUuid)
-            put("question_id", question)
-            put("recording_id", id)
-            put("created_at", java.time.Instant.now().toString())
-        }.toString()
-
+        val paths = store.paths(context, recording.prompt.surveyId)
+        val path = paths.voiceWav(recording.prompt.questionId, recording.id)
         return store.stage(
-            id, V2ArtifactStore.Kind.VOICE, paths.surveyUuid, V2ArtifactStore.profile, path, metadata
-        ) { output -> source.inputStream().use { it.copyTo(output) } }.payload
+            recording.id, V2ArtifactStore.Kind.VOICE, paths.surveyUuid, V2ArtifactStore.profile,
+            path, Json.encodeToString(recording),
+        ) { output -> source.inputStream().use { it.copyTo(output) } }
     }
 
     private fun ensureDir(dir: File, caller: String) {

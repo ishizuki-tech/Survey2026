@@ -130,8 +130,12 @@ internal class V2ArtifactStore(root: File) {
             syncDirectory(directory.parentFile!!)
             syncDirectory(directory.parentFile!!.parentFile!!)
             if (payload.exists() && (!matchesPayload() || !payload.delete())) return@synchronized false
-            val sidecar = File(directory, VOICE_METADATA)
-            !sidecar.exists() || sidecar.delete()
+            if (route.kind != Kind.VOICE) return@synchronized true
+            val metadata = listOf(VOICE_METADATA, SurveyRecordings.METADATA_CHECKSUM, SurveyRecordings.OUTCOME)
+            val interruptedOutcomes = directory.listFiles().orEmpty().filter {
+                it.name.startsWith(SurveyRecordings.OUTCOME_TEMP_PREFIX) && it.name.endsWith(".part")
+            }
+            (metadata.map { File(directory, it) } + interruptedOutcomes).all { !it.exists() || it.delete() }
         }
     }
 
@@ -189,6 +193,11 @@ internal class V2ArtifactStore(root: File) {
             syncDirectory(root.parentFile!!)
             return@synchronized existing
         }
+        if (kind == Kind.VOICE) {
+            check(!hasReservedRoute(surveyKey(checkNotNull(surveyId)))) {
+                "The survey already has an immutable export."
+            }
+        }
         Files.createDirectories(root.toPath())
         syncDirectory(root.parentFile!!)
         val temporary = File(root, ".stage-$id")
@@ -216,6 +225,7 @@ internal class V2ArtifactStore(root: File) {
             val checksum = hash(encoded)
             if (kind == Kind.VOICE) {
                 writeAtomically(File(temporary, VOICE_METADATA), requireNotNull(voiceMetadata))
+                writeAtomically(File(temporary, SurveyRecordings.METADATA_CHECKSUM), hash(voiceMetadata))
             }
             writeAtomically(File(temporary, MANIFEST), "$checksum\n$encoded")
             publishDirectory(temporary, target)
@@ -267,6 +277,38 @@ internal class V2ArtifactStore(root: File) {
         val pending = File(root, ".stage-$id")
         !Files.notExists(target.toPath(), NOFOLLOW_LINKS) ||
             (!Files.notExists(pending.toPath(), NOFOLLOW_LINKS) && !isUnsealed(pending))
+    }
+
+    fun voiceCandidates(): List<Entry> = synchronized(lock) {
+        recoverInterruptedPublications()
+        artifactIds().mapNotNull(::read).filter { it.route.kind == Kind.VOICE }
+    }
+
+    /** Inspect sealed packages too, so corrupt evidence cannot silently disappear from an export. */
+    fun voiceEntries(surveyId: String): List<Entry> = synchronized(lock) {
+        (artifactIds() + interruptedIds()).distinct().sorted().mapNotNull { id ->
+            val entry = read(id)
+            if (entry != null) {
+                return@mapNotNull entry.takeIf { it.route.kind == Kind.VOICE && it.route.surveyId == surveyId }
+            }
+
+            val staging = File(root, ".stage-$id")
+            val sealed = readDirectory(staging, id)
+            if (sealed?.route?.kind == Kind.VOICE && sealed.route.surveyId == surveyId) {
+                recoverInterruptedPublication(id)
+                return@mapNotNull checkNotNull(read(id)) { "A sealed WAV could not be recovered." }
+            }
+
+            val possiblePackages = listOf(directory(id), staging).filter {
+                it.isDirectory && (it != staging || !isUnsealed(it))
+            }
+            check(possiblePackages.none { candidate ->
+                candidate.listFiles().orEmpty().any {
+                    it.name.endsWith("_$id.wav") && "_${surveyId}_" in it.name
+                }
+            }) { "A staged recording has missing or invalid V2 route evidence." }
+            null
+        }
     }
 
     fun isVoiceReferenced(voice: Route): Boolean {
@@ -363,8 +405,8 @@ internal class V2ArtifactStore(root: File) {
             }.getOrNull()
         }
 
-        internal fun writeAtomically(target: File, value: String) {
-            val temporary = File.createTempFile(".write-", ".part", target.parentFile)
+        internal fun writeAtomically(target: File, value: String, tempPrefix: String = ".write-") {
+            val temporary = File.createTempFile(tempPrefix, ".part", target.parentFile)
             try {
                 FileOutputStream(temporary).use {
                     it.write(value.toByteArray(Charsets.UTF_8))

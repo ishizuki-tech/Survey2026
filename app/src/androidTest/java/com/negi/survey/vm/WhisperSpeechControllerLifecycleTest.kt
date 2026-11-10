@@ -3,6 +3,13 @@ package com.negi.survey.vm
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.negi.survey.whisper.RecorderBackend
+import com.negi.survey.net.SurveyRecordings
+import com.negi.survey.net.SurveyUploadFinalizer
+import com.negi.survey.net.SurveyFinalizationResult
+import com.negi.survey.net.TranscriptionOutcome
+import com.negi.survey.net.V2ArtifactStore
+import com.negi.survey.utils.DeviceUploadTag
+import com.negi.survey.utils.newTimeOrderedSurveyId
 import com.negi.survey.runtime.HeavyRuntimeHandoff
 import com.negi.survey.runtime.NoOpHeavyRuntimeHandoff
 import java.io.File
@@ -14,6 +21,10 @@ import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.withContext
@@ -28,6 +39,14 @@ import org.junit.runner.RunWith
 
 @RunWith(AndroidJUnit4::class)
 class WhisperSpeechControllerLifecycleTest {
+    private companion object {
+        fun writeFixtureWav(file: File) {
+            InstrumentationRegistry.getInstrumentation().context.assets.open("whisper/jfk.wav").use { input ->
+                file.outputStream().use { input.copyTo(it) }
+            }
+        }
+    }
+
     @Test
     fun normal_stop_finalizes_once_exports_original_context_and_transcribes() = runBlocking {
         val context = InstrumentationRegistry.getInstrumentation().targetContext.applicationContext
@@ -41,9 +60,11 @@ class WhisperSpeechControllerLifecycleTest {
             transcriber = { _, _ -> Result.success("recorded answer") }
         )
 
-        controller.updateContext("survey-a", "Q8")
-        controller.startRecording()
+        val surveyId = newTimeOrderedSurveyId()
+        val prompt = RecordingPrompt(surveyId, "Q8", RecordingPrompt.Kind.FOLLOWUP, "Exact follow-up?", 2)
+        controller.startRecording(prompt)
         waitUntil { recorder.started }
+        controller.updateContext(newTimeOrderedSurveyId(), "Q9")
         val lockedWhenCaptureEnded = async(Dispatchers.Unconfined, start = CoroutineStart.UNDISPATCHED) {
             controller.isRecording.first { !it }
             controller.isTranscribing.value
@@ -55,9 +76,62 @@ class WhisperSpeechControllerLifecycleTest {
         assertFalse(controller.isRecording.value)
         assertEquals(1, recorder.stopCalls)
         assertEquals(1, exports.size)
-        assertEquals("survey-a", exports.single().surveyId)
+        assertEquals(surveyId, exports.single().surveyId)
         assertEquals("Q8", exports.single().questionId)
         assertTrue(exports.single().byteSize > 44L)
+        val store = V2ArtifactStore(context)
+        val recording = SurveyRecordings(store).inventory(store.paths(context, surveyId), V2ArtifactStore.profile).single()
+        assertEquals(prompt, recording.identity.prompt)
+        assertEquals("recorded answer", recording.outcome.transcript)
+    }
+
+    @Test
+    fun rerecordingsKeepDistinctWavsAndOutcomesThroughFinalizationWithoutCallbacks() = runBlocking {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext.applicationContext
+        val surveyId = newTimeOrderedSurveyId()
+        val original = RecordingPrompt(surveyId, "Q8", RecordingPrompt.Kind.ORIGINAL, "Original?")
+        val followup = RecordingPrompt(surveyId, "Q8", RecordingPrompt.Kind.FOLLOWUP, "Follow-up?", 2)
+        val calls = AtomicInteger()
+        val controller = WhisperSpeechController(
+            appContext = context,
+            recorderFactory = { _, _ -> FakeRecorder() },
+            modelInitializer = {},
+            transcriber = { _, _ ->
+                when (val index = calls.incrementAndGet()) {
+                    3 -> Result.success("  ")
+                    5 -> Result.failure(IllegalStateException("Scripted failure"))
+                    else -> Result.success("raw $index")
+                }
+            },
+        )
+        for (prompt in listOf(original, original, original, followup, followup, followup)) {
+            controller.startRecording(prompt)
+            waitUntil { controller.isCaptureActive.value }
+            controller.stopRecording()
+            waitUntil { !controller.isTranscribing.value }
+        }
+        val snapshot = SurveyFinalizationSnapshot(surveyId, mapOf("Q8" to original.text),
+            mapOf("Q8" to "Edited answer"), emptyMap(), emptyList(), "{}", emptyMap())
+        val finalizer = SurveyUploadFinalizer(context)
+        val pending = finalizer.finalize(snapshot, null, DeviceUploadTag("test"), "stamp")
+            as SurveyFinalizationResult.StagedPending
+        val root = Json.parseToJsonElement(pending.file.readText()).jsonObject
+        val refs = root.getValue("voice_files").jsonArray.map { it.jsonObject }
+        fun field(ref: kotlinx.serialization.json.JsonObject, key: String) = ref[key]?.jsonPrimitive?.content
+        val originals = refs.filter { field(it, "prompt_kind") == "original" }
+        val followups = refs.filter { field(it, "prompt_kind") == "followup" }
+        assertEquals(3, originals.size)
+        assertEquals(3, followups.size)
+        assertEquals(6, refs.map { field(it, "recording_id") }.toSet().size)
+        assertEquals(6, refs.map { field(it, "file") }.toSet().size)
+        assertTrue(originals.all { field(it, "prompt_text") == original.text })
+        assertTrue(followups.all { field(it, "prompt_text") == followup.text && field(it, "followup_position") == "2" })
+        assertEquals(setOf("raw 1", "raw 2", null), originals.map { field(it, "transcript") }.toSet())
+        assertEquals(setOf("raw 4", "raw 6", null), followups.map { field(it, "transcript") }.toSet())
+        assertEquals("empty", field(originals.single { it["transcript"] == null }, "transcription_status"))
+        assertEquals("failed", field(followups.single { it["transcript"] == null }, "transcription_status"))
+        val store = V2ArtifactStore(context)
+        assertTrue(refs.all { store.read(checkNotNull(field(it, "recording_id")))?.matchesPayload() == true })
     }
 
     @Test
@@ -71,18 +145,85 @@ class WhisperSpeechControllerLifecycleTest {
             transcriber = { _, _ -> Result.success("unused") }
         )
 
-        controller.startRecording()
+        val surveyId = newTimeOrderedSurveyId()
+        controller.startRecording(RecordingPrompt(surveyId, "Q8", RecordingPrompt.Kind.ORIGINAL, "Question?"))
         waitUntil { recorder.started }
         controller.stopRecording()
         waitUntil { recorder.stopEntered.isCompleted }
-        controller.startRecording()
+        controller.startFixtureRecording()
 
         assertFalse(controller.isRecording.value)
         assertEquals(1, recorder.startCalls)
         assertEquals(null, controller.errorMessage.value)
 
-        recorder.releaseStop.complete(Unit)
-        waitUntil { !recorder.isActive() }
+        val snapshot = SurveyFinalizationSnapshot(surveyId, emptyMap(), emptyMap(), emptyMap(), emptyList(), "{}", emptyMap())
+        val finalizer = SurveyUploadFinalizer(context)
+        try {
+            val blocked = finalizer.finalize(snapshot, null, DeviceUploadTag("test"), "stamp")
+            assertTrue(blocked is SurveyFinalizationResult.Failure && !blocked.staged)
+        } finally {
+            recorder.releaseStop.complete(Unit)
+        }
+        waitUntil { !controller.isTranscribing.value }
+        assertTrue(finalizer.finalize(snapshot, null, DeviceUploadTag("test"), "stamp") is SurveyFinalizationResult.StagedPending)
+    }
+
+    @Test
+    fun lateWhisperResultFromClearedControllerCannotBecomeTheReplacementTranscript() = runBlocking {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext.applicationContext
+        val oldId = newTimeOrderedSurveyId()
+        val newId = newTimeOrderedSurveyId()
+        val oldPrompt = RecordingPrompt(oldId, "Q8", RecordingPrompt.Kind.ORIGINAL, "Question?")
+        val oldEntered = CompletableDeferred<Unit>()
+        val releaseOld = CompletableDeferred<Unit>()
+        val whisperGate = WhisperSessionGate()
+        val old = WhisperSpeechController(
+            appContext = context,
+            recorderFactory = { _, _ -> FakeRecorder() },
+            recorderSessionMutex = Mutex(),
+            whisperSessionGate = whisperGate,
+            whisperDetacher = {},
+            modelInitializer = {},
+            transcriber = { _, _ ->
+                withContext(NonCancellable) {
+                    oldEntered.complete(Unit)
+                    releaseOld.await()
+                    Result.success("late old result")
+                }
+            },
+        )
+        val replacement = WhisperSpeechController(
+            appContext = context,
+            recorderFactory = { _, _ -> FakeRecorder() },
+            recorderSessionMutex = Mutex(),
+            whisperSessionGate = whisperGate,
+            modelInitializer = {},
+            transcriber = { _, _ -> Result.success("replacement result") },
+        )
+
+        old.startRecording(oldPrompt)
+        waitUntil { old.isCaptureActive.value }
+        old.stopRecording()
+        try {
+            withTimeout(5_000) { oldEntered.await() }
+            WhisperSpeechController::class.java.getDeclaredMethod("onCleared")
+                .apply { isAccessible = true }.invoke(old)
+            replacement.startRecording(oldPrompt.copy(surveyId = newId))
+            waitUntil { replacement.isCaptureActive.value }
+            replacement.stopRecording()
+        } finally {
+            releaseOld.complete(Unit)
+        }
+        waitUntil { !replacement.isTranscribing.value }
+        val store = V2ArtifactStore(context)
+        val recordings = SurveyRecordings(store)
+        val original = recordings.inventory(store.paths(context, oldId), V2ArtifactStore.profile).single()
+        val current = recordings.inventory(store.paths(context, newId), V2ArtifactStore.profile).single()
+        assertTrue(original.identity.id != current.identity.id)
+        assertEquals(TranscriptionOutcome.Status.INTERRUPTED, original.outcome.status)
+        assertEquals(null, original.outcome.transcript)
+        assertEquals("replacement result", current.outcome.transcript)
+        assertEquals("replacement result", replacement.partialText.value)
     }
 
     @Test
@@ -100,14 +241,14 @@ class WhisperSpeechControllerLifecycleTest {
             transcriber = { _, _ -> Result.success("recorded answer") }
         )
 
-        controller.updateContext("survey-old", "Q-old")
-        controller.startRecording()
+        val oldId = newTimeOrderedSurveyId()
+        val newId = newTimeOrderedSurveyId()
+        controller.startRecording(RecordingPrompt(oldId, "Q-old", RecordingPrompt.Kind.ORIGINAL, "Old?"))
         waitUntil { recorders.singleOrNull()?.started == true }
         controller.stopRecording()
         waitUntil { !controller.isTranscribing.value && controller.partialText.value == "recorded answer" }
 
-        controller.updateContext("survey-new", "Q-new")
-        controller.startRecording()
+        controller.startRecording(RecordingPrompt(newId, "Q-new", RecordingPrompt.Kind.ORIGINAL, "New?"))
         waitUntil { recorders.size == 2 && recorders[1].started }
 
         recorders[0].emitError(IllegalStateException("old recorder failed late"))
@@ -120,7 +261,7 @@ class WhisperSpeechControllerLifecycleTest {
         waitUntil { !controller.isTranscribing.value && controller.partialText.value == "recorded answer" }
 
         assertEquals(
-            listOf("survey-old" to "Q-old", "survey-new" to "Q-new"),
+            listOf(oldId to "Q-old", newId to "Q-new"),
             exports.map { it.surveyId to it.questionId }
         )
     }
@@ -137,14 +278,14 @@ class WhisperSpeechControllerLifecycleTest {
             recorderStopTimeoutMs = 50L
         )
 
-        controller.startRecording()
+        controller.startFixtureRecording()
         waitUntil { recorder.started }
         controller.stopRecording()
         waitUntil { recorder.stopEntered.isCompleted && recorder.closeEntered.isCompleted }
         withTimeout(5000) { controller.isTranscribing.first { !it } }
         assertTrue(hasActiveSession(controller))
 
-        controller.startRecording()
+        controller.startFixtureRecording()
 
         assertEquals(1, recorder.startCalls)
         assertFalse(controller.isRecording.value)
@@ -170,7 +311,7 @@ class WhisperSpeechControllerLifecycleTest {
             recorderStopTimeoutMs = 50L
         )
 
-        controller.startRecording()
+        controller.startFixtureRecording()
         waitUntil { timedOutRecorder.started }
         controller.stopRecording()
         waitUntil { timedOutRecorder.closeEntered.isCompleted }
@@ -180,7 +321,7 @@ class WhisperSpeechControllerLifecycleTest {
             timedOutRecorder.closeFinished.isCompleted && !hasActiveSession(controller)
         }
 
-        controller.startRecording()
+        controller.startFixtureRecording()
         waitUntil { replacementRecorder.started }
         controller.stopRecording()
         waitUntil {
@@ -207,11 +348,11 @@ class WhisperSpeechControllerLifecycleTest {
             modelInitializer = { initCalls++; initEntered.complete(Unit); finishInit.await() },
             transcriber = { _, language -> transcribed.complete(language); Result.success("answer") }
         )
-        controller.startRecording()
+        controller.startFixtureRecording()
         withTimeout(5000) { initEntered.await() }
         assertTrue(recorder.started)
         assertTrue(controller.isCaptureActive.value)
-        controller.startRecording()
+        controller.startFixtureRecording()
         assertEquals(1, recorder.startCalls)
         controller.stopRecording()
         withTimeout(5000) { recorder.stopEntered.await() }
@@ -236,13 +377,17 @@ class WhisperSpeechControllerLifecycleTest {
             modelInitializer = { initEntered.complete(Unit); finishInit.await(); error("init failed") },
             transcriber = { _, _ -> transcribed = true; Result.success("unused") }
         )
-        controller.startRecording()
+        val surveyId = newTimeOrderedSurveyId()
+        controller.startRecording(RecordingPrompt(surveyId, "Q8", RecordingPrompt.Kind.ORIGINAL, "Question?"))
         withTimeout(5000) { initEntered.await() }
         controller.stopRecording()
         withTimeout(5000) { exported.await() }
         finishInit.complete(Unit)
         withTimeout(5000) { controller.errorMessage.first { it == "init failed" } }
         assertFalse(transcribed)
+        val store = V2ArtifactStore(context)
+        assertEquals(TranscriptionOutcome.Status.FAILED,
+            SurveyRecordings(store).inventory(store.paths(context, surveyId), V2ArtifactStore.profile).single().outcome.status)
     }
 
     @Test
@@ -256,7 +401,7 @@ class WhisperSpeechControllerLifecycleTest {
             modelInitializer = {},
             transcriber = { _, _ -> transcribed.complete(Unit); Result.success("answer") }
         )
-        controller.startRecording()
+        controller.startFixtureRecording()
         controller.stopRecording()
         withTimeout(5000) { transcribed.await() }
         assertEquals(1, recorder.startCalls)
@@ -284,7 +429,7 @@ class WhisperSpeechControllerLifecycleTest {
                 withContext(NonCancellable) { allowInitToExit.await() }
             }
         )
-        controller.startRecording()
+        controller.startFixtureRecording()
         withTimeout(5000) { entered.await() }
         recorder.emitError(IllegalStateException("recorder failed"))
         assertFalse(released.isCompleted)
@@ -321,7 +466,7 @@ class WhisperSpeechControllerLifecycleTest {
                 withContext(NonCancellable) { allowOldExit.await() }
             }
         )
-        old.startRecording()
+        old.startFixtureRecording()
         withTimeout(5000) { oldEntered.await() }
         WhisperSpeechController::class.java.getDeclaredMethod("onCleared").apply { isAccessible = true }.invoke(old)
         withTimeout(5000) { oldRecorder.closed.await(); recorderGate.lock() }
@@ -336,7 +481,7 @@ class WhisperSpeechControllerLifecycleTest {
             modelInitializer = { assertTrue(oldReleased.isCompleted); newEntered.complete(Unit) },
             transcriber = { _, _ -> Result.success("answer") }
         )
-        replacement.startRecording()
+        replacement.startFixtureRecording()
         withTimeout(5000) { recorder.startedSignal.await() }
         assertFalse(newEntered.isCompleted)
         assertFalse(oldReleased.isCompleted)
@@ -357,7 +502,7 @@ class WhisperSpeechControllerLifecycleTest {
             modelInitializer = {},
             transcriber = { _, _ -> Result.success("answer") }
         )
-        controller.startRecording()
+        controller.startFixtureRecording()
         withTimeout(5000) { recorder.startedSignal.await() }
         assertTrue(controller.isRecording.value)
         assertFalse(controller.isCaptureActive.value)
@@ -389,7 +534,7 @@ class WhisperSpeechControllerLifecycleTest {
             modelInitializer = { initEntered.complete(Unit) },
             transcriber = { _, _ -> Result.success("answer") }
         )
-        replacement.startRecording()
+        replacement.startFixtureRecording()
         withTimeout(5000) { recorder.startedSignal.await() }
         assertFalse(initEntered.isCompleted)
         allowDetach.complete(Unit)
@@ -410,12 +555,12 @@ class WhisperSpeechControllerLifecycleTest {
             modelInitializer = {},
             transcriber = { _, _ -> Result.success("answer") }
         )
-        controller.startRecording()
+        controller.startFixtureRecording()
         withTimeout(5000) { recorder.started.await() }
         controller.stopRecording()
         withTimeout(5000) { controller.errorMessage.first { it == "Recorder cleanup failed; restart the app before recording again" } }
         withTimeout(5000) { controller.isTranscribing.first { !it } }
-        controller.startRecording()
+        controller.startFixtureRecording()
         assertEquals(1, recorder.closeCalls.get())
         assertTrue(hasActiveSession(controller))
         assertEquals("Recorder cleanup failed; restart the app before recording again", controller.errorMessage.value)
@@ -427,7 +572,7 @@ class WhisperSpeechControllerLifecycleTest {
             recorderSessionMutex = recorderGate,
             modelInitializer = {}
         )
-        replacement.startRecording()
+        replacement.startFixtureRecording()
         withTimeout(5000) { replacement.errorMessage.first { it?.contains("Previous recorder") == true } }
         assertFalse(replacementRecorder.started)
     }
@@ -442,7 +587,7 @@ class WhisperSpeechControllerLifecycleTest {
             modelInitializer = {},
             transcriber = { _, _ -> Result.success("answer") }
         )
-        controller.startRecording()
+        controller.startFixtureRecording()
         withTimeout(5000) { recorder.started.await() }
         controller.stopRecording()
         withTimeout(5000) { recorder.closeEntered.await() }
@@ -466,7 +611,7 @@ class WhisperSpeechControllerLifecycleTest {
             modelInitializer = {},
             transcriber = { _, _ -> Result.success("answer") }
         )
-        controller.startRecording()
+        controller.startFixtureRecording()
         withTimeout(5000) { recorder.started.await() }
         controller.stopRecording()
         withTimeout(5000) { recorder.closeEntered.await() }
@@ -485,7 +630,7 @@ class WhisperSpeechControllerLifecycleTest {
             modelInitializer = {},
             transcriber = { _, _ -> Result.success("next") }
         )
-        next.startRecording()
+        next.startFixtureRecording()
         withTimeout(5000) { nextRecorder.startedSignal.await() }
         next.stopRecording()
         withTimeout(5000) { next.partialText.first { it == "next" } }
@@ -511,7 +656,7 @@ class WhisperSpeechControllerLifecycleTest {
             modelInitializer = {},
             transcriber = { _, _ -> Result.success("first") }
         )
-        first.startRecording()
+        first.startFixtureRecording()
         withTimeout(5000) { firstRecorder.startedSignal.await() }
         first.stopRecording()
         withTimeout(5000) { first.errorMessage.first { it == "Speech recognition cleanup failed; restart required" } }
@@ -529,7 +674,7 @@ class WhisperSpeechControllerLifecycleTest {
             modelInitializer = { nextInitCalls++ },
             transcriber = { _, _ -> Result.success("unexpected") }
         )
-        next.startRecording()
+        next.startFixtureRecording()
         withTimeout(5000) { nextRecorder.startedSignal.await() }
         next.stopRecording()
         withTimeout(5000) { next.errorMessage.first { it?.contains("restart the app") == true } }
@@ -560,6 +705,9 @@ class WhisperSpeechControllerLifecycleTest {
             closeReturned.complete(Unit)
         }
     }
+
+    private fun WhisperSpeechController.startFixtureRecording() =
+        startRecording(RecordingPrompt(newTimeOrderedSurveyId(), "Q8", RecordingPrompt.Kind.ORIGINAL, "Fixture question?"))
 
     private suspend fun waitUntil(predicate: () -> Boolean) {
         repeat(100) {
@@ -607,9 +755,7 @@ class WhisperSpeechControllerLifecycleTest {
             stopEntered.complete(Unit)
             if (holdStop) releaseStop.await()
             started = false
-            FileOutputStream(requireNotNull(output)).use { stream ->
-                stream.write(ByteArray(64))
-            }
+            writeFixtureWav(requireNotNull(output))
         }
 
         override fun close() { closed.complete(Unit) }
@@ -630,9 +776,7 @@ class WhisperSpeechControllerLifecycleTest {
 
         override suspend fun stopRecording() {
             started = false
-            FileOutputStream(requireNotNull(output)).use { stream ->
-                stream.write(ByteArray(64))
-            }
+            writeFixtureWav(requireNotNull(output))
         }
 
         fun emitError(error: Exception) = onError(error)

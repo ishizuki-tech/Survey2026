@@ -6,6 +6,12 @@ import com.negi.survey.net.V2ArtifactStore.Profile
 import com.negi.survey.utils.DeviceUploadTag
 import com.negi.survey.utils.V2ArtifactPaths
 import com.negi.survey.utils.newTimeOrderedSurveyId
+import com.negi.survey.vm.RecordingPrompt
+import com.negi.survey.vm.HOME_FREE_TEXT_QID
+import kotlinx.serialization.json.Json
+import io.mockk.justRun
+import io.mockk.mockkObject
+import io.mockk.verify
 import java.io.File
 import java.io.IOException
 import java.time.Instant
@@ -94,10 +100,10 @@ class V2ArtifactStoreTest {
 
     @Test fun receiptAndCleanupAreIndependentAndRouteBound() {
         val store = V2ArtifactStore(temp.root)
-        val survey = survey(store, "survey")
         val voice = store.stage(
             "recording-1", Kind.VOICE, surveyId, profile, paths.voiceWav("Q8", "recording-1"), "{}",
         ) { it.write(byteArrayOf(1, 2, 3)) }
+        val survey = survey(store, "survey")
         assertFalse(voice.cleanup())
         assertTrue(voice.payload.exists())
         survey.recordReceipt()
@@ -105,6 +111,8 @@ class V2ArtifactStoreTest {
         assertTrue(voice.matchesPayload())
         assertFalse(voice.hasReceipt())
 
+        val interrupted = File(voice.directory, "${SurveyRecordings.OUTCOME_TEMP_PREFIX}test.part")
+        interrupted.writeText("interrupted transcription write")
         voice.recordReceipt()
         voice.payload.writeBytes(byteArrayOf(4, 5, 6))
         assertFalse(voice.cleanup())
@@ -113,6 +121,7 @@ class V2ArtifactStoreTest {
         assertTrue(voice.cleanup())
         assertTrue(checkNotNull(V2ArtifactStore(temp.root).read(voice.route.id)).hasReceipt())
         assertFalse(File(voice.directory, V2ArtifactStore.VOICE_METADATA).exists())
+        assertFalse(interrupted.exists())
     }
 
     @Test fun corruptRouteAndReceiptFailClosed() {
@@ -195,6 +204,117 @@ class V2ArtifactStoreTest {
         assertNull(data.getString(GitHubUploadWorker.KEY_TOKEN))
         assertEquals(V2ArtifactDelivery.workName(entry), V2ArtifactDelivery.workName(entry.copy()))
     }
+
+    @Test fun inventoryKeepsEveryCaptureAndItsOwnOutcomeAcrossReopen() {
+        val store = V2ArtifactStore(temp.root)
+        val original = RecordingPrompt(surveyId, "Q8", RecordingPrompt.Kind.ORIGINAL, "Original?")
+        val firstFollowup = RecordingPrompt(surveyId, "Q8", RecordingPrompt.Kind.FOLLOWUP, "Same text?", 1)
+        val secondFollowup = firstFollowup.copy(followupPosition = 2)
+        val note = RecordingPrompt(surveyId, HOME_FREE_TEXT_QID, RecordingPrompt.Kind.SURVEY_NOTE, "Survey Note")
+        val prompts = listOf(original, original, original, firstFollowup, firstFollowup, secondFollowup, note)
+        val results = listOf(
+            Result.success("  raw first  "), Result.success("raw second"), Result.success("   "),
+            Result.success("first follow-up answer"), Result.success("follow-up retake"),
+            Result.failure(IllegalStateException()), null,
+        )
+        val recordings = SurveyRecordings(store)
+        val staged = prompts.mapIndexed { index, prompt ->
+            val identity = RecordingIdentity("recording-$index", prompt)
+            val entry = voice(store, identity)
+            results[index]?.let { recordings.persistOutcome(entry, identity, TranscriptionOutcome.from(it)) }
+            identity to entry
+        }
+        val (first, firstEntry) = staged.first()
+        assertThrows(IllegalStateException::class.java) {
+            recordings.persistOutcome(firstEntry, staged[1].first, TranscriptionOutcome.from(Result.success("wrong ID")))
+        }
+        recordings.persistOutcome(firstEntry, first, TranscriptionOutcome.from(Result.success("late duplicate")))
+        assertEquals(7, staged.map { it.second.route.basename }.toSet().size)
+        assertTrue(staged.all { it.second.matchesPayload() })
+
+        val recovered = SurveyRecordings(V2ArtifactStore(temp.root)).inventory(paths, profile)
+        assertEquals(staged.map { it.first }, recovered.map { it.identity })
+        assertEquals(
+            results.map { it?.let(TranscriptionOutcome::from) ?: TranscriptionOutcome(TranscriptionOutcome.Status.INTERRUPTED) },
+            recovered.map { it.outcome },
+        )
+        assertEquals(3, recovered.count { it.identity.prompt == original })
+    }
+
+    @Test fun sealedWavSurvivesBeforePublishAndBeforeOutcomeWithoutResumingLiveSurvey() {
+        val store = V2ArtifactStore(temp.root)
+        val prompt = RecordingPrompt(surveyId, "Q8", RecordingPrompt.Kind.ORIGINAL, "Original?")
+        val identity = RecordingIdentity("prior-voice", prompt)
+        val entry = voice(store, identity)
+        val sealed = File(temp.root, ".stage-${identity.id}")
+        assertTrue(entry.directory.renameTo(sealed))
+        File(sealed, "${SurveyRecordings.OUTCOME_TEMP_PREFIX}test.part").writeText("partial outcome")
+        val reopened = V2ArtifactStore(temp.root)
+        val recordings = SurveyRecordings(reopened)
+        assertTrue(recordings.abandonedSurveyIds().isEmpty())
+        val restarted = V2ArtifactStore.newId()
+        assertEquals(setOf(surveyId), recordings.abandonedSurveyIds(restarted))
+        val recovered = recordings.inventory(paths, profile).single()
+        assertEquals(identity, recovered.identity)
+        assertEquals(TranscriptionOutcome.Status.INTERRUPTED, recovered.outcome.status)
+        survey(reopened, """{"survey_id":"$surveyId","voice_files":[{"file":"${recovered.file}"}]}""")
+        assertTrue(recordings.abandonedSurveyIds(restarted).isEmpty())
+        assertThrows(IllegalStateException::class.java) { voice(reopened, identity.copy(id = "late")) }
+    }
+
+    @Test fun recordingInventoryRejectsCorruptPromptOutcomePayloadAndRoute() {
+        val store = V2ArtifactStore(temp.root)
+        val identity = RecordingIdentity("voice", RecordingPrompt(surveyId, "Q8", RecordingPrompt.Kind.ORIGINAL, "Original?"))
+        val entry = voice(store, identity)
+        val recordings = SurveyRecordings(store)
+        recordings.persistOutcome(entry, identity, TranscriptionOutcome.from(Result.success("raw")))
+        listOf(
+            File(entry.directory, V2ArtifactStore.VOICE_METADATA),
+            File(entry.directory, SurveyRecordings.OUTCOME),
+            entry.payload,
+            File(entry.directory, "route"),
+        ).forEach { file ->
+            val original = file.readBytes()
+            file.appendText("corrupt")
+            assertThrows(IllegalStateException::class.java) { recordings.inventory(paths, profile) }
+            file.writeBytes(original)
+        }
+        assertEquals(identity, recordings.inventory(paths, profile).single().identity)
+    }
+
+    @Test fun corruptRecordingBlocksAbandonedRecoveryAndLogsOnlySafeContext() {
+        val store = V2ArtifactStore(temp.root)
+        val identity = RecordingIdentity("corrupt-voice",
+            RecordingPrompt(surveyId, "Q8", RecordingPrompt.Kind.ORIGINAL, "Original?"))
+        val entry = voice(store, identity)
+        voice(store, identity.copy(id = "valid-voice"))
+        val metadata = File(entry.directory, V2ArtifactStore.VOICE_METADATA)
+        val invalidJson = """{"recording_id":"corrupt-voice","prompt":"sensitive test marker"}"""
+        metadata.writeText(invalidJson)
+        File(entry.directory, SurveyRecordings.METADATA_CHECKSUM).writeText(V2ArtifactStore.stableId(invalidJson))
+        val processAfterRestart = V2ArtifactStore.newId()
+
+        mockkObject(RuntimeLogStore) {
+            justRun { RuntimeLogStore.w(any(), any(), any()) }
+            assertTrue(SurveyRecordings(store).abandonedSurveyIds(processAfterRestart).isEmpty())
+            verify(exactly = 1) {
+                RuntimeLogStore.w("SurveyRecordings",
+                    "Abandoned survey recovery blocked for survey=$surveyId artifact=corrupt-voice. " +
+                        "recording metadata could not be decoded.", null)
+            }
+            verify(exactly = 1) { RuntimeLogStore.w(any(), any(), any()) }
+        }
+
+        assertNull(store.read(surveyKey))
+        assertTrue(entry.matchesPayload())
+        assertEquals(invalidJson, metadata.readText())
+    }
+
+    private fun voice(store: V2ArtifactStore, identity: RecordingIdentity) =
+        store.stage(
+            identity.id, Kind.VOICE, surveyId, profile, paths.voiceWav(identity.prompt.questionId, identity.id),
+            Json.encodeToString(identity),
+        ) { it.write("immutable wav bytes".toByteArray()) }
 
     private fun survey(store: V2ArtifactStore, value: String) =
         store.stage(surveyKey, Kind.SURVEY, surveyId, profile, paths.surveyJson()) { it.write(value.toByteArray()) }

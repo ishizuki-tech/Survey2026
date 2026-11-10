@@ -9,6 +9,7 @@
 package com.negi.survey.net
 
 import com.negi.survey.utils.DeviceUploadTag
+import com.negi.survey.vm.RecordingPrompt
 import com.negi.survey.vm.SurveyCompletionStatus
 import com.negi.survey.vm.SurveyFinalizationSnapshot
 import com.negi.survey.vm.SurveyFinalizationState
@@ -40,6 +41,35 @@ class SurveyUploadFinalizerTest {
     @After
     fun tearDown() {
         directory.deleteRecursively()
+    }
+
+    @Test
+    fun finalizeWhileRecordingIsInFlightCanRetryAfterTheOwnerReleasesIt() = runBlocking {
+        val operations = FakeOperations(directory)
+        val finalizer = finalizer(operations)
+        val snapshot = snapshot()
+        val prompt = RecordingPrompt(snapshot.surveyId, "Q1", RecordingPrompt.Kind.ORIGINAL, "Question")
+        val recording = RecordingIdentity("active", prompt)
+        val stale = recording.copy(id = "stale")
+        assertTrue(SurveyRecordingGate.begin(recording))
+        try {
+            SurveyRecordingGate.end(stale)
+            val finish = finalizer.finalize(snapshot, null, tag(), STAMP)
+            val exit = finalizer.finalize(snapshot.copy(status = SurveyCompletionStatus.INCOMPLETE), null, tag(), STAMP)
+            assertTrue(finish is SurveyFinalizationResult.Failure && !finish.staged)
+            assertTrue(exit is SurveyFinalizationResult.Failure && !exit.staged)
+            assertEquals(0, operations.stageCalls.get())
+        } finally {
+            SurveyRecordingGate.end(recording)
+        }
+        assertTrue(SurveyRecordingGate.beginFinalization(snapshot.surveyId))
+        try {
+            assertFalse(SurveyRecordingGate.begin(recording))
+        } finally {
+            SurveyRecordingGate.endFinalization(snapshot.surveyId)
+        }
+        assertTrue(finalizer.finalize(snapshot, null, tag(), STAMP) is SurveyFinalizationResult.StagedPending)
+        assertEquals(1, operations.stageCalls.get())
     }
 
     @Test
@@ -549,11 +579,7 @@ class SurveyUploadFinalizerTest {
             return cleanupOutcome
         }
 
-        override suspend fun scheduleVoiceArtifacts(
-            config: GitHubUploader.GitHubConfig,
-            surveyId: String,
-            expectedVoiceFileNames: Set<String>
-        ) {
+        override suspend fun scheduleVoiceArtifacts(config: GitHubUploader.GitHubConfig) {
             events += "voice"
             voiceFailure?.let { throw it }
         }
