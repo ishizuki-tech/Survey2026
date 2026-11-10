@@ -12,6 +12,8 @@ import com.negi.survey.BuildConfig
 import com.negi.survey.vm.SurveyCompletionStatus
 import com.negi.survey.vm.SurveyFinalizationSnapshot
 import com.negi.survey.vm.SurveyViewModel
+import com.negi.survey.vm.RecordingPrompt
+import com.negi.survey.vm.AiViewModel
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.int
@@ -74,7 +76,14 @@ class SurveyExportJsonBuilderTest {
                     """{"Q11":{"score":95,"status":"ACHIEVED","reason":"Both missing points answered"}}""",
                 extraMeta = linkedMapOf("session_free_text" to "Farmer grows maize.")
             ),
-            exportedAt = "2026-09-22_11-37-48"
+            exportedAt = "2026-09-22_11-37-48",
+            recordings = listOf(SurveyRecording(
+                "Q11.wav",
+                RecordingIdentity("recording-1", RecordingPrompt(
+                    surveyId, "Q11", RecordingPrompt.Kind.FOLLOWUP, "What specific pests should the variety resist?", 1,
+                )),
+                TranscriptionOutcome.from(Result.success("  Raw Whisper text  ")),
+            )),
         )
 
         val root = Json.parseToJsonElement(output).jsonObject
@@ -130,13 +139,31 @@ class SurveyExportJsonBuilderTest {
         assertEquals("Q11.wav", voiceFile.getValue("file").jsonPrimitive.content)
         assertEquals(surveyId, voiceFile.getValue("survey_id").jsonPrimitive.content)
         assertEquals("Q11", voiceFile.getValue("question_id").jsonPrimitive.content)
-        assertEquals(
-            "Which pests should the variety resist?",
-            voiceFile.getValue("question").jsonPrimitive.content
+        assertEquals("followup", voiceFile.getValue("prompt_kind").jsonPrimitive.content)
+        assertEquals(1, voiceFile.getValue("followup_position").jsonPrimitive.int)
+        assertEquals("recording-1", voiceFile.getValue("recording_id").jsonPrimitive.content)
+        assertEquals("What specific pests should the variety resist?", voiceFile.getValue("prompt_text").jsonPrimitive.content)
+        assertEquals("success", voiceFile.getValue("transcription_status").jsonPrimitive.content)
+        assertEquals("  Raw Whisper text  ", voiceFile.getValue("transcript").jsonPrimitive.content)
+        assertEquals(null, voiceFile["answer"])
+    }
+
+    @Test fun recordingContextUsesThePendingPositionEvenWhenEarlierTextIsIdentical() {
+        val original = "Original?"
+        val pending = "Same follow-up?"
+        val followups = listOf(
+            SurveyViewModel.FollowupEntry(pending, "Submitted answer"),
+            SurveyViewModel.FollowupEntry(pending, null),
         )
-        assertEquals(
-            "Fall armyworm and maize stalk borer.",
-            voiceFile.getValue("answer").jsonPrimitive.content
-        )
+        val conversation = AiViewModel.ConversationState(AiViewModel.ComposerRole.FOLLOWUP, pending, "")
+        val captured = com.negi.survey.vm.aiRecordingPrompt("survey", "Q11", original, conversation, followups)
+        assertEquals(2, captured?.followupPosition)
+        assertEquals(pending, captured?.text)
+        val changed = conversation.copy(activePromptQuestion = "Another follow-up?")
+        assertEquals(null, com.negi.survey.vm.aiRecordingPrompt("survey", "Q11", original, changed, followups))
+        val main = conversation.copy(role = AiViewModel.ComposerRole.MAIN)
+        val capturedMain = com.negi.survey.vm.aiRecordingPrompt("survey", "Q11", original, main, followups)
+        assertEquals(RecordingPrompt.Kind.ORIGINAL, capturedMain?.kind)
+        assertEquals(original, capturedMain?.text)
     }
 }

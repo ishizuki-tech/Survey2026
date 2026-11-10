@@ -201,6 +201,8 @@ import com.negi.survey.vm.checkTtsOfflineVoice
 import com.negi.survey.vm.UploadStatusViewModel
 import com.negi.survey.vm.UploadStatus
 import com.negi.survey.vm.UploadStatusDetails
+import com.negi.survey.vm.HOME_FREE_TEXT_QID
+import com.negi.survey.vm.RecordingPrompt
 import com.negi.survey.vm.WhisperSpeechController
 import com.negi.survey.vm.toggleQuestionSpeaker
 import java.util.Locale
@@ -1328,7 +1330,6 @@ internal fun SurveyNavHost(
 
     val voiceEnabled = remember(whisperMeta.enabled) { whisperMeta.enabled ?: true }
     val latestNode by vmSurvey.currentNode.collectAsStateWithLifecycle()
-    val latestNodeId = latestNode.id
 
     /** The run UUID also scopes Q00 scroll restoration. */
     val surveyUuid by vmSurvey.surveyUuid.collectAsStateWithLifecycle()
@@ -1365,9 +1366,6 @@ internal fun SurveyNavHost(
             ?: DEFAULT_WHISPER_LANGUAGE
     }
 
-    /** Keep the latest node id without forcing ViewModel recreation. */
-    val latestNodeIdState = rememberUpdatedState(latestNodeId)
-
     val speechController: SpeechController = speechControllerOverride ?: if (voiceEnabled) {
         val factory = remember(appContext, assetPath, lang, vmSurvey) {
             WhisperSpeechController.provideFactory(
@@ -1375,29 +1373,13 @@ internal fun SurveyNavHost(
                 assetModelPath = assetPath,
                 languageCode = lang,
                 heavyRuntimeHandoff = heavyRuntimeHandoff,
-                onVoiceExported = onVoiceExported@{ voice ->
-                    val resolvedQid =
-                        voice.questionId?.takeIf { it.isNotBlank() } ?: latestNodeIdState.value
-
-                    if (resolvedQid.isBlank()) {
-                        Log.w(
-                            MainActivity.TAG,
-                            "onVoiceExported: missing questionId and fallback failed. file=${voice.fileName}"
-                        )
-                        return@onVoiceExported
-                    }
-
-                    Log.d(
-                        MainActivity.TAG,
-                        "onVoiceExported: q=$resolvedQid, file=${voice.fileName}, bytes=${voice.byteSize}, checksum=${voice.checksum}"
-                    )
-
-                    vmSurvey.onVoiceExported(
-                        questionId = resolvedQid,
+                onVoiceExported = { voice ->
+                    vmSurvey.addAudioRef(
+                        questionId = voice.questionId,
                         fileName = voice.fileName,
                         byteSize = voice.byteSize,
                         checksum = voice.checksum,
-                        replace = false
+                        expectedSurveyId = voice.surveyId,
                     )
                 }
             )
@@ -2731,7 +2713,10 @@ private fun HomeScreen(
 
         if (armCommit) {
             val settledUtterance = speechController.partialText.value.trim()
-            if (settledUtterance.isNotBlank()) {
+            val captured = speechController.recordingPrompt
+            val ownsNote = captured == null ||
+                (captured.kind == RecordingPrompt.Kind.SURVEY_NOTE && captured.surveyId == vmSurvey.surveyUuid.value)
+            if (ownsNote && settledUtterance.isNotBlank()) {
                 val merged = mergeFreeTextDraft(
                     existing = vmSurvey.runFreeText.value,
                     utterance = settledUtterance
@@ -2843,15 +2828,17 @@ private fun HomeScreen(
                     speechTranscribing = isTranscribing,
                     onToggleSpeech = if (speechEnabled) {
                         {
-                            // Route Home dictation under a dedicated pseudo question id.
-                            runCatching {
-                                speechController.updateContext(
-                                    surveyUuid,
-                                    HOME_FREE_TEXT_QID
-                                )
-                            }
-                            runCatching {
-                                toggleSpeechRecordingWithTtsInterlock(speechController, ttsController)
+                            if (speechController.isRecording.value) {
+                                speechController.stopRecording()
+                            } else {
+                                val promptText = text.ifBlank { title }
+                                if (promptText.isNotBlank()) {
+                                    val prompt = RecordingPrompt(
+                                        vmSurvey.surveyUuid.value, HOME_FREE_TEXT_QID,
+                                        RecordingPrompt.Kind.SURVEY_NOTE, promptText,
+                                    )
+                                    toggleSpeechRecordingWithTtsInterlock(speechController, ttsController, prompt)
+                                }
                             }
                         }
                     } else {
@@ -2873,9 +2860,6 @@ private fun HomeScreen(
         }
     }
 }
-
-/** Dedicated pseudo question id for Home screen free-text dictation context. */
-private const val HOME_FREE_TEXT_QID: String = "__home_free_text__"
 
 /** Survey Note fallback deadline for settling outside active transcription. */
 private const val HOME_ACTION_TIMEOUT_MS: Long = 8_000L

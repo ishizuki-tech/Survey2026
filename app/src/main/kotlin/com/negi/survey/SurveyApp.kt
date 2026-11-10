@@ -25,6 +25,7 @@ import androidx.work.Configuration
 import androidx.work.WorkManager
 import com.negi.survey.net.GitHubUploader
 import com.negi.survey.net.RuntimeLogStore
+import com.negi.survey.net.SurveyUploadFinalizer
 import com.negi.survey.net.SurveyUploadRescheduler
 import com.negi.survey.net.V2ArtifactDelivery
 import com.negi.survey.diagnostics.V2TraceArtifacts
@@ -396,8 +397,15 @@ class SurveyApp : Application(), Configuration.Provider {
                 cleanupConfirmedSurveys = { V2ArtifactDelivery.cleanupConfirmedSurveys(appCtx) },
                 logWarning = { message, exception -> RuntimeLogStore.w(TAG, message, exception) },
             )
+            try {
+                SurveyUploadFinalizer(appCtx).recoverAbandonedRecordings(appCtx)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                RuntimeLogStore.w(TAG, "Prior-process recording recovery failed", failure)
+            }
+            scheduleStartupSurveyRecoveryOnce(appCtx)
         }
-        scheduleStartupSurveyRecoveryOnce(appCtx)
 
         RuntimeLogStore.d(TAG, "bootTiming: onCreate total=${SystemClock.elapsedRealtime() - t0}ms")
     }

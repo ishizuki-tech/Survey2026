@@ -275,7 +275,7 @@ class Issue86IsolatedIntegrationTest {
             cleanupCalls++
             return SurveyUploadedArtifactCleanup.cleanup(surveyId, file, cleanupOps)
         }
-        override suspend fun scheduleVoiceArtifacts(config: GitHubUploader.GitHubConfig, surveyId: String, expectedVoiceFileNames: Set<String>) { enqueueCalls++ }
+        override suspend fun scheduleVoiceArtifacts(config: GitHubUploader.GitHubConfig) { enqueueCalls++ }
         override suspend fun scheduleLogArtifact(config: GitHubUploader.GitHubConfig, surveyId: String, exportedAtStamp: String) { enqueueCalls++ }
         override suspend fun scheduleDiagnosticTraceArtifacts(config: GitHubUploader.GitHubConfig, surveyId: String) { enqueueCalls++ }
     }

@@ -25,10 +25,13 @@ import com.negi.survey.utils.ExportUtils
 import com.negi.survey.utils.newTimeOrderedSurveyId
 import com.negi.survey.vm.SurveyFinalizationSnapshot
 import com.negi.survey.vm.SurveyViewModel
+import com.negi.survey.vm.RecordingPrompt
+import com.negi.survey.vm.HOME_FREE_TEXT_QID
 import java.io.File
 import java.io.IOException
 import java.time.Instant
 import java.util.zip.GZIPInputStream
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
@@ -47,19 +50,20 @@ class V2ExportIntegrationTest {
 
     @Test fun finalizerKeepsExactWavReferencesAndIndependentDelivery() = runBlocking {
         val surveyId = newTimeOrderedSurveyId(Instant.parse("2026-11-08T23:59:59.999Z").toEpochMilli())
-        val source = File.createTempFile("issue155-", ".wav", context.cacheDir).apply {
-            writeBytes(ByteArray(100) { it.toByte() })
-        }
+        val source = fixtureWav()
         try {
             val question = "Swali la é 漢字"
-            val first = ExportUtils.exportRecordedVoice(context, source, surveyId, question)
-            val second = ExportUtils.exportRecordedVoice(context, source, surveyId, question)
-            val unreferenced = ExportUtils.exportRecordedVoice(context, source, surveyId, question)
-            val recordings = store.artifactIds().mapNotNull(store::read)
-                .filter { it.route.kind == Kind.VOICE && it.route.surveyId == surveyId }
-                .associateBy { it.route.basename }
+            val prompt = RecordingPrompt(surveyId, question, RecordingPrompt.Kind.ORIGINAL, "Original?")
+            val voices = (1..3).map { index ->
+                val identity = RecordingIdentity(V2ArtifactStore.newId(), prompt)
+                ExportUtils.exportRecordedVoice(context, source, identity).also {
+                    SurveyRecordings(store).persistOutcome(it, identity, TranscriptionOutcome.from(Result.success("raw $index")))
+                }
+            }
+            val first = voices.first().payload
+            val second = voices[1].payload
             val cfg = GitHubUploader.GitHubConfig(V2ArtifactStore.OWNER, profile.repo, "synthetic-only", "main", "")
-            val candidate = recordings.getValue(first.name)
+            val candidate = voices.first()
             V2ArtifactDelivery.recoverIndependent(context, cfg)
             assertFalse(V2ArtifactDelivery.isEligible(context, candidate))
             assertTrue(WorkManager.getInstance(context).getWorkInfosForUniqueWork(V2ArtifactDelivery.workName(candidate))
@@ -72,7 +76,7 @@ class V2ExportIntegrationTest {
             assertTrue(early.exceptionOrNull() is IllegalStateException)
             assertNotEquals(first.name, second.name)
             assertArrayEquals(source.readBytes(), first.readBytes())
-            val snapshot = snapshot(surveyId, listOf(first, second), question)
+            val snapshot = snapshot(surveyId, questionId = question)
             val finalizer = SurveyUploadFinalizer(context)
             val tag = DeviceUploadTag("ignored_after_first_artifact")
             val result = finalizer.finalize(snapshot, null, tag, stamp) as SurveyFinalizationResult.StagedPending
@@ -85,15 +89,18 @@ class V2ExportIntegrationTest {
             assertEquals(stamp, root.getValue("exported_at").jsonPrimitive.content)
             val nested = root.getValue("answers").jsonObject.getValue(question).jsonObject.getValue("audio").jsonArray
             val top = root.getValue("voice_files").jsonArray
-            assertEquals(listOf(first.name, second.name), nested.map { it.jsonObject.getValue("file").jsonPrimitive.content })
-            assertEquals(listOf(first.name, second.name), top.map { it.jsonObject.getValue("file").jsonPrimitive.content })
+            val files = voices.map { it.route.basename }
+            assertEquals(files.sorted(), nested.map { it.jsonObject.getValue("file").jsonPrimitive.content }.sorted())
+            assertEquals(files.sorted(), top.map { it.jsonObject.getValue("file").jsonPrimitive.content }.sorted())
+            assertEquals(3, top.map { it.jsonObject.getValue("recording_id").jsonPrimitive.content }.toSet().size)
+            val byFile = top.associateBy { it.jsonObject.getValue("file").jsonPrimitive.content }
+            files.forEachIndexed { index, file ->
+                assertEquals("raw ${index + 1}", byFile.getValue(file).jsonObject.getValue("transcript").jsonPrimitive.content)
+            }
 
             val json = checkNotNull(store.read(V2ArtifactStore.surveyKey(surveyId)))
-            val voices = listOf(first, second).map { recordings.getValue(it.name) }
-            val held = recordings.getValue(unreferenced.name)
             assertEquals(question, top.first().jsonObject.getValue("question_id").jsonPrimitive.content)
             assertTrue(voices.all { V2ArtifactDelivery.isEligible(context, it) })
-            assertFalse(V2ArtifactDelivery.isEligible(context, held))
             assertTrue(voices.all { it.route.path.startsWith("2026-11-08/voice/") })
             assertEquals(json.route.basename.substringBefore("_survey_"), first.name.substringBefore("_voice_"))
             val remote = mutableMapOf<String, ByteArray>()
@@ -131,16 +138,12 @@ class V2ExportIntegrationTest {
             assertFalse(reopened.payload.exists())
             assertTrue(voices.all { it.matchesPayload() && !it.hasReceipt() })
             assertTrue(voices.all { V2ArtifactDelivery.isEligible(context, checkNotNull(V2ArtifactStore(context).read(it.route.id))) })
-            assertFalse(V2ArtifactDelivery.isEligible(context, held))
-            assertTrue(held.matchesPayload())
             V2ArtifactDelivery.recoverIndependent(context, cfg)
             val manager = WorkManager.getInstance(context)
             voices.forEach {
                 assertTrue(manager.getWorkInfosForUniqueWork(V2ArtifactDelivery.workName(it))
                     .get(5, TimeUnit.SECONDS).isNotEmpty())
             }
-            assertTrue(manager.getWorkInfosForUniqueWork(V2ArtifactDelivery.workName(held))
-                .get(5, TimeUnit.SECONDS).isEmpty())
             assertEquals(SurveyUploadExecutionAuthority.Owner.NONE, SurveyUploadExecutionAuthority(context).ownerFor(surveyId))
             val resubmitted = SurveyUploadWork.reconcile(context, cfg, surveyId, reopened.payload, v2Entry = reopened)
             assertEquals(SurveyUploadWork.SurveyWorkAction.SKIP_UPLOADED, resubmitted.decision.action)
@@ -149,10 +152,99 @@ class V2ExportIntegrationTest {
             V2ArtifactDelivery.deliver(context, voices.first(), cfg, transport = ::fakeTransport) {}
             assertTrue(voices.first().hasReceipt())
             assertFalse(voices.first().payload.exists())
-            assertTrue(voices.last().matchesPayload())
+            val held = voices.last()
+            assertTrue(runCatching {
+                V2ArtifactDelivery.deliver(context, held, cfg, transport = { _, _, _ ->
+                    throw IOException("simulated offline WAV")
+                }) {}
+            }.exceptionOrNull() is IOException)
+            assertTrue(held.matchesPayload())
+            assertFalse(held.hasReceipt())
+            assertTrue(V2ArtifactDelivery.confirmed(context, reopened))
             assertEquals(2, creates)
+            V2ArtifactDelivery.deliver(context, held, cfg, transport = ::fakeTransport) {}
+            assertTrue(held.hasReceipt())
+            assertFalse(held.payload.exists())
+            assertTrue(voices[1].matchesPayload())
+            assertFalse(voices[1].hasReceipt())
         } finally {
             source.delete()
+        }
+    }
+
+    @Test fun finalizationFailsExplicitlyAndCanRetryAfterInvalidMetadataIsRepaired() = runBlocking {
+        val surveyId = newTimeOrderedSurveyId()
+        val source = fixtureWav()
+        val identity = RecordingIdentity(V2ArtifactStore.newId(),
+            RecordingPrompt(surveyId, "Q8", RecordingPrompt.Kind.ORIGINAL, "Original?"))
+        val voice = try {
+            ExportUtils.exportRecordedVoice(context, source, identity)
+        } finally {
+            source.delete()
+        }
+        val sidecar = File(voice.directory, V2ArtifactStore.VOICE_METADATA)
+        val original = sidecar.readText()
+        sidecar.appendText("broken")
+        val finalizer = SurveyUploadFinalizer(context)
+        val result = finalizer.finalize(snapshot(surveyId), null, DeviceUploadTag("test"), stamp)
+        assertTrue(result is SurveyFinalizationResult.Failure && !result.staged)
+        assertNull(store.read(V2ArtifactStore.surveyKey(surveyId)))
+        assertTrue(voice.matchesPayload())
+        sidecar.writeText(original)
+        assertTrue(finalizer.finalize(snapshot(surveyId), null, DeviceUploadTag("test"), stamp)
+            is SurveyFinalizationResult.StagedPending)
+    }
+
+    @Test fun recordingsRestart_writeLiveWavWithoutSurveyJson() = runBlocking {
+        val surveyId = newTimeOrderedSurveyId()
+        val source = fixtureWav()
+        val identity = RecordingIdentity(V2ArtifactStore.newId(),
+            RecordingPrompt(surveyId, HOME_FREE_TEXT_QID, RecordingPrompt.Kind.SURVEY_NOTE, "Add general notes."))
+        val voice = try {
+            ExportUtils.exportRecordedVoice(context, source, identity)
+        } finally {
+            source.delete()
+        }
+        SurveyUploadFinalizer(context).recoverAbandonedRecordings(context)
+        assertNull(store.read(V2ArtifactStore.surveyKey(surveyId)))
+        File(context.noBackupFilesDir, "issue138-restart").writeText(
+            "${Process.myPid()}\n$surveyId\n${voice.route.id}\n${voice.route.fingerprint}",
+        )
+        if (InstrumentationRegistry.getArguments().getString("holdForForceStop") == "true") {
+            awaitCancellation()
+        }
+    }
+
+    @Test fun recordingsRestart_readIncompleteSurveyCreatedByStartup() = runBlocking {
+        val (pid, surveyId, recordingId, fingerprint) = File(context.noBackupFilesDir, "issue138-restart").readLines()
+        assertNotEquals(pid.toInt(), Process.myPid())
+        val survey = withTimeout(10_000) {
+            var entry = store.read(V2ArtifactStore.surveyKey(surveyId))
+            while (entry == null) {
+                delay(25)
+                entry = store.read(V2ArtifactStore.surveyKey(surveyId))
+            }
+            entry
+        }
+        val root = Json.parseToJsonElement(survey.payload.readText()).jsonObject
+        val voice = checkNotNull(store.read(recordingId))
+        val ref = root.getValue("voice_files").jsonArray.single().jsonObject
+        assertEquals("incomplete", root.getValue("status").jsonPrimitive.content)
+        assertEquals("survey_note", ref.getValue("prompt_kind").jsonPrimitive.content)
+        assertEquals("Add general notes.", ref.getValue("prompt_text").jsonPrimitive.content)
+        assertEquals("interrupted", ref.getValue("transcription_status").jsonPrimitive.content)
+        assertNull(ref["transcript"])
+        assertEquals(recordingId, ref.getValue("recording_id").jsonPrimitive.content)
+        assertEquals(fingerprint, voice.route.fingerprint)
+        assertTrue(voice.matchesPayload())
+        assertTrue(V2ArtifactDelivery.isEligible(context, voice))
+        SurveyUploadFinalizer(context).recoverAbandonedRecordings(context)
+        assertEquals(survey.routeFingerprint, store.read(survey.route.id)?.routeFingerprint)
+    }
+
+    private fun fixtureWav(): File = File.createTempFile("issue138-", ".wav", context.cacheDir).apply {
+        InstrumentationRegistry.getInstrumentation().context.assets.open("whisper/jfk.wav").use { input ->
+            outputStream().use { input.copyTo(it) }
         }
     }
 
