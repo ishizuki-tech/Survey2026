@@ -590,7 +590,7 @@ class AiScreenInteractionTest {
         assertTrue(oneLineHeight >= (48 * density).toInt())
         if (!largeText) {
             assertEquals(48f, oneLineHeight / density, 1f)
-            assertEquals(56f, oneLineRowHeight / density, 1f)
+            assertEquals(52f, oneLineRowHeight / density, 1f)
             captureFieldUi("compact-editor-single")
         }
 

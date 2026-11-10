@@ -24,6 +24,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.layout.offset
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.ExpandLess
@@ -120,13 +121,16 @@ internal fun FieldMessage(
         }
     } else {
         Surface(
-            modifier = Modifier.fillMaxWidth(0.88f).wrapContentWidth(Alignment.End).widthIn(max = 480.dp),
+            modifier = Modifier
+                .padding(top = 4.dp)
+                .fillMaxWidth(0.88f)
+                .wrapContentWidth(Alignment.End).widthIn(max = 480.dp),
             color = lerp(colors.primaryContainer, colors.surface, 0.40f),
             contentColor = colors.onPrimaryContainer,
             shape = RoundedCornerShape(18.dp, 18.dp, 5.dp, 18.dp)
         ) {
             Text(
-                text, Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
+                text, Modifier.padding(horizontal = 9.dp, vertical = 4.dp),
                 style = MaterialTheme.typography.bodyMedium,
                 lineHeight = 21.sp
             )
@@ -158,9 +162,9 @@ internal fun FieldProcessingRow(reviewing: Boolean, visible: Boolean) {
         verticalAlignment = Alignment.CenterVertically
     ) {
         Canvas(
-            Modifier.size(42.dp).background(
+            Modifier.size(32.dp).background(
                 if (reviewing) colors.tertiaryContainer else Color(0xFF12452F),
-                RoundedCornerShape(11.dp)
+                RoundedCornerShape(7.dp)
             )
         ) {
             val cycle = phase?.value ?: 0f
@@ -282,8 +286,9 @@ internal fun FieldEvaluationDetails(reviewed: Boolean, raw: String, snack: Snack
                         expanded = !expanded
                         rawExpanded = false
                     }
-                    .padding(horizontal = 6.dp, vertical = 2.dp),
-                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    .padding(horizontal = 4.dp, vertical = 1.dp)
+                    .offset(y = (-6).dp),
+                horizontalArrangement = Arrangement.spacedBy(3.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Icon(

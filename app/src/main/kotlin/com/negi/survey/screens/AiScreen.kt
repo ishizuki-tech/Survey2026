@@ -102,6 +102,7 @@ import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyLayoutScrollScope
 import androidx.compose.foundation.lazy.LazyListLayoutInfo
@@ -194,6 +195,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
@@ -1755,9 +1757,19 @@ internal fun AiConversation(
             val isActive = isQuestion && item.id == visualActiveQuestionId
             val isHistorical = isQuestion && !isActive && muteHistory
             androidx.compose.foundation.layout.Row(
-                modifier = Modifier.fillMaxWidth().testTag(item.id)
-                    .padding(top = if (isActive) 2.dp else 0.dp),
-                horizontalArrangement = if (!isAi || isEvaluationStatus) Arrangement.End else Arrangement.Start
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag(item.id)
+                    .padding(top = if (isActive) 1.dp else 0.dp)
+                    .offset(
+                        y = if (isActive && isQuestion && item.id != rootId) {
+                            (-16).dp
+                        } else {
+                            0.dp
+                        }
+                    ),
+                horizontalArrangement = if (!isAi || isEvaluationStatus)
+                    Arrangement.End else Arrangement.Start
             ) {
                 when {
                     item.evaluation == AiViewModel.EvaluationPresentation.REVIEWING ||
@@ -1966,7 +1978,7 @@ private fun AnswerModeOption(
                     if (selected) colors.secondaryContainer else Color.Transparent,
                     CircleShape
                 )
-                .padding(horizontal = 10.dp, vertical = 6.dp),
+                .padding(horizontal = 10.dp, vertical = 3.dp),
             horizontalArrangement = Arrangement.spacedBy(4.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
@@ -2002,7 +2014,7 @@ private fun ChatComposer(
             modifier = Modifier
                 .fillMaxWidth()
                 .testTag("ai-answer-field")
-                .shadow(elevation = 8.dp, shape = CircleShape, clip = false)
+                .shadow(elevation = 8.dp, shape = RoundedCornerShape(18.dp), clip = false)
                 .background(
                     brush = Brush.linearGradient(
                         listOf(
@@ -2010,10 +2022,10 @@ private fun ChatComposer(
                             cs.surface.copy(alpha = 0.65f)
                         )
                     ),
-                    shape = CircleShape
+                    shape = RoundedCornerShape(18.dp)
                 )
-                .neutralEdge(alpha = 0.14f, corner = 999.dp, stroke = 1.dp)
-                .padding(start = 12.dp, end = 6.dp, top = 4.dp, bottom = 4.dp),
+                .neutralEdge(alpha = 0.14f, corner = 18.dp, stroke = 1.dp)
+                .padding(start = 12.dp, end = 6.dp, top = 2.dp, bottom = 2.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             val interactionSource = remember { MutableInteractionSource() }
@@ -2046,7 +2058,10 @@ private fun ChatComposer(
                         .defaultMinSize(minHeight = 48.dp),
                     // Keep the input session alive while Send and draft changes are gated.
                     enabled = textFieldEnabled,
-                    textStyle = MaterialTheme.typography.bodyMedium.copy(color = textColor),
+                    textStyle = MaterialTheme.typography.bodyMedium.copy(
+                        fontSize = 16.sp,
+                        color = textColor
+                    ),
                     keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
                     keyboardActions = KeyboardActions(onSend = { onSend() }),
                     minLines = 1,
@@ -2061,9 +2076,19 @@ private fun ChatComposer(
                             singleLine = false,
                             visualTransformation = VisualTransformation.None,
                             interactionSource = interactionSource,
-                            placeholder = { Text(if (enabled) "Type your answer…" else "Answer input inactive") },
+                            placeholder = {
+                                Text(
+                                    text = if (enabled) "Type your answer…" else "Answer input inactive",
+                                    style = MaterialTheme.typography.bodyMedium.copy(fontSize = 12.sp)
+                                )
+                            },
                             colors = colors,
-                            contentPadding = OutlinedTextFieldDefaults.contentPadding(top = 6.dp, bottom = 4.dp)
+                            contentPadding = OutlinedTextFieldDefaults.contentPadding(
+                                start = 8.dp,
+                                end = 8.dp,
+                                top = 7.dp,
+                                bottom = 3.dp
+                            )
                         )
                     }
                 )
@@ -2072,11 +2097,13 @@ private fun ChatComposer(
             SurveyActionButton(
                 onClick = onSend,
                 modifier = sendModifier,
-                enabled = enabled && value.text.isNotBlank()
+                enabled = enabled && value.text.isNotBlank(),
+                compactIcon = true
             ) {
                 Icon(
                     imageVector = Icons.AutoMirrored.Outlined.Send,
-                    contentDescription = "Send"
+                    contentDescription = "Send",
+                    modifier = Modifier.size(20.dp)
                 )
             }
         }
