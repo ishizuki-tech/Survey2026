@@ -1,0 +1,12 @@
+{
+  "original_branch": "codex/issue-138-recording-integrity",
+  "branch_slug": "codex-issue-138-recording-integrity",
+  "commit_sha": "8e6a3f24361f4235f2b25dfba27d6d37365e6391",
+  "short_sha": "8e6a3f2",
+  "apk_name": "Survey2026-codex-issue-138-recording-integrity-8e6a3f2.apk",
+  "apk_sha256": "7a144b3b162374ba3dde568e20af2774ff3fa2dab1164a2295daba346dd1c3d3",
+  "apk_download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-codex-issue-138-recording-integrity-8e6a3f2-run-215/Survey2026-codex-issue-138-recording-integrity-8e6a3f2.apk",
+  "page_url": "https://ishizuki-tech.github.io/Survey2026/codex-issue-138-recording-integrity/",
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/42744490199",
+  "generated_utc": "2026-11-10T02:49:08Z"
+}
