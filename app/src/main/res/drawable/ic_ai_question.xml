@@ -1,0 +1,23 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <!-- Conversation bubble -->
+    <path
+        android:pathData="M5,6 H13 A2.5,2.5 0,0 1,15.5 8.5 V13 A2.5,2.5 0,0 1,13 15.5 H8 L4.5,18 V15.5 A2.5,2.5 0,0 1,2.5 13 V8.5 A2.5,2.5 0,0 1,5 6 Z"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeLineJoin="round"
+        android:strokeWidth="1.5" />
+    <!-- Three dots and a sparkle -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M6,10.8 m-0.85,0 a0.85,0.85 0,1 0,1.7 0 a0.85,0.85 0,1 0,-1.7 0 M9,10.8 m-0.85,0 a0.85,0.85 0,1 0,1.7 0 a0.85,0.85 0,1 0,-1.7 0 M12,10.8 m-0.85,0 a0.85,0.85 0,1 0,1.7 0 a0.85,0.85 0,1 0,-1.7 0 M19,2 L19.85,4.15 22,5 19.85,5.85 19,8 18.15,5.85 16,5 18.15,4.15 Z" />
+    <!-- Follow-up arrow -->
+    <path
+        android:pathData="M12,19 H21 M18.5,16.5 L21,19 18.5,21.5"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:strokeWidth="1.5" />
+</vector>

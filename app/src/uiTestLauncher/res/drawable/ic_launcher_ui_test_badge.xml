@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Keep the badge inside the adaptive icon's circular safe area. -->
+    <path
+        android:fillColor="#15243C"
+        android:pathData="M49,68 H77 Q79,68 79,70 V75 Q79,77 77,77 H49 Q47,77 47,75 V70 Q47,68 49,68 Z" />
+    <!-- UI TEST, drawn as small block letters to avoid font-dependent rendering. -->
+    <path
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="0.95"
+        android:pathData="M50,70.5 V74.5 H52.5 V70.5 M55,70.5 V74.5 M58.5,70.5 H61.5 M60,70.5 V74.5 M66,70.5 H63.5 V74.5 H66 M63.5,72.5 H65.5 M70.5,70.5 H68 V72.5 H70.5 V74.5 H68 M72.5,70.5 H75.5 M74,70.5 V74.5" />
+</vector>

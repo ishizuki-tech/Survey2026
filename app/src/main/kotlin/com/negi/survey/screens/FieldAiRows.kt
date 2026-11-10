@@ -48,20 +48,23 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.platform.ClipEntry
 import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.currentStateAsState
+import com.negi.survey.R
 import com.negi.survey.vm.AiTurnOutcome
 import com.negi.survey.vm.parseStrictModelJsonObject
 import kotlin.math.PI
@@ -72,38 +75,60 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.intOrNull
 
 @Composable
-internal fun FieldMessage(text: String, isAi: Boolean, typing: Boolean) {
+internal fun FieldMessage(
+    text: String,
+    isAi: Boolean,
+    typing: Boolean,
+    active: Boolean,
+    historical: Boolean
+) {
     val colors = MaterialTheme.colorScheme
     if (isAi) {
         Row(
-            modifier = Modifier.widthIn(max = 540.dp).padding(vertical = 6.dp),
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            modifier = Modifier.widthIn(max = 560.dp).padding(vertical = if (historical) 0.dp else 1.dp).then(
+                when {
+                    active -> Modifier.testTag("Active AI question")
+                    historical -> Modifier.testTag("Historical AI question")
+                    else -> Modifier
+                }
+            ),
+            horizontalArrangement = Arrangement.spacedBy(5.dp),
             verticalAlignment = Alignment.Top
         ) {
             Box(
-                Modifier.size(30.dp).background(colors.primary, CircleShape),
+                Modifier.size(32.dp).background(
+                    if (historical) lerp(colors.primary, colors.primaryContainer, 0.58f) else colors.primary,
+                    CircleShape
+                )
+                    .testTag("AI question avatar"),
                 contentAlignment = Alignment.Center
             ) {
-                Text("AI", style = MaterialTheme.typography.labelSmall, color = colors.onPrimary)
+                Icon(
+                    painter = painterResource(R.drawable.ic_ai_question),
+                    contentDescription = null,
+                    tint = if (historical) colors.onPrimaryContainer else colors.onPrimary,
+                    modifier = Modifier.size(24.dp)
+                )
             }
             Text(
                 text = if (typing && text.isBlank()) "…" else text,
-                style = MaterialTheme.typography.bodyLarge,
-                fontWeight = FontWeight.Medium,
-                color = colors.onSurface,
-                modifier = Modifier.padding(top = 3.dp).testTag("AI message")
+                style = MaterialTheme.typography.bodyMedium,
+                color = if (historical) lerp(colors.onSurfaceVariant, colors.surface, 0.08f) else colors.onSurface,
+                lineHeight = if (historical) 21.sp else 22.sp,
+                modifier = Modifier.padding(top = if (historical) 3.dp else 4.dp).testTag("AI message")
             )
         }
     } else {
         Surface(
             modifier = Modifier.fillMaxWidth(0.88f).wrapContentWidth(Alignment.End).widthIn(max = 480.dp),
-            color = colors.primaryContainer,
+            color = lerp(colors.primaryContainer, colors.surface, 0.40f),
             contentColor = colors.onPrimaryContainer,
             shape = RoundedCornerShape(18.dp, 18.dp, 5.dp, 18.dp)
         ) {
             Text(
-                text, Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
-                style = MaterialTheme.typography.bodyLarge
+                text, Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
+                style = MaterialTheme.typography.bodyMedium,
+                lineHeight = 21.sp
             )
         }
     }
@@ -244,33 +269,37 @@ internal fun FieldEvaluationDetails(reviewed: Boolean, raw: String, snack: Snack
     val heading = if (reviewed) "Answer reviewed" else "Evaluation details"
     Surface(
         modifier = Modifier.widthIn(max = 520.dp),
-        color = colors.surfaceContainer,
-        contentColor = colors.onSurface,
+        color = if (expanded) colors.surfaceContainer else Color.Transparent,
+        contentColor = colors.onSurfaceVariant,
         shape = RoundedCornerShape(12.dp)
     ) {
         Column {
             Row(
-                modifier = Modifier.fillMaxWidth()
+                modifier = Modifier.align(Alignment.End)
                     .heightIn(min = 48.dp)
                     .semantics { stateDescription = if (expanded) "Expanded" else "Collapsed" }
                     .clickable(role = Role.Button, onClickLabel = if (expanded) "Hide details" else "View details") {
                         expanded = !expanded
                         rawExpanded = false
                     }
-                    .padding(horizontal = 10.dp, vertical = 8.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    .padding(horizontal = 6.dp, vertical = 2.dp),
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Icon(
                     if (reviewed) Icons.Filled.Check else Icons.Outlined.Info, contentDescription = null,
-                    modifier = Modifier.size(18.dp), tint = if (reviewed) colors.primary else colors.onSurfaceVariant
+                    modifier = Modifier.size(14.dp)
                 )
                 Text(
                     heading + if (expanded) " · Hide details" else " · View details",
-                    modifier = Modifier.weight(1f),
-                    style = MaterialTheme.typography.labelLarge
+                    modifier = Modifier.weight(1f, fill = false),
+                    style = MaterialTheme.typography.labelMedium
                 )
-                Icon(if (expanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore, contentDescription = null)
+                Icon(
+                    if (expanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
+                    contentDescription = null,
+                    modifier = Modifier.size(16.dp)
+                )
             }
             if (expanded) {
                 val result = remember(raw) { parseStrictModelJsonObject(raw) }
