@@ -34,6 +34,7 @@ import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.test.SemanticsNodeInteraction
@@ -2467,10 +2468,34 @@ class AiScreenInteractionTest {
         }
     }
 
+    @Test fun closedInputShowsSpeechErrorDuringCleanupAndAfterTranscriptionEnds() {
+        host(twoStep = true) { setAiReason("Q8", SurveyAiReason.ACHIEVED) }
+        assertClosedComposer()
+        val error = rule.onNodeWithText("Whisper failed")
+        val status = rule.onNodeWithText("Transcribing…")
+
+        rule.runOnIdle {
+            speech.transitionToTranscribing()
+            speech.errorMessage.value = "Whisper failed"
+        }
+        status.assertIsDisplayed()
+        rule.onAllNodesWithText("Transcribing…", useUnmergedTree = true).assertCountEquals(1)
+        error.assertIsDisplayed()
+
+        rule.runOnIdle { speech.finish("") }
+        status.assertDoesNotExist()
+        error.assertIsDisplayed()
+        assertClosedComposer()
+    }
+
     @Test fun stopAndBackAreGuardedUntilControllerReportsTransition() {
         host()
+        val status = rule.onNodeWithText("Transcribing…")
+        val details = rule.onNodeWithText("Converting speech to text")
+        status.assertDoesNotExist()
         rule.onNodeWithContentDescription("Record answer").performClick()
         rule.onNode(hasText("Starting microphone…") and hasAnyAncestor(isDialog())).assertIsDisplayed()
+        rule.onNode(hasText("Question") and hasAnyAncestor(isDialog())).assertIsDisplayed()
         rule.onNodeWithContentDescription("Send").assertDoesNotExist()
         rule.onNodeWithText("Type").assertIsNotEnabled()
         rule.onNodeWithText("Speak").assertIsSelected().assertIsNotEnabled()
@@ -2480,13 +2505,28 @@ class AiScreenInteractionTest {
         rule.onNodeWithText("Stop").performClick()
         rule.onNodeWithText("Stop").assertIsNotEnabled()
         InstrumentationRegistry.getInstrumentation().sendKeyDownUpSync(KeyEvent.KEYCODE_BACK)
-        rule.runOnIdle { assertEquals(1, speech.stopCalls); speech.transitionToTranscribing() }
-        rule.onNodeWithText("Stop").assertDoesNotExist()
-        rule.onNodeWithText("Transcribing…").assertExists()
+        captureProcessing("transcribing-transition") {
+            rule.runOnIdle { assertEquals(1, speech.stopCalls); speech.transitionToTranscribing() }
+        }
+        rule.onNode(isDialog()).assertDoesNotExist()
+        rule.onNodeWithText("Question").assertIsDisplayed()
+        rule.onAllNodesWithText("Transcribing…", useUnmergedTree = true).assertCountEquals(1)
+        status.assertIsDisplayed()
+            .assert(SemanticsMatcher.expectValue(SemanticsProperties.LiveRegion, LiveRegionMode.Polite))
+            .assert(!hasClickAction())
+        details.assertIsDisplayed()
+        rule.onNodeWithContentDescription("Record answer").assertDoesNotExist()
+        rule.onNodeWithText("Tap to answer").assertDoesNotExist()
+        rule.onNodeWithText("Record again").assertDoesNotExist()
         rule.onNodeWithText("Type").assertIsNotEnabled()
         rule.onNodeWithText("Speak").assertIsSelected().assertIsNotEnabled()
         rule.onNodeWithContentDescription("Send").assertDoesNotExist()
+        captureFieldUi("transcribing")
         rule.runOnIdle { speech.finish("first") }
+        status.assertDoesNotExist()
+        details.assertDoesNotExist()
+        rule.onNodeWithText("first").assertIsDisplayed()
+        rule.runOnIdle { assertEquals("first", survey.getAnswer("Q8")) }
         rule.onNodeWithText("Type").assertIsEnabled()
         rule.onNodeWithText("Record again").performScrollTo().performClick()
         rule.onNodeWithText("0:00").assertExists()
