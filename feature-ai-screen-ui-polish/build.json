@@ -1,12 +1,12 @@
 {
   "original_branch": "feature/ai-screen-ui-polish",
   "branch_slug": "feature-ai-screen-ui-polish",
-  "commit_sha": "42d91322649c9f79eaa408f988f595bfacb5a36d",
-  "short_sha": "42d9132",
-  "apk_name": "Survey2026-feature-ai-screen-ui-polish-42d9132.apk",
-  "apk_sha256": "4eaba9e097233069abbe083a96872623fa5909b3b9402982cdbb338df6f738d7",
-  "apk_download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-feature-ai-screen-ui-polish-42d9132-run-217/Survey2026-feature-ai-screen-ui-polish-42d9132.apk",
+  "commit_sha": "5efd45facd90bb51e4f9e5204baa41339e984b35",
+  "short_sha": "5efd45f",
+  "apk_name": "Survey2026-feature-ai-screen-ui-polish-5efd45f.apk",
+  "apk_sha256": "25170afde6b1c10cba9cad4e645dc818c04930546a76100a8c3d0d9976ec81f8",
+  "apk_download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-feature-ai-screen-ui-polish-5efd45f-run-218/Survey2026-feature-ai-screen-ui-polish-5efd45f.apk",
   "page_url": "https://ishizuki-tech.github.io/Survey2026/feature-ai-screen-ui-polish/",
-  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/42886351232",
-  "generated_utc": "2026-11-10T19:41:07Z"
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/42903996624",
+  "generated_utc": "2026-11-10T21:28:02Z"
 }
