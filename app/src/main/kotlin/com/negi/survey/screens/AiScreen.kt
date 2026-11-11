@@ -102,7 +102,6 @@ import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.windowInsetsPadding
-import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyLayoutScrollScope
 import androidx.compose.foundation.lazy.LazyListLayoutInfo
@@ -1130,8 +1129,8 @@ fun AiScreen(
         ) {
             // Reserve space for the question as well as the scrollable composer when the
             // keyboard leaves a short viewport. Include the gap between the two regions.
-            val conversationGap = 6.dp
             val showModeSelector = !inputClosed && speechController != null
+            val conversationGap = if (showModeSelector) 2.dp else 6.dp
             // Below this height, let the selector scroll with the footer so the
             // selector, editor and conversation can each remain reachable.
             val pinModeSelector = speechController != null && maxHeight >= 180.dp
@@ -1193,6 +1192,8 @@ fun AiScreen(
                         visualActiveQuestionId = activeQuestionId,
                         muteAnsweredQuestions = !awaitingAnswer ||
                             (conv.role == AiViewModel.ComposerRole.MAIN && nid in submittedOriginals),
+                        hasOriginalAnswer = nid in submittedOriginals ||
+                            (followups.isNotEmpty() && !vmSurvey.getAnswer(nid).isNullOrBlank()),
                         snack = snack,
                         modifier = Modifier.weight(1f).fillMaxWidth().padding(horizontal = 10.dp)
                     )
@@ -1200,8 +1201,8 @@ fun AiScreen(
 
                 Surface(
                     color = MaterialTheme.colorScheme.surface.copy(alpha = 0.92f),
-                    tonalElevation = 4.dp,
-                    shadowElevation = 8.dp,
+                    tonalElevation = 2.dp,
+                    shadowElevation = 4.dp,
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(horizontal = 16.dp)
@@ -1213,7 +1214,7 @@ fun AiScreen(
                         modifier = Modifier
                             .fillMaxWidth()
                             .then(if (pinModeSelector) Modifier else Modifier.verticalScroll(footerScrollState))
-                            .padding(top = if (showModeSelector) 2.dp else 6.dp)
+                            .padding(top = if (showModeSelector) 0.dp else 4.dp)
                     ) {
                         if (showModeSelector) {
                             Row(
@@ -1319,7 +1320,7 @@ fun AiScreen(
                                             onSend = onSendAnswer,
                                             enabled = composerEnabled,
                                             textFieldEnabled = textFieldEnabled,
-                                            topPadding = if (showModeSelector) 2.dp else 6.dp,
+                                            topPadding = if (showModeSelector) 0.dp else 6.dp,
                                             sendModifier = Modifier.bringIntoViewRequester(sendButtonRequester),
                                             editorModifier = Modifier
                                                 .focusRequester(focusRequester)
@@ -1588,14 +1589,18 @@ internal fun AiConversation(
     fieldEvaluation: Boolean = false,
     fallbackOutcome: AiTurnOutcome? = null,
     visualActiveQuestionId: String? = null,
-    muteAnsweredQuestions: Boolean = false
+    muteAnsweredQuestions: Boolean = false,
+    hasOriginalAnswer: Boolean = false
 ) {
     val rootId = "qroot-$nodeId"
     val latestPublishedId = chatItems.lastOrNull { it.isFollowupQuestion }?.id
-    val (newestFirst, latestRestoredId) = remember(chatItems, followups, rootId, fallbackOutcome) {
+    val (renderedHistory, latestRestoredId, dividersBefore) = remember(
+        chatItems, followups, rootId, fallbackOutcome, hasOriginalAnswer
+    ) {
         val rows = chatItems.toMutableList()
         var previousQuestionIndex = rows.indexOfFirst { it.id == rootId }
         var restoredId: String? = null
+        val savedAnsweredFollowupIds = mutableSetOf<String>()
         // Retained survey state can supply questions whose in-memory chat rows are missing.
         followups.forEachIndexed { index, entry ->
             val publishedIndex = rows.indexOfLast { it.isFollowupQuestion && it.text == entry.question }
@@ -1606,6 +1611,9 @@ internal fun AiConversation(
                 val id = "restored-followup-$nodeId-$index-${entry.askedAt}"
                 rows.add(++previousQuestionIndex, AiViewModel.ChatItem(id, AiViewModel.ChatSender.AI, text = entry.question))
                 id
+            }
+            if (!entry.answer.isNullOrBlank()) {
+                savedAnsweredFollowupIds.add(rows[previousQuestionIndex].id)
             }
         }
         // Only retained rows establish turn boundaries. Reconstructed questions fill gaps
@@ -1620,7 +1628,36 @@ internal fun AiConversation(
                 outcome = fallbackOutcome
             ))
         }
-        rows.asReversed() to restoredId
+        val dividerIds = mutableSetOf<String>()
+        var precedingTurnAnswered = hasOriginalAnswer
+        // Walk oldest to newest before reversing the display order.
+        for (row in rows) {
+            when {
+                row.id == rootId -> precedingTurnAnswered = hasOriginalAnswer
+                row.isFollowupQuestion || row.id.startsWith("restored-followup-$nodeId-") -> {
+                    if (precedingTurnAnswered) dividerIds.add(row.id)
+                    precedingTurnAnswered = row.id in savedAnsweredFollowupIds
+                }
+                row.sender == AiViewModel.ChatSender.USER && !row.text.isNullOrBlank() ->
+                    precedingTurnAnswered = true
+            }
+        }
+        Triple(rows, restoredId, dividerIds)
+    }
+    val reviewsByAnswer = remember(chatItems, renderedHistory) {
+        // The committed review replaces the scan after its answer in the retained history.
+        // A reconstructed question, missing answer, or intervening row makes pairing unsafe.
+        val retainedPairs = chatItems.zipWithNext().filter { (answer, review) ->
+            answer.sender == AiViewModel.ChatSender.USER && !answer.text.isNullOrBlank() &&
+                review.sender == AiViewModel.ChatSender.AI && !review.isTyping &&
+                review.evaluation == AiViewModel.EvaluationPresentation.REVIEWED
+        }.toSet()
+        renderedHistory.zipWithNext().filter { it in retainedPairs }
+            .associate { (answer, review) -> answer.id to review }
+    }
+    val newestFirst = remember(renderedHistory, reviewsByAnswer) {
+        val groupedReviewIds = reviewsByAnswer.values.map { it.id }.toSet()
+        renderedHistory.asReversed().filterNot { it.id in groupedReviewIds }
     }
 
     // Use the same order and keys as the LazyColumn. Live processing has its own
@@ -1750,6 +1787,7 @@ internal fun AiConversation(
     ) {
         items(newestFirst, key = { it.id }) { item ->
             val isAi = item.sender == AiViewModel.ChatSender.AI
+            val pairedReview = reviewsByAnswer[item.id]
             val isEvaluationStatus = item.evaluation != null &&
                 item.evaluation != AiViewModel.EvaluationPresentation.REVIEWING
             val isQuestion = item.id == rootId || item.isFollowupQuestion ||
@@ -1760,18 +1798,20 @@ internal fun AiConversation(
                 modifier = Modifier
                     .fillMaxWidth()
                     .testTag(item.id)
-                    .padding(top = if (isActive) 1.dp else 0.dp)
-                    .offset(
-                        y = if (isActive && isQuestion && item.id != rootId) {
-                            (-16).dp
-                        } else {
-                            0.dp
-                        }
-                    ),
+                    .padding(top = if (isActive && item.id == rootId) 1.dp else 0.dp),
                 horizontalArrangement = if (!isAi || isEvaluationStatus)
                     Arrangement.End else Arrangement.Start
             ) {
                 when {
+                    pairedReview != null -> key(pairedReview.id) {
+                        FieldEvaluationDetails(
+                            reviewed = true,
+                            raw = pairedReview.json.orEmpty(),
+                            snack = snack,
+                            modifier = Modifier.testTag(pairedReview.id),
+                            answer = item.text.orEmpty()
+                        )
+                    }
                     item.evaluation == AiViewModel.EvaluationPresentation.REVIEWING ||
                         item.followupNotice == AiViewModel.FollowupNotice.PREPARING -> {
                         val visible by remember(scroll, item.id) {
@@ -1792,10 +1832,19 @@ internal fun AiConversation(
                         nextFollowupNumber = followups.size + 1
                     )
                     item.json != null -> JsonBubbleMono(pretty = item.json, snack = snack)
-                    else -> FieldMessage(
-                        text = item.text.orEmpty(), isAi = isAi, typing = item.isTyping,
-                        active = isActive, historical = isHistorical
-                    )
+                    else -> Column {
+                        if (item.id in dividersBefore) {
+                            HorizontalDivider(
+                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 3.dp),
+                                thickness = 1.dp,
+                                color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f)
+                            )
+                        }
+                        FieldMessage(
+                            text = item.text.orEmpty(), isAi = isAi, typing = item.isTyping,
+                            active = isActive, historical = isHistorical
+                        )
+                    }
                 }
             }
         }
@@ -2008,20 +2057,15 @@ private fun ChatComposer(
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(start = 12.dp, end = 12.dp, top = topPadding, bottom = 6.dp)
+            .padding(start = 12.dp, end = 12.dp, top = topPadding, bottom = 4.dp)
     ) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .testTag("ai-answer-field")
-                .shadow(elevation = 8.dp, shape = RoundedCornerShape(18.dp), clip = false)
+                .shadow(elevation = 4.dp, shape = RoundedCornerShape(18.dp), clip = false)
                 .background(
-                    brush = Brush.linearGradient(
-                        listOf(
-                            cs.surfaceVariant.copy(alpha = 0.65f),
-                            cs.surface.copy(alpha = 0.65f)
-                        )
-                    ),
+                    color = cs.surfaceVariant,
                     shape = RoundedCornerShape(18.dp)
                 )
                 .neutralEdge(alpha = 0.14f, corner = 18.dp, stroke = 1.dp)
