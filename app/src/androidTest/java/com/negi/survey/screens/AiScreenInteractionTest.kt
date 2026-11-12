@@ -4,14 +4,17 @@ import androidx.activity.BackEventCompat
 import androidx.activity.OnBackPressedDispatcher
 import androidx.activity.compose.LocalActivity
 import androidx.activity.compose.LocalOnBackPressedDispatcherOwner
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -27,6 +30,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.LocalView
@@ -43,6 +48,8 @@ import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.test.SemanticsNodeInteraction
 import androidx.compose.ui.test.assertCountEquals
+import androidx.compose.ui.test.assertHeightIsAtLeast
+import androidx.compose.ui.test.assertWidthIsAtLeast
 import androidx.compose.ui.test.click
 import androidx.compose.ui.test.assertTextContains
 import androidx.compose.ui.test.performTextClearance
@@ -173,6 +180,8 @@ class AiScreenInteractionTest {
         aiTimeoutMs: Long? = null,
         initialNode: String = "Q8",
         productionImeInsets: Boolean = false,
+        darkTheme: Boolean? = null,
+        onComposerColor: (Color) -> Unit = {},
         onKeyboardShow: (() -> Unit)? = null,
         seed: SurveyViewModel.() -> Unit = {}
     ) {
@@ -264,7 +273,9 @@ class AiScreenInteractionTest {
                         LocalDensity provides contentDensity,
                         LocalSoftwareKeyboardController provides observedKeyboard
                     ) {
-                        SurveyNavTheme {
+                        SurveyNavTheme(darkTheme = darkTheme ?: isSystemInDarkTheme()) {
+                            val composerColor = MaterialTheme.colorScheme.surfaceVariant
+                            SideEffect { onComposerColor(composerColor) }
                             AiScreen(nodeId, survey, ai, survey::advanceToNext, survey::backToPrevious,
                                 if (withSpeech) speech else null, speaker.takeIf { speakerAvailable },
                                 playbackLifecycle = lifecycle)
@@ -308,6 +319,18 @@ class AiScreenInteractionTest {
 
         type.performClick().assertIsSelected()
         waitForKeyboard(visible = true)
+        rule.waitUntil(5_000) {
+            val editorNode = editor.fetchSemanticsNode()
+            val imeTop = rule.runOnUiThread {
+                val root = hostView.rootView
+                val position = IntArray(2)
+                root.getLocationOnScreen(position)
+                val inset = ViewCompat.getRootWindowInsets(hostView)
+                    ?.getInsets(WindowInsetsCompat.Type.ime())?.bottom ?: 0
+                position[1] + root.height - inset
+            }
+            editorNode.positionOnScreen.y + editorNode.size.height <= imeTop
+        }
         editor.assertCaretAt(11)
         editor.tapAtTextOffset(5)
         editor.assertCaretAt(5)
@@ -332,11 +355,11 @@ class AiScreenInteractionTest {
         val layouts = mutableListOf<TextLayoutResult>()
         performSemanticsAction(SemanticsActions.GetTextLayoutResult) { it(layouts) }
         val cursor = layouts.single().getCursorRect(offset)
-        // The unlabeled Material 3 editor insets its text by 16 dp.
+        // Match the start content padding of the composer decoration.
         performTouchInput {
             // Each call represents an independent tap rather than a double-tap word selection.
             advanceEventTime(ViewConfiguration.getDoubleTapTimeout().toLong() + 1)
-            click(Offset(16.dp.toPx() + cursor.left, center.y))
+            click(Offset(8.dp.toPx() + cursor.left, center.y))
         }
     }
 
@@ -475,10 +498,13 @@ class AiScreenInteractionTest {
         val review = evaluationControl("first-review")
         val answer = rule.onNodeWithText("We set aside seed for next season.")
         val answerBounds = answer.fetchSemanticsNode().boundsInRoot
+        review.assertHeightIsAtLeast(48.dp).assertWidthIsAtLeast(48.dp)
         val reviewBounds = review.fetchSemanticsNode().boundsInRoot
-        assertTrue(answerBounds.bottom <= reviewBounds.top)
+        assertPairedAnswer("first-review", "We set aside seed for next season.")
+        rule.onAllNodesWithText(FIRST_FOLLOWUP).assertCountEquals(1)
+        assertTrue(reviewBounds.right <= answerBounds.left)
+        assertTrue(answerBounds.top < reviewBounds.bottom && reviewBounds.top < answerBounds.bottom)
         assertTrue(reviewBounds.bottom <= rule.onNodeWithText(FIRST_FOLLOWUP).fetchSemanticsNode().boundsInRoot.top)
-        assertTrue(reviewBounds.left > conversation.fetchSemanticsNode().boundsInRoot.left)
         captureFieldUi("refined-voice")
         if (capturingFieldUi) {
             review.performClick()
@@ -509,6 +535,29 @@ class AiScreenInteractionTest {
         questionStyle(SECOND_FOLLOWUP, "Historical AI question").assertIsDisplayed()
     }
 
+    @Test fun reviewWithoutAnAdjacentAnswerRetainsStandaloneDetails() {
+        val rows = listOf(
+            AiViewModel.ChatItem("qroot-Q8", AiViewModel.ChatSender.AI, "Original question"),
+            AiViewModel.ChatItem("answer", AiViewModel.ChatSender.USER, "Earlier answer"),
+            AiViewModel.ChatItem("followup", AiViewModel.ChatSender.AI, FIRST_FOLLOWUP, isFollowupQuestion = true),
+            AiViewModel.ChatItem(
+                "orphan-review", AiViewModel.ChatSender.AI, json = NEEDS_FOLLOWUP,
+                evaluation = AiViewModel.EvaluationPresentation.REVIEWED
+            )
+        )
+        rule.setContent {
+            SurveyNavTheme {
+                AiConversation(
+                    "Q8", 1L, rows, emptyList(), false, remember { SnackbarHostState() },
+                    Modifier.fillMaxSize().statusBarsPadding()
+                )
+            }
+        }
+        rule.onAllNodesWithText("Earlier answer").assertCountEquals(1)
+        evaluationControl("orphan-review").assertTextContains("Answer reviewed", substring = true).performClick()
+        rule.onNodeWithText("AI score 30").assertIsDisplayed()
+    }
+
     @Test fun historicalConversationWrapsEnglishAndSwahiliAtLargeFontScale() {
         val oldQuestion = "What changed in your maize harvest during the last growing season?"
         val oldAnswer = "Tulipata mavuno kidogo kwa sababu mvua ilichelewa kuanza."
@@ -516,6 +565,10 @@ class AiScreenInteractionTest {
         val rows = listOf(
             AiViewModel.ChatItem("qroot-Q8", AiViewModel.ChatSender.AI, oldQuestion),
             AiViewModel.ChatItem("answer", AiViewModel.ChatSender.USER, oldAnswer),
+            AiViewModel.ChatItem(
+                "review", AiViewModel.ChatSender.AI, json = NEEDS_FOLLOWUP,
+                evaluation = AiViewModel.EvaluationPresentation.REVIEWED
+            ),
             AiViewModel.ChatItem("active", AiViewModel.ChatSender.AI, activeQuestion, isFollowupQuestion = true)
         )
         rule.setContent {
@@ -525,7 +578,7 @@ class AiScreenInteractionTest {
                     Surface(Modifier.fillMaxSize()) {
                         AiConversation(
                             "Q8", 1L, rows, emptyList(), false, remember { SnackbarHostState() },
-                            Modifier.fillMaxSize().statusBarsPadding().padding(horizontal = 10.dp),
+                            Modifier.width(280.dp).statusBarsPadding().padding(horizontal = 10.dp),
                             visualActiveQuestionId = "active"
                         )
                     }
@@ -540,6 +593,10 @@ class AiScreenInteractionTest {
         val answerLayouts = mutableListOf<TextLayoutResult>()
         rule.onNodeWithText(oldAnswer).assertIsDisplayed()
             .performSemanticsAction(SemanticsActions.GetTextLayoutResult) { it(answerLayouts) }
+        assertPairedAnswer("review", oldAnswer)
+        val answerBounds = rule.onNodeWithText(oldAnswer).fetchSemanticsNode().boundsInRoot
+        val detailsBounds = evaluationControl("review").fetchSemanticsNode().boundsInRoot
+        assertTrue(answerBounds.bottom <= detailsBounds.top)
         listOf(questionLayout, answerLayouts.single()).forEach { layout ->
             assertTrue(layout.lineCount > 1)
             assertTrue(!layout.hasVisualOverflow)
@@ -566,6 +623,51 @@ class AiScreenInteractionTest {
         speakerButton.assertIsDisplayed()
         stopButton.assertDoesNotExist()
         rule.runOnIdle { assertEquals(1, speaker.stopCalls) }
+    }
+
+    @Test fun lightComposerUsesSolidSurfaceWhenFocusedAndUnfocused() =
+        verifyComposerSurface(darkTheme = false)
+
+    @Test fun darkComposerUsesSolidSurfaceWhenFocusedAndUnfocused() =
+        verifyComposerSurface(darkTheme = true)
+
+    private fun verifyComposerSurface(darkTheme: Boolean) {
+        var surface = Color.Unspecified
+        host(productionImeInsets = true, darkTheme = darkTheme, onComposerColor = { surface = it })
+        rule.onNodeWithText("Text").performClick()
+        waitForKeyboard(visible = true)
+        val field = rule.onNodeWithTag("ai-answer-field")
+        val editor = rule.onNode(hasSetTextAction())
+        editor.assertIsFocused()
+        fun assertSolidSurface(state: String) {
+            rule.waitUntil(conditionDescription = "solid composer surface in $state", timeoutMillis = 5_000) {
+                val node = field.fetchSemanticsNode()
+                val x = node.positionOnScreen.x.toInt() + node.size.width * 2 / 3
+                val top = node.positionOnScreen.y.toInt()
+                val samples = listOf(node.size.height / 5, node.size.height / 2, node.size.height * 4 / 5)
+                val screenshot = checkNotNull(InstrumentationRegistry.getInstrumentation().uiAutomation.takeScreenshot())
+                try {
+                    x in 0 until screenshot.width && samples.all { offset ->
+                        val y = top + offset
+                        y in 0 until screenshot.height && screenshot.getPixel(x, y) == surface.toArgb()
+                    }
+                } finally {
+                    screenshot.recycle()
+                }
+            }
+            captureFieldUi("composer-${if (darkTheme) "dark" else "light"}-$state")
+        }
+        assertSolidSurface("focused")
+        rule.onNodeWithText("Voice").performClick()
+        waitForKeyboard(visible = false)
+        rule.onNodeWithContentDescription("Record answer").performClick()
+        rule.runOnIdle { speech.capture.value = true }
+        rule.onNodeWithText("Stop").performClick()
+        rule.runOnIdle { speech.transitionToTranscribing() }
+        rule.onNodeWithText("Transcribing…").assertExists()
+        rule.runOnIdle { speech.finish("Short answer") }
+        editor.assertIsNotFocused()
+        assertSolidSurface("unfocused")
     }
 
     @Test fun compactEditorKeepsItsTouchHeightAndGrowsForMultipleLines() =
@@ -707,7 +809,9 @@ class AiScreenInteractionTest {
         assertSharedAnswerField()
         rule.runOnIdle { assertEquals("answer", survey.getAnswer("Q8")) }
 
+        val keyboardViewport = conversationViewport()
         dismissKeyboardWithBack()
+        rule.waitUntil(5_000) { conversationViewport().height > keyboardViewport.height }
         val viewport = conversationViewport()
         rule.runOnIdle {
             constrained = true
@@ -907,7 +1011,7 @@ class AiScreenInteractionTest {
         assertUnavailableFollowup(score, slot)
         assertEquals("Q07", survey.currentNodeId)
 
-        scrollManuallyTo(chatRows().lastIndex)
+        scrollManuallyTo(conversationIndex("qroot-Q07"))
         rule.onNodeWithText("Q07 original question").assertIsDisplayed()
         rule.onNodeWithText("Back").performScrollTo().performClick()
         rule.onNodeWithText("Experience").assertIsDisplayed()
@@ -916,7 +1020,7 @@ class AiScreenInteractionTest {
         rule.onNodeWithText("Follow-up generation failed").assertIsDisplayed()
         rule.onNodeWithText(PREPARING_FOLLOWUP).assertDoesNotExist()
 
-        scrollManuallyTo(chatRows().lastIndex)
+        scrollManuallyTo(conversationIndex("qroot-Q07"))
         rule.onNodeWithText("Q07 original question").assertIsDisplayed()
         rule.onNodeWithText("Next").performScrollTo().assertIsEnabled().performClick()
         assertQuestionFits("Q08 original question")
@@ -1118,7 +1222,7 @@ class AiScreenInteractionTest {
             }
             assertQuestionFits("Original question")
             rule.runOnIdle { showHistory = true }
-            scrollManuallyTo(history.size + 1)
+            scrollManuallyTo(conversationIndex("qroot-$nodeId"))
             rule.onNodeWithText("Original question").assertIsDisplayed()
             rule.runOnIdle { presentation++ }
             assertLatestEdgeVisible(finalRow.id)
@@ -1243,6 +1347,7 @@ class AiScreenInteractionTest {
 
         rule.onNodeWithText("recognized answer").performClick()
         waitForKeyboard(visible = true)
+        rule.waitUntil(5_000) { rule.onNodeWithText("Question").isDisplayed() }
         assertQuestionFits("Question")
         rule.runOnIdle { constrained = true }
         assertQuestionFits("Question")
@@ -1419,9 +1524,13 @@ class AiScreenInteractionTest {
         conversation.performScrollToIndex(index)
     }
 
+    private fun conversationIndex(key: String): Int =
+        conversation.fetchSemanticsNode().config[SemanticsProperties.IndexForKey](key).also {
+            assertTrue("Missing conversation row $key", it >= 0)
+        }
+
     private fun scrollToOriginalQuestion() {
-        val index = ai.chatHistoryFlow(contextKey).value.asReversed().indexOfFirst { it.id == "qroot-Q8" }
-        scrollManuallyTo(index)
+        scrollManuallyTo(conversationIndex("qroot-Q8"))
         rule.onNodeWithText("Question").assertIsDisplayed()
     }
 
@@ -1927,7 +2036,7 @@ class AiScreenInteractionTest {
         }
         assertTrue(conversationPosition() > 0f)
         // The drag above has already disabled following. Position the reader without a second fling.
-        conversation.performScrollToIndex(chatRows().asReversed().indexOfFirst { it.id == "qroot-Q8" })
+        conversation.performScrollToIndex(conversationIndex("qroot-Q8"))
         val readingTop = originalQuestionTop()
         for (end in 32..80 step 8) {
             sendChunk(followup, question.substring(end - 8, end), question.take(end))
@@ -1985,6 +2094,7 @@ class AiScreenInteractionTest {
         captureFieldUi("02-collapsed-evaluation")
         dismissKeyboardWithBack()
         val firstDetails = evaluationControl(firstScoreRow.id)
+        assertPairedAnswer(firstScoreRow.id, "main answer")
         firstDetails.performSemanticsAction(SemanticsActions.OnClick)
         val scoreText = rule.onNodeWithText("AI score 30")
         if (capturingFieldUi && !scoreText.isDisplayed()) scoreText.performScrollTo()
@@ -2023,6 +2133,7 @@ class AiScreenInteractionTest {
         assertReviewed(45)
         captureFieldUi("07-second-evaluation")
         val secondScoreRow = chatRows().single { it.json == secondScore }
+        assertPairedAnswer(secondScoreRow.id, "two bags")
         val secondSlot = assertScorePrecedesPreparation(secondScoreRow)
         sendChunk(secondFollowup, SECOND_FOLLOWUP.take(16), expected = SECOND_FOLLOWUP.take(16))
         assertEquals(secondSlot, assertScorePrecedesPreparation(secondScoreRow))
@@ -2103,9 +2214,11 @@ class AiScreenInteractionTest {
         rule.onNodeWithText(questions.last()).assertIsDisplayed()
         questions.forEachIndexed { index, question ->
             val key = "question-$index"
-            conversation.performScrollToIndex(rows.asReversed().indexOfFirst { it.id == key })
+            conversation.performScrollToIndex(conversationIndex(key))
             rule.onNode(hasTestTag("AI message") and hasText(question) and hasAnyAncestor(hasTestTag(key)))
                 .assertIsDisplayed()
+            conversation.performScrollToIndex(conversationIndex("answer-$index"))
+            assertPairedAnswer("eval-$index", "Answer ${index + 1}")
         }
     }
 
@@ -2391,8 +2504,14 @@ class AiScreenInteractionTest {
 
     private fun evaluationControl(id: String) = rule.onNode(
         hasAnyAncestor(hasTestTag(id)) and hasClickAction() and
-            (hasText("Answer reviewed", substring = true) or hasText("Evaluation details", substring = true))
+            hasTestTag("Evaluation details toggle")
     )
+
+    private fun assertPairedAnswer(reviewId: String, answer: String) {
+        evaluationControl(reviewId).assertTextContains("Details")
+        rule.onAllNodesWithText(answer).assertCountEquals(1)
+        rule.onNode(hasText(answer) and hasAnyAncestor(hasTestTag(reviewId))).assertExists()
+    }
 
     private fun assertReviewed(score: Int) {
         val row = chatRows().last { it.evaluation == AiViewModel.EvaluationPresentation.REVIEWED }
@@ -2405,6 +2524,8 @@ class AiScreenInteractionTest {
 
     private fun assertScan(expected: String? = null) {
         rule.onNodeWithText("Reviewing your answer…").assertIsDisplayed()
+        rule.onNodeWithText("Checking for additional details").assertIsDisplayed()
+        rule.onNodeWithText(PREPARING_FOLLOWUP).assertDoesNotExist()
         if (expected != null) {
             assertEquals(expected, chatRows().single { it.isTyping }.text)
             rule.onNodeWithText(expected).assertDoesNotExist()

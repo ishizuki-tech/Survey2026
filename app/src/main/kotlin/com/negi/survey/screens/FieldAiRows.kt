@@ -11,6 +11,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -19,12 +20,13 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.wrapContentWidth
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.relocation.BringIntoViewRequester
+import androidx.compose.foundation.relocation.bringIntoViewRequester
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.foundation.layout.offset
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.ExpandLess
@@ -38,6 +40,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -52,6 +55,7 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.platform.ClipEntry
 import androidx.compose.ui.platform.LocalClipboard
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.LiveRegionMode
@@ -114,27 +118,34 @@ internal fun FieldMessage(
             Text(
                 text = if (typing && text.isBlank()) "…" else text,
                 style = MaterialTheme.typography.bodyMedium,
-                color = if (historical) lerp(colors.onSurfaceVariant, colors.surface, 0.08f) else colors.onSurface,
+                color = if (historical) lerp(colors.onSurfaceVariant, colors.surface, 0.12f) else colors.onSurface,
                 lineHeight = if (historical) 21.sp else 22.sp,
                 modifier = Modifier.padding(top = if (historical) 3.dp else 4.dp).testTag("AI message")
             )
         }
     } else {
-        Surface(
-            modifier = Modifier
-                .padding(top = 4.dp)
-                .fillMaxWidth(0.88f)
-                .wrapContentWidth(Alignment.End).widthIn(max = 480.dp),
-            color = lerp(colors.primaryContainer, colors.surface, 0.40f),
-            contentColor = colors.onPrimaryContainer,
-            shape = RoundedCornerShape(18.dp, 18.dp, 5.dp, 18.dp)
-        ) {
-            Text(
-                text, Modifier.padding(horizontal = 9.dp, vertical = 4.dp),
-                style = MaterialTheme.typography.bodyMedium,
-                lineHeight = 21.sp
-            )
-        }
+        FieldAnswerBubble(
+            text = text,
+            modifier = Modifier.padding(top = 4.dp).fillMaxWidth(0.88f)
+                .wrapContentWidth(Alignment.End)
+        )
+    }
+}
+
+@Composable
+private fun FieldAnswerBubble(text: String, modifier: Modifier = Modifier) {
+    val colors = MaterialTheme.colorScheme
+    Surface(
+        modifier = modifier.widthIn(max = 480.dp),
+        color = lerp(colors.primaryContainer, colors.surface, 0.40f),
+        contentColor = colors.onPrimaryContainer,
+        shape = RoundedCornerShape(18.dp, 18.dp, 5.dp, 18.dp)
+    ) {
+        Text(
+            text, Modifier.padding(horizontal = 9.dp, vertical = 4.dp),
+            style = MaterialTheme.typography.bodyMedium,
+            lineHeight = 21.sp
+        )
     }
 }
 
@@ -266,47 +277,90 @@ private fun followupOrdinal(number: Int): String = when (number) {
 }
 
 @Composable
-internal fun FieldEvaluationDetails(reviewed: Boolean, raw: String, snack: SnackbarHostState) {
+internal fun FieldEvaluationDetails(
+    reviewed: Boolean,
+    raw: String,
+    snack: SnackbarHostState,
+    modifier: Modifier = Modifier,
+    answer: String? = null
+) {
     var expanded by rememberSaveable { mutableStateOf(false) }
     var rawExpanded by rememberSaveable { mutableStateOf(false) }
+    var revealDetails by remember { mutableStateOf(false) }
+    val detailsHeading = remember { BringIntoViewRequester() }
     val colors = MaterialTheme.colorScheme
-    val heading = if (reviewed) "Answer reviewed" else "Evaluation details"
+    val heading = when {
+        answer != null -> "Details"
+        reviewed -> "Answer reviewed"
+        else -> "Evaluation details"
+    }
+    val control: @Composable () -> Unit = {
+        Row(
+            modifier = Modifier
+                .widthIn(min = 48.dp)
+                .heightIn(min = 48.dp)
+                .testTag("Evaluation details toggle")
+                .semantics { stateDescription = if (expanded) "Expanded" else "Collapsed" }
+                .clickable(role = Role.Button, onClickLabel = if (expanded) "Hide details" else "View details") {
+                    expanded = !expanded
+                    rawExpanded = false
+                    revealDetails = expanded && answer != null
+                }
+                .padding(horizontal = 4.dp, vertical = 1.dp),
+            horizontalArrangement = Arrangement.spacedBy(3.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(
+                if (reviewed) Icons.Filled.Check else Icons.Outlined.Info, contentDescription = null,
+                modifier = Modifier.size(14.dp)
+            )
+            Text(
+                if (answer != null) heading else heading + if (expanded) " · Hide details" else " · View details",
+                modifier = Modifier.weight(1f, fill = false),
+                style = MaterialTheme.typography.labelMedium
+            )
+            Icon(
+                if (expanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
+                contentDescription = null,
+                modifier = Modifier.size(16.dp)
+            )
+        }
+    }
     Surface(
-        modifier = Modifier.widthIn(max = 520.dp),
+        modifier = modifier.widthIn(max = 520.dp),
         color = if (expanded) colors.surfaceContainer else Color.Transparent,
         contentColor = colors.onSurfaceVariant,
         shape = RoundedCornerShape(12.dp)
     ) {
-        Column {
-            Row(
-                modifier = Modifier.align(Alignment.End)
-                    .heightIn(min = 48.dp)
-                    .semantics { stateDescription = if (expanded) "Expanded" else "Collapsed" }
-                    .clickable(role = Role.Button, onClickLabel = if (expanded) "Hide details" else "View details") {
-                        expanded = !expanded
-                        rawExpanded = false
+        Column(horizontalAlignment = Alignment.End) {
+            if (answer == null) {
+                control()
+            } else {
+                BoxWithConstraints {
+                    // Leave enough width for readable answer text as the Details label scales.
+                    if (maxWidth >= 240.dp * LocalDensity.current.fontScale) {
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(6.dp, Alignment.End),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            control()
+                            FieldAnswerBubble(answer)
+                        }
+                    } else {
+                        Column(horizontalAlignment = Alignment.End) {
+                            FieldAnswerBubble(answer)
+                            control()
+                        }
                     }
-                    .padding(horizontal = 4.dp, vertical = 1.dp)
-                    .offset(y = (-6).dp),
-                horizontalArrangement = Arrangement.spacedBy(3.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Icon(
-                    if (reviewed) Icons.Filled.Check else Icons.Outlined.Info, contentDescription = null,
-                    modifier = Modifier.size(14.dp)
-                )
-                Text(
-                    heading + if (expanded) " · Hide details" else " · View details",
-                    modifier = Modifier.weight(1f, fill = false),
-                    style = MaterialTheme.typography.labelMedium
-                )
-                Icon(
-                    if (expanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
-                    contentDescription = null,
-                    modifier = Modifier.size(16.dp)
-                )
+                }
             }
             if (expanded) {
+                if (revealDetails) {
+                    LaunchedEffect(detailsHeading) {
+                        detailsHeading.bringIntoView()
+                        revealDetails = false
+                    }
+                }
                 val result = remember(raw) { parseStrictModelJsonObject(raw) }
                 val score = (result?.get("score") as? JsonPrimitive)?.takeUnless { it.isString }?.intOrNull
                 val missing = result?.get("missing_points") as? JsonArray
@@ -314,8 +368,13 @@ internal fun FieldEvaluationDetails(reviewed: Boolean, raw: String, snack: Snack
                     Modifier.padding(start = 12.dp, end = 12.dp, bottom = 10.dp),
                     verticalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
-                    Text("Evaluation details", style = MaterialTheme.typography.titleSmall)
-                    if (score != null) Text("AI score $score", style = MaterialTheme.typography.bodyMedium)
+                    Column(
+                        modifier = Modifier.bringIntoViewRequester(detailsHeading),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Text("Evaluation details", style = MaterialTheme.typography.titleSmall)
+                        if (score != null) Text("AI score $score", style = MaterialTheme.typography.bodyMedium)
+                    }
                     if (missing != null) {
                         val points = missing.mapNotNull {
                             (it as? JsonPrimitive)?.takeIf { point -> point.isString && point.content.isNotBlank() }?.content
