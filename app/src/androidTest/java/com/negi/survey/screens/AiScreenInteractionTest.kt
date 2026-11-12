@@ -455,7 +455,7 @@ class AiScreenInteractionTest {
         rule.runOnIdle { survey.goto("Q07") }
         assertQuestionFits("Q07 original question")
         rule.onNodeWithText("Voice").assertIsSelected()
-        rule.onNodeWithContentDescription("Record answer").assertIsDisplayed()
+        rule.onNodeWithText("Tap to answer").assertIsDisplayed()
         rule.onNode(hasSetTextAction()).assertDoesNotExist()
         waitForKeyboard(visible = false)
     }
@@ -467,7 +467,7 @@ class AiScreenInteractionTest {
         val radioButton = SemanticsMatcher.expectValue(SemanticsProperties.Role, Role.RadioButton)
         voice.assert(radioButton).assertIsSelected()
         text.assert(radioButton).assertIsNotSelected()
-        rule.onNodeWithContentDescription("Record answer").assertIsDisplayed().assertIsEnabled()
+        rule.onNodeWithText("Tap to answer").assertIsDisplayed().assertIsEnabled()
         rule.onNodeWithText("Back").assertIsDisplayed().assertIsEnabled()
         rule.onNodeWithText("Next").assertIsDisplayed().assertIsEnabled()
 
@@ -711,6 +711,89 @@ class AiScreenInteractionTest {
         captureFieldUi(if (largeText) "compact-editor-large" else "compact-editor-multiline")
     }
 
+    @Test fun q07VoiceComposerKeepsItsReadyHeightDuringReviewAndFollowup() {
+        val evaluation = ControlledResponse()
+        val followup = ControlledResponse()
+        repo.streamedResponses = listOf(evaluation, followup)
+        host(twoStep = true, initialNode = "Q07")
+
+        val ready = rule.onNodeWithText("Tap to answer")
+        val again = rule.onNodeWithText("Record again")
+        val footer = rule.onNodeWithTag("AI footer")
+        val back = rule.onNodeWithText("Back")
+        val next = rule.onNodeWithText("Next")
+
+        fun geometry(state: String, action: SemanticsNodeInteraction): List<Float> {
+            val heights = listOf(
+                action.fetchSemanticsNode().boundsInRoot.height,
+                footer.fetchSemanticsNode().boundsInRoot.height,
+                conversationViewport().height
+            )
+            if (capturingFieldUi) {
+                android.util.Log.i("VoiceComposerLayout", "$state (action, footer, viewport px): $heights")
+                captureFieldUi(state)
+            }
+            return heights
+        }
+
+        fun record(action: SemanticsNodeInteraction, question: String, expectedStarts: Int, transcript: String) {
+            action.assertIsEnabled().performTouchInput { click() }
+            rule.runOnIdle {
+                assertEquals(expectedStarts, speech.startCalls)
+                speech.capture.value = true
+            }
+            rule.onNode(hasText(question) and hasAnyAncestor(isDialog())).assertIsDisplayed()
+            captureFieldUi("q07-recording-$expectedStarts")
+            rule.onNodeWithText("Stop").performClick()
+            rule.runOnIdle { speech.transitionToTranscribing() }
+            rule.onNodeWithText("Transcribing…").assertIsDisplayed()
+            ready.assertDoesNotExist()
+            again.assertDoesNotExist()
+            back.assertIsNotEnabled()
+            next.assertIsNotEnabled()
+            captureFieldUi("q07-transcribing-$expectedStarts")
+            rule.runOnIdle { speech.finish(transcript) }
+            rule.onNodeWithText(transcript).assertIsDisplayed()
+            rule.onNodeWithContentDescription("Send").assertIsEnabled()
+            again.assertIsDisplayed()
+        }
+
+        val readyHeights = geometry("q07-ready", ready.assertIsDisplayed())
+        record(ready, "Q07 original question", 1, "Two bags of maize")
+        captureFieldUi("q07-original-transcript")
+        rule.onNodeWithContentDescription("Send").performClick()
+        rule.onNodeWithText("Reviewing your answer…").assertIsDisplayed()
+        assertEquals(readyHeights, geometry("q07-reviewing", ready.assertIsNotEnabled()))
+        ready.performTouchInput { click() }
+        rule.runOnIdle { assertEquals(1, speech.startCalls) }
+        back.assertIsNotEnabled()
+        next.assertIsNotEnabled()
+
+        sendChunk(evaluation, NEEDS_FOLLOWUP, expected = NEEDS_FOLLOWUP)
+        evaluation.finish()
+        rule.waitUntil(5_000) { repo.requests == 2 }
+        assertEquals(readyHeights, geometry("q07-preparing", ready.assertIsNotEnabled()))
+        sendChunk(followup, FIRST_FOLLOWUP, expected = FIRST_FOLLOWUP)
+        followup.finish()
+        rule.waitUntil(5_000) {
+            survey.followups.value["Q07"]?.lastOrNull()?.question == FIRST_FOLLOWUP &&
+                !ai.blocksNavigation()
+        }
+
+        assertQuestionFits(FIRST_FOLLOWUP)
+        assertEquals(readyHeights, geometry("q07-followup-ready", ready.assertIsEnabled()))
+        record(ready, FIRST_FOLLOWUP, 2, "I harvested two bags after the rains.")
+        geometry("q07-followup-transcript", again)
+        record(again, FIRST_FOLLOWUP, 3, "I harvested three bags after the rains.")
+        val editedTranscript = "Three bags of maize after the rains."
+        rule.onNode(hasSetTextAction()).performTextReplacement(editedTranscript)
+        rule.runOnIdle {
+            assertEquals(editedTranscript, ai.conversationStateFlow(contextKey).value.composerDraft)
+            assertEquals(listOf("Two bags of maize"), userMessages())
+        }
+        rule.onNodeWithContentDescription("Send").assertIsEnabled()
+    }
+
     @Test fun voiceModeSwitchingPreservesDraftAndTranscriptCanBeEdited() {
         host(productionImeInsets = true)
         val speak = rule.onNodeWithText("Voice")
@@ -718,7 +801,6 @@ class AiScreenInteractionTest {
         val editor = rule.onNode(hasSetTextAction())
         speak.assertIsSelected()
         rule.onNodeWithText("Tap to answer").assertIsDisplayed()
-        rule.onNodeWithContentDescription("Record answer").assertIsDisplayed()
         editor.assertDoesNotExist()
         waitForKeyboard(visible = false)
 
@@ -743,7 +825,7 @@ class AiScreenInteractionTest {
         // The first switch above covers touch. Invoke this one while the IME is still moving.
         speak.performSemanticsAction(SemanticsActions.OnClick).assertIsSelected()
         waitForKeyboard(visible = false)
-        rule.onNodeWithContentDescription("Record answer").performClick()
+        rule.onNodeWithText("Tap to answer").performClick()
         rule.runOnIdle { speech.capture.value = true }
         rule.onNodeWithText("Stop").performClick()
         rule.runOnIdle { speech.transitionToTranscribing() }
@@ -794,7 +876,7 @@ class AiScreenInteractionTest {
         val send = rule.onNode(inAnswerField and hasContentDescription("Send")).assertIsDisplayed()
         assertTrue(send.fetchSemanticsNode().boundsInRoot.left >= editor.fetchSemanticsNode().boundsInRoot.right)
         rule.onNode(inAnswerField and hasContentDescription("Start recording")).assertDoesNotExist()
-        rule.onNode(inAnswerField and hasContentDescription("Record answer")).assertDoesNotExist()
+        rule.onNode(inAnswerField and hasText("Tap to answer")).assertDoesNotExist()
         rule.onNode(inAnswerField and hasText("Record again")).assertDoesNotExist()
     }
 
@@ -804,7 +886,7 @@ class AiScreenInteractionTest {
         val editor = rule.onNode(hasSetTextAction()).assertIsFocused()
         waitForKeyboard(visible = true)
         editor.performTextInput("answer")
-        rule.onNodeWithContentDescription("Record answer").assertDoesNotExist()
+        rule.onNodeWithText("Tap to answer").assertDoesNotExist()
         rule.onNodeWithText("Voice").assertDoesNotExist()
         assertSharedAnswerField()
         rule.runOnIdle { assertEquals("answer", survey.getAnswer("Q8")) }
@@ -933,7 +1015,7 @@ class AiScreenInteractionTest {
             addFollowupQuestion("Q8", "Saved follow-up?")
         }
         rule.onNodeWithText("Saved follow-up?").assertIsDisplayed()
-        rule.onNodeWithContentDescription("Record answer").assertIsDisplayed().assertIsEnabled()
+        rule.onNodeWithText("Tap to answer").assertIsDisplayed().assertIsEnabled()
     }
 
     @Test fun lateSavedFollowupBecomesVisibleAndAnswerUpdatesDoNotRepeatPositioning() {
@@ -1334,7 +1416,7 @@ class AiScreenInteractionTest {
         appendConversationHistory()
         assertQuestionFits("Question")
 
-        rule.onNodeWithContentDescription("Record answer").performClick()
+        rule.onNodeWithText("Tap to answer").performClick()
         rule.runOnIdle { speech.capture.value = true }
         rule.onNode(hasText("Question") and hasAnyAncestor(isDialog())).assertIsDisplayed()
         rule.onNodeWithText("Stop").performClick()
@@ -1438,7 +1520,7 @@ class AiScreenInteractionTest {
         }
 
         // A transcript changes the draft without creating a new conversation question.
-        rule.onNodeWithContentDescription("Record answer").performScrollTo().performClick()
+        rule.onNodeWithText("Tap to answer").performScrollTo().performClick()
         rule.runOnIdle { speech.transitionToTranscribing() }
         rule.waitForIdle()
         rule.runOnIdle { speech.finish("two bags") }
@@ -2226,7 +2308,7 @@ class AiScreenInteractionTest {
         val response = ControlledResponse()
         repo.streamedResponses = listOf(response)
         host(twoStep = true)
-        rule.onNodeWithContentDescription("Record answer").performClick()
+        rule.onNodeWithText("Tap to answer").performClick()
         rule.runOnIdle { speech.capture.value = true }
         rule.onNodeWithText("Stop").performClick()
         rule.runOnIdle {
@@ -2409,7 +2491,7 @@ class AiScreenInteractionTest {
         rule.onNodeWithText("Answer input is closed").assertIsDisplayed()
         rule.onNode(hasSetTextAction()).assertDoesNotExist()
         rule.onNodeWithContentDescription("Send").assertDoesNotExist()
-        rule.onNodeWithContentDescription("Record answer").assertDoesNotExist()
+        rule.onNodeWithText("Tap to answer").assertDoesNotExist()
         rule.onNodeWithText("Retry saved answers").assertDoesNotExist()
         rule.onNodeWithText("Text").assertDoesNotExist()
         rule.onNodeWithText("Voice").assertDoesNotExist()
@@ -2718,7 +2800,7 @@ class AiScreenInteractionTest {
 
     @Test fun finalizedInputKeepsExplicitStopAndIgnoresLateTranscription() {
         host(twoStep = true, useNavDisplay = true)
-        rule.onNodeWithContentDescription("Record answer").performClick()
+        rule.onNodeWithText("Tap to answer").performClick()
         rule.runOnIdle { speech.capture.value = true }
         val stop = rule.onNode(hasText("Stop") and hasAnyAncestor(isDialog()))
         stop.assertIsDisplayed().assertIsEnabled()
@@ -2731,7 +2813,7 @@ class AiScreenInteractionTest {
         }
         stop.assertIsDisplayed().assertIsEnabled()
         rule.onNode(hasSetTextAction()).assertDoesNotExist()
-        rule.onNodeWithContentDescription("Record answer").assertDoesNotExist()
+        rule.onNodeWithText("Tap to answer").assertDoesNotExist()
         rule.onNodeWithContentDescription("Send").assertDoesNotExist()
         rule.onNodeWithText("Next").assertIsNotEnabled()
         rule.runOnIdle { assertEquals(0, speech.stopCalls) }
@@ -2791,7 +2873,7 @@ class AiScreenInteractionTest {
         val status = rule.onNodeWithText("Transcribing…")
         val details = rule.onNodeWithText("Converting speech to text")
         status.assertDoesNotExist()
-        rule.onNodeWithContentDescription("Record answer").performClick()
+        rule.onNodeWithText("Tap to answer").performClick()
         rule.onNode(hasText("Starting microphone…") and hasAnyAncestor(isDialog())).assertIsDisplayed()
         rule.onNode(hasText("Question") and hasAnyAncestor(isDialog())).assertIsDisplayed()
         rule.onNodeWithContentDescription("Send").assertDoesNotExist()
@@ -2813,7 +2895,6 @@ class AiScreenInteractionTest {
             .assert(SemanticsMatcher.expectValue(SemanticsProperties.LiveRegion, LiveRegionMode.Polite))
             .assert(!hasClickAction())
         details.assertIsDisplayed()
-        rule.onNodeWithContentDescription("Record answer").assertDoesNotExist()
         rule.onNodeWithText("Tap to answer").assertDoesNotExist()
         rule.onNodeWithText("Record again").assertDoesNotExist()
         rule.onNodeWithText("Text").assertIsNotEnabled()
@@ -2834,7 +2915,7 @@ class AiScreenInteractionTest {
 
     @Test fun leavingQuestionStopsAnActiveRecording() {
         host()
-        rule.onNodeWithContentDescription("Record answer").performClick()
+        rule.onNodeWithText("Tap to answer").performClick()
         rule.runOnIdle { visible = false }
         rule.waitForIdle()
         rule.runOnIdle { assertEquals(1, speech.stopCalls) }
@@ -3129,7 +3210,7 @@ class AiScreenInteractionTest {
         rule.onNodeWithText("Question").assertIsDisplayed()
         rule.onNodeWithText("Voice").assertIsSelected()
         rule.onNodeWithText("Text").assertIsNotSelected()
-        rule.onNodeWithContentDescription("Record answer").performScrollTo().assertIsDisplayed()
+        rule.onNodeWithText("Tap to answer").performScrollTo().assertIsDisplayed()
         rule.onNodeWithText("Next").performScrollTo().assertIsDisplayed().assertIsEnabled()
         rule.onNodeWithText("Back").performScrollTo().assertIsDisplayed().assertIsEnabled()
     }
@@ -3409,8 +3490,12 @@ class AiScreenInteractionTest {
         override val isTranscribing = transcribing
         override val partialText = partial
         override val errorMessage = MutableStateFlow<String?>(null)
+        var startCalls = 0
         var stopCalls = 0
-        override fun startRecording() { recording.value = true }
+        override fun startRecording() {
+            startCalls++
+            recording.value = true
+        }
         override fun stopRecording() { stopCalls++ }
         fun transitionToTranscribing() { recording.value = false; capture.value = false; transcribing.value = true }
         fun finish(text: String) { partial.value = text; transcribing.value = false }
