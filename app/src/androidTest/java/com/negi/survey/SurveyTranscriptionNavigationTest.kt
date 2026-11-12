@@ -314,7 +314,7 @@ class SurveyTranscriptionNavigationTest {
         val details = rule.onNodeWithText("Converting speech to text")
         status.assertExists()
         details.assertExists()
-        rule.onNodeWithContentDescription("Record answer").assertDoesNotExist()
+        rule.onNodeWithText("Tap to answer").assertDoesNotExist()
         pressSystemBack()
         rule.runOnIdle {
             assertEquals("AI", survey.currentNodeId)
@@ -324,7 +324,7 @@ class SurveyTranscriptionNavigationTest {
         status.assertDoesNotExist()
         details.assertDoesNotExist()
         rule.onNodeWithText("Whisper failed").assertExists()
-        rule.onNodeWithContentDescription("Record answer").assertIsEnabled()
+        rule.onNodeWithText("Tap to answer").assertIsEnabled()
         assertEnabled("Back", "Next")
         rule.runOnIdle { assertEquals("AI", survey.currentNodeId) }
         pressSystemBack()

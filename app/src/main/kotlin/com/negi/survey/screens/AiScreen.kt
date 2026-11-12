@@ -1207,6 +1207,7 @@ fun AiScreen(
                         .fillMaxWidth()
                         .padding(horizontal = 16.dp)
                         .heightIn(max = footerMaxHeight)
+                        .testTag("AI footer")
                         .navigationBarsPadding()
                         .neutralEdge(alpha = 0.14f, corner = 16.dp, stroke = 1.dp)
                 ) {
@@ -2164,7 +2165,8 @@ private fun TranscriptionIndicator() {
         rememberInfiniteTransition(label = "Transcription waveform").animateFloat(
             initialValue = 0f,
             targetValue = 1f,
-            animationSpec = infiniteRepeatable(tween(durationMillis = 1600, easing = LinearEasing)),
+            // Eight 950 ms cycles let the bars drift while keeping the loop seamless.
+            animationSpec = infiniteRepeatable(tween(durationMillis = 8 * 950, easing = LinearEasing)),
             label = "Waveform phase"
         )
     } else null
@@ -2183,8 +2185,10 @@ private fun TranscriptionIndicator() {
             // Compose pauses the loop at zero motion scale. Read it only in the draw phase.
             val cycle = phase?.value ?: 0f
             for (bar in -3..3) {
-                val pulse = cos(2 * PI * (cycle - bar * 0.14)).toFloat()
-                val halfHeight = (10f - abs(bar) * 2f + pulse * 2f).dp.toPx()
+                val primary = cos(2 * PI * (cycle * (8 + bar) + bar * 0.19))
+                val secondary = cos(2 * PI * (cycle * (3 + abs(bar)) + bar * bar * 0.11 + bar * 0.07))
+                val pulse = (primary * 1.4 + secondary * 0.6).toFloat()
+                val halfHeight = (10f - abs(bar) * 2f + pulse).dp.toPx()
                 val x = center.x + bar * 9.dp.toPx()
                 drawLine(
                     color = colors.primary,
@@ -2225,30 +2229,34 @@ internal fun VoiceRecordingAction(
             .padding(start = 12.dp, end = 12.dp, top = topPadding, bottom = 4.dp),
         contentAlignment = Alignment.Center
     ) {
-        Column(
-            modifier = Modifier.clickable(enabled = enabled, role = Role.Button, onClick = onRecord),
-            horizontalAlignment = Alignment.CenterHorizontally
+        Button(
+            onClick = onRecord,
+            enabled = enabled,
+            shape = CircleShape,
+            colors = ButtonDefaults.buttonColors(
+                containerColor = cs.surfaceContainerHigh,
+                contentColor = cs.onSurface,
+                disabledContainerColor = cs.surfaceContainerHigh,
+                disabledContentColor = cs.onSurfaceVariant
+            ),
+            contentPadding = PaddingValues(start = 6.dp, end = 16.dp, top = 6.dp, bottom = 6.dp)
         ) {
-            Surface(
-                shape = CircleShape,
-                color = if (enabled) cs.primary else cs.onSurface.copy(alpha = 0.12f),
-                contentColor = if (enabled) cs.onPrimary else cs.onSurface.copy(alpha = 0.38f),
-                modifier = Modifier.size(96.dp)
+            Box(
+                modifier = Modifier.size(56.dp)
+                    .background(if (enabled) cs.primary else cs.surfaceVariant, CircleShape),
+                contentAlignment = Alignment.Center
             ) {
-                Box(contentAlignment = Alignment.Center) {
-                    Icon(
-                        imageVector = Icons.Filled.Mic,
-                        contentDescription = if (recordAgain) null else "Record answer",
-                        modifier = Modifier.size(48.dp)
-                    )
-                }
+                Icon(
+                    imageVector = Icons.Filled.Mic,
+                    contentDescription = null,
+                    modifier = Modifier.size(28.dp),
+                    tint = if (enabled) cs.onPrimary else cs.onSurfaceVariant
+                )
             }
-            Spacer(Modifier.height(4.dp))
+            Spacer(Modifier.width(8.dp))
             Text(
                 text = if (recordAgain) "Record again" else "Tap to answer",
-                textAlign = TextAlign.Center,
-                style = MaterialTheme.typography.titleMedium,
-                color = if (enabled) cs.onSurface else cs.onSurface.copy(alpha = 0.38f)
+                style = MaterialTheme.typography.titleMedium
             )
         }
     }
