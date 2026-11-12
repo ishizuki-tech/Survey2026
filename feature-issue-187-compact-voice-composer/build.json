@@ -1,0 +1,12 @@
+{
+  "original_branch": "feature/issue-187-compact-voice-composer",
+  "branch_slug": "feature-issue-187-compact-voice-composer",
+  "commit_sha": "c68d3e58f4fb97c6dfedfd204b9c0e8657cc3091",
+  "short_sha": "c68d3e5",
+  "apk_name": "Survey2026-feature-issue-187-compact-voice-composer-c68d3e5.apk",
+  "apk_sha256": "bb193119c1dbe37b40c167ef09207cac8763cd808b5664d4f8d7dd013df0d074",
+  "apk_download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-feature-issue-187-compact-voice-composer-c68d3e5-run-220/Survey2026-feature-issue-187-compact-voice-composer-c68d3e5.apk",
+  "page_url": "https://ishizuki-tech.github.io/Survey2026/feature-issue-187-compact-voice-composer/",
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/43314999269",
+  "generated_utc": "2026-11-12T22:02:15Z"
+}
