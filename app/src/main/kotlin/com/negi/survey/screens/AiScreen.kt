@@ -167,7 +167,9 @@ import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
@@ -243,6 +245,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 
 private const val TAG = "AiScreen"
+private val AnswerModeVisualInset = 6.dp
 
 internal fun followupCapacityRemaining(entries: List<SurveyViewModel.FollowupEntry>, maxFollowups: Int = 2): Int =
     (maxFollowups - entries.size).coerceAtLeast(0)
@@ -1218,12 +1221,23 @@ fun AiScreen(
                             .padding(top = if (showModeSelector) 0.dp else 4.dp)
                     ) {
                         if (showModeSelector) {
+                            val pillColor = MaterialTheme.colorScheme.surfaceContainer
                             Row(
                                 modifier = Modifier
                                     .align(Alignment.End)
                                     .padding(end = 12.dp)
                                     .selectableGroup()
-                                    .background(MaterialTheme.colorScheme.surfaceContainer, CircleShape)
+                                    .drawBehind {
+                                        // Inset the pill without shrinking either option's touch bounds.
+                                        val inset = AnswerModeVisualInset.toPx()
+                                        val height = (size.height - 2 * inset).coerceAtLeast(0f)
+                                        drawRoundRect(
+                                            color = pillColor,
+                                            topLeft = Offset(0f, inset),
+                                            size = Size(size.width, height),
+                                            cornerRadius = CornerRadius(height / 2)
+                                        )
+                                    }
                                     .padding(horizontal = 3.dp)
                             ) {
                                 AnswerModeOption(
@@ -2019,16 +2033,18 @@ private fun AnswerModeOption(
                 enabled = enabled,
                 role = Role.RadioButton,
                 onClick = onClick
-            ),
+            )
+            .padding(vertical = AnswerModeVisualInset),
         contentAlignment = Alignment.Center
     ) {
         Row(
             modifier = Modifier
+                .heightIn(min = 36.dp)
                 .background(
                     if (selected) colors.secondaryContainer else Color.Transparent,
                     CircleShape
                 )
-                .padding(horizontal = 10.dp, vertical = 3.dp),
+                .padding(horizontal = 8.dp, vertical = 3.dp),
             horizontalArrangement = Arrangement.spacedBy(4.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
@@ -2239,17 +2255,17 @@ internal fun VoiceRecordingAction(
                 disabledContainerColor = cs.surfaceContainerHigh,
                 disabledContentColor = cs.onSurfaceVariant
             ),
-            contentPadding = PaddingValues(start = 6.dp, end = 16.dp, top = 6.dp, bottom = 6.dp)
+            contentPadding = PaddingValues(start = 6.dp, end = 16.dp, top = 2.dp, bottom = 2.dp)
         ) {
             Box(
-                modifier = Modifier.size(56.dp)
+                modifier = Modifier.size(44.dp)
                     .background(if (enabled) cs.primary else cs.surfaceVariant, CircleShape),
                 contentAlignment = Alignment.Center
             ) {
                 Icon(
                     imageVector = Icons.Filled.Mic,
                     contentDescription = null,
-                    modifier = Modifier.size(28.dp),
+                    modifier = Modifier.size(24.dp),
                     tint = if (enabled) cs.onPrimary else cs.onSurfaceVariant
                 )
             }
