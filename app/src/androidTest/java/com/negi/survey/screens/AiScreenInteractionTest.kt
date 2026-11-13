@@ -130,6 +130,7 @@ import com.negi.survey.vm.StopQuestionSpeakerInBackground
 import com.negi.survey.vm.SurveyAiReason
 import com.negi.survey.vm.SurveyViewModel
 import com.negi.survey.vm.toggleQuestionSpeaker
+import com.negi.survey.whisper.RecordingSpectrum
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.NonCancellable
@@ -740,9 +741,11 @@ class AiScreenInteractionTest {
             action.assertIsEnabled().performTouchInput { click() }
             rule.runOnIdle {
                 assertEquals(expectedStarts, speech.startCalls)
+                speech.recordingLevel.value = RecordingSpectrum(FloatArray(RecordingSpectrum.BAND_COUNT) { 0.5f })
                 speech.capture.value = true
             }
             rule.onNode(hasText(question) and hasAnyAncestor(isDialog())).assertIsDisplayed()
+            rule.onNodeWithTag("live-recording-waveform").assertIsDisplayed()
             captureFieldUi("q07-recording-$expectedStarts")
             rule.onNodeWithText("Stop").performClick()
             rule.runOnIdle { speech.transitionToTranscribing() }
@@ -2871,6 +2874,7 @@ class AiScreenInteractionTest {
     @Test fun stopAndBackAreGuardedUntilControllerReportsTransition() {
         host()
         val status = rule.onNodeWithText("Transcribing…")
+        val waveform = rule.onNodeWithTag("live-recording-waveform")
         val details = rule.onNodeWithText("Converting speech to text")
         status.assertDoesNotExist()
         rule.onNodeWithText("Tap to answer").performClick()
@@ -2880,15 +2884,26 @@ class AiScreenInteractionTest {
         rule.onNodeWithText("Text").assertIsNotEnabled()
         rule.onNodeWithText("Voice").assertIsSelected().assertIsNotEnabled()
         rule.onNodeWithText("0:00").assertExists()
-        rule.runOnIdle { speech.capture.value = true }
-        rule.onNode(hasText("Listening…") and hasAnyAncestor(isDialog())).assertIsDisplayed()
+        waveform.assertDoesNotExist()
+        rule.runOnIdle {
+            speech.recordingLevel.value = RecordingSpectrum(FloatArray(RecordingSpectrum.BAND_COUNT) { 0.5f })
+            speech.capture.value = true
+        }
+        rule.onAllNodesWithText("Listening…").assertCountEquals(0)
+        rule.onNode(hasText("Question") and hasAnyAncestor(isDialog())).assertIsDisplayed()
+        waveform.assertIsDisplayed()
+            .assert(!SemanticsMatcher.keyIsDefined(SemanticsProperties.ContentDescription))
+            .assert(!hasClickAction())
         rule.onNodeWithText("Stop").performClick()
         rule.onNodeWithText("Stop").assertIsNotEnabled()
+        rule.runOnIdle { speech.recordingLevel.value = RecordingSpectrum(FloatArray(RecordingSpectrum.BAND_COUNT) { 0.9f }) }
+        waveform.assertDoesNotExist()
         InstrumentationRegistry.getInstrumentation().sendKeyDownUpSync(KeyEvent.KEYCODE_BACK)
         captureProcessing("transcribing-transition") {
             rule.runOnIdle { assertEquals(1, speech.stopCalls); speech.transitionToTranscribing() }
         }
         rule.onNode(isDialog()).assertDoesNotExist()
+        waveform.assertDoesNotExist()
         rule.onNodeWithText("Question").assertIsDisplayed()
         rule.onAllNodesWithText("Transcribing…", useUnmergedTree = true).assertCountEquals(1)
         status.assertIsDisplayed()
@@ -2911,6 +2926,19 @@ class AiScreenInteractionTest {
         rule.onNodeWithText("0:00").assertExists()
         InstrumentationRegistry.getInstrumentation().sendKeyDownUpSync(KeyEvent.KEYCODE_BACK)
         rule.runOnIdle { assertEquals(2, speech.stopCalls) }
+    }
+
+    @Test fun recordingOverlayKeepsPromptTimerAndStopReachableAtLargeFontScale() {
+        host(largeText = true)
+        rule.onNodeWithText("Tap to answer").performScrollTo().performClick()
+        rule.runOnIdle {
+            speech.recordingLevel.value = RecordingSpectrum(FloatArray(RecordingSpectrum.BAND_COUNT) { 0.5f })
+            speech.capture.value = true
+        }
+        rule.onNode(hasText("Question") and hasAnyAncestor(isDialog())).assertIsDisplayed()
+        rule.onNodeWithContentDescription("Recording for 0:00").assertIsDisplayed()
+        rule.onNodeWithTag("live-recording-waveform").assertIsDisplayed()
+        rule.onNodeWithText("Stop").performScrollTo().assertIsDisplayed().assertIsEnabled()
     }
 
     @Test fun leavingQuestionStopsAnActiveRecording() {
@@ -3487,6 +3515,7 @@ class AiScreenInteractionTest {
         val partial = MutableStateFlow("")
         override val isRecording = recording
         override val isCaptureActive = capture
+        override val recordingLevel = MutableStateFlow<RecordingSpectrum?>(null)
         override val isTranscribing = transcribing
         override val partialText = partial
         override val errorMessage = MutableStateFlow<String?>(null)
@@ -3494,6 +3523,7 @@ class AiScreenInteractionTest {
         var stopCalls = 0
         override fun startRecording() {
             startCalls++
+            recordingLevel.value = null
             recording.value = true
         }
         override fun stopRecording() { stopCalls++ }

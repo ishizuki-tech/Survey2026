@@ -161,6 +161,7 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.MotionDurationScale
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.shadow
@@ -172,6 +173,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
 import androidx.compose.ui.input.nestedscroll.NestedScrollSource
@@ -204,6 +206,7 @@ import androidx.compose.ui.semantics.semantics
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.currentStateAsState
+import androidx.lifecycle.repeatOnLifecycle
 import com.negi.survey.BuildConfig
 import com.negi.survey.net.RuntimeLogStore
 import com.negi.survey.diagnostics.DiagnosticContentPolicy
@@ -227,6 +230,7 @@ import kotlin.collections.ArrayDeque
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.cos
+import com.negi.survey.whisper.RecordingSpectrum
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
@@ -315,6 +319,9 @@ interface SpeechController {
 
     /** True after the recorder reports that the microphone is capturing. */
     val isCaptureActive: StateFlow<Boolean> get() = isRecording
+
+    /** Optional live frequency spectrum. A null value indicates that there is no active meter. */
+    val recordingLevel: StateFlow<RecordingSpectrum?>? get() = null
 
     /** True while the captured audio is being transcribed. */
     val isTranscribing: StateFlow<Boolean>
@@ -461,8 +468,7 @@ fun AiScreen(
     val speechStatusText: String? = when {
         speechError != null -> speechError
         speechController != null && speechTranscribing -> TRANSCRIBING_LABEL
-        speechController != null && speechRecording && captureActive -> "Listening…"
-        speechController != null && speechRecording -> "Starting microphone…"
+        speechController != null && speechRecording && !captureActive -> "Starting microphone…"
         else -> null
     }
     val speechStatusIsError = speechError != null
@@ -1407,7 +1413,8 @@ fun AiScreen(
     if (speechController != null && speechRecording) {
         var stopRequested by remember(speechController) { mutableStateOf(false) }
         RecordingTimerOverlay(
-            question = followups.lastOrNull()?.question ?: rootQuestion,
+            question = speechController.recordingPrompt?.text ?: followups.lastOrNull()?.question ?: rootQuestion,
+            recordingLevel = speechController.recordingLevel.takeIf { captureActive && !stopRequested },
             elapsedSeconds = recordingElapsedSeconds,
             statusText = speechStatusText,
             stopRequested = stopRequested
@@ -1442,6 +1449,7 @@ fun AiScreen(
 @Composable
 private fun RecordingTimerOverlay(
     question: String,
+    recordingLevel: StateFlow<RecordingSpectrum?>?,
     elapsedSeconds: Int,
     statusText: String?,
     stopRequested: Boolean,
@@ -1496,6 +1504,10 @@ private fun RecordingTimerOverlay(
                         color = cs.onSurfaceVariant
                     )
                 }
+                if (recordingLevel != null) {
+                    Spacer(Modifier.height(12.dp))
+                    LiveRecordingWaveform(recordingLevel)
+                }
                 Spacer(Modifier.height(32.dp))
                 Button(
                     onClick = onStop,
@@ -1516,6 +1528,50 @@ private fun RecordingTimerOverlay(
                     Text("Stop", style = MaterialTheme.typography.headlineSmall)
                 }
             }
+        }
+    }
+}
+
+private const val LIVE_WAVEFORM_BARS = RecordingSpectrum.BAND_COUNT * 2 - 1
+
+@Composable
+internal fun LiveRecordingWaveform(levels: StateFlow<RecordingSpectrum?>) {
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
+    val motionScale = rememberCoroutineScope().coroutineContext[MotionDurationScale]
+    var reading by remember(levels) { mutableStateOf<RecordingSpectrum?>(null) }
+    val colors = MaterialTheme.colorScheme
+    val restingColor = colors.onSurfaceVariant.copy(alpha = 0.45f)
+
+    LaunchedEffect(levels, lifecycle) {
+        lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            try {
+                levels.collect { reading = it }
+            } finally {
+                reading = null
+            }
+        }
+    }
+    Canvas(Modifier.fillMaxWidth(0.75f).height(56.dp).testTag("live-recording-waveform")) {
+        val spectrum = reading ?: return@Canvas
+        val centerBar = LIVE_WAVEFORM_BARS / 2
+        val step = size.width / LIVE_WAVEFORM_BARS
+        val strokeWidth = minOf(6.dp.toPx(), step * 0.42f)
+        val capRadius = strokeWidth / 2
+        val baseline = size.height - capRadius
+        val restingHeight = 4.dp.toPx()
+        val maxHeight = baseline - capRadius
+        val showMotion = motionScale?.scaleFactor != 0f
+        for (bar in -centerBar..centerBar) {
+            val level = if (showMotion) spectrum[abs(bar)] else 0f
+            val barHeight = restingHeight + (maxHeight - restingHeight) * level
+            val x = center.x + step * bar
+            drawLine(
+                color = lerp(restingColor, colors.primary, level),
+                start = Offset(x, baseline - barHeight),
+                end = Offset(x, baseline),
+                strokeWidth = strokeWidth,
+                cap = StrokeCap.Round
+            )
         }
     }
 }

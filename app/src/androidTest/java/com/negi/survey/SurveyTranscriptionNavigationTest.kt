@@ -43,6 +43,7 @@ import com.negi.survey.vm.SurveyViewModel
 import com.negi.survey.vm.WhisperSessionGate
 import com.negi.survey.vm.WhisperSpeechController
 import com.negi.survey.whisper.RecorderBackend
+import com.negi.survey.whisper.RecordingSpectrum
 import java.io.File
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicInteger
@@ -143,6 +144,8 @@ class SurveyTranscriptionNavigationTest {
         rule.onNodeWithContentDescription("Start recording").performClick()
         rule.waitUntil(5_000L) { controller.isCaptureActive.value }
         val recorder = recorders.single()
+        recorder.reportLevel(0.4f)
+        assertEquals(0.4f, controller.recordingLevel.value!![0], 0f)
 
         repeat(2) {
             scenario.recreate()
@@ -151,6 +154,8 @@ class SurveyTranscriptionNavigationTest {
             assertTrue(controller.isCaptureActive.value)
             assertFalse(controller.isTranscribing.value)
             assertSame(recorder, recorders.single())
+            recorder.reportLevel(0.6f)
+            assertEquals(0.6f, controller.recordingLevel.value!![0], 0f)
             assertEquals(0, recorder.stopCalls.get())
             assertEquals(0, transcriptionCalls.get())
         }
@@ -159,6 +164,8 @@ class SurveyTranscriptionNavigationTest {
         rule.waitUntil(10_000L) {
             !controller.isTranscribing.value && controller.partialText.value == "Recorded across recreation"
         }
+        recorder.reportLevel(1f)
+        assertNull(controller.recordingLevel.value)
         assertEquals(1, recorder.stopCalls.get())
         assertEquals(1, transcriptionCalls.get())
 
@@ -169,6 +176,8 @@ class SurveyTranscriptionNavigationTest {
             ViewModelProvider(activity)[SurveySessionStore::class.java].clearSession(sessionKey)
         }
         rule.waitUntil(5_000L) { recorderAtSessionEnd.closed.isCompleted }
+        recorderAtSessionEnd.reportLevel(1f)
+        assertNull(controller.recordingLevel.value)
         assertEquals(0, recorderAtSessionEnd.stopCalls.get())
         assertEquals(1, transcriptionCalls.get())
     }
@@ -603,9 +612,18 @@ class SurveyTranscriptionNavigationTest {
         private lateinit var output: File
         private var active = false
         private var onCaptureStarted: () -> Unit = {}
+        private var onCaptureLevel: (RecordingSpectrum?) -> Unit = {}
 
         override fun setOnCaptureStarted(callback: () -> Unit) {
             onCaptureStarted = callback
+        }
+
+        override fun setOnCaptureLevel(callback: (RecordingSpectrum?) -> Unit) {
+            onCaptureLevel = callback
+        }
+
+        fun reportLevel(level: Float) {
+            onCaptureLevel(RecordingSpectrum(FloatArray(RecordingSpectrum.BAND_COUNT) { level }))
         }
 
         override fun isActive() = active
