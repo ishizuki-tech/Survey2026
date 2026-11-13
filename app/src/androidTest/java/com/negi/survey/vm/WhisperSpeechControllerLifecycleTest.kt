@@ -3,6 +3,7 @@ package com.negi.survey.vm
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.negi.survey.whisper.RecorderBackend
+import com.negi.survey.whisper.RecordingSpectrum
 import com.negi.survey.net.SurveyRecordings
 import com.negi.survey.net.SurveyUploadFinalizer
 import com.negi.survey.net.SurveyFinalizationResult
@@ -224,6 +225,57 @@ class WhisperSpeechControllerLifecycleTest {
         assertEquals(null, original.outcome.transcript)
         assertEquals("replacement result", current.outcome.transcript)
         assertEquals("replacement result", replacement.partialText.value)
+    }
+
+    @Test
+    fun meterRejectsReadingsBeforeCaptureAfterStopAndFromPreviousRecordings() = runBlocking {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext.applicationContext
+        val first = FakeRecorder(holdStop = true, autoReady = false)
+        val second = FakeRecorder(autoReady = false)
+        val recorders = listOf(first, second).iterator()
+        val errors = mutableListOf<(Exception) -> Unit>()
+        val controller = WhisperSpeechController(
+            appContext = context,
+            recorderFactory = { _, onError -> errors.add(onError); recorders.next() },
+            recorderSessionMutex = Mutex(),
+            whisperSessionGate = WhisperSessionGate(),
+            modelInitializer = {},
+            transcriber = { _, _ -> Result.success("recorded answer") },
+        )
+        controller.startFixtureRecording()
+        withTimeout(5000) { first.startedSignal.await() }
+        first.reportLevel(1f)
+        assertEquals(null, controller.recordingLevel.value)
+        first.reportCapture()
+        first.reportLevel(0.6f)
+        assertEquals(0.6f, controller.recordingLevel.value!![0], 0f)
+
+        controller.stopRecording()
+        withTimeout(5000) { first.stopEntered.await() }
+        controller.stopRecording()
+        first.reportCapture()
+        first.reportLevel(1f)
+        assertEquals(null, controller.recordingLevel.value)
+        assertTrue(controller.isTranscribing.value)
+        assertEquals(1, first.stopCalls)
+        first.releaseStop.complete(Unit)
+        waitUntil { !controller.isTranscribing.value }
+
+        controller.startFixtureRecording()
+        withTimeout(5000) { second.startedSignal.await() }
+        second.reportCapture()
+        first.reportLevel(1f)
+        first.reportLevel(null)
+        assertEquals(0f, controller.recordingLevel.value!![0], 0f)
+        second.reportLevel(0.3f)
+        assertEquals(0.3f, controller.recordingLevel.value!![0], 0f)
+        second.reportLevel(null)
+        assertEquals(null, controller.recordingLevel.value)
+        errors.last()(IllegalStateException("capture failed"))
+        second.reportLevel(1f)
+        assertEquals(null, controller.recordingLevel.value)
+        assertFalse(controller.isRecording.value)
+        withTimeout(5000) { second.closed.await() }
     }
 
     @Test
@@ -735,8 +787,11 @@ class WhisperSpeechControllerLifecycleTest {
         val releaseStop = CompletableDeferred<Unit>()
         private var output: File? = null
         private var onCaptureStarted: () -> Unit = {}
+        private var onCaptureLevel: (RecordingSpectrum?) -> Unit = {}
 
         override fun setOnCaptureStarted(callback: () -> Unit) { onCaptureStarted = callback }
+
+        override fun setOnCaptureLevel(callback: (RecordingSpectrum?) -> Unit) { onCaptureLevel = callback }
 
         override fun isActive(): Boolean = started
 
@@ -749,6 +804,9 @@ class WhisperSpeechControllerLifecycleTest {
         }
 
         fun reportCapture() = onCaptureStarted()
+        fun reportLevel(level: Float?) {
+            onCaptureLevel(level?.let { value -> RecordingSpectrum(FloatArray(RecordingSpectrum.BAND_COUNT) { value }) })
+        }
 
         override suspend fun stopRecording() {
             stopCalls += 1

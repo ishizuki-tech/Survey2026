@@ -47,6 +47,7 @@ import com.negi.survey.runtime.NoOpHeavyRuntimeHandoff
 import com.negi.survey.utils.ExportUtils
 import com.negi.survey.whisper.Recorder
 import com.negi.survey.whisper.RecorderBackend
+import com.negi.survey.whisper.RecordingSpectrum
 import com.negi.survey.whisper.WhisperEngine
 import com.negi.survey.whisper.InitTiming
 import java.io.File
@@ -201,12 +202,14 @@ class WhisperSpeechController(
 
     private val _isRecording = MutableStateFlow(false)
     private val _isCaptureActive = MutableStateFlow(false)
+    private val _recordingLevel = MutableStateFlow<RecordingSpectrum?>(null)
     private val _isTranscribing = MutableStateFlow(false)
     private val _partialText = MutableStateFlow("")
     private val _error = MutableStateFlow<String?>(null)
 
     override val isRecording: StateFlow<Boolean> = _isRecording
     override val isCaptureActive: StateFlow<Boolean> = _isCaptureActive
+    override val recordingLevel: StateFlow<RecordingSpectrum?> = _recordingLevel
     override val isTranscribing: StateFlow<Boolean> = _isTranscribing
     override val partialText: StateFlow<String> = _partialText
     override val errorMessage: StateFlow<String?> = _error
@@ -317,9 +320,18 @@ class WhisperSpeechController(
                     session.recorder?.setOnCaptureStarted {
                         synchronized(session) {
                             if (owns(session) && _isRecording.value) {
+                                _recordingLevel.value = RecordingSpectrum()
                                 _isCaptureActive.value = true
                                 WhisperTraceRegistry.event(session.surveyId, session.questionId, "RECORDING_STARTED", mapOf("whisperRecordingId" to session.id))
                             }
+                        }
+                    }
+                    session.recorder?.setOnCaptureLevel { level ->
+                        // Identity distinguishes equal readings and prevents an old writer
+                        // from publishing after Stop or into a replacement session.
+                        val previous = _recordingLevel.value
+                        if (previous != null && owns(session)) {
+                            _recordingLevel.compareAndSet(previous, level)
                         }
                     }
                     Log.d(TAG, "startRecording: recorder.startRecording -> ${wav.path}")
@@ -330,6 +342,7 @@ class WhisperSpeechController(
                 } catch (ce: CancellationException) {
                     Log.d(TAG, "startRecording: cancelled")
                     if (!owns(session)) return@withLock
+                    _recordingLevel.value = null
                     _isRecording.value = false
                     val tmp = session.outputFile
                     session.outputFile = null
@@ -341,6 +354,7 @@ class WhisperSpeechController(
                     DiagnosticContentPolicy.logError(TAG, "startRecording: failed", t)
                     if (!owns(session)) return@withLock
                     _error.value = t.message ?: "Speech recognition start failed"
+                    _recordingLevel.value = null
                     _isRecording.value = false
                     _isTranscribing.value = false
 
@@ -368,6 +382,7 @@ class WhisperSpeechController(
             Log.d(TAG, "recording stop requested elapsedMs=${SystemClock.elapsedRealtime()} session=${session.id}")
             // Publish the lock before ending capture so observers never see an idle gap.
             _isTranscribing.value = true
+            _recordingLevel.value = null
             _isRecording.value = false
             _isCaptureActive.value = false
         }
@@ -713,6 +728,7 @@ class WhisperSpeechController(
 
             session.recorderFailed = true
             synchronized(session) {
+                _recordingLevel.value = null
                 _error.value = e.message ?: "Recording error"
                 _isRecording.value = false
                 _isCaptureActive.value = false
@@ -984,6 +1000,7 @@ class WhisperSpeechController(
 
     override fun onCleared() {
         val session = activeSession.getAndSet(null)
+        if (session != null) synchronized(session) { _recordingLevel.value = null }
         session?.startupJob?.cancel()
         session?.workerJob?.cancel()
 

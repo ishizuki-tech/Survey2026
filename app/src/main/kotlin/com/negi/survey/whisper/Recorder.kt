@@ -55,6 +55,9 @@ interface RecorderBackend : Closeable {
 
     /** Called after AudioRecord reports that capture has started. */
     fun setOnCaptureStarted(callback: () -> Unit) = Unit
+
+    /** Receives bounded frequency-band levels on the capture thread and null when the writer exits. */
+    fun setOnCaptureLevel(callback: (RecordingSpectrum?) -> Unit) = Unit
 }
 
 /**
@@ -84,6 +87,9 @@ class Recorder(
     // -------------------------------------------------------------------------
     private var onCaptureStarted: () -> Unit = {}
     override fun setOnCaptureStarted(callback: () -> Unit) { onCaptureStarted = callback }
+
+    private var onCaptureLevel: ((RecordingSpectrum?) -> Unit)? = null
+    override fun setOnCaptureLevel(callback: (RecordingSpectrum?) -> Unit) { onCaptureLevel = callback }
 
     private var writerJob: Job? = null
     private val activeRecorder = AtomicReference<AudioRecord?>(null)
@@ -151,6 +157,11 @@ class Recorder(
                         BufferedOutputStream(fos, conf.bufferSize).use { bos ->
                             val shortBuf = ShortArray(conf.bufferSize / 2)
                             val byteBuf = ByteArray(shortBuf.size * 2)
+                            val reportLevel = onCaptureLevel
+                            val meter = reportLevel?.let { PcmSpectrumMeter(conf.sampleRate) }
+                            // Keep the AudioRecord buffer size while limiting how long each
+                            // metered blocking read waits for samples.
+                            val readSamples = minOf(shortBuf.size, meter?.windowSamples ?: shortBuf.size)
                             var started = false
 
                             try {
@@ -170,7 +181,7 @@ class Recorder(
 
                                 // Use both state AND coroutine cancellation to control the loop.
                                 while (isActive && this@Recorder.state.get() == State.Recording) {
-                                    val n = rec.read(shortBuf, 0, shortBuf.size)
+                                    val n = rec.read(shortBuf, 0, readSamples)
                                     if (n <= 0) {
                                         if (n < 0) Log.w(TAG, "read() error=$n → break")
                                         break
@@ -187,6 +198,10 @@ class Recorder(
                                         byteBuf[j++] = ((v ushr 8) and 0xFF).toByte()
                                     }
                                     bos.write(byteBuf, 0, n * 2)
+                                    if (meter != null && isActive && state.get() == State.Recording) {
+                                        val level = meter.read(shortBuf, n)
+                                        if (level != null) reportLevel(level)
+                                    }
                                 }
 
                                 bos.flush()
@@ -198,6 +213,7 @@ class Recorder(
                                 if (started) runCatching { rec.stop() }
                                 runCatching { rec.release() }
                                 activeRecorder.compareAndSet(rec, null)
+                                reportLevel?.invoke(null)
                                 Log.i(TAG, "🎙 stopped & released (writer exit)")
                             }
                         }

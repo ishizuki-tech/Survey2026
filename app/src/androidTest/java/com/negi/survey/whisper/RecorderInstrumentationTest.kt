@@ -4,6 +4,7 @@ import android.Manifest
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import java.io.File
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.CopyOnWriteArrayList
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
@@ -52,14 +53,28 @@ class RecorderInstrumentationTest {
         val output = File.createTempFile("recorder-device-smoke-", ".wav", context.cacheDir)
         files += output
 
+        val levelCount = AtomicInteger()
+        val invalidCount = AtomicInteger()
+        val writerEnds = AtomicInteger()
+        recorder.setOnCaptureLevel { level ->
+            when {
+                level == null -> writerEnds.incrementAndGet()
+                (0 until RecordingSpectrum.BAND_COUNT).all { level[it] in 0f..1f } -> levelCount.incrementAndGet()
+                else -> invalidCount.incrementAndGet()
+            }
+        }
         recorder.startRecording(output)
         withTimeout(ACTIVE_TIMEOUT_MS) {
-            while (!recorder.isActive()) delay(POLL_INTERVAL_MS)
+            while (levelCount.get() < 15) delay(POLL_INTERVAL_MS)
         }
-
-        // This is capture duration, not a synchronization workaround.
-        delay(CAPTURE_DURATION_MS)
         withTimeout(STOP_TIMEOUT_MS) { recorder.stopRecording() }
+        assertTrue("Capture levels were out of range", invalidCount.get() == 0)
+        assertTrue("Meter did not terminate with the writer", writerEnds.get() == 1)
+        val decodedSampleRate = 16_000
+        val pcm = decodeWaveFile(output, targetSampleRate = decodedSampleRate)
+        assertTrue("Recorded WAV could not be decoded", pcm.isNotEmpty())
+        val readingsPerSecond = levelCount.get() * decodedSampleRate.toFloat() / pcm.size
+        assertTrue("Unexpected meter cadence: $readingsPerSecond readings/s", readingsPerSecond in 26f..31f)
         return output
     }
 
@@ -72,7 +87,6 @@ class RecorderInstrumentationTest {
         const val WAV_HEADER_BYTES = 44L
         const val ACTIVE_TIMEOUT_MS = 3_000L
         const val STOP_TIMEOUT_MS = 6_000L
-        const val CAPTURE_DURATION_MS = 500L
         const val POLL_INTERVAL_MS = 20L
     }
 }
