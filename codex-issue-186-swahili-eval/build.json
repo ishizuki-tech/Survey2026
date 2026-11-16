@@ -1,0 +1,12 @@
+{
+  "original_branch": "codex/issue-186-swahili-eval",
+  "branch_slug": "codex-issue-186-swahili-eval",
+  "commit_sha": "91868c071a2bf462d108c46a87f5711113415472",
+  "short_sha": "91868c0",
+  "apk_name": "Survey2026-codex-issue-186-swahili-eval-91868c0.apk",
+  "apk_sha256": "9bd6f43f0ab4f51d708015518b1d9d5bb737363f5eb30a8fcab5b518fd7ec749",
+  "apk_download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-codex-issue-186-swahili-eval-91868c0-run-223/Survey2026-codex-issue-186-swahili-eval-91868c0.apk",
+  "page_url": "https://ishizuki-tech.github.io/Survey2026/codex-issue-186-swahili-eval/",
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/43937206301",
+  "generated_utc": "2026-11-16T19:22:16Z"
+}
