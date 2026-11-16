@@ -368,7 +368,9 @@ prompts:
       followup_temperature: 1.0
     eval_prompt: |-
       Lengo la jibu: idadi ya magunia, ambayo chini yake wewe na wakulima wengine eneo lenu mkivuna mahindi kidogo sana, mngeamua kubadilisha mbegu.
+      Tambua idadi ya magunia iwe imeandikwa kwa tarakimu au kwa maneno. Kubali pia kiwango cha chini cha mavuno ambacho mhojiwa akifikia ataendelea kutumia mbegu hiyo, ikiwa kutokana na kauli hiyo ni wazi kuwa angebadilisha mbegu akivuna chini ya kiwango hicho.
       Ikiwa idadi ya magunia haijatajwa katika jibu au historia, missing_points iwe ["idadi ya magunia"] na followup_needed iwe true.
+      Ikiwa idadi imetajwa lakini haieleweki ni lini mhojiwa angeendelea kutumia au kubadilisha mbegu, taja utata huo katika missing_points na weka followup_needed kuwa true.
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
@@ -395,7 +397,15 @@ prompts:
 
   - nodeId: Q13
     eval_prompt: |-
-      Lengo la jibu: vigezo/sababu zinazotumika kuamua ugawaji wa mahindi kati ya chakula, malisho, kuuza, na matumizi mengine.
+      Lengo: Tathmini jinsi mkulima anavyoamua kugawa mahindi baada ya mavuno.
+
+      Angalia jibu la awali na majibu yote ya ufuatiliaji.
+      Tambua sababu za kutenga mahindi kwa chakula, mifugo, kuuza au matumizi mengine yanayotajwa.
+
+      Usihesabu taarifa iliyotolewa kuwa inakosekana.
+      Usidai kiasi halisi ikiwa sababu za ugawaji zimeelezwa wazi.
+      Ikiwa jibu linatosha, rudisha score 90-100, missing_points=[], followup_needed=false.
+
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}

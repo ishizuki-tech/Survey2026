@@ -85,6 +85,36 @@ class SurveyConfigConditionalNavigationTest {
     }
 
     @Test
+    fun swahili_q11_eval_accepts_a_clear_continuation_threshold() {
+        val config = SurveyConfigLoader.fromFileStrictValidated(assetFile("survey_config_sw_10.yaml").absolutePath)
+        val prompt = checkNotNull(config.resolveEvalPrompt("Q11"))
+
+        assertTrue(prompt.contains("kwa tarakimu au kwa maneno"))
+        assertTrue(prompt.contains("ataendelea kutumia mbegu hiyo"))
+        assertTrue(prompt.contains("angebadilisha mbegu akivuna chini ya kiwango hicho"))
+        assertTrue(prompt.contains("""missing_points iwe ["idadi ya magunia"] na followup_needed iwe true"""))
+        assertTrue(prompt.contains("taja utata huo katika missing_points na weka followup_needed kuwa true"))
+    }
+
+    @Test
+    fun swahili_q13_eval_requires_allocation_criteria_for_actual_uses() {
+        val config = SurveyConfigLoader.fromFileStrictValidated(assetFile("survey_config_sw_10.yaml").absolutePath)
+        val prompt = checkNotNull(config.resolveEvalPrompt("Q13"))
+
+        assertTrue(prompt.contains("sababu za kutenga mahindi kwa chakula, mifugo, kuuza au matumizi mengine yanayotajwa"))
+        assertTrue(prompt.contains("Usidai kiasi halisi ikiwa sababu za ugawaji zimeelezwa wazi"))
+        assertTrue(prompt.contains("Angalia jibu la awali na majibu yote ya ufuatiliaji"))
+        assertTrue(prompt.contains("Usihesabu taarifa iliyotolewa kuwa inakosekana"))
+        assertTrue(prompt.contains("score 90-100, missing_points=[], followup_needed=false"))
+        assertTrue(
+            config.composeSystemPromptEval().contains(
+                "For score below 90, missing_points must contain the specific missing or ambiguous target-required information " +
+                    "and followup_needed must be true."
+            )
+        )
+    }
+
+    @Test
     fun kiambu_questionnaire_graphs_have_q1_through_q16_with_expected_input_contracts() {
         listOf(
             "survey_config10.yaml" to "Prefer not to say",
