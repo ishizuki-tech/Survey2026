@@ -195,6 +195,11 @@ graph:
       title: "Ugawaji wa Mahindi: Chakula, Malisho, Kuuza"
       question: >-
         Baada ya kuvuna, unagawanya mahindi yako vipi? Kwa mfano unaamuaje kiasi cha kutumia kwa chakula, mifugo, kuuza, au matumizi mengine?
+      required_component_catalog:
+        - id: allocation_decision_criterion
+          text: >-
+            Kigezo au sababu inayotumiwa kuamua jinsi
+            ya kugawa mahindi baada ya mavuno
       nextId: Q14a
 
     - id: Q14a
@@ -365,7 +370,7 @@ prompts:
   - nodeId: Q11
     phase_sampling:
       eval_temperature: 0.0
-      followup_temperature: 1.0
+      followup_temperature: 0.3
     eval_prompt: |-
       Lengo la jibu: idadi ya magunia, ambayo chini yake wewe na wakulima wengine eneo lenu mkivuna mahindi kidogo sana, mngeamua kubadilisha mbegu.
       Tambua idadi ya magunia iwe imeandikwa kwa tarakimu au kwa maneno. Kubali pia kiwango cha chini cha mavuno ambacho mhojiwa akifikia ataendelea kutumia mbegu hiyo, ikiwa kutokana na kauli hiyo ni wazi kuwa angebadilisha mbegu akivuna chini ya kiwango hicho.
@@ -375,8 +380,10 @@ prompts:
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
     followup_prompt: |-
-      Lengo la jibu: idadi ya magunia, ambayo chini yake wewe na wakulima wengine eneo lenu mkivuna mahindi kidogo sana, mngeamua kubadilisha mbegu.
-      Mwelekeze mhojiwa kwa nafsi ya pili; usinakili nafsi ya kwanza ya jibu la awali.
+      Fuata EVAL_JSON na zingatia jibu la awali na majibu ya ufuatiliaji.
+      Ikiwa idadi ya magunia haijatajwa, uliza moja kwa moja kwa nafsi ya pili idadi ya magunia ya mahindi ambayo akivuna chini yake ataamua kubadilisha mbegu. Mfano: Ukivuna chini ya magunia mangapi, utaamua kubadilisha mbegu?
+      Ikiwa idadi imetajwa lakini uamuzi hauko wazi, uliza tu kama atabadilisha mbegu akivuna chini ya idadi hiyo.
+      Usiulize tena idadi iliyotajwa, wala usiulize nani anayefanya uamuzi. Usiulize kuhusu kuzungumza, kujadili au kufikiria kubadilisha mbegu.
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
@@ -404,6 +411,8 @@ prompts:
 
       Usihesabu taarifa iliyotolewa kuwa inakosekana.
       Usidai kiasi halisi ikiwa sababu za ugawaji zimeelezwa wazi.
+      Ikiwa jibu la awali pamoja na majibu ya ufuatiliaji bado hayajaeleza kigezo cha uamuzi vya kutosha, rudisha score 1-89, missing_points=["allocation_decision_criterion"], followup_needed=true.
+      Usiweke maelezo ya Kiswahili au majina ya matumizi ya mahindi katika missing_points.
       Ikiwa jibu linatosha, rudisha score 90-100, missing_points=[], followup_needed=false.
 
       Question: {{QUESTION}}

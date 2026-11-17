@@ -12,7 +12,7 @@ class PhaseSamplingConfigTest {
         val config = SurveyConfigLoader.fromFileStrictValidated(assetFile("survey_config_sw_10.yaml").absolutePath)
 
         assertEquals(0.0, config.resolvePhaseSampling("Q11")?.evalTemperature)
-        assertEquals(1.0, config.resolvePhaseSampling("Q11")?.followupTemperature)
+        assertEquals(0.3, config.resolvePhaseSampling("Q11")?.followupTemperature)
         assertNull(config.resolvePhaseSampling("Q10"))
     }
 
