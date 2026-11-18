@@ -49,8 +49,8 @@ This document contains **concrete unfinished work only**. It is a documentation 
 
 ### [#99 — Q12/Q13 semantic mismatches](https://github.com/ishizuki-tech/Survey2026/issues/99)
 
-- [ ] Reproduce incomplete-answer / follow-up decision mismatches with controlled fixtures.
-- [ ] Distinguish prompt/model semantic errors from deterministic parsing/guard errors before changing behavior.
+- [ ] Validate that generated Q12 follow-ups explicitly ask which maize growth stage suffered the greatest drought damage. Include fresh Swahili partial answers and answered follow-up histories, and check for timing substitutions, repetition, and unclear wording.
+- [ ] Compare any targeted FOLLOWUP correction with the existing prompt using the same Q12 EVAL clarification. Include Q12 and Q13 complete-answer controls. See the [investigation and evidence](docs/issue-99-q12-q13-investigation.md).
 
 ### [#100 — Swahili FOLLOWUP quality](https://github.com/ishizuki-tech/Survey2026/issues/100)
 

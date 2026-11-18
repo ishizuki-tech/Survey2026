@@ -112,6 +112,11 @@ Known validation limitation:
 - Run/survey ownership and cancellation isolation
 - Fail-closed behavior for malformed or contradictory evaluation output
 
+### Kiambu Swahili Q12 and Q13 real-model evidence
+
+- A matched Pixel 9a experiment verified that the Q12 EVAL clarification identified the missing maize growth stage for the rainfall-cessation and drought-effects answers. The drought-effects answer changed from `ACHIEVED` to `GENERATE`. The historical Q12 and Q13 complete fixtures each reached `ACHIEVED` in all three runs per arm, with no follow-up.
+- Format admission accepted questions that missed the Q12 growth-stage target. The EVAL-only change leaves FOLLOWUP generation in place, and the observed wording and semantic risks remain. See the [investigation and evidence](docs/issue-99-q12-q13-investigation.md).
+
 ### V2 artifact identity and recording association — integrated implementation baseline
 
 - [#155](https://github.com/ishizuki-tech/Survey2026/issues/155) completed the clean-install **V2-only** artifact protocol: canonical UUIDv7 survey identity, filenames/dates based on the UTC survey start encoded in that UUID, and explicit destination-relative paths under the selected export repository root (not a new leading `exports/` folder).
