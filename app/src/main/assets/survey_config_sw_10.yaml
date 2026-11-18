@@ -392,6 +392,7 @@ prompts:
   - nodeId: Q12
     eval_prompt: |-
       Lengo la jibu: hatua ya ukuaji wa mahindi (kwa mfano yakiwa madogo, yakitoa maua, yakianza kuzaa, au hatua nyingine) inayoathiriwa zaidi na ukame.
+      Ikiwa jibu linataja wakati mvua zilipokatika bila kutaja hatua ya ukuaji wa mahindi, hatua hiyo bado haijajibiwa.
       Question: {{QUESTION}}
       Original answer: {{ANSWER}}
       Answered followup pairs: {{HISTORY}}
