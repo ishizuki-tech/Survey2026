@@ -8,30 +8,30 @@
   <script id="release-metadata" type="application/json">{
   "repository": "ishizuki-tech/Survey2026",
   "stable_tag": "",
-  "source_commit_sha": "b71d5733d5423ebbc75b793505001e492f8d092c",
-  "release_tag": "build-177-b71d573",
+  "source_commit_sha": "0be5e33fd688ee1de80f38fd3893414c22b15360",
+  "release_tag": "build-178-0be5e33",
   "branch": "main",
-  "release_url": "https://github.com/ishizuki-tech/Survey2026/releases/tag/build-177-b71d573",
-  "download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/build-177-b71d573/Survey2026-b71d573-release.apk",
+  "release_url": "https://github.com/ishizuki-tech/Survey2026/releases/tag/build-178-0be5e33",
+  "download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/build-178-0be5e33/Survey2026-0be5e33-release.apk",
   "config_files": {
     "english": {
-      "view_url": "https://github.com/ishizuki-tech/Survey2026/blob/b71d5733d5423ebbc75b793505001e492f8d092c/app/src/main/assets/survey_config10.yaml",
-      "download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/build-177-b71d573/survey_config10.yaml",
+      "view_url": "https://github.com/ishizuki-tech/Survey2026/blob/0be5e33fd688ee1de80f38fd3893414c22b15360/app/src/main/assets/survey_config10.yaml",
+      "download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/build-178-0be5e33/survey_config10.yaml",
       "sha256": "49fbf540dcd2addb7f53cc7d8b98f33322fb2836aa64598e3d232c6c82eb0b22"
     },
     "swahili": {
-      "view_url": "https://github.com/ishizuki-tech/Survey2026/blob/b71d5733d5423ebbc75b793505001e492f8d092c/app/src/main/assets/survey_config_sw_10.yaml",
-      "download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/build-177-b71d573/survey_config_sw_10.yaml",
+      "view_url": "https://github.com/ishizuki-tech/Survey2026/blob/0be5e33fd688ee1de80f38fd3893414c22b15360/app/src/main/assets/survey_config_sw_10.yaml",
+      "download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/build-178-0be5e33/survey_config_sw_10.yaml",
       "sha256": "65ae0f0b69d42629e97b5d0c2ad852a0a95166cc110b95413a8247ce09420b80"
     }
   },
-  "apk_name": "Survey2026-b71d573-release.apk",
-  "apk_sha256": "63a20c7b9f94138db6f4497ae86c5eac6cc4ece2f1cc5eabfe4f8f1417f52217",
+  "apk_name": "Survey2026-0be5e33-release.apk",
+  "apk_sha256": "ef60b70d6e8cdc5bcee5751ace0addeef0ebfa5167ff5cf760e6998312e1174b",
   "signing_cert_sha256": "d6edef47ec6734a46122ab7fddb5e4f17d19d4d51ae3eaddfb32f309ee5036ea",
-  "short_sha": "b71d573",
-  "run_id": "44223102611",
-  "run_number": "177",
-  "generated_utc": "2026-11-18T02:33:30Z",
+  "short_sha": "0be5e33",
+  "run_id": "44635978749",
+  "run_number": "178",
+  "generated_utc": "2026-11-19T23:25:59Z",
   "deployment_status": "Field validated",
   "verified_device": {
     "model": "Samsung SM-S731U",
@@ -80,61 +80,79 @@
         <h2>Build provenance</h2>
         
         <p>
-        <strong>Source:</strong> <code>b71d5733d5423ebbc75b793505001e492f8d092c</code></p>
+        <strong>Source:</strong> <code>0be5e33fd688ee1de80f38fd3893414c22b15360</code></p>
         <p><strong>Deployment status:</strong> <code>Field validated</code></p>
         <p><strong>Verified device:</strong> <code>Samsung SM-S731U, Android 16 (API 36)</code></p>
       </section>
-      <section class="config-files"><h2>What's New</h2><h3>fix(slm): clarify Q12 evaluation and document Issue #99 findings</h3><pre class="whats-new-body">## Summary
+      <section class="config-files"><h2>What's New</h2><h3>fix(model): prevent concurrent model artifact corruption</h3><pre class="whats-new-body">## Summary
 
-- Clarify Q12 EVAL so rainfall cessation alone does not satisfy the missing maize growth-stage requirement.
-- Document Issue #99 investigations, including Candidates A–F, EVAL-only testing, and semantic-validator findings.
-- Update TODO.md and ROADMAP.md to preserve validated findings and track remaining Q12 FOLLOWUP work.
+Fixes #123
 
-## Validation
+Prevents concurrent model import, download, and MediaStore recovery operations from corrupting or replacing shared model artifacts.
 
-- 50 focused JVM tests passed.
-- Archived 30-session real-model comparison verified.
-- Q12 drought-effects EVAL improved from `ACHIEVED` to `GENERATE` in 3/3 runs.
-- Q12 and Q13 complete-answer fixtures remained `ACHIEVED` in 3/3 runs per arm.
+### Changes
+
+- Introduce destination-scoped ownership and coordination across model operations.
+- Use unique staging files to prevent concurrent imports from writing to the same temporary file.
+- Guard artifact promotion, persistence, and UI state updates against superseded operations.
+- Preserve previously valid models when replacement downloads or persistence fail.
+- Coordinate MediaStore recovery and publication with model installation.
+- Preserve existing download resume/retry behavior and HeavyInitializer single-flight behavior.
+- Fix staging-file creation for single-character model filenames.
+- Select the newest completed, nonempty MediaStore entry by insertion ID rather than file size.
+
+### Validation
+
+- **504 JVM unit tests passed**, with no skipped tests.
+- **3 Android instrumentation tests passed** on Pixel 9a.
+- Debug APK build succeeded.
 - `git diff --check` passed.
+- Controlled concurrency regression tests verified that a canceled import cannot corrupt a newer installation.
 
-## Known limitations
+### Concurrency Review
 
-This is a partial Q12 EVAL improvement, not an end-to-end FOLLOWUP fix.
+A focused investigation of HeavyInitializer lock ordering and MediaStore publication boundaries found no confirmed correctness defect requiring a pre-merge fix in the current production call graph.
 
-The EVAL-only experiment produced 0/9 qualifying follow-ups on partial-answer fixtures. Semantic accuracy and Swahili wording remain unresolved.
+### Remaining Risks
 
-No changes to FOLLOWUP prompts, TWO_STEP orchestration, or policy logic.
+- Blocking filesystem or MediaStore I/O may delay cancellation.
+- A future HeavyInitializer caller could introduce a lock-order cycle if it bypasses the existing destination ownership protocol.
+- MediaStore publication interruption and failed cleanup may leave transient or retained entries.
+- Power-loss crash consistency and OEM-specific MediaStore behavior remain unverified.
 
-Related to #99. Keep Issue #99 open.</pre></section>
-      <a class="download" href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-177-b71d573/Survey2026-b71d573-release.apk">Download APK</a>
+These are documented follow-up risks, not confirmed regressions.
+
+### Scope
+
+Changes are limited to model artifact concurrency, recovery, persistence, and associated regression tests. No unrelated refactoring is intended.</pre></section>
+      <a class="download" href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-178-0be5e33/Survey2026-0be5e33-release.apk">Download APK</a>
       <p class="note">Direct GitHub Release asset. No ZIP extraction is required.</p>
       <section class="config-files">
         <h2>Config files included in this APK</h2>
         <p class="note">These config files were extracted from the exact APK build shown on this page.</p>
-        <p><strong>English — survey_config10.yaml</strong><br><a href="https://github.com/ishizuki-tech/Survey2026/blob/b71d5733d5423ebbc75b793505001e492f8d092c/app/src/main/assets/survey_config10.yaml">View in browser</a> · <a href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-177-b71d573/survey_config10.yaml">Download</a><br><code>SHA-256: 49fbf540dcd2addb7f53cc7d8b98f33322fb2836aa64598e3d232c6c82eb0b22</code></p>
-        <p><strong>Swahili — survey_config_sw_10.yaml</strong><br><a href="https://github.com/ishizuki-tech/Survey2026/blob/b71d5733d5423ebbc75b793505001e492f8d092c/app/src/main/assets/survey_config_sw_10.yaml">View in browser</a> · <a href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-177-b71d573/survey_config_sw_10.yaml">Download</a><br><code>SHA-256: 65ae0f0b69d42629e97b5d0c2ad852a0a95166cc110b95413a8247ce09420b80</code></p>
+        <p><strong>English — survey_config10.yaml</strong><br><a href="https://github.com/ishizuki-tech/Survey2026/blob/0be5e33fd688ee1de80f38fd3893414c22b15360/app/src/main/assets/survey_config10.yaml">View in browser</a> · <a href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-178-0be5e33/survey_config10.yaml">Download</a><br><code>SHA-256: 49fbf540dcd2addb7f53cc7d8b98f33322fb2836aa64598e3d232c6c82eb0b22</code></p>
+        <p><strong>Swahili — survey_config_sw_10.yaml</strong><br><a href="https://github.com/ishizuki-tech/Survey2026/blob/0be5e33fd688ee1de80f38fd3893414c22b15360/app/src/main/assets/survey_config_sw_10.yaml">View in browser</a> · <a href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-178-0be5e33/survey_config_sw_10.yaml">Download</a><br><code>SHA-256: 65ae0f0b69d42629e97b5d0c2ad852a0a95166cc110b95413a8247ce09420b80</code></p>
       </section>
       <div class="qr-panel">
-        <div class="qr-box"><img src="qr.png" alt="QR code that downloads the Survey2026 APK for build-177-b71d573" width="300" height="300"></div>
-        <div><h2>Scan with Android</h2><p class="subtitle">This QR code downloads the APK for this build (build-177-b71d573).</p><code>https://github.com/ishizuki-tech/Survey2026/releases/download/build-177-b71d573/Survey2026-b71d573-release.apk</code></div>
+        <div class="qr-box"><img src="qr.png" alt="QR code that downloads the Survey2026 APK for build-178-0be5e33" width="300" height="300"></div>
+        <div><h2>Scan with Android</h2><p class="subtitle">This QR code downloads the APK for this build (build-178-0be5e33).</p><code>https://github.com/ishizuki-tech/Survey2026/releases/download/build-178-0be5e33/Survey2026-0be5e33-release.apk</code></div>
       </div>
       <div class="grid">
-        <div class="item"><span class="label">Release tag</span><code>build-177-b71d573</code></div>
+        <div class="item"><span class="label">Release tag</span><code>build-178-0be5e33</code></div>
         <div class="item"><span class="label">Branch</span><code>main</code></div>
-        <div class="item"><span class="label">Commit SHA</span><code>b71d573</code></div>
-        <div class="item"><span class="label">APK filename</span><code>Survey2026-b71d573-release.apk</code></div>
-        <div class="item"><span class="label">Workflow run number</span><code>177</code></div>
-        <div class="item"><span class="label">APK SHA-256</span><code>63a20c7b9f94138db6f4497ae86c5eac6cc4ece2f1cc5eabfe4f8f1417f52217</code></div>
+        <div class="item"><span class="label">Commit SHA</span><code>0be5e33</code></div>
+        <div class="item"><span class="label">APK filename</span><code>Survey2026-0be5e33-release.apk</code></div>
+        <div class="item"><span class="label">Workflow run number</span><code>178</code></div>
+        <div class="item"><span class="label">APK SHA-256</span><code>ef60b70d6e8cdc5bcee5751ace0addeef0ebfa5167ff5cf760e6998312e1174b</code></div>
         <div class="item"><span class="label">Signing certificate SHA-256</span><code>d6edef47ec6734a46122ab7fddb5e4f17d19d4d51ae3eaddfb32f309ee5036ea</code></div>
-        <div class="item"><span class="label">Generated timestamp</span><code>2026-11-18T02:33:30Z</code></div>
+        <div class="item"><span class="label">Generated timestamp</span><code>2026-11-19T23:25:59Z</code></div>
       </div>
       <div class="links">
-        <a href="https://github.com/ishizuki-tech/Survey2026/releases/tag/build-177-b71d573">GitHub Release</a>
-        <a href="https://github.com/ishizuki-tech/Survey2026/actions/runs/44223102611">GitHub Actions run</a>
+        <a href="https://github.com/ishizuki-tech/Survey2026/releases/tag/build-178-0be5e33">GitHub Release</a>
+        <a href="https://github.com/ishizuki-tech/Survey2026/actions/runs/44635978749">GitHub Actions run</a>
         <a href="https://github.com/ishizuki-tech/Survey2026">Repository</a>
       </div>
-      <footer>Survey2026 release metadata generated 2026-11-18T02:33:30Z.</footer>
+      <footer>Survey2026 release metadata generated 2026-11-19T23:25:59Z.</footer>
     </section>
   </main>
 </body>
