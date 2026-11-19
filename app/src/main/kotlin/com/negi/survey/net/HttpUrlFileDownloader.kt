@@ -37,6 +37,7 @@ import android.os.StatFs
 import android.util.Log
 import java.io.BufferedOutputStream
 import java.io.File
+import com.negi.survey.utils.ModelArtifactOperations
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.IOException
@@ -97,6 +98,24 @@ class HttpUrlFileDownloader(
         ioBufferBytes: Int = 1 * 1024 * 1024,
         maxRetries: Int = 3,
         resumeOverlapBytes: Int = 64 * 1024,
+        reuseExisting: Boolean = true,
+    ) = ModelArtifactOperations.withDestination(dst) {
+        downloadOwned(url, dst, onProgress, expectedSha256, connectTimeoutMs,
+            firstByteTimeoutMs, stallTimeoutMs, ioBufferBytes, maxRetries, resumeOverlapBytes, reuseExisting)
+    }
+
+    private suspend fun downloadOwned(
+        url: String,
+        dst: File,
+        onProgress: (Long, Long?) -> Unit,
+        expectedSha256: String?,
+        connectTimeoutMs: Int,
+        firstByteTimeoutMs: Int,
+        stallTimeoutMs: Int,
+        ioBufferBytes: Int,
+        maxRetries: Int,
+        resumeOverlapBytes: Int,
+        reuseExisting: Boolean,
     ) = withContext(Dispatchers.IO) {
 
         val parent =
@@ -145,7 +164,7 @@ class HttpUrlFileDownloader(
                                         )
                                 )
 
-            if (sizeMatches && hashMatches) {
+            if (reuseExisting && sizeMatches && hashMatches) {
                 onProgress(
                     dst.length(),
                     dst.length(),
@@ -594,19 +613,15 @@ class HttpUrlFileDownloader(
                         /*
                          * Promote .part to the final file.
                          */
-                        promotePartToDestination(
-                            part = part,
-                            dst = dst,
-                        )
-
-                        meta.delete()
-
                         validateFinalFile(
-                            dst = dst,
+                            dst = part,
                             total = total,
                             expectedSha256 =
                                 expectedSha256,
                         )
+
+                        promotePartToDestination(part, dst)
+                        meta.delete()
 
                         onProgress(
                             dst.length(),
@@ -2683,7 +2698,7 @@ class HttpUrlFileDownloader(
      * HTTP 416 reconciliation
      * ====================================================================== */
 
-    private fun handleRangeNotSatisfiable(
+    private suspend fun handleRangeNotSatisfiable(
         dst: File,
         part: File,
         meta: MetaFile,
@@ -2711,32 +2726,9 @@ class HttpUrlFileDownloader(
         if (
             onDisk == total
         ) {
-            promotePartToDestination(
-                part = part,
-                dst = dst,
-            )
-
+            validateFinalFile(part, total, expectedSha256)
+            promotePartToDestination(part, dst)
             meta.delete()
-
-            if (
-                expectedSha256 != null
-            ) {
-                val actual =
-                    sha256(dst)
-
-                if (
-                    !actual.equals(
-                        expectedSha256,
-                        ignoreCase = true,
-                    )
-                ) {
-                    safeDelete(dst)
-
-                    throw IOException(
-                        "SHA mismatch after 416 reconciliation."
-                    )
-                }
-            }
 
             onProgress(
                 total,
@@ -2765,26 +2757,10 @@ class HttpUrlFileDownloader(
      * File validation
      * ====================================================================== */
 
-    private fun promotePartToDestination(
-        part: File,
-        dst: File,
-    ) {
-        if (
-            dst.exists()
-        ) {
-            safeDelete(dst)
-        }
-
-        if (
-            !part.renameTo(dst)
-        ) {
-            part.copyTo(
-                target = dst,
-                overwrite = true,
-            )
-
-            safeDelete(part)
-        }
+    private suspend fun promotePartToDestination(part: File, dst: File) {
+        val lease = ModelArtifactOperations.current()
+        check(lease.file == dst.canonicalFile)
+        lease.promote(part)
     }
 
     private fun validateFinalFile(

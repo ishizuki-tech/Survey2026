@@ -41,6 +41,7 @@ import android.util.Log
 import androidx.annotation.ChecksSdkIntAtLeast
 import androidx.annotation.RequiresApi
 import com.negi.survey.BuildConfig
+import kotlinx.coroutines.CancellationException
 import java.io.File
 
 object PersistentModelStore {
@@ -54,7 +55,8 @@ object PersistentModelStore {
         get() = Environment.DIRECTORY_DOWNLOADS + File.separator + SUBFOLDER
 
     /** One row from the persisted-models collection. */
-    private data class PersistedEntry(
+    internal data class PersistedEntry(
+        val id: Long,
         val uri: Uri,
         val displayName: String,
         val size: Long,
@@ -102,9 +104,19 @@ object PersistentModelStore {
      * - If persisted storage is empty, or unsupported on this API level, this
      *   returns false with neither callback invoked.
      *
-     * Never throws: any I/O failure is logged and treated as "not available".
+     * I/O failures are logged and treated as "not available". Cancellation propagates.
      */
-    fun reuseOrReplace(
+    suspend fun reuseOrReplace(
+        context: Context,
+        targetFileName: String,
+        privateDestination: File,
+        onReused: (bytes: Long) -> Unit,
+        onReplacing: (oldFileName: String) -> Unit
+    ): Boolean = ModelArtifactOperations.withDestination(privateDestination) {
+        reuseOrReplaceOwned(context, targetFileName, privateDestination, onReused, onReplacing)
+    }
+
+    private suspend fun reuseOrReplaceOwned(
         context: Context,
         targetFileName: String,
         privateDestination: File,
@@ -138,6 +150,7 @@ object PersistentModelStore {
 
             false
         }.getOrElse { t ->
+            if (t is CancellationException) throw t
             Log.w(TAG, "reuseOrReplace failed; falling back to network", t)
             false
         }
@@ -151,7 +164,15 @@ object PersistentModelStore {
      * copy in private storage remains the source of truth for the current
      * run either way.
      */
-    fun persistFromPrivate(context: Context, fileName: String, sourceFile: File): Boolean {
+    suspend fun persistFromPrivate(
+        context: Context, fileName: String, sourceFile: File, replaceExisting: Boolean = false,
+    ): Boolean = ModelArtifactOperations.withDestination(File(context.applicationContext.filesDir, fileName)) {
+        persistFromPrivateOwned(context, fileName, sourceFile, replaceExisting)
+    }
+
+    private suspend fun persistFromPrivateOwned(
+        context: Context, fileName: String, sourceFile: File, replaceExisting: Boolean,
+    ): Boolean {
         if (!isSupported()) return false
         if (!sourceFile.exists() || sourceFile.length() <= 0L) return false
 
@@ -161,7 +182,8 @@ object PersistentModelStore {
             }
             val best = bestOf(existingMatches)
 
-            if (best != null && best.size == sourceFile.length()) {
+            ModelArtifactOperations.current().checkCurrent()
+            if (!replaceExisting && best != null && best.size == sourceFile.length()) {
                 Log.d(TAG, "persistFromPrivate: already persisted with matching size, skipping re-upload")
                 // Still clean up visible completed collision variants left over from a past run.
                 existingMatches.filter { !it.isPending && it.uri != best.uri }.forEach { deleteEntry(context, it.uri) }
@@ -170,7 +192,6 @@ object PersistentModelStore {
 
             // Replace only visible completed variants of this same logical model.
             // Never delete pending rows or differently named model versions.
-            existingMatches.filterNot { it.isPending }.forEach { deleteEntry(context, it.uri) }
 
             val resolver = context.contentResolver
             val values = ContentValues().apply {
@@ -180,30 +201,29 @@ object PersistentModelStore {
                 put(MediaStore.Downloads.IS_PENDING, 1)
             }
 
-            val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-                ?: return@runCatching false
-
-            try {
-                val opened = resolver.openOutputStream(uri)?.use { out ->
-                    sourceFile.inputStream().use { input -> input.copyTo(out, bufferSize = 1 shl 20) }
-                    true
-                } ?: false
-
-                if (!opened) {
-                    runCatching { resolver.delete(uri, null, null) }
-                    return@runCatching false
-                }
-
-                val done = ContentValues().apply { put(MediaStore.Downloads.IS_PENDING, 0) }
-                resolver.update(uri, done, null, null)
-
-                Log.i(TAG, "persistFromPrivate: persisted $fileName (${sourceFile.length()} bytes)")
-                true
-            } catch (t: Throwable) {
-                runCatching { resolver.delete(uri, null, null) }
-                throw t
-            }
+            ModelArtifactOperations.current().persist(
+                create = {
+                    resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                        ?: throw java.io.IOException("Could not create persisted model row")
+                },
+                write = { uri ->
+                    (resolver.openOutputStream(uri)
+                        ?: throw java.io.IOException("Could not write persisted model")).use { out ->
+                        sourceFile.inputStream().use { input -> input.copyTo(out, bufferSize = 1 shl 20) }
+                    }
+                },
+                commit = { uri ->
+                    val done = ContentValues().apply { put(MediaStore.Downloads.IS_PENDING, 0) }
+                    check(resolver.update(uri, done, null, null) == 1) { "Could not publish persisted model" }
+                },
+                cleanup = { uri -> resolver.delete(uri, null, null) }
+            )
+            // Keep the previous completed copy until the replacement has become visible.
+            existingMatches.filterNot { it.isPending }.forEach { deleteEntry(context, it.uri) }
+            Log.i(TAG, "persistFromPrivate: persisted $fileName (${sourceFile.length()} bytes)")
+            true
         }.getOrElse { t ->
+            if (t is CancellationException) throw t
             Log.w(TAG, "persistFromPrivate failed (non-fatal; next run will just redownload)", t)
             false
         }
@@ -222,7 +242,11 @@ object PersistentModelStore {
      *
      * Best-effort: failures are logged and swallowed.
      */
-    fun forget(context: Context, targetFileName: String): Boolean {
+    suspend fun forget(context: Context, targetFileName: String): Boolean = ModelArtifactOperations.withDestination(File(context.applicationContext.filesDir, targetFileName)) {
+        forgetOwned(context, targetFileName)
+    }
+
+    private suspend fun forgetOwned(context: Context, targetFileName: String): Boolean {
         if (!isSupported()) return false
 
         return runCatching {
@@ -231,6 +255,7 @@ object PersistentModelStore {
                 .forEach { deleteEntry(context, it.uri) }
             true
         }.getOrElse { t ->
+            if (t is CancellationException) throw t
             Log.w(TAG, "forget failed for $targetFileName", t)
             false
         }
@@ -270,6 +295,7 @@ object PersistentModelStore {
                 val uri = ContentUris.withAppendedId(MediaStore.Downloads.EXTERNAL_CONTENT_URI, id)
                 out.add(
                     PersistedEntry(
+                        id = id,
                         uri = uri,
                         displayName = cursor.getString(nameCol).orEmpty(),
                         size = cursor.getLong(sizeCol),
@@ -282,35 +308,21 @@ object PersistentModelStore {
     }
 
     /**
-     * Picks the best candidate among entries that share the same display name
-     * (there should only ever be one, but a killed-mid-persist run or a racing
-     * write can leave more than one behind): prefer a fully-written entry
-     * (not [PersistedEntry.isPending]) and, among those, the largest — a
-     * truncated leftover copy is reliably smaller than a complete model file.
-     * Returns null if every candidate is still pending (nothing safe to reuse).
+     * Selects the newest completed, nonempty installation, not the largest file.
+     * MediaProvider allocates increasing row IDs to our serialized inserts. An older
+     * completed row may survive a failed delete or process death after replacement
+     * publication; it remains a fallback while the replacement is pending, but must
+     * not supersede the newer completed row. No wall-clock timestamp ordering is used.
      */
-    private fun bestOf(candidates: List<PersistedEntry>): PersistedEntry? =
-        candidates.filterNot { it.isPending }.maxByOrNull { it.size }
+    internal fun bestOf(candidates: List<PersistedEntry>): PersistedEntry? =
+        candidates.filter { !it.isPending && it.size > 0L }.maxByOrNull { it.id }
 
-    private fun copyToPrivate(context: Context, uri: Uri, destination: File): Boolean {
-        return runCatching {
-            destination.parentFile?.mkdirs()
-            val tmp = File(destination.parentFile, destination.name + ".fromCache.tmp")
-
-            context.contentResolver.openInputStream(uri)?.use { input ->
-                tmp.outputStream().use { out -> input.copyTo(out, bufferSize = 1 shl 20) }
-            } ?: return false
-
-            if (!tmp.renameTo(destination)) {
-                tmp.copyTo(destination, overwrite = true)
-                tmp.delete()
-            }
-
-            destination.exists() && destination.length() > 0L
-        }.getOrElse { t ->
-            Log.w(TAG, "copyToPrivate failed", t)
-            false
-        }
+    private suspend fun copyToPrivate(context: Context, uri: Uri, destination: File): Boolean {
+        check(ModelArtifactOperations.current().file == destination.canonicalFile)
+        ModelArtifactOperations.current().import(
+            open = { context.contentResolver.openInputStream(uri) }, installed = { }
+        )
+        return true
     }
 
     private fun deleteEntry(context: Context, uri: Uri) {
