@@ -178,8 +178,8 @@ object HeavyInitializer {
      * resolved by HfTokenProvider immediately before Hugging Face requests.
      * @param fileName Relative destination path under application filesDir.
      * @param timeoutMs Overall transfer timeout. Must be positive.
-     * @param forceFresh When true, remove the completed file and all known
-     * resumable transfer artifacts before starting.
+     * @param forceFresh When true, discard resumable transfer artifacts and fetch a replacement.
+     * The installed file is preserved until a validated replacement can be promoted atomically.
      * @param onProgress Progress callback. Exceptions thrown by the callback are
      * isolated so UI code cannot abort the network transfer.
      */
@@ -245,6 +245,27 @@ object HeavyInitializer {
         flight.ownerJob =
             currentCoroutineContext()[Job]
 
+        return try {
+            ModelArtifactOperations.withDestination(finalFile) {
+                runFlight(finalFile, modelUrl, timeoutMs, forceFresh, onProgress, flight)
+            }
+        } catch (ce: CancellationException) {
+            flight.deferred.complete(Result.failure(IOException("Canceled", ce)))
+            throw ce
+        } finally {
+            flight.ownerJob = null
+            flights.remove(flightKey, flight)
+        }
+    }
+
+    private suspend fun runFlight(
+        finalFile: File,
+        modelUrl: String,
+        timeoutMs: Long,
+        forceFresh: Boolean,
+        onProgress: (Long, Long?) -> Unit,
+        flight: Flight,
+    ): Result<File> {
         val startedAtMs =
             SystemClock.elapsedRealtime()
 
@@ -304,7 +325,7 @@ object HeavyInitializer {
 
                 cleanupTransferState(
                     finalFile = finalFile,
-                    deleteFinal = true,
+                    deleteFinal = false,
                     includeLegacyTmpState = true,
                 )
             } else {
@@ -395,6 +416,7 @@ object HeavyInitializer {
                 downloader.downloadToFile(
                     url = modelUrl,
                     dst = finalFile,
+                    reuseExisting = !forceFresh,
                     onProgress =
                         safeProgress,
                     connectTimeoutMs =
@@ -624,14 +646,6 @@ object HeavyInitializer {
 
             return result
 
-        } finally {
-            flight.ownerJob =
-                null
-
-            flights.remove(
-                flightKey,
-                flight,
-            )
         }
     }
 
@@ -719,7 +733,7 @@ object HeavyInitializer {
      * does not already exist. All files live in the same directory, so rename
      * should normally be atomic and inexpensive.
      */
-    private fun migrateLegacyTransferState(
+    private suspend fun migrateLegacyTransferState(
         finalFile: File,
     ) {
         val parent =
@@ -762,12 +776,7 @@ object HeavyInitializer {
             legacyTmp.isFile &&
             legacyTmp.length() > 0L
         ) {
-            moveBestEffort(
-                source =
-                    legacyTmp,
-                destination =
-                    finalFile,
-            )
+            ModelArtifactOperations.current().promote(legacyTmp)
 
             Log.d(
                 TAG,

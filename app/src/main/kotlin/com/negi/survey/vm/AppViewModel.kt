@@ -47,19 +47,19 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
+import com.negi.survey.utils.ModelArtifactOperations
 import com.negi.survey.utils.HeavyInitializer
 import com.negi.survey.ui.theme.outdoorBackplate
 import com.negi.survey.utils.PersistentModelStore
 import java.io.File
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 
 /* ───────────────────────────── Download State ───────────────────────────── */
 
@@ -127,300 +127,148 @@ class AppViewModel(
     @Volatile
     private var downloadJob: Job? = null
 
-    /**
-     * Ensures the target model exists locally, downloading if needed.
-     *
-     * Behavioral rules:
-     * - If already DONE and file exists, return (unless forceFresh=true).
-     * - If a plausible cached file exists, emit DONE and return (unless forceFresh=true).
-     * - Only one download job can run at a time.
-     * - forceFresh cancels the current job and starts a new attempt.
-     */
-    fun ensureModelDownloaded(
-        appContext: Context,
-        forceFresh: Boolean = false
+    private var operation: ModelArtifactOperations.Lease? = null
+
+    @Volatile
+    private var completedInstallation: Pair<DlState.Done, ModelArtifactOperations.Lease>? = null
+
+    /** Claims before launching, so callbacks from a previous request cannot win launch ordering. */
+    private fun launchOperation(
+        app: Context,
+        block: suspend (ModelArtifactOperations.Lease) -> Unit,
     ) {
-        val app = appContext.applicationContext
-
-        val currentState = _state.value
-        if (!forceFresh && currentState is DlState.Done && currentState.file.exists()) {
-            return
-        }
-
-        // Single job policy (Job-based, avoids AtomicBoolean races).
-        val running = downloadJob
-        if (running?.isActive == true) {
-            if (!forceFresh) return
-            running.cancel(CancellationException("forceFresh requested"))
-            HeavyInitializer.cancel()
-        }
-
-        if (!forceFresh) {
-            val safeName = suggestFileName(modelUrl, fileName)
-            findExistingModelFile(app, safeName)?.let { existing ->
-                Log.i("AppViewModel", "private model reused: name=$safeName bytes=${existing.length()}")
-                _state.value = DlState.Done(existing)
-                return
-            }
-        }
-
-        // An explicit forced re-download (e.g. "Retry" after choosing to
-        // redownload, or a debug reset) skips the manual-file prompt below
-        // and goes straight to the network.
-        if (forceFresh) {
-            startDownload(app, forceFresh = true)
-            return
-        }
-
-        downloadJob = viewModelScope.launch(Dispatchers.IO) {
+        operation?.cancel()
+        downloadJob?.cancel(CancellationException("Model request replaced"))
+        val destination = File(app.filesDir, suggestFileName(modelUrl, fileName))
+        val lease = ModelArtifactOperations.begin(destination)
+        operation = lease
+        val job = viewModelScope.launch(Dispatchers.IO + lease, start = CoroutineStart.LAZY) {
             try {
-                val nowState = _state.value
-                if (nowState is DlState.Downloading || nowState is DlState.Done) {
-                    return@launch
-                }
-
-                val safeName = suggestFileName(modelUrl, fileName)
-                val privateDestination = File(app.filesDir, safeName)
-                val reused = runCatching {
-                    PersistentModelStore.reuseOrReplace(
-                        context = app,
-                        targetFileName = safeName,
-                        privateDestination = privateDestination,
-                        onReused = { bytes ->
-                            Log.i("AppViewModel", "Reused persisted model '$safeName' ($bytes bytes)")
-                        },
-                        onReplacing = { oldFileName ->
-                            Log.i("AppViewModel", "Removing stale persisted model '$oldFileName' before downloading '$safeName'")
-                        }
-                    )
-                }.getOrElse { e ->
-                    Log.w("AppViewModel", "Persisted model store check failed: ${e.message}")
-                    false
-                }
-
-                if (reused && privateDestination.exists() && privateDestination.length() > 0L) {
-                    _state.value = DlState.Done(privateDestination)
-                    return@launch
-                }
-
-                // Nothing found automatically in this app's own storage or the
-                // shared persisted-model folder. Pause here (instead of starting
-                // the network download immediately) so the UI can offer the user
-                // a chance to pick a copy saved elsewhere on the device — e.g. by
-                // another install of this app. proceedWithDownload() or
-                // useManuallySelectedModel() resumes from here.
-                _state.value = DlState.NeedsModel(safeName)
+                block(lease)
             } catch (ce: CancellationException) {
-                if (_state.value !is DlState.Error) {
-                    _state.value = DlState.Error("Canceled by user")
-                }
+                throw ce
             } catch (t: Throwable) {
-                _state.value = DlState.Error(t.message ?: "Failed to check for an existing model")
-            } finally {
-                if (downloadJob === this.coroutineContext[Job]) {
-                    downloadJob = null
+                publish(lease, DlState.Error(t.message ?: "Model preparation failed"))
+            }
+        }
+        lease.attach(job)
+        downloadJob = job
+        job.start()
+    }
+
+    private fun publish(lease: ModelArtifactOperations.Lease, state: DlState) {
+        try {
+            lease.publish {
+                if (state is DlState.Done) completedInstallation = state to lease
+                _state.value = state
+            }
+        } catch (_: CancellationException) {
+            // A canceled/replaced request has no authority over the current UI.
+        }
+    }
+
+    /** Reuses private/MediaStore models; otherwise offers the manual-file prompt. */
+    fun ensureModelDownloaded(appContext: Context, forceFresh: Boolean = false) {
+        val app = appContext.applicationContext
+        val current = _state.value
+        if (!forceFresh && current is DlState.Done && current.file.exists()) return
+        if (!forceFresh && downloadJob?.isActive == true) return
+        if (forceFresh) {
+            startDownload(app, true)
+            return
+        }
+        launchOperation(app) { lease ->
+            lease.locked {
+                val existing = findExistingModelFile(app, lease.file.name)
+                if (existing != null) {
+                    publish(lease, DlState.Done(existing))
+                } else {
+                    val reused = PersistentModelStore.reuseOrReplace(
+                        app, lease.file.name, lease.file,
+                        onReused = { bytes -> Log.i("AppViewModel", "Reused persisted model ($bytes bytes)") },
+                        onReplacing = { }
+                    )
+                    lease.checkCurrent()
+                    publish(lease, if (reused) DlState.Done(lease.file) else DlState.NeedsModel(lease.file.name))
                 }
             }
         }
     }
 
-    /**
-     * Dismisses [DlState.NeedsModel] and starts the normal network download,
-     * for when the user doesn't have (or can't find) a copy saved elsewhere
-     * on the device to pick instead.
-     */
     fun proceedWithDownload(appContext: Context) {
-        startDownload(appContext.applicationContext, forceFresh = false)
+        startDownload(appContext.applicationContext, false)
     }
 
-    /**
-     * Copies a model file the user picked via the system file/document picker
-     * (e.g. a copy saved by another install of this app) into private storage
-     * and marks the model ready, skipping the network download entirely.
-     *
-     * On failure, surfaces a [DlState.Error] so the user can try picking again
-     * (via "Retry", which re-enters [ensureModelDownloaded] and will offer the
-     * prompt again) or fall back to downloading.
-     */
+    /** Copies to operation-owned staging before entering the shared installation boundary. */
     fun useManuallySelectedModel(appContext: Context, uri: Uri) {
         val app = appContext.applicationContext
-
-        val running = downloadJob
-        if (running?.isActive == true) {
-            running.cancel(CancellationException("manual model file selected"))
-            HeavyInitializer.cancel()
-        }
-
-        downloadJob = viewModelScope.launch(Dispatchers.IO) {
-            try {
-                _state.value = DlState.ImportingSelectedFile
-
-                val safeName = suggestFileName(modelUrl, fileName)
-                val destination = File(app.filesDir, safeName)
-                val tmp = File(app.filesDir, "$safeName.fromPicker.tmp")
-
-                val copied = runCatching {
-                    app.contentResolver.openInputStream(uri)?.use { input ->
-                        tmp.outputStream().use { out -> input.copyTo(out, bufferSize = 1 shl 20) }
-                        true
-                    } ?: false
-                }.getOrElse { e ->
-                    Log.w("AppViewModel", "Failed to read manually selected model file: ${e.message}")
-                    false
-                }
-
-                if (!copied || !tmp.exists() || tmp.length() <= 0L) {
-                    tmp.delete()
-                    _state.value = DlState.Error(
-                        "Couldn't read the selected file. Choose another file, or retry to download the model instead."
-                    )
-                    return@launch
-                }
-
-                if (!tmp.renameTo(destination)) {
-                    tmp.copyTo(destination, overwrite = true)
-                    tmp.delete()
-                }
-
-                if (!isActive) return@launch
-
-                runCatching { PersistentModelStore.persistFromPrivate(app, safeName, destination) }
-                    .onFailure { e -> Log.w("AppViewModel", "Failed to persist manually selected model: ${e.message}") }
-
-                Log.i("AppViewModel", "Using manually selected model file: name=$safeName bytes=${destination.length()}")
-                _state.value = DlState.Done(destination, fromManualSelection = true)
-            } catch (t: Throwable) {
-                _state.value = DlState.Error(t.message ?: "Couldn't use the selected file.")
-            } finally {
-                if (downloadJob === this.coroutineContext[Job]) {
-                    downloadJob = null
-                }
+        launchOperation(app) { lease ->
+            publish(lease, DlState.ImportingSelectedFile)
+            lease.import(open = { app.contentResolver.openInputStream(uri) }) { file ->
+                PersistentModelStore.persistFromPrivate(app, file.name, file, replaceExisting = true)
+                publish(lease, DlState.Done(file, fromManualSelection = true))
             }
         }
     }
 
-    /**
-     * Deletes a model file that turned out to be unusable after a manual
-     * selection (see [useManuallySelectedModel]) — both the private copy
-     * and any copy already persisted to the public Downloads store — so
-     * [ensureModelDownloaded] never offers it again as an existing file.
-     *
-     * Intended to be called right before forcing an app restart: once the
-     * native runtime is poisoned (see NativeRuntimePoisonedException in the
-     * slm package), nothing else in this process can recover, so there's no
-     * further UI state to publish here — the fresh process starts clean.
-     */
-    suspend fun discardBadManuallySelectedModel(appContext: Context, file: File) {
-        val app = appContext.applicationContext
-        withContext(Dispatchers.IO) {
-            runCatching { file.delete() }
-                .onFailure { e -> Log.w("AppViewModel", "Failed to delete bad manual model file: ${e.message}") }
-            runCatching { PersistentModelStore.forget(app, file.name) }
-                .onFailure { e -> Log.w("AppViewModel", "Failed to forget persisted bad model file: ${e.message}") }
+    /** Rejects recovery callbacks from an installation replaced by another owner. */
+    suspend fun discardBadManuallySelectedModel(appContext: Context, installation: DlState.Done) {
+        val completed = completedInstallation?.takeIf { it.first === installation } ?: return
+        val lease = completed.second
+        val file = installation.file
+        lease.recover { recovery ->
+            recovery.publish {
+                if (!file.delete() && file.exists()) throw java.io.IOException("Could not delete bad model")
+            }
+            PersistentModelStore.forget(appContext.applicationContext, file.name)
         }
     }
 
-    /** Starts the actual network download; the only path that calls [HeavyInitializer.ensureInitialized]. */
     private fun startDownload(app: Context, forceFresh: Boolean) {
-        val running = downloadJob
-        if (running?.isActive == true) {
-            if (!forceFresh) return
-            running.cancel(CancellationException("forceFresh requested"))
-            HeavyInitializer.cancel()
-        }
-
-        downloadJob = viewModelScope.launch(Dispatchers.IO) {
-            val job = coroutineContext[Job]
-            try {
-                val nowState = _state.value
-                if (!forceFresh && (nowState is DlState.Downloading || nowState is DlState.Done)) {
-                    return@launch
-                }
-
-                val safeName = suggestFileName(modelUrl, fileName)
-
-                _state.value = DlState.Downloading(downloaded = 0L, total = null)
-
+        if (!forceFresh && downloadJob?.isActive == true) return
+        launchOperation(app) { lease ->
+            lease.locked {
+                publish(lease, DlState.Downloading(0L, null))
                 var lastEmitNs = System.nanoTime()
                 var lastBytes = 0L
-
-                val progressBridge: (Long, Long?) -> Unit = progress@{ got, total ->
-                    if (job?.isActive == false) return@progress
-
+                val progress: (Long, Long?) -> Unit = { got, total ->
                     val now = System.nanoTime()
-                    val elapsedMs = (now - lastEmitNs) / 1_000_000L
-                    val deltaBytes = got - lastBytes
-
-                    val shouldEmit =
-                        elapsedMs >= uiThrottleMs ||
-                                deltaBytes >= uiMinDeltaBytes ||
-                                (total != null && got >= total)
-
-                    if (shouldEmit) {
+                    if ((now - lastEmitNs) / 1_000_000L >= uiThrottleMs ||
+                        got - lastBytes >= uiMinDeltaBytes || (total != null && got >= total)) {
                         lastEmitNs = now
                         lastBytes = got
-                        _state.value = DlState.Downloading(got, total)
+                        publish(lease, DlState.Downloading(got, total))
                     }
                 }
-
                 val result = HeavyInitializer.ensureInitialized(
-                    context = app,
-                    modelUrl = modelUrl,
-                    fileName = safeName,
-                    timeoutMs = timeoutMs,
-                    forceFresh = forceFresh,
-                    onProgress = progressBridge
+                    context = app, modelUrl = modelUrl, fileName = lease.file.name,
+                    timeoutMs = timeoutMs, forceFresh = forceFresh, onProgress = progress
                 )
-
-                if (!isActive) return@launch
-
-                _state.value = result.fold(
-                    onSuccess = { file ->
-                        runCatching { PersistentModelStore.persistFromPrivate(app, safeName, file) }
-                            .onFailure { e -> Log.w("AppViewModel", "Failed to persist model to shared storage: ${e.message}") }
-                        DlState.Done(file)
-                    },
-                    onFailure = { error -> DlState.Error(error.message ?: "Download failed") }
-                )
-            } catch (ce: CancellationException) {
-                if (_state.value !is DlState.Error) {
-                    _state.value = DlState.Error("Canceled by user")
-                }
-            } catch (t: Throwable) {
-                if (!isActive) return@launch
-                _state.value = DlState.Error(t.message ?: "Download failed")
-            } finally {
-                if (downloadJob === this.coroutineContext[Job]) {
-                    downloadJob = null
-                }
+                lease.checkCurrent()
+                val file = result.getOrThrow()
+                PersistentModelStore.persistFromPrivate(app, file.name, file, replaceExisting = true)
+                publish(lease, DlState.Done(file))
             }
         }
     }
 
-    /**
-     * Cancels the current download attempt.
-     *
-     * This cancels:
-     * - the ViewModel job
-     * - the HeavyInitializer owner job (best-effort)
-     */
     fun cancelDownload() {
+        operation?.cancel()
         downloadJob?.cancel(CancellationException("canceled by user"))
-        HeavyInitializer.cancel()
         _state.value = DlState.Error("Canceled by user")
         downloadJob = null
     }
 
     fun resetForDebug() {
+        operation?.cancel()
         downloadJob?.cancel(CancellationException("resetForDebug"))
-        HeavyInitializer.resetForDebug()
         _state.value = DlState.Idle
         downloadJob = null
     }
 
     override fun onCleared() {
+        operation?.cancel()
         downloadJob?.cancel(CancellationException("onCleared"))
-        runCatching { HeavyInitializer.cancel() }
         downloadJob = null
         super.onCleared()
     }

@@ -53,7 +53,7 @@ class DaBuildIsolationTest {
     }
 
     @Test
-    fun modelCopyAndRestoreUseTheExperimentalDownloadsFolder() {
+    fun modelCopyAndRestoreUseTheExperimentalDownloadsFolder() = runBlocking {
         assumeTrue(Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
         val name = "da-isolation-${UUID.randomUUID()}.bin"
         val source = File(context.cacheDir, name)

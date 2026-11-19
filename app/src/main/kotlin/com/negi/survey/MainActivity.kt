@@ -1003,6 +1003,8 @@ fun AppNav() {
         }
     ) { modelFile ->
 
+        // Capture the installation, not just its reusable path, for late recovery callbacks.
+        val installedModel = state as? DlState.Done
         val modelConfig = remember(cfg) { buildModelConfig(cfg.slm) }
         val slmModel = remember(modelFile.absolutePath, modelConfig, cfg.modelDefaults.defaultFileName) {
             val modelName = cfg.modelDefaults.defaultFileName
@@ -1037,7 +1039,7 @@ fun AppNav() {
                 // surfaces this wrapped in a generic IllegalStateException (with no
                 // cause reference back to the original), so type-matching only ever
                 // caught it starting on the second attempt.
-                val fromManualPick = (state as? DlState.Done)?.fromManualSelection == true
+                val fromManualPick = installedModel?.fromManualSelection == true
                 val isPoisoned = error.message?.contains(NATIVE_RUNTIME_POISON_MESSAGE) == true
                 if (fromManualPick && isPoisoned) {
                     "Pick a different file"
@@ -1046,7 +1048,7 @@ fun AppNav() {
                 }
             },
             onRetry = { error, defaultRetry ->
-                val fromManualPick = (state as? DlState.Done)?.fromManualSelection == true
+                val fromManualPick = installedModel?.fromManualSelection == true
                 val isPoisoned = error.message?.contains(NATIVE_RUNTIME_POISON_MESSAGE) == true
                 if (fromManualPick && isPoisoned) {
                     // The bad file was already discarded down in init()'s own catch
@@ -1119,8 +1121,8 @@ fun AppNav() {
                         // same bad file, because nothing had removed it yet. This way
                         // it's gone before the error even has a chance to render.
                         val isPoisoned = e.message?.contains(NATIVE_RUNTIME_POISON_MESSAGE) == true
-                        if (isPoisoned && (state as? DlState.Done)?.fromManualSelection == true) {
-                            appVm.discardBadManuallySelectedModel(appContext, modelFile)
+                        if (isPoisoned && installedModel?.fromManualSelection == true) {
+                            appVm.discardBadManuallySelectedModel(appContext, installedModel)
                         }
                         throw e
                     }
