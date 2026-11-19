@@ -1,0 +1,12 @@
+{
+  "original_branch": "codex/issue-123-artifact-concurrency",
+  "branch_slug": "codex-issue-123-artifact-concurrency",
+  "commit_sha": "7a67bcbb82f85c24361cd6a86b0d11517bfc207b",
+  "short_sha": "7a67bcb",
+  "apk_name": "Survey2026-codex-issue-123-artifact-concurrency-7a67bcb.apk",
+  "apk_sha256": "1ae142dee25ee42c30133935a7370c15e88a7bb76103eff34e6855226adbcb51",
+  "apk_download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-codex-issue-123-artifact-concurrency-7a67bcb-run-226/Survey2026-codex-issue-123-artifact-concurrency-7a67bcb.apk",
+  "page_url": "https://ishizuki-tech.github.io/Survey2026/codex-issue-123-artifact-concurrency/",
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/44629216661",
+  "generated_utc": "2026-11-19T22:36:56Z"
+}
