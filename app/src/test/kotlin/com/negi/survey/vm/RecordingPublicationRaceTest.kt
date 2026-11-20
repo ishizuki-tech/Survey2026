@@ -62,10 +62,10 @@ class RecordingPublicationRaceTest {
         Dispatchers.resetMain()
     }
 
-    private fun controller(hooks: WhisperSpeechController.PublicationHooks? = null): WhisperSpeechController {
+    private fun controller(hooks: WhisperSpeechController.PublicationHooks? = null, beforeClose: () -> Unit = {}): WhisperSpeechController {
         val vm = WhisperSpeechController(context, microphonePermission = { true },
             publicationHooks = hooks,
-            recorderFactory = { _, onError -> WavRecorder(onError).also { recorders += it } },
+            recorderFactory = { _, onError -> WavRecorder(onError, beforeClose).also { recorders += it } },
             modelInitializer = {}, transcriber = { _, _ -> Result.success("accepted transcript") },
             onVoiceExported = { exports += it }, whisperDetacher = {},
             recorderSessionMutex = kotlinx.coroutines.sync.Mutex(), whisperSessionGate = WhisperSessionGate())
@@ -208,16 +208,71 @@ class RecordingPublicationRaceTest {
         assertTrue(artifactStore.voiceEntries(prompt.surveyId).single().matchesPayload())
     }
 
+    @Test fun managedWavLeaseOutlivesRecorderClosureAndDecisionBarrier() = runBlocking {
+        val barrier = Barrier()
+        val closed = CompletableDeferred<Unit>()
+        val vm = controller(object : WhisperSpeechController.PublicationHooks {
+            override fun beforeDecision() = barrier.block()
+        }, beforeClose = { closed.complete(Unit) })
+        val recorder = startAndStop(vm)
+        withTimeout(5_000) { barrier.entered.await(); closed.await() }
+        val wav = requireNotNull(recorder.output)
+        try {
+            assertTrue(wav.exists())
+            assertLeaseLocked(wav)
+            // A different generation still cannot reclaim the entry during transcription/publication.
+            com.negi.survey.whisper.CaptureCache(temp.root, java.util.UUID.randomUUID().toString()).begin().finish()
+            assertTrue(wav.exists())
+        } finally { barrier.release.countDown() }
+        settled(vm)
+        withTimeout(5_000) { while (wav.parentFile!!.exists()) yield() }
+        assertEquals(1, exports.size)
+    }
+
+    @Test fun managedFilesStayLockedThroughPendingRecorderClose() = runBlocking {
+        val closing = Barrier()
+        val vm = controller(beforeClose = closing::block)
+        val recorder = startAndStop(vm)
+        withTimeout(5_000) { closing.entered.await() }
+        val wav = requireNotNull(recorder.output)
+        try { assertTrue(wav.exists()); assertLeaseLocked(wav) }
+        finally { closing.release.countDown() }
+        settled(vm)
+        withTimeout(5_000) { while (wav.parentFile!!.exists()) yield() }
+    }
+
+    @Test fun clearedControllerKeepsManagedLeaseUntilBlockedWorkerReturns() = runBlocking {
+        val barrier = Barrier()
+        val vm = controller(object : WhisperSpeechController.PublicationHooks {
+            override fun beforeDecision() = barrier.block()
+        })
+        val recorder = startAndStop(vm)
+        withTimeout(5_000) { barrier.entered.await() }
+        val wav = requireNotNull(recorder.output)
+        store.clear()
+        try { assertTrue(wav.exists()); assertLeaseLocked(wav) }
+        finally { barrier.release.countDown() }
+        withTimeout(5_000) { while (wav.parentFile!!.exists()) yield() }
+        assertTrue(exports.isEmpty())
+    }
+
+    private fun assertLeaseLocked(wav: File) {
+        java.nio.channels.FileChannel.open(File(wav.parentFile, "owner.lock").toPath(),
+            java.nio.file.StandardOpenOption.READ, java.nio.file.StandardOpenOption.WRITE).use { channel ->
+            assertThrows(java.nio.channels.OverlappingFileLockException::class.java) { channel.tryLock() }
+        }
+    }
+
     private class Barrier {
         val entered = CompletableDeferred<Unit>()
         val release = CountDownLatch(1)
         fun block() { entered.complete(Unit); check(release.await(10, TimeUnit.SECONDS)) }
     }
 
-    private class WavRecorder(val error: (Exception) -> Unit) : RecorderBackend {
+    private class WavRecorder(val error: (Exception) -> Unit, val beforeClose: () -> Unit = {}) : RecorderBackend {
         val started = CompletableDeferred<Unit>()
         var capture: () -> Unit = {}
-        private var output: File? = null
+        var output: File? = null
         override fun setOnCaptureStarted(callback: () -> Unit) { capture = callback }
         override fun isActive() = started.isCompleted
         override fun startRecording(output: File, rates: IntArray) {
@@ -226,6 +281,6 @@ class RecordingPublicationRaceTest {
         override suspend fun stopRecording() {
             File("src/androidTest/assets/whisper/jfk.wav").copyTo(requireNotNull(output), overwrite = true)
         }
-        override fun close() = Unit
+        override fun close() = beforeClose()
     }
 }

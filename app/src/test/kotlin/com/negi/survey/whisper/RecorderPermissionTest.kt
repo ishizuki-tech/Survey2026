@@ -33,7 +33,7 @@ class RecorderPermissionTest {
     @After fun cleanup() { unmockkAll() }
     @Test fun deniedPermissionRejectsCaptureBeforeCreatingFilesAndReturnsIdle() = runBlocking {
         val error = CompletableDeferred<Exception>()
-        val recorder = Recorder(context) { error.complete(it) }
+        val recorder = Recorder(context, { error("Denied capture must not allocate PCM") }) { error.complete(it) }
         val output = File(directory.root, "denied.wav")
         try {
             recorder.startRecording(output)

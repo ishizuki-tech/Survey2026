@@ -21,7 +21,8 @@ import org.junit.runner.RunWith
 class RecorderInstrumentationTest {
     private val instrumentation = InstrumentationRegistry.getInstrumentation()
     private val context = instrumentation.targetContext.applicationContext
-    private val files = mutableListOf<File>()
+    private val captures = mutableListOf<CaptureCache.Capture>()
+    private var currentCapture: CaptureCache.Capture? = null
 
     @Before
     fun grantMicrophonePermission() {
@@ -34,7 +35,7 @@ class RecorderInstrumentationTest {
     @Test
     fun microphone_record_stop_and_rerecord_finalizes_non_empty_wavs() = runBlocking {
         val errors = CopyOnWriteArrayList<Exception>()
-        val recorder = Recorder(context) { errors += it }
+        val recorder = Recorder(context, { checkNotNull(currentCapture).pcm }) { errors += it }
 
         try {
             val first = recordShortClip(recorder)
@@ -50,8 +51,10 @@ class RecorderInstrumentationTest {
     }
 
     private suspend fun recordShortClip(recorder: Recorder): File {
-        val output = File.createTempFile("recorder-device-smoke-", ".wav", context.cacheDir)
-        files += output
+        val capture = CaptureCache.forCache(context.cacheDir) {}.begin()
+        captures += capture
+        currentCapture = capture
+        val output = capture.wav
 
         val levelCount = AtomicInteger()
         val invalidCount = AtomicInteger()
@@ -80,7 +83,7 @@ class RecorderInstrumentationTest {
 
     @After
     fun deleteTemporaryFiles() {
-        files.forEach { file -> file.delete() }
+        captures.forEach { it.finish() }
     }
 
     private companion object {

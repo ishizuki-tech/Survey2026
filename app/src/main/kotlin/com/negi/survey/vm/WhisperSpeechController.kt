@@ -49,6 +49,7 @@ import com.negi.survey.runtime.HeavyRuntimeHandoff
 import com.negi.survey.runtime.NoOpHeavyRuntimeHandoff
 import com.negi.survey.utils.ExportUtils
 import com.negi.survey.whisper.Recorder
+import com.negi.survey.whisper.CaptureCache
 import com.negi.survey.whisper.RecorderBackend
 import com.negi.survey.whisper.RecordingSpectrum
 import com.negi.survey.whisper.WhisperEngine
@@ -199,6 +200,8 @@ class WhisperSpeechController(
         val questionId get() = recording.prompt.questionId
         var recorder: RecorderBackend? = null
         var outputFile: File? = null
+        val captureFiles = AtomicReference<CaptureCache.Capture?>(null)
+        val captureReleaseStarted = java.util.concurrent.atomic.AtomicBoolean(false)
         var workerJob: Job? = null
         var startupJob: Job? = null
         var initJob: Deferred<Unit>? = null
@@ -339,12 +342,11 @@ class WhisperSpeechController(
                     session.outputFile = null
                     deleteTempFileQuietly(old, reason = "start_cleanup")
 
-                    val dir = File(appContext.cacheDir, "whisper_rec")
-                    if (!dir.exists() && !dir.mkdirs()) {
-                        throw IllegalStateException("Failed to create cache dir: ${dir.path}")
-                    }
-
-                    val wav = File.createTempFile("survey_input_", ".wav", dir)
+                    val capture = CaptureCache.forCache(appContext.cacheDir) {
+                        Log.w(TAG, it)
+                    }.begin(session.recording.id)
+                    session.captureFiles.set(capture)
+                    val wav = capture.wav
                     session.outputFile = wav
 
                     session.recorder?.setOnCaptureStarted {
@@ -776,7 +778,21 @@ class WhisperSpeechController(
 
     private fun newRecorder(session: RecordingSession): RecorderBackend {
         return recorderFactory?.invoke(appContext) { failRecording(session, it) }
-            ?: Recorder(appContext) { failRecording(session, it) }
+            ?: Recorder(appContext, { checkNotNull(session.captureFiles.get()).pcm }) { failRecording(session, it) }
+    }
+
+    /** Recorder closure alone is insufficient: the WAV may still be read by transcription. */
+    private fun scheduleCaptureRelease(session: RecordingSession) {
+        if (!session.captureReleaseStarted.compareAndSet(false, true)) return
+        cleanupScope.launch(start = CoroutineStart.UNDISPATCHED) {
+            withContext(NonCancellable) {
+                session.startupJob?.join()
+                session.workerJob?.join()
+                if (session.recorderClose.request().await().isSuccess) {
+                    session.captureFiles.getAndSet(null)?.finish()
+                }
+            }
+        }
     }
 
     /** Discard the owned in-flight capture when Android reports permission loss. */
@@ -824,7 +840,10 @@ class WhisperSpeechController(
     /** A close that times out or fails keeps the session reserved until proven closed. */
     private suspend fun closeRecorderOrMonitor(session: RecordingSession): Boolean = withContext(NonCancellable) {
         val result = withTimeoutOrNull(recorderCloseTimeoutMs) { session.recorderClose.request().await() }
-        if (result != null && result.isSuccess) return@withContext true
+        if (result != null && result.isSuccess) {
+            scheduleCaptureRelease(session)
+            return@withContext true
+        }
         session.poisoned = true
         if (owns(session)) {
             _error.value = if (result == null) RECORDER_CLOSE_PENDING else RECORDER_CLOSE_FAILED
@@ -848,6 +867,7 @@ class WhisperSpeechController(
                     val tmp = session.outputFile
                     session.outputFile = null
                     deleteTempFileQuietly(tmp, reason = "recorder_close")
+                    scheduleCaptureRelease(session)
                     if (_error.value == RECORDER_CLOSE_PENDING) _error.value = null
                     activeSession.compareAndSet(session, null)
                     _isTranscribing.value = false
@@ -1086,7 +1106,10 @@ class WhisperSpeechController(
                 session?.let { active ->
                     val closeResult = checkNotNull(close).await()
                     closeResult.onFailure { e -> DiagnosticContentPolicy.logWarning(TAG, "Recorder.close failed", e) }
-                        .onSuccess { deleteTempFileQuietly(active.outputFile, reason = "view_model_cleared") }
+                        .onSuccess {
+                            deleteTempFileQuietly(active.outputFile, reason = "view_model_cleared")
+                            active.captureFiles.getAndSet(null)?.finish()
+                        }
                 }
             }
         }
