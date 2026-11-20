@@ -1,0 +1,12 @@
+{
+  "original_branch": "codex/issue-121-tts-session-disable",
+  "branch_slug": "codex-issue-121-tts-session-disable",
+  "commit_sha": "c7991f0933a2cd596b816128700a4ea88d8ecc4e",
+  "short_sha": "c7991f0",
+  "apk_name": "Survey2026-codex-issue-121-tts-session-disable-c7991f0.apk",
+  "apk_sha256": "a5a6a8d241d44be8d841fb3a86785030efee83e8828d49a88a41a4799b16029c",
+  "apk_download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-codex-issue-121-tts-session-disable-c7991f0-run-227/Survey2026-codex-issue-121-tts-session-disable-c7991f0.apk",
+  "page_url": "https://ishizuki-tech.github.io/Survey2026/codex-issue-121-tts-session-disable/",
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/44651281202",
+  "generated_utc": "2026-11-20T01:13:58Z"
+}
