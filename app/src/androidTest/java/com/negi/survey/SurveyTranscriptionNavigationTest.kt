@@ -92,6 +92,7 @@ class SurveyTranscriptionNavigationTest {
         val factory = viewModelFactory {
             initializer {
                 WhisperSpeechController(
+            microphonePermission = { true },
                     appContext = instrumentation.targetContext.applicationContext,
                     recorderFactory = { _, _ -> FixtureWavRecorder().also { recorders.add(it) } },
                     recorderSessionMutex = Mutex(),
@@ -348,6 +349,7 @@ class SurveyTranscriptionNavigationTest {
         val cleanupEntered = CompletableDeferred<Unit>()
         val finishCleanup = CompletableDeferred<Unit>()
         val controller = WhisperSpeechController(
+            microphonePermission = { true },
             appContext = instrumentation.targetContext.applicationContext,
             recorderFactory = { _, _ -> FixtureWavRecorder() },
             recorderSessionMutex = Mutex(),

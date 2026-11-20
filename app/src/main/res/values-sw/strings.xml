@@ -1,0 +1,5 @@
+<resources>
+    <string name="microphone_unavailable">Kurekodi hakupatikani. Bado unaweza kuandika majibu yako.</string>
+    <string name="microphone_allow">Ruhusu maikrofoni</string>
+    <string name="microphone_settings">Fungua mipangilio ya programu</string>
+</resources>

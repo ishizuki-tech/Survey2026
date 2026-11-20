@@ -33,6 +33,9 @@ import com.negi.survey.net.SurveyRecordingGate
 import com.negi.survey.net.SurveyRecordings
 import com.negi.survey.net.TranscriptionOutcome
 import com.negi.survey.net.V2ArtifactStore
+import android.Manifest
+import android.content.pm.PackageManager
+import androidx.core.content.ContextCompat
 import android.content.Context
 import android.os.SystemClock
 import android.util.Log
@@ -95,8 +98,28 @@ class WhisperSpeechController(
     private val recorderCloseTimeoutMs: Long = RECORDER_CLOSE_TIMEOUT_MS,
     private val whisperDetacher: suspend () -> Unit = { WhisperEngine.detach() },
     private val recorderSessionMutex: Mutex = globalRecorderSessionMutex,
-    private val whisperSessionGate: WhisperSessionGate = globalWhisperSessionGate
+    private val whisperSessionGate: WhisperSessionGate = globalWhisperSessionGate,
+    private val microphonePermission: () -> Boolean = {
+        ContextCompat.checkSelfPermission(appContext, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+    },
+    private val publicationHooks: PublicationHooks? = null,
 ) : ViewModel(), SpeechController {
+
+    /** Deterministic boundary observers for tests; production does not install hooks. */
+    interface PublicationHooks {
+        fun afterAudioStaged() = Unit
+        fun beforeDecision() = Unit
+        fun persistOutcome(write: () -> Unit) = write()
+        fun beforeTranscriptPublication() = Unit
+    }
+
+    /**
+     * Publication and resource ownership are separate. COMMITTED wins immediately before
+     * outcome persistence begins, after capture and transcription have produced a result.
+     * Later permission loss cannot retroactively fail an accepted result. No I/O or callback
+     * runs inside this decision: FAILED and COMMITTED compete through one atomic CAS.
+     */
+    private enum class PublicationDecision { PENDING, FAILED, COMMITTED }
 
     companion object {
         private const val TAG = "WhisperSpeechController"
@@ -184,6 +207,7 @@ class WhisperSpeechController(
         val whisperCleanup = OnceCleanup()
         lateinit var recorderClose: SharedClose
         val closeMonitorStarted = java.util.concurrent.atomic.AtomicBoolean(false)
+        val publication = AtomicReference(PublicationDecision.PENDING)
         @Volatile var recorderFailed = false
         @Volatile var poisoned = false
     }
@@ -235,6 +259,11 @@ class WhisperSpeechController(
     }
 
     override fun startRecording(prompt: RecordingPrompt) {
+        if (!microphonePermission()) {
+            _error.value = appContext.getString(com.negi.survey.R.string.microphone_unavailable)
+            onMicrophonePermissionLost()
+            return
+        }
         if (_isRecording.value || _isTranscribing.value) {
             Log.d(TAG, "startRecording: busy, ignoring")
             return
@@ -299,6 +328,7 @@ class WhisperSpeechController(
             recordingMutex.withLock {
                 try {
                     ensureActive()
+                    check(microphonePermission()) { "Microphone permission was revoked." }
                     check(!V2ArtifactStore(appContext).hasReservedRoute(V2ArtifactStore.surveyKey(session.surveyId))) {
                         "The survey already has an immutable export."
                     }
@@ -318,6 +348,11 @@ class WhisperSpeechController(
                     session.outputFile = wav
 
                     session.recorder?.setOnCaptureStarted {
+                        if (!owns(session)) return@setOnCaptureStarted
+                        if (!microphonePermission()) {
+                            failRecording(session, SecurityException("Microphone permission was revoked."))
+                            return@setOnCaptureStarted
+                        }
                         synchronized(session) {
                             if (owns(session) && _isRecording.value) {
                                 _recordingLevel.value = RecordingSpectrum()
@@ -327,6 +362,12 @@ class WhisperSpeechController(
                         }
                     }
                     session.recorder?.setOnCaptureLevel { level ->
+                        // Recorder already reports writer termination with null. Normal Stop
+                        // clears isRecording first; an unexpected exit must settle ownership.
+                        if (level == null && owns(session) && _isRecording.value) {
+                            failRecording(session, IllegalStateException("Microphone capture ended unexpectedly."))
+                            return@setOnCaptureLevel
+                        }
                         // Identity distinguishes equal readings and prevents an old writer
                         // from publishing after Stop or into a replacement session.
                         val previous = _recordingLevel.value
@@ -337,7 +378,7 @@ class WhisperSpeechController(
                     Log.d(TAG, "startRecording: recorder.startRecording -> ${wav.path}")
                     session.recorder?.startRecording(output = wav, rates = RECORDER_RATE_CANDIDATES)
                         ?: error("Recorder session was not initialized")
-                    session.initJob?.start()
+                    if (!session.recorderFailed) session.initJob?.start()
                     Log.d(TAG, "startRecording: recorder requested")
                 } catch (ce: CancellationException) {
                     Log.d(TAG, "startRecording: cancelled")
@@ -470,6 +511,7 @@ class WhisperSpeechController(
                         }
                     }
 
+                    if (!owns(session) || session.recorderFailed) return@withLock
                     val recording = session.recording
                     val staged = try {
                         check(info != null && info.dataBytes > 0 && info.dataOffset + info.dataBytes <= wav.length()) {
@@ -483,24 +525,8 @@ class WhisperSpeechController(
                         if (owns(session)) _error.value = "Could not save this recording."
                         null
                     }
-                    if (staged != null && owns(session)) {
-                        val route = staged.route
-                        try {
-                            onVoiceExported?.invoke(ExportedVoice(
-                                surveyId = session.surveyId,
-                                questionId = session.questionId,
-                                fileName = route.basename,
-                                byteSize = route.size,
-                                checksum = route.fingerprint,
-                            ))
-                        } catch (cancelled: CancellationException) {
-                            throw cancelled
-                        } catch (failure: Exception) {
-                            DiagnosticContentPolicy.logWarning(TAG, "WAV export observer failed", failure)
-                        }
-                        WhisperTraceRegistry.event(session.surveyId, session.questionId, "AUDIO_EXPORTED",
-                            mapOf("fileName" to route.basename, "byteSize" to route.size))
-                    }
+                    publicationHooks?.afterAudioStaged()
+                    if (session.publication.get() == PublicationDecision.FAILED) return@withLock
 
                     if (!owns(session)) return@withLock
                     val result = try {
@@ -532,11 +558,41 @@ class WhisperSpeechController(
                     (result.exceptionOrNull() as? CancellationException)?.let { throw it }
                     ensureActive()
                     if (!owns(session)) return@withLock
+                    publicationHooks?.beforeDecision()
+                    ensureActive()
+                    if (!owns(session) || !session.publication.compareAndSet(
+                            PublicationDecision.PENDING, PublicationDecision.COMMITTED
+                        )) return@withLock
+                    // The immutable outcome may now be written without blocking failure handling.
+                    // If failure won before the CAS, no successful outcome or observer is published.
                     if (staged != null) {
-                        SurveyRecordings(V2ArtifactStore(appContext)).persistOutcome(
-                            staged, recording, TranscriptionOutcome.from(result),
-                        )
+                        val write = {
+                            SurveyRecordings(V2ArtifactStore(appContext)).persistOutcome(
+                                staged, recording, TranscriptionOutcome.from(result),
+                            )
+                        }
+                        publicationHooks?.persistOutcome(write) ?: write()
                     }
+                    if (staged != null && owns(session)) {
+                        val route = staged.route
+                        try {
+                            onVoiceExported?.invoke(ExportedVoice(
+                                surveyId = session.surveyId,
+                                questionId = session.questionId,
+                                fileName = route.basename,
+                                byteSize = route.size,
+                                checksum = route.fingerprint,
+                            ))
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (failure: Exception) {
+                            DiagnosticContentPolicy.logWarning(TAG, "WAV export observer failed", failure)
+                        }
+                        WhisperTraceRegistry.event(session.surveyId, session.questionId, "AUDIO_EXPORTED",
+                            mapOf("fileName" to route.basename, "byteSize" to route.size))
+                    }
+
+                    publicationHooks?.beforeTranscriptPublication()
 
                     result
                         .onSuccess { text ->
@@ -719,39 +775,50 @@ class WhisperSpeechController(
     private fun owns(session: RecordingSession): Boolean = activeSession.get() === session
 
     private fun newRecorder(session: RecordingSession): RecorderBackend {
-        val onError: (Exception) -> Unit = onError@{ e ->
-            DiagnosticContentPolicy.logError(TAG, "Recorder error", e)
-            if (!owns(session)) {
-                Log.d(TAG, "Ignoring stale recorder error for session=${session.id}")
-                return@onError
-            }
+        return recorderFactory?.invoke(appContext) { failRecording(session, it) }
+            ?: Recorder(appContext) { failRecording(session, it) }
+    }
 
+    /** Discard the owned in-flight capture when Android reports permission loss. */
+    fun onMicrophonePermissionLost() {
+        val session = activeSession.get() ?: return
+        failRecording(session, SecurityException("Microphone permission was revoked."))
+    }
+
+    private fun failRecording(session: RecordingSession, e: Exception) {
+        DiagnosticContentPolicy.logError(TAG, "Recorder error", e)
+        if (!owns(session)) {
+            Log.d(TAG, "Ignoring stale recorder error for session=${session.id}")
+            return
+        }
+
+        synchronized(session) {
+            if (!owns(session) || !session.publication.compareAndSet(
+                    PublicationDecision.PENDING, PublicationDecision.FAILED
+                )) return
             session.recorderFailed = true
-            synchronized(session) {
-                _recordingLevel.value = null
-                _error.value = e.message ?: "Recording error"
-                _isRecording.value = false
-                _isCaptureActive.value = false
-            }
+            _recordingLevel.value = null
+            _error.value = e.message ?: "Recording error"
+            _isRecording.value = false
+            _isCaptureActive.value = false
+        }
 
-            cleanupScope.launch {
-                withContext(NonCancellable) {
-                    if (owns(session)) {
-                        session.startupJob?.cancelAndJoin()
-                        session.workerJob?.cancelAndJoin()
-                        recordingMutex.withLock {
-                            if (!owns(session)) return@withLock
-                            session.poisoned = true
-                            closePoisonedSessionAsync(session)
-                            runCatching { finishWhisperSession(session) }
-                            SurveyRecordingGate.end(session.recording)
-                            _isTranscribing.value = false
-                        }
+        cleanupScope.launch {
+            withContext(NonCancellable) {
+                if (owns(session)) {
+                    session.startupJob?.cancelAndJoin()
+                    session.workerJob?.cancelAndJoin()
+                    recordingMutex.withLock {
+                        if (!owns(session)) return@withLock
+                        session.poisoned = true
+                        closePoisonedSessionAsync(session)
+                        runCatching { finishWhisperSession(session) }
+                        SurveyRecordingGate.end(session.recording)
+                        _isTranscribing.value = false
                     }
                 }
             }
         }
-        return recorderFactory?.invoke(appContext, onError) ?: Recorder(appContext, onError)
     }
 
     /** A close that times out or fails keeps the session reserved until proven closed. */
@@ -1000,6 +1067,7 @@ class WhisperSpeechController(
 
     override fun onCleared() {
         val session = activeSession.getAndSet(null)
+        session?.publication?.compareAndSet(PublicationDecision.PENDING, PublicationDecision.FAILED)
         if (session != null) synchronized(session) { _recordingLevel.value = null }
         session?.startupJob?.cancel()
         session?.workerJob?.cancel()
