@@ -1,0 +1,12 @@
+{
+  "original_branch": "codex/issue-124-capture-cache-cleanup",
+  "branch_slug": "codex-issue-124-capture-cache-cleanup",
+  "commit_sha": "3545e0e242b50912e42219ea7d7616a511ccf0a3",
+  "short_sha": "3545e0e",
+  "apk_name": "Survey2026-codex-issue-124-capture-cache-cleanup-3545e0e.apk",
+  "apk_sha256": "707c08388ff0f7ab3b2e7fc570cbbcf75fdc405ebd63693ae7fb8240c5877f9c",
+  "apk_download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-codex-issue-124-capture-cache-cleanup-3545e0e-run-229/Survey2026-codex-issue-124-capture-cache-cleanup-3545e0e.apk",
+  "page_url": "https://ishizuki-tech.github.io/Survey2026/codex-issue-124-capture-cache-cleanup/",
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/44815547084",
+  "generated_utc": "2026-11-20T21:01:19Z"
+}
