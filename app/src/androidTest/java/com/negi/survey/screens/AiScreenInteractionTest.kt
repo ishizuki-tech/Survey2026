@@ -142,6 +142,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.withContext
 import kotlin.math.abs
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Rule
@@ -169,6 +170,8 @@ class AiScreenInteractionTest {
 
     private fun host(
         withSpeech: Boolean = true,
+        speechControllerForTest: SpeechController = speech,
+        microphonePermission: com.negi.survey.MicrophonePermissionState? = null,
         twoStep: Boolean = false,
         readAloud: Boolean = true,
         playbackState: Lifecycle.State? = null,
@@ -234,7 +237,8 @@ class AiScreenInteractionTest {
                         ttsMeta = SurveyConfig.TtsMeta(enabled = false),
                         onResolveUploadStatusDetails = { error("Unused") },
                         onClearCompletedSurveys = {},
-                        speechControllerOverride = speech,
+                        speechControllerOverride = speechControllerForTest,
+                        microphonePermission = microphonePermission,
                     )
                 }
                 return@content
@@ -258,7 +262,7 @@ class AiScreenInteractionTest {
             if (visible) {
                 SurveyQuestionAutoRead(
                     survey, ai, speaker.takeIf { speakerAvailable },
-                    speech.takeIf { withSpeech }, autoplay, lifecycle
+                    speechControllerForTest.takeIf { withSpeech }, autoplay, lifecycle
                 )
             }
             val screen: @Composable (String) -> Unit = { nodeId ->
@@ -278,8 +282,8 @@ class AiScreenInteractionTest {
                             val composerColor = MaterialTheme.colorScheme.surfaceVariant
                             SideEffect { onComposerColor(composerColor) }
                             AiScreen(nodeId, survey, ai, survey::advanceToNext, survey::backToPrevious,
-                                if (withSpeech) speech else null, speaker.takeIf { speakerAvailable },
-                                playbackLifecycle = lifecycle)
+                                if (withSpeech) speechControllerForTest else null, speaker.takeIf { speakerAvailable },
+                                playbackLifecycle = lifecycle, microphonePermission = microphonePermission)
                         }
                     }
                 }
@@ -310,6 +314,159 @@ class AiScreenInteractionTest {
     private fun addFollowup(question: String) {
         survey.addFollowupQuestion("Q8", question)
         ai.setFollowupMode(contextKey, question)
+    }
+
+    @Test fun deniedPermissionShowsTextAndPreservesDraftAcrossRegrantWithoutStartingCapture() {
+        var granted = false
+        var requests = 0
+        val permission = com.negi.survey.MicrophonePermissionState(false, { granted }, { requests++ }, {})
+        host(microphonePermission = permission) { setAnswer("existing draft", "Q8") }
+        rule.onNode(hasSetTextAction()).assertExists()
+        rule.onNodeWithText("Tap to answer").assertDoesNotExist()
+        rule.onNodeWithText("Voice").assertIsNotEnabled()
+        rule.runOnIdle {
+            assertEquals(0, requests)
+            assertEquals("existing draft", survey.getAnswer("Q8"))
+        }
+        rule.onNodeWithText("Allow microphone").performScrollTo().performClick()
+        rule.runOnIdle {
+            assertEquals(1, requests)
+            granted = true
+            permission.refresh()
+        }
+        rule.onNodeWithText("Voice").assertIsEnabled()
+        rule.runOnIdle {
+            assertEquals("existing draft", survey.getAnswer("Q8"))
+            assertEquals("existing draft", ai.conversationStateFlow(contextKey).value.composerDraft)
+            assertEquals(0, speech.startCalls)
+        }
+    }
+
+    @Test fun failedRecordingStartupPreservesOriginalDraftUntilValidTranscriptReplacesIt() {
+        host { setAnswer("typed draft", "Q8") }
+        rule.onNodeWithText("Tap to answer").performClick()
+        rule.runOnIdle {
+            assertEquals("typed draft", survey.getAnswer("Q8"))
+            assertEquals("typed draft", ai.conversationStateFlow(contextKey).value.composerDraft)
+            speech.errorMessage.value = "Microphone start failed"
+            speech.recording.value = false
+        }
+        rule.waitForIdle()
+        rule.runOnIdle {
+            assertEquals("typed draft", survey.getAnswer("Q8"))
+            assertEquals("typed draft", ai.conversationStateFlow(contextKey).value.composerDraft)
+        }
+        rule.onNodeWithText("Tap to answer").performClick()
+        rule.runOnIdle { speech.transitionToTranscribing() }
+        rule.waitForIdle()
+        rule.runOnIdle { speech.finish("valid replacement") }
+        rule.waitForIdle()
+        rule.runOnIdle { assertEquals("valid replacement", survey.getAnswer("Q8")) }
+    }
+
+    @Test fun failedFollowupRecordingPreservesSubmittedOriginalAndFollowupDraft() {
+        host { acceptAiOriginalAnswer("Q8", "submitted original") }
+        rule.runOnIdle {
+            addFollowup("Clarification?")
+            ai.updateComposerDraft(contextKey, "follow-up draft")
+        }
+        rule.waitForIdle()
+        rule.onNodeWithText("Tap to answer").performClick()
+        rule.waitForIdle()
+        rule.runOnIdle {
+            speech.errorMessage.value = "Microphone start failed"
+            speech.recording.value = false
+        }
+        rule.waitForIdle()
+        rule.runOnIdle {
+            assertEquals("submitted original", survey.getAnswer("Q8"))
+            assertTrue("Q8" in survey.submittedAiOriginals.value)
+            assertEquals("follow-up draft", ai.conversationStateFlow(contextKey).value.composerDraft)
+            assertNull(survey.followups.value.getValue("Q8").last().answer)
+        }
+    }
+
+    @Test fun failedPublicationPreservesOriginalTypedDraftWithRealController() =
+        verifyFailedPublicationKeepsTypedContent(followup = false)
+
+    @Test fun failedPublicationPreservesSubmittedOriginalAndFollowupDraftWithRealController() =
+        verifyFailedPublicationKeepsTypedContent(followup = true)
+
+    private fun verifyFailedPublicationKeepsTypedContent(followup: Boolean) {
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        val context = instrumentation.targetContext.applicationContext
+        val decisionEntered = kotlinx.coroutines.CompletableDeferred<Unit>()
+        val releaseDecision = java.util.concurrent.CountDownLatch(1)
+        val closed = kotlinx.coroutines.CompletableDeferred<Unit>()
+        val controllerStore = androidx.lifecycle.ViewModelStore()
+        val owner = object : androidx.lifecycle.ViewModelStoreOwner { override val viewModelStore = controllerStore }
+        val controller = com.negi.survey.vm.WhisperSpeechController(
+            appContext = context, microphonePermission = { true }, modelInitializer = {},
+            whisperDetacher = {}, recorderSessionMutex = kotlinx.coroutines.sync.Mutex(),
+            whisperSessionGate = com.negi.survey.vm.WhisperSessionGate(),
+            transcriber = { _, _ -> Result.success("must not replace typed content") },
+            onVoiceExported = { voice -> survey.addAudioRef(voice.questionId, voice.fileName,
+                expectedSurveyId = voice.surveyId) },
+            publicationHooks = object : com.negi.survey.vm.WhisperSpeechController.PublicationHooks {
+                override fun beforeDecision() {
+                    decisionEntered.complete(Unit)
+                    check(releaseDecision.await(10, java.util.concurrent.TimeUnit.SECONDS))
+                }
+            },
+            recorderFactory = { _, _ -> object : com.negi.survey.whisper.RecorderBackend {
+                private var capture: () -> Unit = {}
+                private lateinit var output: java.io.File
+                override fun setOnCaptureStarted(callback: () -> Unit) { capture = callback }
+                override fun isActive() = !closed.isCompleted
+                override fun startRecording(output: java.io.File, rates: IntArray) { this.output = output; capture() }
+                override suspend fun stopRecording() {
+                    instrumentation.context.assets.open("whisper/jfk.wav").use { input ->
+                        output.outputStream().use { input.copyTo(it) }
+                    }
+                }
+                override fun close() { closed.complete(Unit) }
+            } },
+        )
+        androidx.lifecycle.ViewModelProvider(owner, object : androidx.lifecycle.ViewModelProvider.Factory {
+            override fun <T : androidx.lifecycle.ViewModel> create(modelClass: Class<T>): T {
+                @Suppress("UNCHECKED_CAST") return controller as T
+            }
+        })[com.negi.survey.vm.WhisperSpeechController::class.java]
+        try {
+            host(speechControllerForTest = controller) {
+                if (followup) acceptAiOriginalAnswer("Q8", "submitted original")
+                else setAnswer("typed original", "Q8")
+            }
+            if (followup) rule.runOnIdle {
+                addFollowup("Clarification?")
+                ai.updateComposerDraft(contextKey, "typed follow-up")
+            }
+            rule.runOnIdle {
+                val prompt = checkNotNull(com.negi.survey.vm.aiRecordingPrompt(survey.surveyUuid.value, "Q8", survey.getQuestion("Q8"),
+                    ai.conversationStateFlow(contextKey).value, survey.followups.value["Q8"].orEmpty()))
+                controller.startRecording(prompt)
+            }
+            rule.waitUntil(5_000) { controller.isCaptureActive.value }
+            rule.runOnIdle { controller.stopRecording() }
+            rule.waitUntil(5_000) { decisionEntered.isCompleted }
+            rule.runOnIdle { controller.onMicrophonePermissionLost() }
+            releaseDecision.countDown()
+            rule.waitUntil(5_000) { !controller.isTranscribing.value && closed.isCompleted }
+            rule.runOnIdle {
+                assertEquals("", controller.partialText.value)
+                assertEquals(if (followup) "submitted original" else "typed original", survey.getAnswer("Q8"))
+                assertEquals(if (followup) "typed follow-up" else "typed original",
+                    ai.conversationStateFlow(contextKey).value.composerDraft)
+                assertTrue(survey.getAudioRefsForRunFlat().isEmpty())
+                if (followup) {
+                    assertTrue("Q8" in survey.submittedAiOriginals.value)
+                    assertNull(survey.followups.value.getValue("Q8").last().answer)
+                }
+            }
+        } finally {
+            releaseDecision.countDown()
+            rule.runOnIdle { controllerStore.clear() }
+        }
     }
 
     @Test fun typeModeStartsAtEndAndKeepsUserSelectionDuringEditing() {
@@ -823,7 +980,9 @@ class AiScreenInteractionTest {
         waitForKeyboard(visible = true)
         rule.onNodeWithText("typed draft").assertIsDisplayed()
         dismissKeyboardWithBack()
-        type.assertIsSelected().performClick()
+        // The selected control moves while the IME hides. Exercise its callback
+        // directly here; the mode switches above retain touch coverage.
+        type.assertIsSelected().performSemanticsAction(SemanticsActions.OnClick)
         waitForKeyboard(visible = true)
         // The first switch above covers touch. Invoke this one while the IME is still moving.
         speak.performSemanticsAction(SemanticsActions.OnClick).assertIsSelected()

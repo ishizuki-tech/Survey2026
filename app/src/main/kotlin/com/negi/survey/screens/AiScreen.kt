@@ -62,6 +62,8 @@
 
 package com.negi.survey.screens
 
+import com.negi.survey.MicrophonePermissionState
+import com.negi.survey.MicrophonePermissionNotice
 import android.content.ClipData
 import android.os.SystemClock
 import android.util.Log
@@ -396,7 +398,8 @@ fun AiScreen(
     onBack: () -> Unit,
     speechController: SpeechController? = null,
     ttsController: QuestionSpeaker? = null,
-    playbackLifecycle: Lifecycle = LocalLifecycleOwner.current.lifecycle
+    playbackLifecycle: Lifecycle = LocalLifecycleOwner.current.lifecycle,
+    microphonePermission: MicrophonePermissionState? = null
 ) {
     val nid = remember(nodeId) { nodeId.trim() }
     val localContext = LocalContext.current.applicationContext
@@ -563,7 +566,11 @@ fun AiScreen(
     }
 
     val prefersTypedInput by vmSurvey.prefersTypedAiInput.collectAsState()
-    val typeSelected = speechController == null || prefersTypedInput
+    val microphoneAvailable = microphonePermission?.granted != false
+    LaunchedEffect(microphoneAvailable) {
+        if (!microphoneAvailable) vmSurvey.setPrefersTypedAiInput(true)
+    }
+    val typeSelected = speechController == null || !microphoneAvailable || prefersTypedInput
     val focusRequester = remember(contextKey, presentation) { FocusRequester() }
     var textOnlyFocusHandled by key(contextKey) { rememberSaveable { mutableStateOf(false) } }
     var typeFocusRequested by remember(contextKey, presentation) { mutableStateOf(false) }
@@ -864,13 +871,9 @@ fun AiScreen(
         if (startedThisUtterance) {
             val traceId = vmSurvey.answerTraceId(nid)
             WhisperTraceRegistry.start(localContext, surveyUuid)?.event("RECORDING_STARTED", traceId, nid, mapOf("inputSource" to "voice"))
-            vmAI.updateComposerDraft(contextKey, "")
+            // Keep typed content until a valid replacement transcript is accepted.
             transcriptReady = false
             lastCommitted = null
-
-            if (conv.role == AiViewModel.ComposerRole.MAIN) {
-                vmSurvey.clearAnswer(nid)
-            }
 
             RuntimeLogStore.d(TAG, "Speech started (node=$nid role=${conv.role})")
         }
@@ -1275,7 +1278,7 @@ fun AiScreen(
                                             vmSurvey.setPrefersTypedAiInput(false)
                                         }
                                     },
-                                    enabled = composerEnabled
+                                    enabled = composerEnabled && microphoneAvailable
                                 )
                             }
                         }
@@ -1290,6 +1293,7 @@ fun AiScreen(
                                         return@toggle
                                     }
                                     if (!ownsPresentation() || inputBlocked()) return@toggle
+                                    if (microphonePermission?.refresh() == false) return@toggle
                                     val prompt = aiRecordingPrompt(
                                         vmSurvey.surveyUuid.value, nid, vmSurvey.getQuestion(nid),
                                         conversation.value, vmSurvey.followups.value[nid].orEmpty(),
@@ -1304,6 +1308,7 @@ fun AiScreen(
                             val onSendAnswer: () -> Unit = {
                                 if (composerEnabled) submit()
                             }
+                            MicrophonePermissionNotice(microphonePermission)
                             if (inputClosed) {
                                 Text(
                                     "Answer input is closed",

@@ -502,137 +502,79 @@ private fun restartApp(context: Context) {
     Runtime.getRuntime().exit(0)
 }
 
-/* ──────────────────────── Audio Permission Gate ─────────────────────────── */
+/* ──────────────────────── Microphone Permission ─────────────────────────── */
+
+/** Android permission observation is independent of the logical survey session. */
+class MicrophonePermissionState(
+    initialGranted: Boolean,
+    private val permissionCheck: () -> Boolean,
+    val request: () -> Unit,
+    val openSettings: () -> Unit,
+) {
+    var granted by mutableStateOf(initialGranted)
+        private set
+
+    fun refresh(): Boolean = permissionCheck().also { granted = it }
+}
 
 @Composable
-fun AudioPermissionGate(
-    modifier: Modifier = Modifier,
-    content: @Composable () -> Unit
-) {
+internal fun rememberMicrophonePermissionState(): MicrophonePermissionState {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
-    val scope = rememberCoroutineScope()
-    val snackbarHostState = remember { SnackbarHostState() }
-
     val permission = Manifest.permission.RECORD_AUDIO
-
-    var hasPermission by remember {
-        mutableStateOf(
-            ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED
+    val check = remember(context) {
+        { ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED }
+    }
+    var requestInFlight by rememberSaveable { mutableStateOf(false) }
+    val refreshTarget = remember { arrayOfNulls<MicrophonePermissionState>(1) }
+    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
+        requestInFlight = false
+        refreshTarget[0]?.refresh()
+    }
+    val state = remember(context, launcher) {
+        MicrophonePermissionState(
+            initialGranted = check(),
+            permissionCheck = check,
+            request = {
+                if (!check() && !requestInFlight) {
+                    requestInFlight = true
+                    launcher.launch(permission)
+                }
+            },
+            openSettings = {
+                context.startActivity(Intent(
+                    Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    Uri.fromParts("package", context.packageName, null)
+                ))
+            },
         )
     }
-
-    DisposableEffect(lifecycleOwner, context) {
+    SideEffect { refreshTarget[0] = state }
+    DisposableEffect(lifecycleOwner, state) {
         val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_RESUME) {
-                hasPermission =
-                    ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED
-            }
+            if (event == Lifecycle.Event.ON_RESUME) state.refresh()
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
+    return state
+}
 
-    val launcher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.RequestPermission()
-    ) { granted ->
-        hasPermission = granted
-        if (!granted) {
-            scope.launch {
-                val result = snackbarHostState.showSnackbar(
-                    message = "Microphone permission is required for voice input.",
-                    actionLabel = "Settings"
-                )
-                if (result == SnackbarResult.ActionPerformed) {
-                    val intent = Intent(
-                        Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                        Uri.fromParts("package", context.packageName, null)
-                    ).apply {
-                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                    }
-                    context.startActivity(intent)
-                }
+/** Nonblocking actions shared by Survey Note and AI answer input. */
+@Composable
+internal fun MicrophonePermissionNotice(state: MicrophonePermissionState?) {
+    if (state == null || state.granted) return
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text(androidx.compose.ui.res.stringResource(R.string.microphone_unavailable),
+            style = MaterialTheme.typography.bodySmall)
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            androidx.compose.material3.TextButton(onClick = state.request, modifier = Modifier.weight(1f)) {
+                Text(androidx.compose.ui.res.stringResource(R.string.microphone_allow))
+            }
+            androidx.compose.material3.TextButton(onClick = state.openSettings, modifier = Modifier.weight(1f)) {
+                Text(androidx.compose.ui.res.stringResource(R.string.microphone_settings))
             }
         }
-    }
-
-    if (hasPermission) {
-        content()
-        return
-    }
-
-    val backplate = outdoorBackplate()
-
-    Box(
-        modifier = modifier
-            .fillMaxSize()
-            .imePadding()
-            .navigationBarsPadding()
-            .background(backplate)
-            .padding(24.dp),
-        contentAlignment = Alignment.Center
-    ) {
-        Surface(
-            tonalElevation = 6.dp,
-            shadowElevation = 8.dp,
-            shape = MaterialTheme.shapes.large,
-            color = MaterialTheme.colorScheme.surface.copy(alpha = 0.97f),
-            modifier = Modifier
-                .fillMaxWidth()
-                .widthIn(max = 360.dp)
-                .wrapContentWidth()
-                .neonEdgeThin()
-        ) {
-            Column(
-                modifier = Modifier
-                    .verticalScroll(rememberScrollState())
-                    .padding(horizontal = 24.dp, vertical = 20.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                Icon(
-                    imageVector = Icons.Filled.Mic,
-                    contentDescription = "Microphone",
-                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.size(32.dp)
-                )
-                Text(
-                    text = "Microphone permission needed",
-                    style = MaterialTheme.typography.titleMedium
-                )
-                Text(
-                    text = "To use voice input for survey answers, allow microphone access.",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-                SurveyActionButton(onClick = { launcher.launch(permission) }) {
-                    Text("Allow microphone")
-                }
-                IconButton(
-                    onClick = {
-                        val intent = Intent(
-                            Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                            Uri.fromParts("package", context.packageName, null)
-                        ).apply {
-                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                        }
-                        context.startActivity(intent)
-                    }
-                ) {
-                    Icon(
-                        imageVector = Icons.Filled.Settings,
-                        contentDescription = "Open app settings"
-                    )
-                }
-            }
-        }
-
-        SnackbarHost(
-            hostState = snackbarHostState,
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .padding(16.dp)
-        )
     }
 }
 
@@ -1145,44 +1087,26 @@ fun AppNav() {
                 chosenId = null
             }
 
-            val voiceEnabled = remember(cfg) { cfg.whisper.enabled ?: true }
-            if (voiceEnabled) {
-                AudioPermissionGate {
-                    SurveyNavHost(
-                        vmSurvey = vmSurvey,
-                        vmAI = vmAI,
-                        backStack = backStack,
-                        onResetToSelector = resetToSelector,
-                        onEndSurveySession = { (repo as LiteRtRepository).endSurveySession() },
-                        whisperMeta = cfg.whisper,
-                        ttsMeta = cfg.tts,
-                        sessionTtsDisabled = sessionTtsDisabled,
-                        sessionId = sessionKey,
-                        sessionVmOwner = sessionVmOwner,
-                        heavyRuntimeHandoff = heavyRuntimeCoordinator,
-                        uploadStatus = uploadStatus,
-                        onResolveUploadStatusDetails = uploadStatusViewModel::loadDetails,
-                        onClearCompletedSurveys = uploadStatusViewModel::clearCompletedSurveys
-                    )
-                }
-            } else {
-                SurveyNavHost(
-                    vmSurvey = vmSurvey,
-                    vmAI = vmAI,
-                    backStack = backStack,
-                    onResetToSelector = resetToSelector,
-                    onEndSurveySession = { (repo as LiteRtRepository).endSurveySession() },
-                    whisperMeta = cfg.whisper,
-                    ttsMeta = cfg.tts,
-                    sessionTtsDisabled = sessionTtsDisabled,
-                    sessionId = sessionKey,
-                    sessionVmOwner = sessionVmOwner,
-                    heavyRuntimeHandoff = heavyRuntimeCoordinator,
-                    uploadStatus = uploadStatus,
-                    onResolveUploadStatusDetails = uploadStatusViewModel::loadDetails,
-                    onClearCompletedSurveys = uploadStatusViewModel::clearCompletedSurveys
-                )
-            }
+            val microphonePermission = if (cfg.whisper.enabled != false) {
+                rememberMicrophonePermissionState()
+            } else null
+            SurveyNavHost(
+                microphonePermission = microphonePermission,
+                vmSurvey = vmSurvey,
+                vmAI = vmAI,
+                backStack = backStack,
+                onResetToSelector = resetToSelector,
+                onEndSurveySession = { (repo as LiteRtRepository).endSurveySession() },
+                whisperMeta = cfg.whisper,
+                ttsMeta = cfg.tts,
+                sessionTtsDisabled = sessionTtsDisabled,
+                sessionId = sessionKey,
+                sessionVmOwner = sessionVmOwner,
+                heavyRuntimeHandoff = heavyRuntimeCoordinator,
+                uploadStatus = uploadStatus,
+                onResolveUploadStatusDetails = uploadStatusViewModel::loadDetails,
+                onClearCompletedSurveys = uploadStatusViewModel::clearCompletedSurveys
+            )
         }
     }
 }
@@ -1334,6 +1258,7 @@ internal fun SurveyNavHost(
     speechControllerOverride: SpeechController? = null,
     sessionTtsDisabled: Boolean = false,
     ttsFactoryOverride: ViewModelProvider.Factory? = null,
+    microphonePermission: MicrophonePermissionState? = null,
 ) {
     val localContext = LocalContext.current
     val app = localContext.applicationContext as android.app.Application
@@ -1415,6 +1340,12 @@ internal fun SurveyNavHost(
     } else {
         remember {
             NoOpSpeechController("Voice input is disabled by configuration.")
+        }
+    }
+
+    LaunchedEffect(microphonePermission?.granted, speechController) {
+        if (microphonePermission?.granted == false) {
+            (speechController as? WhisperSpeechController)?.onMicrophonePermissionLost()
         }
     }
 
@@ -1614,6 +1545,7 @@ internal fun SurveyNavHost(
                         speechController = speechController,
                         ttsController = ttsController,
                         speechEnabled = voiceEnabled,
+                        microphonePermission = microphonePermission,
                         title = node.title,
                         text = node.question,
                         sessionOpen = homeExit.canStart && !exitAccepted &&
@@ -1782,7 +1714,8 @@ internal fun SurveyNavHost(
                         onBack = previousQuestion,
                         speechController = speechController.takeIf { voiceEnabled },
                         ttsController = ttsController.takeIf { ttsEnabled },
-                        playbackLifecycle = playbackLifecycle
+                        playbackLifecycle = playbackLifecycle,
+                        microphonePermission = microphonePermission
                     )
                 }
 
@@ -2598,6 +2531,7 @@ private fun HomeScreen(
     speechController: SpeechController,
     ttsController: QuestionSpeaker,
     speechEnabled: Boolean,
+    microphonePermission: MicrophonePermissionState?,
     title: String,
     text: String,
     onNext: () -> Unit,
@@ -2849,19 +2783,21 @@ private fun HomeScreen(
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
 
+                MicrophonePermissionNotice(microphonePermission)
                 HomeFreeTextComposer(
                     value = freeText,
                     onValueChange = onUpdateFreeText,
                     enabled = pendingAction == null && sessionOpen,
                     exitEnabled = pendingAction == null && exitEnabled,
-                    speechEnabled = speechEnabled,
+                    speechEnabled = speechEnabled && microphonePermission?.granted != false,
                     speechRecording = isRecording,
                     speechTranscribing = isTranscribing,
                     onToggleSpeech = if (speechEnabled) {
-                        {
+                        toggle@{
                             if (speechController.isRecording.value) {
                                 speechController.stopRecording()
                             } else {
+                                if (microphonePermission?.refresh() == false) return@toggle
                                 val promptText = text.ifBlank { title }
                                 if (promptText.isNotBlank()) {
                                     val prompt = RecordingPrompt(

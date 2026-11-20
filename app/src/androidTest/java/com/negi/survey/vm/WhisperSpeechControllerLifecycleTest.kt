@@ -54,6 +54,7 @@ class WhisperSpeechControllerLifecycleTest {
         val recorder = FakeRecorder()
         val exports = mutableListOf<WhisperSpeechController.ExportedVoice>()
         val controller = WhisperSpeechController(
+            microphonePermission = { true },
             appContext = context,
             onVoiceExported = { exports += it },
             recorderFactory = { _, _ -> recorder },
@@ -94,6 +95,7 @@ class WhisperSpeechControllerLifecycleTest {
         val followup = RecordingPrompt(surveyId, "Q8", RecordingPrompt.Kind.FOLLOWUP, "Follow-up?", 2)
         val calls = AtomicInteger()
         val controller = WhisperSpeechController(
+            microphonePermission = { true },
             appContext = context,
             recorderFactory = { _, _ -> FakeRecorder() },
             modelInitializer = {},
@@ -140,6 +142,7 @@ class WhisperSpeechControllerLifecycleTest {
         val context = InstrumentationRegistry.getInstrumentation().targetContext.applicationContext
         val recorder = FakeRecorder(holdStop = true)
         val controller = WhisperSpeechController(
+            microphonePermission = { true },
             appContext = context,
             recorderFactory = { _, _ -> recorder },
             modelInitializer = {},
@@ -179,6 +182,7 @@ class WhisperSpeechControllerLifecycleTest {
         val releaseOld = CompletableDeferred<Unit>()
         val whisperGate = WhisperSessionGate()
         val old = WhisperSpeechController(
+            microphonePermission = { true },
             appContext = context,
             recorderFactory = { _, _ -> FakeRecorder() },
             recorderSessionMutex = Mutex(),
@@ -194,6 +198,7 @@ class WhisperSpeechControllerLifecycleTest {
             },
         )
         val replacement = WhisperSpeechController(
+            microphonePermission = { true },
             appContext = context,
             recorderFactory = { _, _ -> FakeRecorder() },
             recorderSessionMutex = Mutex(),
@@ -235,6 +240,7 @@ class WhisperSpeechControllerLifecycleTest {
         val recorders = listOf(first, second).iterator()
         val errors = mutableListOf<(Exception) -> Unit>()
         val controller = WhisperSpeechController(
+            microphonePermission = { true },
             appContext = context,
             recorderFactory = { _, onError -> errors.add(onError); recorders.next() },
             recorderSessionMutex = Mutex(),
@@ -284,6 +290,7 @@ class WhisperSpeechControllerLifecycleTest {
         val recorders = mutableListOf<CallbackRecorder>()
         val exports = mutableListOf<WhisperSpeechController.ExportedVoice>()
         val controller = WhisperSpeechController(
+            microphonePermission = { true },
             appContext = context,
             onVoiceExported = { exports += it },
             recorderFactory = { _, onError ->
@@ -323,6 +330,7 @@ class WhisperSpeechControllerLifecycleTest {
         val context = InstrumentationRegistry.getInstrumentation().targetContext.applicationContext
         val recorder = TimeoutRecorder()
         val controller = WhisperSpeechController(
+            microphonePermission = { true },
             appContext = context,
             recorderFactory = { _, _ -> recorder },
             modelInitializer = {},
@@ -354,6 +362,7 @@ class WhisperSpeechControllerLifecycleTest {
         val replacementRecorder = FakeRecorder()
         var factoryCalls = 0
         val controller = WhisperSpeechController(
+            microphonePermission = { true },
             appContext = context,
             recorderFactory = { _, _ ->
                 if (factoryCalls++ == 0) timedOutRecorder else replacementRecorder
@@ -394,6 +403,7 @@ class WhisperSpeechControllerLifecycleTest {
         val transcribed = CompletableDeferred<String>()
         var initCalls = 0
         val controller = WhisperSpeechController(
+            microphonePermission = { true },
             appContext = context,
             languageCode = "sw",
             recorderFactory = { _, _ -> recorder },
@@ -423,6 +433,7 @@ class WhisperSpeechControllerLifecycleTest {
         val exported = CompletableDeferred<Unit>()
         var transcribed = false
         val controller = WhisperSpeechController(
+            microphonePermission = { true },
             appContext = context,
             onVoiceExported = { exported.complete(Unit) },
             recorderFactory = { _, _ -> recorder },
@@ -433,8 +444,8 @@ class WhisperSpeechControllerLifecycleTest {
         controller.startRecording(RecordingPrompt(surveyId, "Q8", RecordingPrompt.Kind.ORIGINAL, "Question?"))
         withTimeout(5000) { initEntered.await() }
         controller.stopRecording()
-        withTimeout(5000) { exported.await() }
         finishInit.complete(Unit)
+        withTimeout(5000) { exported.await() }
         withTimeout(5000) { controller.errorMessage.first { it == "init failed" } }
         assertFalse(transcribed)
         val store = V2ArtifactStore(context)
@@ -448,6 +459,7 @@ class WhisperSpeechControllerLifecycleTest {
         val recorder = FakeRecorder()
         val transcribed = CompletableDeferred<Unit>()
         val controller = WhisperSpeechController(
+            microphonePermission = { true },
             appContext = context,
             recorderFactory = { _, _ -> recorder },
             modelInitializer = {},
@@ -473,6 +485,7 @@ class WhisperSpeechControllerLifecycleTest {
             override suspend fun releaseWhisper() { releaseCalls++; released.complete(Unit) }
         }
         val controller = WhisperSpeechController(
+            microphonePermission = { true },
             appContext = context,
             heavyRuntimeHandoff = handoff,
             recorderFactory = { _, onError -> CallbackRecorder(onError).also { recorder = it } },
@@ -509,6 +522,7 @@ class WhisperSpeechControllerLifecycleTest {
         val oldRecorder = FakeRecorder()
         val recorderGate = Mutex()
         val old = WhisperSpeechController(
+            microphonePermission = { true },
             appContext = context,
             heavyRuntimeHandoff = handoff,
             recorderFactory = { _, _ -> oldRecorder },
@@ -526,6 +540,7 @@ class WhisperSpeechControllerLifecycleTest {
 
         val recorder = FakeRecorder()
         val replacement = WhisperSpeechController(
+            microphonePermission = { true },
             appContext = context,
             heavyRuntimeHandoff = handoff,
             recorderFactory = { _, _ -> recorder },
@@ -549,6 +564,7 @@ class WhisperSpeechControllerLifecycleTest {
         val context = InstrumentationRegistry.getInstrumentation().targetContext.applicationContext
         val recorder = FakeRecorder(autoReady = false)
         val controller = WhisperSpeechController(
+            microphonePermission = { true },
             appContext = context,
             recorderFactory = { _, _ -> recorder },
             modelInitializer = {},
@@ -573,7 +589,7 @@ class WhisperSpeechControllerLifecycleTest {
         val detachEntered = CompletableDeferred<Unit>()
         val allowDetach = CompletableDeferred<Unit>()
         val initEntered = CompletableDeferred<Unit>()
-        val old = WhisperSpeechController(appContext = context, whisperDetacher = {
+        val old = WhisperSpeechController(microphonePermission = { true }, appContext = context, whisperDetacher = {
             detachEntered.complete(Unit)
             allowDetach.await()
         })
@@ -581,6 +597,7 @@ class WhisperSpeechControllerLifecycleTest {
         withTimeout(5000) { detachEntered.await() }
         val recorder = FakeRecorder()
         val replacement = WhisperSpeechController(
+            microphonePermission = { true },
             appContext = context,
             recorderFactory = { _, _ -> recorder },
             modelInitializer = { initEntered.complete(Unit) },
@@ -601,6 +618,7 @@ class WhisperSpeechControllerLifecycleTest {
         val recorder = ClosingRecorder(fail = true)
         val recorderGate = Mutex()
         val controller = WhisperSpeechController(
+            microphonePermission = { true },
             appContext = context,
             recorderFactory = { _, _ -> recorder },
             recorderSessionMutex = recorderGate,
@@ -619,6 +637,7 @@ class WhisperSpeechControllerLifecycleTest {
         WhisperSpeechController::class.java.getDeclaredMethod("onCleared").apply { isAccessible = true }.invoke(controller)
         val replacementRecorder = FakeRecorder()
         val replacement = WhisperSpeechController(
+            microphonePermission = { true },
             appContext = context,
             recorderFactory = { _, _ -> replacementRecorder },
             recorderSessionMutex = recorderGate,
@@ -634,6 +653,7 @@ class WhisperSpeechControllerLifecycleTest {
         val context = InstrumentationRegistry.getInstrumentation().targetContext.applicationContext
         val recorder = ClosingRecorder(fail = false)
         val controller = WhisperSpeechController(
+            microphonePermission = { true },
             appContext = context,
             recorderFactory = { _, _ -> recorder },
             modelInitializer = {},
@@ -656,6 +676,7 @@ class WhisperSpeechControllerLifecycleTest {
         val recorder = ClosingRecorder(fail = false)
         val gate = Mutex()
         val controller = WhisperSpeechController(
+            microphonePermission = { true },
             appContext = context,
             recorderFactory = { _, _ -> recorder },
             recorderSessionMutex = gate,
@@ -676,6 +697,7 @@ class WhisperSpeechControllerLifecycleTest {
         assertFalse(controller.isTranscribing.value)
         val nextRecorder = FakeRecorder()
         val next = WhisperSpeechController(
+            microphonePermission = { true },
             appContext = context,
             recorderFactory = { _, _ -> nextRecorder },
             recorderSessionMutex = gate,
@@ -700,6 +722,7 @@ class WhisperSpeechControllerLifecycleTest {
             override suspend fun releaseWhisper() { releaseCalls++; error("native release failed") }
         }
         val first = WhisperSpeechController(
+            microphonePermission = { true },
             appContext = context,
             recorderFactory = { _, _ -> firstRecorder },
             recorderSessionMutex = recorderGate,
@@ -718,6 +741,7 @@ class WhisperSpeechControllerLifecycleTest {
         val nextRecorder = FakeRecorder()
         var nextInitCalls = 0
         val next = WhisperSpeechController(
+            microphonePermission = { true },
             appContext = context,
             recorderFactory = { _, _ -> nextRecorder },
             recorderSessionMutex = recorderGate,
