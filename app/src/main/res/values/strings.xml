@@ -1,7 +1,7 @@
 <resources>
-    <string name="app_name">.Survey 2026.</string>
-    <string name="app_name_local">Survey2026 Local</string>
-    <string name="app_name_da">Survey D+A</string>
+    <string name="app_name" translatable="false">.Survey 2026.</string>
+    <string name="app_name_local" translatable="false">Survey2026 Local</string>
+    <string name="app_name_da" translatable="false">Survey D+A</string>
     <string name="microphone_unavailable">Recording unavailable. You can still type your answers.</string>
     <string name="microphone_allow">Allow microphone</string>
     <string name="microphone_settings">Open app settings</string>
