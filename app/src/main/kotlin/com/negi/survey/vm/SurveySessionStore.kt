@@ -4,6 +4,9 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelStore
 import androidx.lifecycle.ViewModelStoreOwner
 import com.negi.survey.slm.Repository
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 
 /**
  * Activity-retained owner for one logical survey session.
@@ -16,6 +19,8 @@ class SurveySessionStore : ViewModel() {
 
     private class SessionEntry {
         val viewModelStore = ViewModelStore()
+        val ttsDisabled = MutableStateFlow(false)
+        val ttsDisabledState = ttsDisabled.asStateFlow()
         val owner = object : ViewModelStoreOwner {
             override val viewModelStore: ViewModelStore = this@SessionEntry.viewModelStore
         }
@@ -27,6 +32,17 @@ class SurveySessionStore : ViewModel() {
     @Synchronized
     fun ownerFor(sessionKey: String): ViewModelStoreOwner =
         sessions.getOrPut(sessionKey) { SessionEntry() }.owner
+
+    /** Interviewer playback policy, retained with the logical session across recreation. */
+    @Synchronized
+    fun ttsDisabledFor(sessionKey: String): StateFlow<Boolean> =
+        sessions.getOrPut(sessionKey) { SessionEntry() }.ttsDisabledState
+
+    /** Monotonic for this session; readiness or voice installation cannot undo the choice. */
+    @Synchronized
+    fun disableTts(sessionKey: String) {
+        sessions.getOrPut(sessionKey) { SessionEntry() }.ttsDisabled.value = true
+    }
 
     /**
      * Keeps the repository associated with the same child ViewModels across an

@@ -88,6 +88,7 @@ class SurveySessionActivityRecreationTest {
             val sessions = ViewModelProvider(activity)[SurveySessionStore::class.java]
             val owner = sessions.ownerFor(sessionKey)
             firstOwnerStore = owner.viewModelStore
+            sessions.disableTts(sessionKey)
             survey = ViewModelProvider(owner, surveyFactory(NavBackStack<NavKey>(FlowHome)))["survey", SurveyViewModel::class.java]
 
             survey.advanceToNext()
@@ -109,6 +110,7 @@ class SurveySessionActivityRecreationTest {
             val restoredSurvey = ViewModelProvider(owner, surveyFactory(NavBackStack<NavKey>(FlowHome)))["survey", SurveyViewModel::class.java]
 
             assertSame(firstOwnerStore, owner.viewModelStore)
+            assertTrue(sessions.ttsDisabledFor(sessionKey).value)
             assertSame(survey, restoredSurvey)
             assertEquals("Q1", restoredSurvey.currentNodeId)
             assertEquals("kept draft", restoredSurvey.getAnswer("Q1"))
@@ -122,6 +124,7 @@ class SurveySessionActivityRecreationTest {
             assertEquals(3, restoredNav.size)
 
             sessions.clearSession(sessionKey)
+            assertFalse(sessions.ttsDisabledFor(sessionKey).value)
             val nextOwner = sessions.ownerFor(sessionKey)
             val nextSurvey = ViewModelProvider(nextOwner, surveyFactory(NavBackStack<NavKey>(FlowHome)))["survey", SurveyViewModel::class.java]
             assertEquals("Start", nextSurvey.currentNodeId)

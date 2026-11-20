@@ -194,6 +194,7 @@ import com.negi.survey.vm.SurveyFinalizationState
 import com.negi.survey.vm.SurveyFinalizationStatePolicy
 import com.negi.survey.vm.SurveyFinalizationViewModel
 import com.negi.survey.vm.ProcessTtsReadiness
+import com.negi.survey.vm.TtsReadinessStore
 import com.negi.survey.vm.TtsReadinessKey
 import com.negi.survey.vm.TtsController
 import androidx.lifecycle.compose.LifecycleResumeEffect
@@ -871,96 +872,12 @@ fun AppNav() {
 
     val cfg = config!!
 
-    /*
-     * TTS readiness check. Runs before the SLM is downloaded or initialized, so a phone
-     * missing its voice fails fast instead of after a long model load:
-     *  - tts.require_engine: the tts.engine app must be installed.
-     *  - tts.require_offline_voice: that engine must also have a downloaded (offline) voice
-     *    for tts.language.
-     * Once it passes (or the interviewer continues without voice) it isn't checked again
-     * for this session.
-     */
-    val ttsGateEngine = remember(cfg) { cfg.tts.engine?.trim()?.ifBlank { null } }
-    val ttsGateLang = remember(cfg) {
-        cfg.tts.language?.trim()?.lowercase(Locale.US)?.ifBlank { null } ?: DEFAULT_TTS_LANGUAGE
-    }
-    val ttsGateNeedsVoice = remember(cfg, ttsGateEngine) {
-        (cfg.tts.enabled ?: true) && (cfg.tts.requireOfflineVoice ?: false) && ttsGateEngine != null
-    }
-    val ttsGateNeedsEngine = remember(cfg, ttsGateEngine) {
-        (cfg.tts.enabled ?: true) && (cfg.tts.requireEngine ?: false) && ttsGateEngine != null
-    }
-    val ttsReadinessKey = remember(ttsGateEngine, ttsGateLang, ttsGateNeedsVoice, ttsGateNeedsEngine) {
-        ttsGateEngine?.takeIf { ttsGateNeedsVoice || ttsGateNeedsEngine }?.let {
-            TtsReadinessKey.create(it, ttsGateLang, ttsGateNeedsVoice, ttsGateNeedsEngine)
-        }
-    }
-    val readiness = ProcessTtsReadiness.store
-    // Seed the gate synchronously so a warm selection never composes the spinner.
-    var ttsGateResult by remember(sessionKey, ttsReadinessKey) {
-        mutableStateOf(
-            if (ttsReadinessKey == null || readiness.isReady(ttsReadinessKey)) TtsVoiceCheck.OK else null
-        )
-    }
-    var ttsGateContinue by remember(sessionKey, ttsReadinessKey) { mutableStateOf(false) }
-    var ttsGateTick by remember(sessionKey, ttsReadinessKey) { mutableIntStateOf(0) }
-
-    LaunchedEffect(sessionKey, ttsReadinessKey, ttsGateTick, ttsGateContinue) {
-        val key = ttsReadinessKey ?: return@LaunchedEffect
-        if (ttsGateResult == TtsVoiceCheck.OK || ttsGateContinue) return@LaunchedEffect
-        val result = readiness.check(key) {
-            val checked = if (key.requiresOfflineVoice) {
-                checkTtsOfflineVoice(appContext, key.enginePackage, key.language)
-            } else if (isTtsEngineInstalled(appContext, key.enginePackage)) {
-                TtsVoiceCheck.OK
-            } else {
-                TtsVoiceCheck.ENGINE_MISSING
-            }
-            if (ttsGateContinue) throw CancellationException("TTS readiness was skipped")
-            checked
-        }
-        Log.d(MainActivity.TAG, "TTS gate: engine=${key.enginePackage} lang=${key.language} result=$result session=$sessionKey")
-        ttsGateResult = result
-    }
-
-    if (ttsGateResult != TtsVoiceCheck.OK && !ttsGateContinue) {
-        val gateContext = LocalContext.current
-        // The missing-voice flow sends the user to system settings outside the app.
-        LifecycleResumeEffect(sessionKey, ttsReadinessKey) {
-            if (ttsGateResult != null && ttsGateEngine != null) {
-                ProcessTtsReadiness.invalidateVoiceData(ttsGateEngine)
-                ttsGateTick++
-            }
-            onPauseOrDispose { }
-        }
-        val result = ttsGateResult
-        if (result == null) {
-            Box(
-                modifier = Modifier.fillMaxSize().imePadding(),
-                contentAlignment = Alignment.Center
-            ) {
-                CircularProgressIndicator(color = MaterialTheme.colorScheme.outline)
-            }
-        } else {
-            TtsEngineMissingScreen(
-                enginePackage = ttsGateEngine.orEmpty(),
-                languageCode = ttsGateLang,
-                onContinueWithoutVoice = {
-                    Log.w(MainActivity.TAG, "TTS gate failed ($result); continuing without read-aloud")
-                    ttsGateContinue = true
-                },
-                onExit = {
-                    ttsGateEngine?.let(ProcessTtsReadiness::invalidateVoiceData)
-                    Log.w(MainActivity.TAG, "TTS gate failed ($result) -> exiting app. session=$sessionKey")
-                    sessionStore.clearSession(sessionKey)
-                    chosenId = null
-                    (gateContext as? android.app.Activity)?.finishAndRemoveTask()
-                },
-                modifier = Modifier.fillMaxSize().imePadding()
-            )
-        }
-        return
-    }
+    val gateContext = LocalContext.current
+    if (!SurveyTtsReadinessGate(cfg, sessionKey, sessionStore, onExit = {
+            chosenId = null
+            (gateContext as? android.app.Activity)?.finishAndRemoveTask()
+        })) return
+    val sessionTtsDisabled by sessionStore.ttsDisabledFor(sessionKey).collectAsStateWithLifecycle()
 
     val sessionVmOwner = remember(sessionStore, sessionKey) {
         sessionStore.ownerFor(sessionKey)
@@ -1239,6 +1156,7 @@ fun AppNav() {
                         onEndSurveySession = { (repo as LiteRtRepository).endSurveySession() },
                         whisperMeta = cfg.whisper,
                         ttsMeta = cfg.tts,
+                        sessionTtsDisabled = sessionTtsDisabled,
                         sessionId = sessionKey,
                         sessionVmOwner = sessionVmOwner,
                         heavyRuntimeHandoff = heavyRuntimeCoordinator,
@@ -1256,6 +1174,7 @@ fun AppNav() {
                     onEndSurveySession = { (repo as LiteRtRepository).endSurveySession() },
                     whisperMeta = cfg.whisper,
                     ttsMeta = cfg.tts,
+                    sessionTtsDisabled = sessionTtsDisabled,
                     sessionId = sessionKey,
                     sessionVmOwner = sessionVmOwner,
                     heavyRuntimeHandoff = heavyRuntimeCoordinator,
@@ -1266,6 +1185,100 @@ fun AppNav() {
             }
         }
     }
+}
+
+/** Readiness and the Continue decision share the logical session owner, before runtime loading. */
+@Composable
+internal fun SurveyTtsReadinessGate(
+    cfg: SurveyConfig,
+    sessionKey: String,
+    sessionStore: SurveySessionStore,
+    onExit: () -> Unit,
+    readiness: TtsReadinessStore = ProcessTtsReadiness.store,
+    checkReadiness: (suspend (TtsReadinessKey) -> TtsVoiceCheck)? = null,
+): Boolean {
+    val appContext = LocalContext.current.applicationContext
+    val ttsGateEngine = remember(cfg) { cfg.tts.engine?.trim()?.ifBlank { null } }
+    val ttsGateLang = remember(cfg) {
+        cfg.tts.language?.trim()?.lowercase(Locale.US)?.ifBlank { null } ?: DEFAULT_TTS_LANGUAGE
+    }
+    val ttsGateNeedsVoice = remember(cfg, ttsGateEngine) {
+        (cfg.tts.enabled ?: true) && (cfg.tts.requireOfflineVoice ?: false) && ttsGateEngine != null
+    }
+    val ttsGateNeedsEngine = remember(cfg, ttsGateEngine) {
+        (cfg.tts.enabled ?: true) && (cfg.tts.requireEngine ?: false) && ttsGateEngine != null
+    }
+    val ttsReadinessKey = remember(ttsGateEngine, ttsGateLang, ttsGateNeedsVoice, ttsGateNeedsEngine) {
+        ttsGateEngine?.takeIf { ttsGateNeedsVoice || ttsGateNeedsEngine }?.let {
+            TtsReadinessKey.create(it, ttsGateLang, ttsGateNeedsVoice, ttsGateNeedsEngine)
+        }
+    }
+    // Seed the gate synchronously so a warm selection never composes the spinner.
+    var ttsGateResult by remember(sessionKey, ttsReadinessKey) {
+        mutableStateOf(
+            if (ttsReadinessKey == null || readiness.isReady(ttsReadinessKey)) TtsVoiceCheck.OK else null
+        )
+    }
+    val ttsDisabled by sessionStore.ttsDisabledFor(sessionKey).collectAsStateWithLifecycle()
+    var ttsGateTick by remember(sessionKey, ttsReadinessKey) { mutableIntStateOf(0) }
+
+    LaunchedEffect(sessionKey, ttsReadinessKey, ttsGateTick, ttsDisabled) {
+        val key = ttsReadinessKey ?: return@LaunchedEffect
+        if (ttsGateResult == TtsVoiceCheck.OK || ttsDisabled) return@LaunchedEffect
+        val result = readiness.check(key) {
+            val checked = if (checkReadiness != null) {
+                checkReadiness(key)
+            } else if (key.requiresOfflineVoice) {
+                checkTtsOfflineVoice(appContext, key.enginePackage, key.language)
+            } else if (isTtsEngineInstalled(appContext, key.enginePackage)) {
+                TtsVoiceCheck.OK
+            } else {
+                TtsVoiceCheck.ENGINE_MISSING
+            }
+            if (ttsDisabled) throw CancellationException("TTS readiness was skipped")
+            checked
+        }
+        Log.d(MainActivity.TAG, "TTS gate: engine=${key.enginePackage} lang=${key.language} result=$result session=$sessionKey")
+        ttsGateResult = result
+    }
+
+    if (ttsGateResult != TtsVoiceCheck.OK && !ttsDisabled) {
+        // The missing-voice flow sends the user to system settings outside the app.
+        LifecycleResumeEffect(sessionKey, ttsReadinessKey) {
+            if (ttsGateResult != null && ttsGateEngine != null) {
+                ProcessTtsReadiness.invalidateVoiceData(ttsGateEngine)
+                ttsGateTick++
+            }
+            onPauseOrDispose { }
+        }
+        val result = ttsGateResult
+        if (result == null) {
+            Box(
+                modifier = Modifier.fillMaxSize().imePadding(),
+                contentAlignment = Alignment.Center
+            ) {
+                CircularProgressIndicator(color = MaterialTheme.colorScheme.outline)
+            }
+        } else {
+            TtsEngineMissingScreen(
+                enginePackage = ttsGateEngine.orEmpty(),
+                languageCode = ttsGateLang,
+                onContinueWithoutVoice = {
+                    Log.w(MainActivity.TAG, "TTS gate failed ($result); continuing without read-aloud")
+                    sessionStore.disableTts(sessionKey)
+                },
+                onExit = {
+                    ttsGateEngine?.let(ProcessTtsReadiness::invalidateVoiceData)
+                    sessionStore.clearSession(sessionKey)
+                    onExit()
+                },
+                modifier = Modifier.fillMaxSize().imePadding()
+            )
+        }
+        return false
+    }
+
+    return true
 }
 
 /* ───────────────────────────── No-op Speech ───────────────────────────── */
@@ -1318,7 +1331,9 @@ internal fun SurveyNavHost(
     uploadStatus: UploadStatus = UploadStatus(),
     onResolveUploadStatusDetails: suspend () -> UploadStatusDetails,
     onClearCompletedSurveys: suspend (Set<String>) -> Unit,
-    speechControllerOverride: SpeechController? = null
+    speechControllerOverride: SpeechController? = null,
+    sessionTtsDisabled: Boolean = false,
+    ttsFactoryOverride: ViewModelProvider.Factory? = null,
 ) {
     val localContext = LocalContext.current
     val app = localContext.applicationContext as android.app.Application
@@ -1435,7 +1450,7 @@ internal fun SurveyNavHost(
 
     /* ───────────────────────── Text-to-speech (question read-aloud) ───────────────────────── */
 
-    val ttsEnabled = remember(ttsMeta.enabled) { ttsMeta.enabled ?: true }
+    val ttsEnabled = (ttsMeta.enabled ?: true) && !sessionTtsDisabled
     val ttsAutoPlay = remember(ttsMeta.autoPlay) { ttsMeta.autoPlay ?: true }
 
     val ttsLang = remember(ttsMeta.language) {
@@ -1474,12 +1489,17 @@ internal fun SurveyNavHost(
         val ttsVm: TtsController = viewModel(
             viewModelStoreOwner = owner,
             key = "TtsController_${sessionId}_${ttsLang}_${ttsEngine.orEmpty()}_$ttsEngineInstalled",
-            factory = ttsFactory
+            factory = ttsFactoryOverride ?: ttsFactory
         )
 
         ttsVm
     } else {
-        remember { NoOpQuestionSpeaker("Text-to-speech is disabled by configuration.") }
+        remember(sessionTtsDisabled) {
+            NoOpQuestionSpeaker(
+                if (sessionTtsDisabled) "Read-aloud is disabled for this survey session."
+                else "Text-to-speech is disabled by configuration."
+            )
+        }
     }
 
     val playbackLifecycle = LocalLifecycleOwner.current.lifecycle
@@ -1491,8 +1511,8 @@ internal fun SurveyNavHost(
     )
 
     fun replayQuestion(nodeId: String, question: String) {
-        if (playbackLifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
-            if (ttsEnabled && !ttsController.isReady.value) vmSurvey.noteQueuedOrdinaryReplay(nodeId)
+        if (ttsEnabled && playbackLifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
+            if (!ttsController.isReady.value) vmSurvey.noteQueuedOrdinaryReplay(nodeId)
             toggleQuestionSpeaker(ttsController, question, nodeId)
         }
     }

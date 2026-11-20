@@ -2,6 +2,9 @@ package com.negi.survey.vm
 
 import android.speech.tts.TextToSpeech
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.test.junit4.v2.createComposeRule
 import androidx.lifecycle.Lifecycle
@@ -60,4 +63,36 @@ class TtsControllerLifecycleTest {
             engine.speak("Manual replay", TextToSpeech.QUEUE_FLUSH, any<android.os.Bundle>(), "replay")
         }
     }
+
+    @Test
+    fun disposalDropsQueuedReplayBeforeLateEngineInitialization() {
+        val engine = mockk<TextToSpeech>(relaxed = true)
+        every { engine.setLanguage(any()) } returns TextToSpeech.LANG_COUNTRY_AVAILABLE
+        lateinit var init: TextToSpeech.OnInitListener
+        lateinit var controller: TtsController
+        var attached by mutableStateOf(true)
+        rule.setContent {
+            val context = LocalContext.current.applicationContext
+            controller = remember {
+                TtsController(context, createEngine = { _, listener, _ ->
+                    init = listener
+                    engine
+                })
+            }
+            if (attached) {
+                StopQuestionSpeakerInBackground(controller, androidx.lifecycle.compose.LocalLifecycleOwner.current.lifecycle)
+            }
+        }
+        rule.runOnIdle {
+            controller.speak("Queued manual replay", "queued")
+            attached = false
+        }
+        rule.waitForIdle()
+        verify(atLeast = 1) { engine.stop() }
+        init.onInit(TextToSpeech.SUCCESS)
+        rule.waitUntil(5_000) { controller.isReady.value }
+        verify(exactly = 0) { engine.speak(any(), any(), any<android.os.Bundle>(), any()) }
+        rule.runOnIdle { controller.stop(); engine.shutdown() }
+    }
+
 }

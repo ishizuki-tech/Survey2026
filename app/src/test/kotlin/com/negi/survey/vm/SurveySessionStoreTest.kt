@@ -52,6 +52,31 @@ class SurveySessionStoreTest {
         assertEquals(false, nextViewModel.cleared)
     }
 
+    @Test
+    fun ttsDisableIsRetainedByTheSessionOwnerAndIsolatedFromOtherSessions() {
+        val sessions = SurveySessionStore()
+        val policy = sessions.ttsDisabledFor("config@1")
+        assertFalse(policy.value)
+        sessions.disableTts("config@1")
+        sessions.ownerFor("config@1")
+        assertSame(policy, sessions.ttsDisabledFor("config@1"))
+        assertTrue(policy.value)
+        assertFalse(sessions.ttsDisabledFor("config@2").value)
+        assertFalse(sessions.ttsDisabledFor("other@1").value)
+        sessions.disableTts("config@1")
+        assertTrue(policy.value)
+    }
+
+    @Test
+    fun clearingSessionDropsTtsDisableEvenWhenTheSameKeyIsReused() {
+        val sessions = SurveySessionStore()
+        sessions.disableTts("config@1")
+        val oldPolicy = sessions.ttsDisabledFor("config@1")
+        sessions.clearSession("config@1")
+        assertNotSame(oldPolicy, sessions.ttsDisabledFor("config@1"))
+        assertFalse(sessions.ttsDisabledFor("config@1").value)
+    }
+
     class TrackingViewModel : ViewModel() {
         var cleared = false
 
