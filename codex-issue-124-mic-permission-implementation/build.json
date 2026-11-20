@@ -1,0 +1,12 @@
+{
+  "original_branch": "codex/issue-124-mic-permission-implementation",
+  "branch_slug": "codex-issue-124-mic-permission-implementation",
+  "commit_sha": "5c0489bb2ec549cbf8b875d6b10dd039b7ea0658",
+  "short_sha": "5c0489b",
+  "apk_name": "Survey2026-codex-issue-124-mic-permission-implementation-5c0489b.apk",
+  "apk_sha256": "ddda4bf50f2f2e0fe37825f2ab0fc56ee13e664f758d7a1523a3a74072933354",
+  "apk_download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-codex-issue-124-mic-permission-implementation-5c0489b-run-228/Survey2026-codex-issue-124-mic-permission-implementation-5c0489b.apk",
+  "page_url": "https://ishizuki-tech.github.io/Survey2026/codex-issue-124-mic-permission-implementation/",
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/44679737950",
+  "generated_utc": "2026-11-20T05:21:59Z"
+}
