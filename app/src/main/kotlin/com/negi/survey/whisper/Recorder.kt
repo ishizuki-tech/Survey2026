@@ -70,6 +70,7 @@ interface RecorderBackend : Closeable {
  */
 class Recorder(
     private val context: Context,
+    private val pcmFile: () -> File,
     private val onError: (Exception) -> Unit
 ) : RecorderBackend {
 
@@ -148,7 +149,7 @@ class Recorder(
                 }
 
                 activeRecorder.set(rec)
-                tempPcm = File.createTempFile("rec_", ".pcm", context.cacheDir)
+                tempPcm = pcmFile()
                 val tmp = tempPcm ?: error("Temp PCM file creation failed")
 
                 // Create writer job first (LAZY) to avoid race where stop happens before writerJob is visible.
