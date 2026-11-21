@@ -1,0 +1,12 @@
+{
+  "original_branch": "codex/issue-119-branch-invalidation",
+  "branch_slug": "codex-issue-119-branch-invalidation",
+  "commit_sha": "57b8b17447c165c4cbfb1d7b55e7bd6dc7af2711",
+  "short_sha": "57b8b17",
+  "apk_name": "Survey2026-codex-issue-119-branch-invalidation-57b8b17.apk",
+  "apk_sha256": "d36973885778afe07332d09a5ddbef15e9d80cfecfd5239c949eb946fe473754",
+  "apk_download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/branch-preview-codex-issue-119-branch-invalidation-57b8b17-run-232/Survey2026-codex-issue-119-branch-invalidation-57b8b17.apk",
+  "page_url": "https://ishizuki-tech.github.io/Survey2026/codex-issue-119-branch-invalidation/",
+  "run_url": "https://github.com/ishizuki-tech/Survey2026/actions/runs/44857053716",
+  "generated_utc": "2026-11-21T02:46:59Z"
+}
