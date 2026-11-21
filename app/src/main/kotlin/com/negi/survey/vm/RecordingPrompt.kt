@@ -11,6 +11,8 @@ data class RecordingPrompt(
     @SerialName("prompt_kind") val kind: Kind,
     @SerialName("prompt_text") val text: String,
     @SerialName("followup_position") val followupPosition: Int? = null,
+    /** Internal capture ownership; omitted from the respondent export format. */
+    @SerialName("branch_revision") val branchRevision: Long? = null,
 ) {
     @Serializable
     enum class Kind {
@@ -35,10 +37,11 @@ internal fun aiRecordingPrompt(
     original: String,
     conversation: AiViewModel.ConversationState,
     followups: List<SurveyViewModel.FollowupEntry>,
+    branchRevision: Long = 0,
 ): RecordingPrompt? {
     if (conversation.role == AiViewModel.ComposerRole.MAIN) {
         return original.takeIf(String::isNotBlank)?.let {
-            RecordingPrompt(surveyId, questionId, RecordingPrompt.Kind.ORIGINAL, it)
+            RecordingPrompt(surveyId, questionId, RecordingPrompt.Kind.ORIGINAL, it, branchRevision = branchRevision)
         }
     }
     val pending = followups.indexOfLast { it.answer == null && it.question.isNotBlank() }
@@ -46,5 +49,6 @@ internal fun aiRecordingPrompt(
     return RecordingPrompt(
         surveyId, questionId, RecordingPrompt.Kind.FOLLOWUP, conversation.activePromptQuestion,
         followupPosition = pending + 1,
+        branchRevision = branchRevision,
     )
 }

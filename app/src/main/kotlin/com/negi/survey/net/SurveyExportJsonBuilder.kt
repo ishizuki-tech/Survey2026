@@ -27,7 +27,12 @@ object SurveyExportJsonBuilder {
         exportedAt: String,
         recordings: List<SurveyRecording> = emptyList(),
     ): String = buildString {
-        val audioByQuestion = recordings.groupBy { it.identity.prompt.questionId }
+        val selectedRecordings = recordings.filter { recording ->
+            val id = recording.identity.prompt.questionId
+            id !in snapshot.excludedNodeIds &&
+                (snapshot.nodeStateRevisions[id]?.let { it == recording.identity.prompt.branchRevision } ?: true)
+        }
+        val audioByQuestion = selectedRecordings.groupBy { it.identity.prompt.questionId }
         val answerOwnerIds = linkedSetOf<String>().apply {
             addAll(snapshot.questions.keys)
             addAll(snapshot.answers.keys)
@@ -88,21 +93,21 @@ object SurveyExportJsonBuilder {
         append("  },\n")
 
         append("  \"voice_files\": [\n")
-        recordings.forEachIndexed { index, recording ->
+        selectedRecordings.forEachIndexed { index, recording ->
             val prompt = Json.encodeToJsonElement(
                 com.negi.survey.vm.RecordingPrompt.serializer(), recording.identity.prompt,
             ) as JsonObject
             val entry = buildJsonObject {
                 put("file", recording.file)
                 put("recording_id", recording.identity.id)
-                prompt.forEach { (field, value) -> put(field, value) }
+                prompt.filterKeys { it != "branch_revision" }.forEach { (field, value) -> put(field, value) }
                 put("transcription_status", Json.encodeToJsonElement(
                     TranscriptionOutcome.Status.serializer(), recording.outcome.status,
                 ))
                 recording.outcome.transcript?.let { put("transcript", it) }
             }
             append("    ").append(entry)
-            if (index != recordings.lastIndex) append(',')
+            if (index != selectedRecordings.lastIndex) append(',')
             append('\n')
         }
         append("  ]\n")

@@ -1325,6 +1325,7 @@ internal fun SurveyNavHost(
                         byteSize = voice.byteSize,
                         checksum = voice.checksum,
                         expectedSurveyId = voice.surveyId,
+                        expectedNodeRevision = voice.branchRevision,
                     )
                 }
             )
@@ -1358,7 +1359,8 @@ internal fun SurveyNavHost(
         vmSurvey.bindNavigationToProcessing(speechController.isTranscribing, vmAI::blocksNavigation)
     }
 
-    fun navigationLockedNow() = speechController.isTranscribing.value || vmAI.blocksNavigation()
+    fun navigationLockedNow() = speechController.isTranscribing.value || vmAI.blocksNavigation() ||
+        vmSurvey.navigationLocked()
 
     fun guardedNavigation(action: () -> Unit): () -> Unit = {
         if (!navigationLockedNow()) action()
@@ -1645,11 +1647,10 @@ internal fun SurveyNavHost(
                         otherTextOption = node.otherTextOption,
                         initialOtherText = node.decomposeSingleChoiceAnswer(answers[node.id]).otherText,
                         onSubmit = submit@{ selection, otherText ->
-                            if (navigationLockedNow()) return@submit
+                            if (speechController.isTranscribing.value || vmAI.blocksNavigation()) return@submit
                             node.composeSingleChoiceAnswer(selection, otherText)?.let { answer ->
                                 runCatching { ttsController.stop() }
-                                vmSurvey.setAnswer(answer, node.id)
-                                vmSurvey.advanceToNext()
+                                vmSurvey.submitSingleChoiceAnswer(answer, node.id)
                             }
                         },
                         onBack = previousQuestion,

@@ -548,6 +548,7 @@ class AiViewModel(
     ): Job = synchronized(executionLock) {
         evalJobRef.get()?.takeIf { it.isActive }?.let { return@synchronized it }
         val runUuid = survey.surveyUuid.value
+        val branchRevision = survey.nodeStateRevision(nodeId)
         val answer = survey.getAnswer(nodeId)
         val answerTraceId = survey.commitAnswer(nodeId, inputSource = "typed")
         val remaining = survey.remainingFollowups(nodeId)
@@ -577,7 +578,7 @@ class AiViewModel(
             proceedOnTimeout = false,
             twoStepChat = TwoStepChat(
                 contextKey, nodeId,
-                isCurrentSurvey = { survey.surveyUuid.value == runUuid },
+                isCurrentSurvey = { survey.surveyUuid.value == runUuid && survey.nodeStateRevision(nodeId) == branchRevision },
                 acceptsEvaluation = {
                     admission(it.raw, it.timedOut, it.error).decision != SurveyAiDecision.FAILURE
                 }
@@ -610,7 +611,7 @@ class AiViewModel(
                 }
             },
             onFinished = { evaluation, generation ->
-                if (survey.surveyUuid.value == runUuid) {
+                survey.withNodeStateOwner(runUuid, nodeId, branchRevision) {
                     val diagnosticMissingPoints = if (DiagnosticContentPolicy.permitsRawRespondentContent) {
                         traceMissingPoints
                     } else {

@@ -41,5 +41,6 @@ internal class AnswerTraceTransactions {
     fun commit(questionId: String): Transaction? = active[questionId]
     fun markVoiceAccepted(questionId: String) { acceptedVoice += questionId }
     fun consumeVoiceAccepted(questionId: String): Boolean = acceptedVoice.remove(questionId)
+    fun remove(questionId: String) { active.remove(questionId); acceptedVoice.remove(questionId) }
     fun clear() { active.clear(); acceptedVoice.clear() }
 }
