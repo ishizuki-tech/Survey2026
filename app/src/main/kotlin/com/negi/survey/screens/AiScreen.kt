@@ -419,7 +419,10 @@ fun AiScreen(
     val surveySessionId by vmSurvey.sessionId.collectAsState()
     val surveyUuid by vmSurvey.surveyUuid.collectAsState()
 
-    val contextKey = remember(nid, surveySessionId) { "sid=$surveySessionId|nid=$nid" }
+    val branchRevision = vmSurvey.nodeStateRevision(nid)
+    val contextKey = remember(nid, surveySessionId, branchRevision) {
+        "sid=$surveySessionId|nid=$nid" + if (branchRevision == 0L) "" else "|branch=$branchRevision"
+    }
 
     /**
      * Determine if this node is configured as TWO_STEP.
@@ -858,6 +861,7 @@ fun AiScreen(
         val matchesPrompt = captured == null || captured == aiRecordingPrompt(
             vmSurvey.surveyUuid.value, nid, vmSurvey.getQuestion(nid),
             conversation.value, vmSurvey.followups.value[nid].orEmpty(),
+            branchRevision = vmSurvey.nodeStateRevision(nid),
         )
         if (inputClosed || !ownsPresentation() || !matchesPrompt) {
             wasRecording = false
@@ -1297,6 +1301,7 @@ fun AiScreen(
                                     val prompt = aiRecordingPrompt(
                                         vmSurvey.surveyUuid.value, nid, vmSurvey.getQuestion(nid),
                                         conversation.value, vmSurvey.followups.value[nid].orEmpty(),
+                                        branchRevision = vmSurvey.nodeStateRevision(nid),
                                     ) ?: return@toggle
                                     keyboard?.hide()
                                     focusManager.clearFocus(force = true)

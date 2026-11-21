@@ -22,5 +22,8 @@ data class SurveyFinalizationSnapshot(
     val audioRefs: List<SurveyViewModel.AudioRef>,
     val aiOutcomesJson: String,
     val extraMeta: Map<String, String>,
-    val status: SurveyCompletionStatus = SurveyCompletionStatus.COMPLETED
+    val status: SurveyCompletionStatus = SurveyCompletionStatus.COMPLETED,
+    /** Capture generations for previously invalidated nodes, including fresh interrupted WAVs. */
+    val nodeStateRevisions: Map<String, Long> = emptyMap(),
+    val excludedNodeIds: Set<String> = emptySet(),
 )

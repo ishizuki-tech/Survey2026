@@ -180,7 +180,8 @@ class WhisperSpeechController(
         val questionId: String,
         val fileName: String,
         val byteSize: Long,
-        val checksum: String? = null
+        val checksum: String? = null,
+        val branchRevision: Long = 0,
     )
 
     // ---------------------------------------------------------------------
@@ -584,6 +585,7 @@ class WhisperSpeechController(
                                 fileName = route.basename,
                                 byteSize = route.size,
                                 checksum = route.fingerprint,
+                                branchRevision = recording.prompt.branchRevision ?: 0,
                             ))
                         } catch (cancelled: CancellationException) {
                             throw cancelled

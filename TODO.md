@@ -8,9 +8,13 @@ This document contains **concrete unfinished work only**. It is a documentation 
 
 ### [#119 — Remove unreachable Q14b survey data](https://github.com/ishizuki-tech/Survey2026/issues/119)
 
-- [ ] On the current `main`, confirm and test the Q14a **Yes → No** route change and every persisted Q14b data owner (answers, AI state, follow-ups and audio references).
-- [ ] Remove only now-unreachable Q14b survey data on the changed route, preserving data on the still-valid path and preventing stale export entries.
-- [ ] Cover back navigation, repeated changes, unfinished survey save and final JSON export with focused regression tests.
+Implementation and deterministic regression coverage are prepared locally on `codex/issue-119-branch-invalidation`, based on `4f56a7b707d4a9dffc6fd038a8a742c7053b558d`; they are not yet integrated into `main`.
+
+Durable route/revision commits and abandoned-recovery filtering are implemented locally, including failure/retry and legacy-record regression coverage. Review and integration remain pending.
+
+- [ ] Review and integrate branch-state invalidation, atomic persistence and EN/SW finalization/recovery regressions.
+- [ ] Define bounded, ownership-aware cleanup for detached WAVs if indefinite local retention is no longer desired. They are intentionally ineligible for independent upload and retained without a receipt.
+- [ ] Perform target-device/export acceptance separately; local automated tests do not establish field acceptance.
 
 ### [#118 — Release Whisper runtime on session exit](https://github.com/ishizuki-tech/Survey2026/issues/118)
 

@@ -16,6 +16,8 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.setMain
@@ -87,7 +89,11 @@ class RecordingPublicationRaceTest {
 
     private suspend fun settled(vm: WhisperSpeechController) {
         val field = WhisperSpeechController::class.java.getDeclaredField("activeSession").apply { isAccessible = true }
-        withTimeout(5_000) { while ((field.get(vm) as AtomicReference<*>).get() != null) yield() }
+        withTimeout(5_000) {
+            while ((field.get(vm) as AtomicReference<*>).get() != null) yield()
+            // Owner release and the final state publication are separate worker writes.
+            vm.isTranscribing.first { !it }
+        }
         assertFalse(vm.isRecording.value)
         assertFalse(vm.isTranscribing.value)
     }
@@ -206,6 +212,25 @@ class RecordingPublicationRaceTest {
         assertEquals(prompt, saved.identity.prompt)
         assertEquals("accepted transcript", saved.outcome.transcript)
         assertTrue(artifactStore.voiceEntries(prompt.surveyId).single().matchesPayload())
+    }
+
+    @Test fun settledWaitsForTranscribingStateAfterOwnerIsReleased() = runBlocking {
+        val vm = controller()
+        val field = WhisperSpeechController::class.java.getDeclaredField("_isTranscribing").apply { isAccessible = true }
+        @Suppress("UNCHECKED_CAST")
+        val transcribing = field.get(vm) as MutableStateFlow<Boolean>
+        // Model the valid interval between releasing activeSession and publishing false.
+        // The terminal observer must suspend until both independently published states settle.
+        transcribing.value = true
+        supervisorScope {
+            val observation = async(start = CoroutineStart.UNDISPATCHED) { settled(vm) }
+            try {
+                assertFalse("Owner release alone does not complete transcription", observation.isCompleted)
+            } finally {
+                transcribing.value = false
+            }
+            observation.await()
+        }
     }
 
     @Test fun managedWavLeaseOutlivesRecorderClosureAndDecisionBarrier() = runBlocking {
