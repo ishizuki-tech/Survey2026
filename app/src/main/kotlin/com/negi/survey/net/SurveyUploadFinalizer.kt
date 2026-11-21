@@ -181,11 +181,14 @@ class SurveyUploadFinalizer private constructor(
         if (abandoned.isEmpty()) return
         val tag = DeviceUploadTagProvider.from(context)
         for (surveyId in abandoned) {
-            val snapshot = SurveyFinalizationSnapshot(
-                surveyId = surveyId, questions = emptyMap(), answers = emptyMap(),
-                followups = emptyMap(), audioRefs = emptyList(), aiOutcomesJson = "{}",
-                extraMeta = emptyMap(), status = SurveyCompletionStatus.INCOMPLETE,
-            )
+            val snapshot = try {
+                SurveyBranchStateStore(context).recoverySnapshot(surveyId)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                RuntimeLogStore.w("SurveyFinalizer", "Branch evidence could not be verified for $surveyId; recordings retained.")
+                continue
+            }
             val result = finalize(
                 snapshot, null, tag,
                 Instant.now().toString(), abandoned = true,

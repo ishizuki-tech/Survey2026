@@ -25,6 +25,15 @@
 
 package com.negi.survey.vm
 
+import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.CancellationException
+import com.negi.survey.net.SurveyBranchStateStore
 import androidx.lifecycle.ViewModel
 import androidx.navigation3.runtime.NavBackStack
 import androidx.navigation3.runtime.NavKey
@@ -157,7 +166,8 @@ enum class PromptMode {
 open class SurveyViewModel(
     private var nav: NavBackStack<NavKey>,
     private val config: SurveyConfig,
-    private val traceContext: Context? = null
+    private val traceContext: Context? = null,
+    private val branchStateStore: SurveyBranchStateStore? = traceContext?.let(::SurveyBranchStateStore),
 ) : ViewModel() {
 
     companion object {
@@ -314,6 +324,7 @@ open class SurveyViewModel(
     fun createFinalizationSnapshot(
         status: SurveyCompletionStatus = SurveyCompletionStatus.COMPLETED
     ): SurveyFinalizationSnapshot {
+        check(!branchCommitPending && !branchCommitFailed) { "Retry saving the conditional answer before export." }
         val surveyId = _surveyUuid.value
         val runAudioRefs = getAudioRefsForRunFlat(surveyId).toList()
         val snapshotQuestions = questions.value
@@ -337,7 +348,9 @@ open class SurveyViewModel(
             } else {
                 exportExtraMeta()
             },
-            status = status
+            status = status,
+            nodeStateRevisions = nodeStateRevisions.toMap(),
+            excludedNodeIds = inactiveBranchNodes.toSet(),
         )
     }
 
@@ -441,7 +454,9 @@ open class SurveyViewModel(
     private val _questions = MutableStateFlow<Map<String, String>>(LinkedHashMap())
     val questions: StateFlow<Map<String, String>> = _questions.asStateFlow()
 
+    @Synchronized
     fun setQuestion(text: String, key: String) {
+        if (key.trim() in inactiveBranchNodes) return
         _questions.update { old ->
             old.mutableLinked().apply { put(key.trim(), text) }
         }
@@ -462,15 +477,145 @@ open class SurveyViewModel(
     internal val submittedAiOriginals = _submittedAiOriginals.asStateFlow()
 
     /** Records acceptance before validation starts, independently of subsequent draft edits. */
+    @Synchronized
     internal fun acceptAiOriginalAnswer(nodeId: String, text: String) {
+        if (nodeId.trim() in inactiveBranchNodes) return
         setAnswer(text, nodeId)
         _submittedAiOriginals.update { it + nodeId.trim() }
     }
 
-    fun setAnswer(text: String, key: String) {
-        _answers.update { old ->
-            old.mutableLinked().apply { put(key.trim(), text) }
+    private val nodeStateRevisions = mutableMapOf<String, Long>()
+    private val inactiveBranchNodes = mutableSetOf<String>()
+    private var branchCommitPending = false
+    private var branchCommitFailed = false
+    private var failedBranchChoice: Pair<String, String>? = null
+
+    /** Owns the disk transaction across Activity recreation; writes finish before route publication. */
+    @Synchronized
+    fun submitSingleChoiceAnswer(text: String, key: String, advance: Boolean = true): Job? {
+        val id = key.trim()
+        if (branchCommitPending || transcriptionState?.value == true || aiNavigationLocked()) return null
+        val node = graph[id] ?: return null
+        // A failed rename/fsync may already have committed the attempted choice. Finish that
+        // exact transaction before accepting a different choice; never roll its revision back.
+        if (branchCommitFailed && failedBranchChoice != (id to text)) {
+            emitSnack("Retry Next with the previous choice before changing it.")
+            return null
         }
+        if (branchStateStore == null || node.nextIdByAnswer.isEmpty()) {
+            if (branchCommitFailed) return null
+            setAnswer(text, id)
+            if (advance) advanceToNext()
+            return null
+        }
+        if (id in inactiveBranchNodes) return null
+        val selected = node.resolveNextId(text)
+        val retained = reachableNodes(selected, id)
+        val excluded = (listOfNotNull(node.nextId) + node.nextIdByAnswer.values)
+            .flatMap { reachableNodes(it, id) }.toSet() - retained
+        val abandoned = if (getAnswer(id) == text) emptySet() else excluded
+        val revisions = nodeStateRevisions.toMutableMap().apply {
+            if ("Q14b" in graph) putIfAbsent("Q14b", 0L)
+            abandoned.forEach { put(it, nodeStateRevision(it) + 1) }
+        }
+        val inactive = (inactiveBranchNodes - retained) + excluded
+        val state = SurveyBranchStateStore.State(surveyUuid.value,
+            answers.value.filterKeys { graph[it]?.nextIdByAnswer?.isNotEmpty() == true } + (id to text),
+            revisions, inactive)
+        branchCommitPending = true
+        return viewModelScope.launch(start = CoroutineStart.UNDISPATCHED) {
+            // Cancellation cannot strand a committed disk state behind an unacknowledged live route.
+            withContext(NonCancellable) {
+                try {
+                    withContext(Dispatchers.IO) { branchStateStore.commit(state) }
+                    synchronized(this@SurveyViewModel) {
+                        abandoned.forEach(::invalidateBranchNode)
+                        nodeStateRevisions.clear()
+                        nodeStateRevisions.putAll(state.revisions)
+                        inactiveBranchNodes.clear()
+                        inactiveBranchNodes.addAll(state.inactive)
+                        _answers.update { old -> old.mutableLinked().apply { put(id, text) } }
+                        branchCommitPending = false
+                        branchCommitFailed = false
+                        failedBranchChoice = null
+                        if (advance) advanceToNext()
+                    }
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (failure: Exception) {
+                    synchronized(this@SurveyViewModel) {
+                        branchCommitPending = false
+                        branchCommitFailed = true
+                        failedBranchChoice = id to text
+                        _single.value = text
+                        emitSnack("Could not save the conditional answer. Retry Next.")
+                    }
+                }
+            }
+        }
+    }
+
+    @Synchronized
+    internal fun nodeStateRevision(nodeId: String): Long = nodeStateRevisions[nodeId] ?: 0L
+
+    /** Check ownership and publish one AI turn atomically with branch edits and snapshots. */
+    @Synchronized
+    internal fun withNodeStateOwner(surveyId: String, nodeId: String, revision: Long, publish: () -> Unit) {
+        if (surveyUuid.value == surveyId && nodeStateRevision(nodeId) == revision &&
+            nodeId !in inactiveBranchNodes) publish()
+    }
+
+    /** Stored route edits invalidate only the abandoned branch, preserving shared successors. */
+    @Synchronized
+    fun setAnswer(text: String, key: String) {
+        val id = key.trim()
+        if (id in inactiveBranchNodes) return
+        val node = graph[id]
+        if (branchStateStore != null &&
+            node?.type == NodeType.SINGLE_CHOICE && node.nextIdByAnswer.isNotEmpty()) {
+            submitSingleChoiceAnswer(text, id, advance = false)
+            return
+        }
+        if (node?.type == NodeType.SINGLE_CHOICE && node.nextIdByAnswer.isNotEmpty()) {
+            val previous = node.resolveNextId(getAnswer(id))
+            val selected = node.resolveNextId(text)
+            if (previous != selected) {
+                if (navigationLocked()) return
+                val retained = reachableNodes(selected, id)
+                inactiveBranchNodes.removeAll(retained)
+                (reachableNodes(previous, id) - retained).forEach(::invalidateBranchNode)
+            }
+        }
+        _answers.update { old -> old.mutableLinked().apply { put(id, text) } }
+    }
+
+    // Follow all configured edges so a shared successor's own conditional branches survive.
+    private fun reachableNodes(start: String?, gateId: String): Set<String> {
+        val visited = mutableSetOf<String>()
+        val pending = ArrayDeque<String>()
+        start?.let(pending::addLast)
+        while (pending.isNotEmpty()) {
+            val id = pending.removeFirst()
+            if (id == gateId || !visited.add(id)) continue
+            val node = graph[id] ?: continue
+            node.nextId?.let(pending::addLast)
+            node.nextIdByAnswer.values.forEach(pending::addLast)
+            node.numericRoutes.forEach { pending.addLast(it.nextId) }
+        }
+        return visited
+    }
+
+    private fun invalidateBranchNode(id: String) {
+        inactiveBranchNodes.add(id)
+        nodeStateRevisions[id] = nodeStateRevision(id) + 1
+        clearAnswer(id)
+        _questions.update { it - id }
+        _submittedAiOriginals.update { it - id }
+        clearFollowups(id)
+        answerTraceIds.remove(id)
+        // Detach associations only. Immutable WAVs may be owned by V2 delivery or another
+        // snapshot; their existing receipt-based cleanup retains ownership of the files.
+        clearAudioRefs(id)
     }
 
     fun commitAnswer(questionId: String, inputSource: String): String? {
@@ -480,7 +625,9 @@ open class SurveyViewModel(
     }
 
     /** Marks the one voice-to-submit handoff that must retain its mic-start transaction. */
+    @Synchronized
     fun acceptVoiceTranscript(questionId: String, text: String) {
+        if (questionId.trim() in inactiveBranchNodes) return
         setAnswer(text, questionId)
         answerTraceIds.markVoiceAccepted(questionId)
     }
@@ -544,7 +691,9 @@ open class SurveyViewModel(
     private val _aiReasons = MutableStateFlow<Map<String, SurveyAiReason>>(emptyMap())
     val aiReasons: StateFlow<Map<String, SurveyAiReason>> = _aiReasons.asStateFlow()
 
+    @Synchronized
     fun setAiReason(nodeId: String, reason: SurveyAiReason?) {
+        if (reason != null && nodeId.trim() in inactiveBranchNodes) return
         _aiReasons.update { old ->
             if (reason == null) old - nodeId.trim() else old + (nodeId.trim() to reason)
         }
@@ -584,12 +733,14 @@ open class SurveyViewModel(
                 "Follow-up ${index + 1}: ${entry.question}\nAnswer ${index + 1}: ${entry.answer}"
             }.joinToString("\n")
 
+    @Synchronized
     fun addFollowupQuestion(
         nodeId: String,
         question: String,
         dedupAdjacent: Boolean = true
     ): Boolean {
         val k = nodeId.trim()
+        if (k in inactiveBranchNodes) return false
         val q = question.trim()
         if (q.isBlank()) return false
 
@@ -674,10 +825,12 @@ open class SurveyViewModel(
         checksum: String? = null,
         dedupByFileName: Boolean = true,
         expectedSurveyId: String = surveyUuid.value,
+        expectedNodeRevision: Long = nodeStateRevision(questionId.trim()),
     ) {
         val qid = questionId.trim()
         val sid = expectedSurveyId
-        if (sid != surveyUuid.value) return
+        if (sid != surveyUuid.value || qid in inactiveBranchNodes ||
+            expectedNodeRevision != nodeStateRevision(qid)) return
 
         _recordedAudioRefs.update { old ->
             val mutable = old.mutableLinkedLists<AudioRef>()
@@ -710,6 +863,7 @@ open class SurveyViewModel(
         checksum: String? = null
     ) {
         val qid = questionId.trim()
+        if (qid in inactiveBranchNodes) return
         val sid = surveyUuid.value
 
         _recordedAudioRefs.update { old ->
@@ -1119,7 +1273,8 @@ open class SurveyViewModel(
     }
 
     @Synchronized
-    internal fun navigationLocked(): Boolean = transcriptionState?.value == true || aiNavigationLocked()
+    internal fun navigationLocked(): Boolean = branchCommitPending || branchCommitFailed ||
+        transcriptionState?.value == true || aiNavigationLocked()
 
     @Synchronized
     fun goto(nodeId: String) {
@@ -1179,6 +1334,8 @@ open class SurveyViewModel(
         closeDiagnosticInterval()
         regenerateSurveyUuid()
         answerTraceIds.clear()
+        nodeStateRevisions.clear()
+        inactiveBranchNodes.clear()
         trace = traceContext?.let { SurveyTraceRegistry.start(it, _surveyUuid.value) }
 
         resetQuestions()
