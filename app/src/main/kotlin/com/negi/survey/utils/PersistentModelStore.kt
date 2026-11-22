@@ -10,10 +10,8 @@
  *
  *  Identity model:
  *  ---------------------------------------------------------------------
- *  A model's on-disk file name is already derived from its configured
- *  download URL (see AppViewModel.suggestFileName). Two configs that name
- *  the same file are treated as the same model; a different file name
- *  means a different model version. No separate metadata sidecar is kept.
+ *  Names locate candidates only. Trusted size and SHA-256 establish identity
+ *  before restoration or publication; no durable verification sidecar is used.
  *
  *  Platform support:
  *  ---------------------------------------------------------------------
@@ -111,9 +109,10 @@ object PersistentModelStore {
         targetFileName: String,
         privateDestination: File,
         onReused: (bytes: Long) -> Unit,
-        onReplacing: (oldFileName: String) -> Unit
+        onReplacing: (oldFileName: String) -> Unit,
+        identity: ModelArtifactIdentity = GemmaModelIdentity.forFile(targetFileName),
     ): Boolean = ModelArtifactOperations.withDestination(privateDestination) {
-        reuseOrReplaceOwned(context, targetFileName, privateDestination, onReused, onReplacing)
+        reuseOrReplaceOwned(context, targetFileName, privateDestination, onReused, onReplacing, identity)
     }
 
     private suspend fun reuseOrReplaceOwned(
@@ -121,7 +120,8 @@ object PersistentModelStore {
         targetFileName: String,
         privateDestination: File,
         onReused: (bytes: Long) -> Unit,
-        onReplacing: (oldFileName: String) -> Unit
+        onReplacing: (oldFileName: String) -> Unit,
+        identity: ModelArtifactIdentity,
     ): Boolean {
         if (!isSupported()) return false
 
@@ -130,22 +130,17 @@ object PersistentModelStore {
             val matching = entries.filter {
                 isMediaStoreCollisionVariant(it.displayName, targetFileName)
             }
-            val match = bestOf(matching)
-
-            if (match != null) {
-                val ok = copyToPrivate(context, match.uri, privateDestination)
-                if (ok) {
-                    // Copy first so a failed read never destroys a usable fallback candidate.
-                    // Pending rows are protected because they may still belong to an active write.
-                    matching
-                        .filter { !it.isPending && it.uri != match.uri }
-                        .forEach { deleteEntry(context, it.uri) }
-                    Log.i(TAG, "reuseOrReplace: reused persisted model file=$targetFileName bytes=${match.size}")
+            for (match in matching.filter { !it.isPending && it.size > 0 }.sortedByDescending { it.id }) {
+                try {
+                    copyToPrivate(context, match.uri, privateDestination, identity)
                     onReused(privateDestination.length())
                     return@runCatching true
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (error: java.io.IOException) {
+                    // An invalid newest row must not hide a valid older fallback.
+                    Log.w(TAG, "Persisted candidate rejected; checking older completed rows", error)
                 }
-                Log.w(TAG, "reuseOrReplace: found persisted entry but copy failed, will redownload")
-                return@runCatching false
             }
 
             false
@@ -162,16 +157,19 @@ object PersistentModelStore {
      *
      * Best-effort: failures are logged and swallowed. The caller's in-app
      * copy in private storage remains the source of truth for the current
-     * run either way.
+     * run either way. [replaceExisting] is retained for caller compatibility; every
+     * replacement now verifies the actual pending bytes, regardless of reported size.
      */
     suspend fun persistFromPrivate(
         context: Context, fileName: String, sourceFile: File, replaceExisting: Boolean = false,
+        identity: ModelArtifactIdentity = GemmaModelIdentity.forFile(fileName),
     ): Boolean = ModelArtifactOperations.withDestination(File(context.applicationContext.filesDir, fileName)) {
-        persistFromPrivateOwned(context, fileName, sourceFile, replaceExisting)
+        persistFromPrivateOwned(context, fileName, sourceFile, replaceExisting, identity)
     }
 
     private suspend fun persistFromPrivateOwned(
         context: Context, fileName: String, sourceFile: File, replaceExisting: Boolean,
+        identity: ModelArtifactIdentity,
     ): Boolean {
         if (!isSupported()) return false
         if (!sourceFile.exists() || sourceFile.length() <= 0L) return false
@@ -180,19 +178,8 @@ object PersistentModelStore {
             val existingMatches = listEntries(context).filter {
                 isMediaStoreCollisionVariant(it.displayName, fileName)
             }
-            val best = bestOf(existingMatches)
-
             ModelArtifactOperations.current().checkCurrent()
-            if (!replaceExisting && best != null && best.size == sourceFile.length()) {
-                Log.d(TAG, "persistFromPrivate: already persisted with matching size, skipping re-upload")
-                // Still clean up visible completed collision variants left over from a past run.
-                existingMatches.filter { !it.isPending && it.uri != best.uri }.forEach { deleteEntry(context, it.uri) }
-                return@runCatching true
-            }
-
-            // Replace only visible completed variants of this same logical model.
-            // Never delete pending rows or differently named model versions.
-
+            // Same size does not establish content identity. Always verify the pending copy.
             val resolver = context.contentResolver
             val values = ContentValues().apply {
                 put(MediaStore.Downloads.DISPLAY_NAME, fileName)
@@ -211,6 +198,7 @@ object PersistentModelStore {
                         ?: throw java.io.IOException("Could not write persisted model")).use { out ->
                         sourceFile.inputStream().use { input -> input.copyTo(out, bufferSize = 1 shl 20) }
                     }
+                    identity.validateStream { resolver.openInputStream(uri) }
                 },
                 commit = { uri ->
                     val done = ContentValues().apply { put(MediaStore.Downloads.IS_PENDING, 0) }
@@ -234,11 +222,8 @@ object PersistentModelStore {
      * collision variants of it) from the public persisted store, including
      * pending rows.
      *
-     * Used when a copy turns out to be unusable (e.g. the user picked a
-     * corrupt or incompatible file via the manual picker, and
-     * [AppViewModel.useManuallySelectedModel] already persisted it
-     * alongside the private copy) so [reuseOrReplace] never offers it
-     * again on a future run.
+     * Explicit administrative/test cleanup only. Native initialization failure must
+     * not call this: runtime incompatibility does not invalidate verified fallback bytes.
      *
      * Best-effort: failures are logged and swallowed.
      */
@@ -317,10 +302,11 @@ object PersistentModelStore {
     internal fun bestOf(candidates: List<PersistedEntry>): PersistedEntry? =
         candidates.filter { !it.isPending && it.size > 0L }.maxByOrNull { it.id }
 
-    private suspend fun copyToPrivate(context: Context, uri: Uri, destination: File): Boolean {
+    private suspend fun copyToPrivate(context: Context, uri: Uri, destination: File, identity: ModelArtifactIdentity): Boolean {
         check(ModelArtifactOperations.current().file == destination.canonicalFile)
         ModelArtifactOperations.current().import(
-            open = { context.contentResolver.openInputStream(uri) }, installed = { }
+            open = { context.contentResolver.openInputStream(uri) },
+            validate = { identity.validate(it) }, installed = { }
         )
         return true
     }

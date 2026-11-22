@@ -157,7 +157,6 @@ import com.negi.survey.slm.LiteRtLM
 import com.negi.survey.slm.LiteRtPublicationHandoff
 import com.negi.survey.slm.LiteRtRepository
 import com.negi.survey.slm.Model
-import com.negi.survey.slm.NATIVE_RUNTIME_POISON_MESSAGE
 import com.negi.survey.slm.Repository
 import com.negi.survey.slm.SLM
 import com.negi.survey.slm.buildModelConfig
@@ -888,37 +887,11 @@ fun AppNav() {
             subText = "Setting up accelerated runtime and buffers",
             onErrorMessage = { "Failed to initialize model: ${it.message}" },
             retryLabel = { error ->
-                // A poisoned native runtime (see NATIVE_RUNTIME_POISON_MESSAGE) can
-                // never recover in this process; a plain retry would just hit the
-                // same error again. If the user picked this file manually, the most
-                // likely cause is the file itself, so offer to pick a different one
-                // instead of a label ("Retry") that would be misleading here.
-                //
-                // Matched by message text, not exception type: the first failure
-                // surfaces this wrapped in a generic IllegalStateException (with no
-                // cause reference back to the original), so type-matching only ever
-                // caught it starting on the second attempt.
-                val fromManualPick = installedModel?.fromManualSelection == true
-                val isPoisoned = error.message?.contains(NATIVE_RUNTIME_POISON_MESSAGE) == true
-                if (fromManualPick && isPoisoned) {
-                    "Pick a different file"
-                } else {
-                    "Retry"
-                }
+                if (AppViewModel.requiresNativeRuntimeRestart(error)) "Restart app" else "Retry"
             },
             onRetry = { error, defaultRetry ->
-                val fromManualPick = installedModel?.fromManualSelection == true
-                val isPoisoned = error.message?.contains(NATIVE_RUNTIME_POISON_MESSAGE) == true
-                if (fromManualPick && isPoisoned) {
-                    // The bad file was already discarded down in init()'s own catch
-                    // block the moment this error occurred -- not here -- so even a
-                    // user who force-closes the app instead of tapping this button
-                    // still gets it cleaned up. This just does the actual restart.
-                    Log.w(
-                        MainActivity.TAG,
-                        "SLM init poisoned after a manually selected file -> " +
-                            "restarting the app. session=$sessionKey"
-                    )
+                if (AppViewModel.requiresNativeRuntimeRestart(error)) {
+                    // A new process resets poisoned native state; verified model bytes are retained.
                     initRetryScope.launch { restartApp(appContext) }
                 } else {
                     defaultRetry()
@@ -966,22 +939,9 @@ fun AppNav() {
                     } catch (ce: CancellationException) {
                         throw ce
                     } catch (e: Throwable) {
-                        // Matched by message text, not exception type: a poisoned
-                        // native runtime (see NATIVE_RUNTIME_POISON_MESSAGE) surfaces
-                        // here wrapped in a generic IllegalStateException on its first
-                        // failure -- with no cause reference back to the original --
-                        // so type-matching would only catch it starting on retry #2.
-                        //
-                        // Discard the bad file right here, synchronously, before this
-                        // throw ever reaches the UI. Doing it only from the error
-                        // screen's "Pick a different file" button left a gap: a user
-                        // who force-closed the app instead of tapping it (the natural
-                        // reaction to a scary error) relaunched straight back into the
-                        // same bad file, because nothing had removed it yet. This way
-                        // it's gone before the error even has a chance to render.
-                        val isPoisoned = e.message?.contains(NATIVE_RUNTIME_POISON_MESSAGE) == true
-                        if (isPoisoned && installedModel?.fromManualSelection == true) {
-                            appVm.discardBadManuallySelectedModel(appContext, installedModel)
+                        // Runtime poisoning is not evidence of artifact corruption.
+                        if (AppViewModel.requiresNativeRuntimeRestart(e) && installedModel != null) {
+                            appVm.prepareNativeRuntimeRestart(installedModel)
                         }
                         throw e
                     }

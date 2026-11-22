@@ -466,7 +466,7 @@ prompts:
       EVAL_JSON: {{EVAL_JSON}}
 
 model_defaults:
-  default_model_url: "https://huggingface.co/google/gemma-3n-E4B-it-litert-lm/resolve/main/gemma-3n-E4B-it-int4.litertlm"
+  default_model_url: "https://huggingface.co/google/gemma-3n-E4B-it-litert-lm/resolve/297ed75955702dec3503e00c2c2ecbbf475300bc/gemma-3n-E4B-it-int4.litertlm"
   default_file_name: "Gemma3n4B.litertlm"
   timeout_ms: 1800000
   ui_throttle_ms: 250

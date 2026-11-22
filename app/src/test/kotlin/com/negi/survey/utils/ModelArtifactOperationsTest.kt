@@ -48,7 +48,7 @@ class ModelArtifactOperationsTest {
     @Test fun oneCharacterDestinationUsesUniqueStagingWithoutRenamingModel() = runBlocking {
         val destination = file("a")
         val lease = ModelArtifactOperations.begin(destination)
-        lease.import({ input("model") }) { installed ->
+        lease.import(validate = testIdentity("model")::validate, open = { input("model") }) { installed ->
             assertEquals(destination.canonicalFile, installed)
             assertEquals("a", installed.name)
         }
@@ -62,7 +62,7 @@ class ModelArtifactOperationsTest {
         var selected = "none"
         val old = ModelArtifactOperations.begin(destination)
         val oldJob = launch(Dispatchers.IO) {
-            old.import({ stream }) { old.publish { selected = "old" } }
+            old.import(validate = testIdentity("AX")::validate, open = { stream }) { old.publish { selected = "old" } }
         }
         old.attach(oldJob)
         try {
@@ -71,7 +71,7 @@ class ModelArtifactOperationsTest {
             assertEquals("A", oldStaging.readText())
             oldJob.cancel()
             val replacement = ModelArtifactOperations.begin(destination)
-            replacement.import({ input("BB") }) { replacement.publish { selected = "new" } }
+            replacement.import(validate = testIdentity("BB")::validate, open = { input("BB") }) { replacement.publish { selected = "new" } }
             assertEquals("BB", destination.readText())
             assertTrue(oldStaging.exists()) // New cleanup did not touch old staging.
         } finally {
@@ -88,7 +88,7 @@ class ModelArtifactOperationsTest {
         val stream = BlockedCopy()
         val lease = ModelArtifactOperations.begin(destination)
         var done = false
-        val job = launch(Dispatchers.IO) { lease.import({ stream }) { done = true } }
+        val job = launch(Dispatchers.IO) { lease.import(validate = testIdentity("AX")::validate, open = { stream }) { done = true } }
         lease.attach(job)
         try {
             withTimeout(5000) { stream.blocked.await() }
@@ -125,14 +125,14 @@ class ModelArtifactOperationsTest {
         val destination = file().apply { writeText("valid") }
         val lease = ModelArtifactOperations.begin(destination)
         val failure = runCatching {
-            lease.import({ object : InputStream() {
+            lease.import(validate = testIdentity("valid")::validate, open = { object : InputStream() {
                 override fun read(): Int = throw IOException("injected read failure")
             } }) { fail("Must not install") }
         }.exceptionOrNull()
         assertTrue(failure is IOException)
         assertEquals("valid", destination.readText())
         assertEquals(1, directory.root.listFiles()!!.size)
-        assertTrue(runCatching { lease.import({ input("") }) {} }.exceptionOrNull() is IOException)
+        assertTrue(runCatching { lease.import(validate = testIdentity("valid")::validate, open = { input("") }) {} }.exceptionOrNull() is IOException)
     }
 
     @Test fun persistenceSupersessionRemovesOnlyOwnedPendingRow() = runBlocking {
@@ -220,7 +220,7 @@ class ModelArtifactOperationsTest {
             withTimeout(5000) { entered.await() }
             withTimeout(5000) {
                 val second = ModelArtifactOperations.begin(file("two"))
-                second.import({ input("two") }) {}
+                second.import(validate = testIdentity("two")::validate, open = { input("two") }) {}
             }
             assertEquals("two", file("two").readText())
         } finally {

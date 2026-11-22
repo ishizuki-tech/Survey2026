@@ -5,6 +5,7 @@ import android.content.Context
 import android.net.Uri
 import android.util.Log
 import androidx.lifecycle.ViewModelStore
+import com.negi.survey.utils.ModelArtifactIdentity
 import com.negi.survey.utils.HeavyInitializer
 import com.negi.survey.utils.ModelArtifactOperations
 import com.negi.survey.utils.PersistentModelStore
@@ -48,8 +49,8 @@ class AppViewModelArtifactOwnershipTest {
         every { Log.w(any(), any<String>()) } returns 0
         every { Log.w(any(), any<String>(), any()) } returns 0
         mockkObject(PersistentModelStore)
-        coEvery { PersistentModelStore.persistFromPrivate(any(), any(), any(), any()) } returns true
-        coEvery { PersistentModelStore.reuseOrReplace(any(), any(), any(), any(), any()) } returns false
+        coEvery { PersistentModelStore.persistFromPrivate(any(), any(), any(), any(), any()) } returns true
+        coEvery { PersistentModelStore.reuseOrReplace(any(), any(), any(), any(), any(), any()) } returns false
     }
 
     @After fun cleanup() = runBlocking {
@@ -59,13 +60,17 @@ class AppViewModelArtifactOwnershipTest {
         Dispatchers.resetMain()
     }
 
-    private fun vm() = AppViewModel(modelUrl = "https://example.invalid/model.bin", fileName = "model.bin")
+    private fun vm(content: String = "BB") = AppViewModel(modelUrl = "https://example.invalid/model.bin", fileName = "model.bin",
+        trustedIdentity = syntheticIdentity(content))
         .also { models += it }
     private fun job(vm: AppViewModel): Job = (AppViewModel::class.java.getDeclaredField("downloadJob")
         .apply { isAccessible = true }.get(vm) as Job).also { jobs += it }
     private fun uri(stream: InputStream): Uri = mockk<Uri>().also {
         every { resolver.openInputStream(it) } returns stream
     }
+    private fun syntheticIdentity(content: String) = ModelArtifactIdentity("test", "test", "model.bin", content.toByteArray().size.toLong(),
+        java.security.MessageDigest.getInstance("SHA-256").digest(content.toByteArray()).joinToString("") { "%02x".format(it) })
+
     private fun input(text: String) = ByteArrayInputStream(text.toByteArray())
 
     private class BlockedRead(private val failure: Boolean = false) : InputStream() {
@@ -102,7 +107,7 @@ class AppViewModelArtifactOwnershipTest {
         }
         assertEquals("BB", destination.readText())
         assertEquals(DlState.Done(destination, true), vm.state.value)
-        coVerify(exactly = 1) { PersistentModelStore.persistFromPrivate(app, "model.bin", any(), true) }
+        coVerify(exactly = 1) { PersistentModelStore.persistFromPrivate(app, "model.bin", any(), true, any()) }
     }
 
     @Test fun cancelWhileCopyBlockedKeepsExistingArtifactAndDoesNotPublishDone() = runBlocking {
@@ -121,7 +126,7 @@ class AppViewModelArtifactOwnershipTest {
         assertEquals("valid", destination.readText())
         assertEquals(DlState.Error("Canceled by user"), vm.state.value)
         assertFalse(directory.root.listFiles()!!.any { it.name.endsWith(".tmp") })
-        coVerify(exactly = 0) { PersistentModelStore.persistFromPrivate(any(), any(), any(), any()) }
+        coVerify(exactly = 0) { PersistentModelStore.persistFromPrivate(any(), any(), any(), any(), any()) }
     }
 
     @Test fun clearedViewModelCannotCorruptReplacementViewModel() = runBlocking {
@@ -163,7 +168,7 @@ class AppViewModelArtifactOwnershipTest {
         assertEquals("BB", destination.readText())
         assertFalse(oldVm.state.value is DlState.Done)
         assertEquals(DlState.Done(destination, true), replacement.state.value)
-        coVerify(exactly = 1) { PersistentModelStore.persistFromPrivate(any(), any(), any(), true) }
+        coVerify(exactly = 1) { PersistentModelStore.persistFromPrivate(any(), any(), any(), true, any()) }
     }
 
     @Test fun oldFailureCannotOverwriteNewError() = runBlocking {
@@ -190,8 +195,8 @@ class AppViewModelArtifactOwnershipTest {
         val started = CompletableDeferred<Unit>()
         val release = CountDownLatch(1)
         var progress: ((Long, Long?) -> Unit)? = null
-        coEvery { HeavyInitializer.ensureInitialized(any(), any(), any(), any(), any(), any(), any()) } coAnswers {
-            progress = arg(6)
+        coEvery { HeavyInitializer.ensureInitialized(any(), any(), any(), any(), any(), any(), any(), any()) } coAnswers {
+            progress = arg(7)
             started.complete(Unit)
             check(release.await(10, TimeUnit.SECONDS))
             // Deliberately emulate a blocking source returning success despite cancellation.
@@ -216,14 +221,14 @@ class AppViewModelArtifactOwnershipTest {
         }
         assertEquals("BB", destination.readText())
         assertEquals(DlState.Done(destination, true), vm.state.value)
-        coVerify(exactly = 1) { PersistentModelStore.persistFromPrivate(any(), any(), any(), true) }
+        coVerify(exactly = 1) { PersistentModelStore.persistFromPrivate(any(), any(), any(), true, any()) }
     }
 
     @Test fun cancellationAtPersistenceBoundaryCannotPublishDone() = runBlocking {
-        val vm = vm()
+        val vm = vm("valid")
         val entered = CompletableDeferred<Unit>()
         val release = CountDownLatch(1)
-        coEvery { PersistentModelStore.persistFromPrivate(any(), any(), any(), any()) } coAnswers {
+        coEvery { PersistentModelStore.persistFromPrivate(any(), any(), any(), any(), any()) } coAnswers {
             entered.complete(Unit)
             check(release.await(10, TimeUnit.SECONDS))
             true
@@ -241,37 +246,121 @@ class AppViewModelArtifactOwnershipTest {
         assertEquals(DlState.Error("Canceled by user"), vm.state.value)
     }
 
-    @Test fun completedManualInstallationStillSupportsBadModelRecovery() = runBlocking {
+    @Test fun verifiedManualInstallationSurvivesRuntimeRecovery() = runBlocking {
         val vm = vm()
-        vm.useManuallySelectedModel(app, uri(input("bad")))
+        vm.useManuallySelectedModel(app, uri(input("BB")))
         withTimeout(5000) { job(vm).join() }
         coEvery { PersistentModelStore.forget(app, "model.bin") } returns true
-        vm.discardBadManuallySelectedModel(app, vm.state.value as DlState.Done)
-        assertFalse(destination.exists())
-        coVerify(exactly = 1) { PersistentModelStore.forget(app, "model.bin") }
+        vm.prepareNativeRuntimeRestart(vm.state.value as DlState.Done)
+        assertEquals("BB", destination.readText())
+        coVerify(exactly = 0) { PersistentModelStore.forget(app, "model.bin") }
     }
 
     @Test fun lateRecoveryInSameViewModelCannotDeleteNewInstallationAtSamePath() = runBlocking {
-        val vm = vm()
-        vm.useManuallySelectedModel(app, uri(input("bad")))
+        val vm = vm("valid")
+        vm.useManuallySelectedModel(app, uri(input("valid")))
         withTimeout(5000) { job(vm).join() }
         val oldInstallation = vm.state.value as DlState.Done
         vm.useManuallySelectedModel(app, uri(input("valid")))
         withTimeout(5000) { job(vm).join() }
-        vm.discardBadManuallySelectedModel(app, oldInstallation)
+        vm.prepareNativeRuntimeRestart(oldInstallation)
         assertEquals("valid", destination.readText())
         coVerify(exactly = 0) { PersistentModelStore.forget(any(), any()) }
     }
 
     @Test fun badModelRecoveryDoesNotDeleteReplacementInstallation() = runBlocking {
         val oldVm = vm()
-        oldVm.useManuallySelectedModel(app, uri(input("bad")))
+        oldVm.useManuallySelectedModel(app, uri(input("BB")))
         withTimeout(5000) { job(oldVm).join() }
-        val replacement = vm()
+        val replacement = vm("valid")
         replacement.useManuallySelectedModel(app, uri(input("valid")))
         withTimeout(5000) { job(replacement).join() }
-        assertTrue(runCatching { oldVm.discardBadManuallySelectedModel(app, oldVm.state.value as DlState.Done) }
+        assertTrue(runCatching { oldVm.prepareNativeRuntimeRestart(oldVm.state.value as DlState.Done) }
             .exceptionOrNull() is CancellationException)
         assertEquals("valid", destination.readText())
     }
+    @Test fun checksumFailurePreservesPrivateAndNeverPersistsOrForgets() = runBlocking {
+        destination.writeText("valid")
+        val vm = vm("valid")
+        vm.useManuallySelectedModel(app, uri(input("wrong")))
+        withTimeout(5000) { job(vm).join() }
+        assertTrue(vm.state.value is DlState.Error)
+        assertEquals("valid", destination.readText())
+        coVerify(exactly = 0) { PersistentModelStore.persistFromPrivate(any(), any(), any(), any(), any()) }
+        coVerify(exactly = 0) { PersistentModelStore.forget(any(), any()) }
+    }
+
+    @Test fun invalidEarlierPrivateCandidateDoesNotHideLaterValidCacheFile() = runBlocking {
+        destination.writeText("wrong")
+        val cached = File(app.cacheDir, "model.bin").apply { writeText("valid") }
+        val vm = vm("valid")
+        vm.ensureModelDownloaded(app)
+        withTimeout(5000) { job(vm).join() }
+        assertEquals(DlState.Done(cached), vm.state.value)
+        assertEquals("wrong", destination.readText())
+    }
+
+    @Test fun doneAndRestartBothRevalidateModifiedPrivateBytes() = runBlocking {
+        destination.writeText("valid")
+        val vm = vm("valid")
+        vm.ensureModelDownloaded(app)
+        withTimeout(5000) { job(vm).join() }
+        assertTrue(vm.state.value is DlState.Done)
+        destination.writeText("wrong")
+        vm.ensureModelDownloaded(app)
+        withTimeout(5000) { job(vm).join() }
+        assertTrue(vm.state.value is DlState.NeedsModel)
+        val restarted = vm("valid")
+        restarted.ensureModelDownloaded(app)
+        withTimeout(5000) { job(restarted).join() }
+        assertTrue(restarted.state.value is DlState.NeedsModel)
+    }
+
+    @Test fun bestEffortPersistenceFailureKeepsVerifiedPrivateAndDone() = runBlocking {
+        coEvery { PersistentModelStore.persistFromPrivate(any(), any(), any(), any(), any()) } returns false
+        val vm = vm("valid")
+        vm.useManuallySelectedModel(app, uri(input("valid")))
+        withTimeout(5000) { job(vm).join() }
+        assertTrue(vm.state.value is DlState.Done)
+        assertEquals("valid", destination.readText())
+    }
+
+    @Test fun unsupportedConfigurationFailsBeforeCopyingOrPublishingDone() = runBlocking {
+        val vm = AppViewModel(modelUrl = "https://example.invalid/unknown.bin").also { models += it }
+        vm.useManuallySelectedModel(app, uri(input("valid")))
+        withTimeout(5000) { job(vm).join() }
+        assertTrue(vm.state.value is DlState.Error)
+        assertTrue((vm.state.value as DlState.Error).message.contains("Unsupported model configuration"))
+        verify(exactly = 0) { resolver.openInputStream(any()) }
+    }
+
+    @Test fun verifiedPrivateModelSurvivesRuntimeRecoveryWithoutPersistence() = runBlocking {
+        // false covers unsupported API 26-28 and best-effort provider failure alike.
+        coEvery { PersistentModelStore.persistFromPrivate(any(), any(), any(), any(), any()) } returns false
+        val vm = vm("valid")
+        vm.useManuallySelectedModel(app, uri(input("valid")))
+        withTimeout(5000) { job(vm).join() }
+        vm.prepareNativeRuntimeRestart(vm.state.value as DlState.Done)
+        assertTrue(destination.isFile)
+        assertEquals("valid", destination.readText())
+        coVerify(exactly = 0) { PersistentModelStore.forget(any(), any()) }
+    }
+
+    @Test fun poisonedRuntimeRetriesSelectProcessRestartInsteadOfSameProcessRetry() {
+        assertTrue(AppViewModel.requiresNativeRuntimeRestart(
+            IllegalStateException(com.negi.survey.slm.NATIVE_RUNTIME_POISON_MESSAGE)))
+        assertFalse(AppViewModel.requiresNativeRuntimeRestart(IOException("temporary initialization failure")))
+    }
+
+    @Test fun unsupportedMediaStoreDoesNotDiscardVerifiedPrivateModelOnRuntimeFailure() = runBlocking {
+        every { PersistentModelStore.isSupported() } returns false
+        coEvery { PersistentModelStore.persistFromPrivate(any(), any(), any(), any(), any()) } coAnswers { callOriginal() }
+        val vm = vm("valid")
+        vm.useManuallySelectedModel(app, uri(input("valid")))
+        withTimeout(5000) { job(vm).join() }
+        vm.prepareNativeRuntimeRestart(vm.state.value as DlState.Done)
+        assertEquals("valid", destination.readText())
+        coVerify(exactly = 0) { PersistentModelStore.forget(any(), any()) }
+    }
+
 }

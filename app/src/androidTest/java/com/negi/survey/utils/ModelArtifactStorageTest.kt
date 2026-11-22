@@ -5,6 +5,7 @@ import android.content.ContentValues
 import android.os.Environment
 import android.provider.MediaStore
 import com.negi.survey.BuildConfig
+import com.negi.survey.utils.ModelArtifactIdentity
 import android.os.Build
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
@@ -22,6 +23,9 @@ import org.junit.runner.RunWith
 /** Tiny artifacts validate the Android filesystem and real MediaStore adapter; no model inference. */
 @RunWith(AndroidJUnit4::class)
 class ModelArtifactStorageTest {
+    private fun identity(content: String) = ModelArtifactIdentity("test", "test", "test.bin", content.toByteArray().size.toLong(),
+        java.security.MessageDigest.getInstance("SHA-256").digest(content.toByteArray()).joinToString("") { "%02x".format(it) })
+
     @Test fun sameSizedReplacementPersistsAndRestoresNewestBytes() = runBlocking {
         assumeTrue(Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
         val context = InstrumentationRegistry.getInstrumentation().targetContext
@@ -29,11 +33,11 @@ class ModelArtifactStorageTest {
         val file = File(context.filesDir, name)
         try {
             file.writeText("AA")
-            assertTrue(PersistentModelStore.persistFromPrivate(context, name, file, replaceExisting = true))
+            assertTrue(PersistentModelStore.persistFromPrivate(context, name, file, replaceExisting = true, identity = identity(file.readText())))
             file.writeText("BB")
-            assertTrue(PersistentModelStore.persistFromPrivate(context, name, file, replaceExisting = true))
+            assertTrue(PersistentModelStore.persistFromPrivate(context, name, file, replaceExisting = true, identity = identity(file.readText())))
             assertTrue(file.delete())
-            assertTrue(PersistentModelStore.reuseOrReplace(context, name, file, {}, {}))
+            assertTrue(PersistentModelStore.reuseOrReplace(context, name, file, {}, {}, identity = identity("BB")))
             assertEquals("BB", file.readText())
         } finally {
             PersistentModelStore.forget(context, name)
@@ -70,11 +74,11 @@ class ModelArtifactStorageTest {
             val replacement = insertCopy("BB")
             assertTrue(ContentUris.parseId(replacement) > ContentUris.parseId(old))
             // Both completed rows remain, exactly as after interrupted/failed old-row cleanup.
-            assertTrue(PersistentModelStore.reuseOrReplace(context, name, destination, {}, {}))
+            assertTrue(PersistentModelStore.reuseOrReplace(context, name, destination, {}, {}, identity = identity("BB")))
             assertEquals("BB", destination.readText())
             destination.delete()
             insertCopy("incomplete-newer-copy", pending = true)
-            assertTrue(PersistentModelStore.reuseOrReplace(context, name, destination, {}, {}))
+            assertTrue(PersistentModelStore.reuseOrReplace(context, name, destination, {}, {}, identity = identity("BB")))
             assertEquals("BB", destination.readText())
         } finally {
             PersistentModelStore.forget(context, name)
@@ -90,7 +94,7 @@ class ModelArtifactStorageTest {
         val release = CountDownLatch(1)
         val old = ModelArtifactOperations.begin(file)
         val job = launch(Dispatchers.IO) {
-            old.import({ object : ByteArrayInputStream("AX".toByteArray()) {
+            old.import(validate = identity("AX")::validate, open = { object : ByteArrayInputStream("AX".toByteArray()) {
                 override fun read(b: ByteArray, off: Int, len: Int): Int {
                     entered.complete(Unit)
                     check(release.await(10, TimeUnit.SECONDS))
@@ -102,7 +106,7 @@ class ModelArtifactStorageTest {
         try {
             withTimeout(5000) { entered.await() }
             job.cancel()
-            ModelArtifactOperations.begin(file).import({ ByteArrayInputStream("BB".toByteArray()) }) {}
+            ModelArtifactOperations.begin(file).import(validate = identity("BB")::validate, open = { ByteArrayInputStream("BB".toByteArray()) }) {}
             release.countDown()
             withTimeout(5000) { job.join() }
             assertEquals("BB", file.readText())

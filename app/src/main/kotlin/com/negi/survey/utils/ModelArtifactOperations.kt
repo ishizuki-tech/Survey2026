@@ -87,9 +87,12 @@ object ModelArtifactOperations {
             }
         }
 
-        /** Stage outside the destination lock: a blocked old stream cannot corrupt a new import. */
+        /** Stage and validate before promotion: blocked old I/O cannot corrupt a new import.
+         * [validate] is required; trust-sensitive callers must supply the configured identity.
+         */
         suspend fun import(
             open: () -> InputStream?,
+            validate: suspend (File) -> Unit,
             installed: suspend (File) -> Unit,
         ) = withContext(Dispatchers.IO + this) {
             checkCurrent()
@@ -99,6 +102,7 @@ object ModelArtifactOperations {
                 (open() ?: throw IOException("Couldn't read the selected file")).use { input ->
                     staging.outputStream().use { output -> input.copyTo(output, 1 shl 20) }
                 }
+                validate(staging)
                 locked {
                     promote(staging)
                     installed(file)

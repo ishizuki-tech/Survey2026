@@ -8,6 +8,7 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.negi.survey.net.GitHubUploader
 import com.negi.survey.utils.PersistentModelStore
+import com.negi.survey.utils.ModelArtifactIdentity
 import java.io.DataInputStream
 import java.io.File
 import java.io.IOException
@@ -23,6 +24,9 @@ import org.junit.runner.RunWith
 
 @RunWith(AndroidJUnit4::class)
 class DaBuildIsolationTest {
+    private fun identity(content: String) = ModelArtifactIdentity("test", "test", "test.bin", content.toByteArray().size.toLong(),
+        java.security.MessageDigest.getInstance("SHA-256").digest(content.toByteArray()).joinToString("") { "%02x".format(it) })
+
     private val context get() = InstrumentationRegistry.getInstrumentation().targetContext
 
     @Before
@@ -61,7 +65,7 @@ class DaBuildIsolationTest {
         val contents = "D+A model storage probe"
         try {
             source.writeText(contents)
-            assertTrue(PersistentModelStore.persistFromPrivate(context, name, source))
+            assertTrue(PersistentModelStore.persistFromPrivate(context, name, source, identity = identity(contents)))
             context.contentResolver.query(
                 MediaStore.Downloads.EXTERNAL_CONTENT_URI,
                 arrayOf(MediaStore.Downloads.RELATIVE_PATH),
@@ -74,7 +78,7 @@ class DaBuildIsolationTest {
                 assertEquals("Download/Survey2026Models-da/", rows.getString(0))
                 assertEquals(1, rows.count)
             }
-            assertTrue(PersistentModelStore.reuseOrReplace(context, name, restored, {}, {}))
+            assertTrue(PersistentModelStore.reuseOrReplace(context, name, restored, {}, {}, identity = identity(contents)))
             assertEquals(contents, restored.readText())
         } finally {
             PersistentModelStore.forget(context, name)
