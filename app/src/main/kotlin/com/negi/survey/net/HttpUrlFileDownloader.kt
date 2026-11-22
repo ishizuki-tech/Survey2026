@@ -37,6 +37,9 @@ import android.os.StatFs
 import android.util.Log
 import java.io.BufferedOutputStream
 import java.io.File
+import com.negi.survey.utils.ModelIntegrityException
+import com.negi.survey.utils.ModelArtifactIdentity
+import com.negi.survey.utils.GemmaModelIdentity
 import com.negi.survey.utils.ModelArtifactOperations
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -77,6 +80,7 @@ import kotlinx.coroutines.withContext
 class HttpUrlFileDownloader(
     private val hfTokenProvider: () -> String? = HfTokenProvider::token,
     private val debugLogs: Boolean = true,
+    private val parallelMinFileBytes: Long = PARALLEL_MIN_FILE_BYTES,
 ) {
     private val tag = "HttpUrlFileDl"
 
@@ -99,9 +103,12 @@ class HttpUrlFileDownloader(
         maxRetries: Int = 3,
         resumeOverlapBytes: Int = 64 * 1024,
         reuseExisting: Boolean = true,
+        identity: ModelArtifactIdentity = GemmaModelIdentity.resolve(url),
     ) = ModelArtifactOperations.withDestination(dst) {
-        downloadOwned(url, dst, onProgress, expectedSha256, connectTimeoutMs,
-            firstByteTimeoutMs, stallTimeoutMs, ioBufferBytes, maxRetries, resumeOverlapBytes, reuseExisting)
+        withContext(identity) {
+            downloadOwned(url, dst, onProgress, expectedSha256, connectTimeoutMs,
+                firstByteTimeoutMs, stallTimeoutMs, ioBufferBytes, maxRetries, resumeOverlapBytes, reuseExisting)
+        }
     }
 
     private suspend fun downloadOwned(
@@ -164,7 +171,17 @@ class HttpUrlFileDownloader(
                                         )
                                 )
 
-            if (reuseExisting && sizeMatches && hashMatches) {
+            val verifiedExisting = if (reuseExisting && sizeMatches && hashMatches) {
+                try {
+                    requireNotNull(coroutineContext[ModelArtifactIdentity]).validate(dst)
+                    true
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (_: IOException) {
+                    false // Preserve the old file until a verified replacement is ready.
+                }
+            } else false
+            if (verifiedExisting) {
                 onProgress(
                     dst.length(),
                     dst.length(),
@@ -203,7 +220,7 @@ class HttpUrlFileDownloader(
 
                 val parallelEligible =
                     total != null &&
-                            total >= PARALLEL_MIN_FILE_BYTES &&
+                            total >= parallelMinFileBytes &&
                             probe.acceptRanges &&
                             !part.exists()
 
@@ -1268,7 +1285,7 @@ class HttpUrlFileDownloader(
                     ignoreCase = true,
                 )
             ) {
-                safeDelete(part)
+                invalidateRejectedTransfer(part)
 
                 throw IOException(
                     "SHA-256 mismatch after parallel download: " +
@@ -2760,10 +2777,33 @@ class HttpUrlFileDownloader(
     private suspend fun promotePartToDestination(part: File, dst: File) {
         val lease = ModelArtifactOperations.current()
         check(lease.file == dst.canonicalFile)
-        lease.promote(part)
+        lease.locked {
+            try {
+                requireNotNull(coroutineContext[ModelArtifactIdentity]).validate(part)
+            } catch (rejected: ModelIntegrityException) {
+                invalidateRejectedTransfer(part)
+                throw rejected
+            }
+            lease.promote(part)
+        }
     }
 
-    private fun validateFinalFile(
+    /** Definitive integrity rejection is different from a resumable transport interruption. */
+    private suspend fun invalidateRejectedTransfer(part: File) {
+        val lease = ModelArtifactOperations.current()
+        check(File(lease.file.path + ".part").canonicalFile == part.canonicalFile)
+        lease.locked {
+            // A replacement cannot write these paths until the destination mutex is released.
+            // Ownership is checked before cleanup; no blocking I/O enters the short monitor.
+            coroutineContext.ensureActive()
+            lease.checkCurrent()
+            val transferFiles = listOf(part, File(part.path + ".meta"), File(part.path + ".meta.tmp")) +
+                part.parentFile!!.listFiles().orEmpty().filter { it.name.startsWith(part.name + ".chunk.") }
+            for (file in transferFiles) java.nio.file.Files.deleteIfExists(file.toPath())
+        }
+    }
+
+    private suspend fun validateFinalFile(
         dst: File,
         total: Long?,
         expectedSha256: String?,
@@ -2790,7 +2830,7 @@ class HttpUrlFileDownloader(
                     ignoreCase = true,
                 )
             ) {
-                safeDelete(dst)
+                invalidateRejectedTransfer(dst)
 
                 throw IOException(
                     "SHA-256 mismatch: " +
@@ -2800,7 +2840,7 @@ class HttpUrlFileDownloader(
         }
     }
 
-    private fun sha256(
+    private suspend fun sha256(
         file: File
     ): String {
         val digest =
@@ -2818,6 +2858,8 @@ class HttpUrlFileDownloader(
                 )
 
             while (true) {
+                coroutineContext.ensureActive()
+                coroutineContext[ModelArtifactOperations.Lease]?.checkCurrent()
                 val count =
                     input.read(
                         buffer

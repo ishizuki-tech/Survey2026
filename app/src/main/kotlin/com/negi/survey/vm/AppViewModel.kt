@@ -47,6 +47,8 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
+import com.negi.survey.utils.GemmaModelIdentity
+import com.negi.survey.utils.ModelArtifactIdentity
 import com.negi.survey.utils.ModelArtifactOperations
 import com.negi.survey.utils.HeavyInitializer
 import com.negi.survey.ui.theme.outdoorBackplate
@@ -98,8 +100,8 @@ sealed class DlState {
         /**
          * True when [file] came from [AppViewModel.useManuallySelectedModel]
          * rather than a normal download or a reused cached/persisted copy.
-         * Lets the UI offer a different recovery path (re-pick a file,
-         * rather than a plain retry) if initializing this file fails.
+         * Records acquisition provenance; imports and downloads use the same
+         * integrity and native-runtime recovery policy.
          */
         val fromManualSelection: Boolean = false
     ) : DlState()
@@ -116,7 +118,8 @@ class AppViewModel(
     private val fileName: String = DEFAULT_FILE_NAME,
     private val timeoutMs: Long = DEFAULT_TIMEOUT_MS,
     private val uiThrottleMs: Long = DEFAULT_UI_THROTTLE_MS,
-    private val uiMinDeltaBytes: Long = DEFAULT_UI_MIN_DELTA_BYTES
+    private val uiMinDeltaBytes: Long = DEFAULT_UI_MIN_DELTA_BYTES,
+    private val trustedIdentity: ModelArtifactIdentity? = null,
 ) : ViewModel() {
 
     private val _state = MutableStateFlow<DlState>(DlState.Idle)
@@ -144,7 +147,8 @@ class AppViewModel(
         operation = lease
         val job = viewModelScope.launch(Dispatchers.IO + lease, start = CoroutineStart.LAZY) {
             try {
-                block(lease)
+                val identity = trustedIdentity ?: GemmaModelIdentity.resolve(modelUrl)
+                kotlinx.coroutines.withContext(identity) { block(lease) }
             } catch (ce: CancellationException) {
                 throw ce
             } catch (t: Throwable) {
@@ -170,14 +174,13 @@ class AppViewModel(
     /** Reuses private/MediaStore models; otherwise offers the manual-file prompt. */
     fun ensureModelDownloaded(appContext: Context, forceFresh: Boolean = false) {
         val app = appContext.applicationContext
-        val current = _state.value
-        if (!forceFresh && current is DlState.Done && current.file.exists()) return
         if (!forceFresh && downloadJob?.isActive == true) return
         if (forceFresh) {
             startDownload(app, true)
             return
         }
         launchOperation(app) { lease ->
+            publish(lease, DlState.Downloading(0L, null))
             lease.locked {
                 val existing = findExistingModelFile(app, lease.file.name)
                 if (existing != null) {
@@ -186,7 +189,7 @@ class AppViewModel(
                     val reused = PersistentModelStore.reuseOrReplace(
                         app, lease.file.name, lease.file,
                         onReused = { bytes -> Log.i("AppViewModel", "Reused persisted model ($bytes bytes)") },
-                        onReplacing = { }
+                        onReplacing = { }, identity = identity()
                     )
                     lease.checkCurrent()
                     publish(lease, if (reused) DlState.Done(lease.file) else DlState.NeedsModel(lease.file.name))
@@ -204,24 +207,18 @@ class AppViewModel(
         val app = appContext.applicationContext
         launchOperation(app) { lease ->
             publish(lease, DlState.ImportingSelectedFile)
-            lease.import(open = { app.contentResolver.openInputStream(uri) }) { file ->
-                PersistentModelStore.persistFromPrivate(app, file.name, file, replaceExisting = true)
+            lease.import(open = { app.contentResolver.openInputStream(uri) },
+                validate = { identity().validate(it) }) { file ->
+                PersistentModelStore.persistFromPrivate(app, file.name, file, replaceExisting = true, identity = identity())
                 publish(lease, DlState.Done(file, fromManualSelection = true))
             }
         }
     }
 
-    /** Rejects recovery callbacks from an installation replaced by another owner. */
-    suspend fun discardBadManuallySelectedModel(appContext: Context, installation: DlState.Done) {
+    /** Authorizes process restart only for this installation; runtime failure never deletes bytes. */
+    suspend fun prepareNativeRuntimeRestart(installation: DlState.Done) {
         val completed = completedInstallation?.takeIf { it.first === installation } ?: return
-        val lease = completed.second
-        val file = installation.file
-        lease.recover { recovery ->
-            recovery.publish {
-                if (!file.delete() && file.exists()) throw java.io.IOException("Could not delete bad model")
-            }
-            PersistentModelStore.forget(appContext.applicationContext, file.name)
-        }
+        completed.second.recover { recovery -> recovery.checkCurrent() }
     }
 
     private fun startDownload(app: Context, forceFresh: Boolean) {
@@ -242,11 +239,11 @@ class AppViewModel(
                 }
                 val result = HeavyInitializer.ensureInitialized(
                     context = app, modelUrl = modelUrl, fileName = lease.file.name,
-                    timeoutMs = timeoutMs, forceFresh = forceFresh, onProgress = progress
+                    timeoutMs = timeoutMs, forceFresh = forceFresh, onProgress = progress, identity = identity()
                 )
                 lease.checkCurrent()
                 val file = result.getOrThrow()
-                PersistentModelStore.persistFromPrivate(app, file.name, file, replaceExisting = true)
+                PersistentModelStore.persistFromPrivate(app, file.name, file, replaceExisting = true, identity = identity())
                 publish(lease, DlState.Done(file))
             }
         }
@@ -275,8 +272,11 @@ class AppViewModel(
 
     companion object {
 
-        const val DEFAULT_MODEL_URL: String =
-            "https://huggingface.co/google/gemma-3n-E4B-it-litert-lm/resolve/main/gemma-3n-E4B-it-int4.litertlm"
+        /** Poisoning requires a new process, regardless of how the verified model was acquired. */
+        fun requiresNativeRuntimeRestart(error: Throwable): Boolean =
+            error.message?.contains(com.negi.survey.slm.NATIVE_RUNTIME_POISON_MESSAGE) == true
+
+        val DEFAULT_MODEL_URL: String = GemmaModelIdentity.trusted.downloadUrl
 
         private const val DEFAULT_FILE_NAME: String = "model.litertlm"
         private const val DEFAULT_TIMEOUT_MS: Long = 30L * 60L * 1000L
@@ -337,7 +337,10 @@ class AppViewModel(
             return sb.toString().take(160).ifBlank { DEFAULT_FILE_NAME }
         }
 
-        private fun findExistingModelFile(context: Context, name: String): File? {
+        private suspend fun identity(): ModelArtifactIdentity =
+            requireNotNull(kotlinx.coroutines.currentCoroutineContext()[ModelArtifactIdentity])
+
+        private suspend fun findExistingModelFile(context: Context, name: String): File? {
             val privateModelsDir = runCatching { context.getDir("models", Context.MODE_PRIVATE) }
                 .getOrNull()
 
@@ -349,9 +352,18 @@ class AppViewModel(
                 add(File(context.cacheDir, "models/$name"))
             }
 
-            return candidates.firstOrNull { f ->
-                f.exists() && f.isFile && f.length() > 0L
+            for (file in candidates) {
+                if (!file.isFile) continue
+                try {
+                    identity().validate(file)
+                    return file
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (_: java.io.IOException) {
+                    // Continue to later private/cache locations without deleting user files.
+                }
             }
+            return null
         }
     }
 }

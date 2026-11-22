@@ -18,9 +18,8 @@
  *  Design goals:
  *  ---------------------------------------------------------------------
  *  - Fast local startup:
- *      A non-empty, previously completed local model is accepted immediately.
- *      Model URLs/filenames should therefore be versioned or forceFresh should
- *      be used when a remote replacement must be fetched.
+ *      A local model is reused offline only after trusted size/SHA-256 verification.
+ *      forceFresh fetches a replacement while preserving the installed file.
  *  - Keyed single-flight:
  *      Concurrent callers targeting the same destination share one operation,
  *      while unrelated model files are not accidentally coupled together.
@@ -53,6 +52,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 
 /**
@@ -97,6 +97,7 @@ object HeavyInitializer {
     /** Shared state for one destination-specific initialization. */
     private class Flight(
         val deferred: CompletableDeferred<Result<File>>,
+        val identity: ModelArtifactIdentity,
     ) {
         /** Owner coroutine performing the actual transfer. */
         @Volatile
@@ -191,6 +192,7 @@ object HeavyInitializer {
         fileName: String,
         timeoutMs: Long,
         forceFresh: Boolean,
+        identity: ModelArtifactIdentity = GemmaModelIdentity.resolve(modelUrl),
         onProgress: (
             downloaded: Long,
             total: Long?,
@@ -221,6 +223,7 @@ object HeavyInitializer {
             Flight(
                 deferred =
                     CompletableDeferred(),
+                identity = identity,
             )
 
         val existing =
@@ -230,6 +233,7 @@ object HeavyInitializer {
             )
 
         if (existing != null) {
+            require(existing.identity == identity) { "A different trusted identity is already preparing this destination" }
             Log.d(
                 TAG,
                 "ensureInitialized: joining existing flight " +
@@ -247,7 +251,7 @@ object HeavyInitializer {
 
         return try {
             ModelArtifactOperations.withDestination(finalFile) {
-                runFlight(finalFile, modelUrl, timeoutMs, forceFresh, onProgress, flight)
+                withContext(identity) { runFlight(finalFile, modelUrl, timeoutMs, forceFresh, onProgress, flight) }
             }
         } catch (ce: CancellationException) {
             flight.deferred.complete(Result.failure(IOException("Canceled", ce)))
@@ -316,7 +320,7 @@ object HeavyInitializer {
             currentCoroutineContext()
                 .ensureActive()
 
-            if (forceFresh) {
+            val migratedVerified = if (forceFresh) {
                 Log.i(
                     TAG,
                     "phase=cleanup-fresh " +
@@ -328,6 +332,7 @@ object HeavyInitializer {
                     deleteFinal = false,
                     includeLegacyTmpState = true,
                 )
+                false
             } else {
                 /*
                  * Preserve resume compatibility with the previous
@@ -346,12 +351,17 @@ object HeavyInitializer {
              * restarting the application should not require a remote HEAD
              * request before LiteRT-LM can start loading the local model.
              */
-            if (
-                !forceFresh &&
-                finalFile.exists() &&
-                finalFile.isFile &&
-                finalFile.length() > 0L
-            ) {
+            val reusableLocal = if (migratedVerified) true else if (!forceFresh && finalFile.isFile) {
+                try {
+                    requireNotNull(currentCoroutineContext()[ModelArtifactIdentity]).validate(finalFile)
+                    true
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (_: IOException) {
+                    false // Invalid legacy bytes must not block a verified replacement download.
+                }
+            } else false
+            if (reusableLocal) {
                 val length =
                     finalFile.length()
 
@@ -416,7 +426,9 @@ object HeavyInitializer {
                 downloader.downloadToFile(
                     url = modelUrl,
                     dst = finalFile,
-                    reuseExisting = !forceFresh,
+                    identity = requireNotNull(currentCoroutineContext()[ModelArtifactIdentity]),
+                    // The local candidate was already checked above; do not hash it again.
+                    reuseExisting = false,
                     onProgress =
                         safeProgress,
                     connectTimeoutMs =
@@ -733,12 +745,15 @@ object HeavyInitializer {
      * does not already exist. All files live in the same directory, so rename
      * should normally be atomic and inexpensive.
      */
-    private suspend fun migrateLegacyTransferState(
+    internal suspend fun migrateLegacyTransferState(
         finalFile: File,
-    ) {
+        validate: suspend (File) -> Unit = {
+            requireNotNull(currentCoroutineContext()[ModelArtifactIdentity]).validate(it)
+        },
+    ): Boolean {
         val parent =
             finalFile.parentFile
-                ?: return
+                ?: return false
 
         val legacyTmp =
             File(
@@ -770,18 +785,27 @@ object HeavyInitializer {
                 currentPart.name + ".meta",
             )
 
+        var promotedVerified = false
         if (
             !finalFile.exists() &&
             legacyTmp.exists() &&
             legacyTmp.isFile &&
             legacyTmp.length() > 0L
         ) {
-            ModelArtifactOperations.current().promote(legacyTmp)
+            try {
+                validate(legacyTmp)
+                ModelArtifactOperations.current().promote(legacyTmp)
+                promotedVerified = true
+            } catch (rejected: ModelIntegrityException) {
+                currentCoroutineContext().ensureActive()
+                ModelArtifactOperations.current().checkCurrent()
+                java.nio.file.Files.deleteIfExists(legacyTmp.toPath())
+                Log.w(TAG, "Rejected legacy completed model; continuing verified acquisition", rejected)
+            }
 
             Log.d(
                 TAG,
-                "Migrated legacy completed temp file " +
-                        "to ${finalFile.name}",
+                "Checked legacy completed temp file for ${finalFile.name}",
             )
         }
 
@@ -857,6 +881,7 @@ object HeavyInitializer {
                     )
                 }
             }
+        return promotedVerified
     }
 
     /**
