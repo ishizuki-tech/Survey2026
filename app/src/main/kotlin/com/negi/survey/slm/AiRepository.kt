@@ -47,6 +47,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.channels.SendChannel
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
@@ -204,6 +205,25 @@ sealed interface RepositoryTraceEvent {
  * - We also reuse this gate for warm-up to guarantee strict serialization.
  */
 private val AI_INFERENCE_GATE = Semaphore(1)
+
+/**
+ * Request-bound listener entry and channel delivery. The supplied flags are the
+ * request's live state. Processing, completion, cancellation and gate ownership
+ * remain with the repository driver; this boundary neither copies nor resets them.
+ */
+internal class RepositoryChannelDelivery(
+    private val out: SendChannel<String>,
+    private val closed: AtomicBoolean,
+    private val collectorClosed: AtomicBoolean,
+    private val logicalDone: AtomicBoolean,
+) {
+    fun listener(process: (String, Boolean) -> Unit): (String, Boolean) -> Unit = listener@{ partial, done ->
+        if (closed.get() || collectorClosed.get() || logicalDone.get()) return@listener
+        process(partial, done)
+    }
+
+    fun trySend(accepted: String): Boolean = out.trySend(accepted).isSuccess
+}
 
 /* ====================================================================== */
 /*  Logging / Trace utilities                                              */
@@ -1435,6 +1455,7 @@ class LiteRtRepository(
                         val logicalDoneAt = AtomicLong(-1L)
 
                         val logicalDone = AtomicBoolean(false)
+                        val channelDelivery = RepositoryChannelDelivery(out, closed, collectorClosed, logicalDone)
                         val nativeTerminated = AtomicBoolean(false)
                         val capturedAll = AtomicBoolean(true)
 
@@ -2061,15 +2082,7 @@ class LiteRtRepository(
                                         SLM.runInference(
                                         model = model,
                                         input = cappedPrompt,
-                                        resultListener = { partial, done ->
-                                            if (
-                                                closed.get() ||
-                                                collectorClosed.get() ||
-                                                logicalDone.get()
-                                            ) {
-                                                return@runInference
-                                            }
-
+                                        resultListener = channelDelivery.listener { partial, done ->
                                             lastEventAt.set(SystemClock.elapsedRealtime())
                                             messageCount++
 
@@ -2086,7 +2099,7 @@ class LiteRtRepository(
                                                     issueBackendCancel(r)
                                                     markForceReinit(r)
                                                     scheduleCancelGrace(r, e)
-                                                    return@runInference
+                                                    return@listener
                                                 }
 
                                                 val remaining =
@@ -2103,7 +2116,7 @@ class LiteRtRepository(
                                                     issueBackendCancel(r)
                                                     markForceReinit(r)
                                                     scheduleCancelGrace(r, e)
-                                                    return@runInference
+                                                    return@listener
                                                 }
 
                                                 val accepted =
@@ -2118,12 +2131,12 @@ class LiteRtRepository(
                                                     accepted.length.toLong()
                                                 )
 
-                                                if (!out.trySend(accepted).isSuccess) {
+                                                if (!channelDelivery.trySend(accepted)) {
                                                     collectorClosed.set(true)
                                                     issueBackendCancel("channel-closed")
                                                     markForceReinit("channel-closed")
                                                     scheduleCancelGrace("channel-closed")
-                                                    return@runInference
+                                                    return@listener
                                                 }
 
                                                 if (accepted.length != delta.length) {
@@ -2136,7 +2149,7 @@ class LiteRtRepository(
                                                     issueBackendCancel(r)
                                                     markForceReinit(r)
                                                     scheduleCancelGrace(r, e)
-                                                    return@runInference
+                                                    return@listener
                                                 }
                                             }
 
