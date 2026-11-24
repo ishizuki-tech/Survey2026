@@ -8,30 +8,30 @@
   <script id="release-metadata" type="application/json">{
   "repository": "ishizuki-tech/Survey2026",
   "stable_tag": "",
-  "source_commit_sha": "1c3f96d62daec0e256e6efa7aad5a210f5037c4b",
-  "release_tag": "build-184-1c3f96d",
+  "source_commit_sha": "294a69efcfb58f1c49e46e41af028ca3041d7c88",
+  "release_tag": "build-185-294a69e",
   "branch": "main",
-  "release_url": "https://github.com/ishizuki-tech/Survey2026/releases/tag/build-184-1c3f96d",
-  "download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/build-184-1c3f96d/Survey2026-1c3f96d-release.apk",
+  "release_url": "https://github.com/ishizuki-tech/Survey2026/releases/tag/build-185-294a69e",
+  "download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/build-185-294a69e/Survey2026-294a69e-release.apk",
   "config_files": {
     "english": {
-      "view_url": "https://github.com/ishizuki-tech/Survey2026/blob/1c3f96d62daec0e256e6efa7aad5a210f5037c4b/app/src/main/assets/survey_config10.yaml",
-      "download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/build-184-1c3f96d/survey_config10.yaml",
+      "view_url": "https://github.com/ishizuki-tech/Survey2026/blob/294a69efcfb58f1c49e46e41af028ca3041d7c88/app/src/main/assets/survey_config10.yaml",
+      "download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/build-185-294a69e/survey_config10.yaml",
       "sha256": "9c6e8f8959b7d5bd7370bc1dc9af4833d8b81a8c2f9e025bb0ec5dbddab171d2"
     },
     "swahili": {
-      "view_url": "https://github.com/ishizuki-tech/Survey2026/blob/1c3f96d62daec0e256e6efa7aad5a210f5037c4b/app/src/main/assets/survey_config_sw_10.yaml",
-      "download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/build-184-1c3f96d/survey_config_sw_10.yaml",
+      "view_url": "https://github.com/ishizuki-tech/Survey2026/blob/294a69efcfb58f1c49e46e41af028ca3041d7c88/app/src/main/assets/survey_config_sw_10.yaml",
+      "download_url": "https://github.com/ishizuki-tech/Survey2026/releases/download/build-185-294a69e/survey_config_sw_10.yaml",
       "sha256": "8dc233b93569de815ad36257019e2418839c3351a77e87bb84f8421eff33cc32"
     }
   },
-  "apk_name": "Survey2026-1c3f96d-release.apk",
-  "apk_sha256": "bdbe8703d070bcbf19e911dc244f1bd48422774106217f1cb059a296bb8bb266",
+  "apk_name": "Survey2026-294a69e-release.apk",
+  "apk_sha256": "132b31a193205bdf62e6a762e39e0eac0b23da5d3957c86a63e88b6ee2eb4f9d",
   "signing_cert_sha256": "d6edef47ec6734a46122ab7fddb5e4f17d19d4d51ae3eaddfb32f309ee5036ea",
-  "short_sha": "1c3f96d",
-  "run_id": "45051115199",
-  "run_number": "184",
-  "generated_utc": "2026-11-22T17:53:13Z",
+  "short_sha": "294a69e",
+  "run_id": "45486349888",
+  "run_number": "185",
+  "generated_utc": "2026-11-24T21:06:57Z",
   "deployment_status": "Field validated",
   "verified_device": {
     "model": "Samsung SM-S731U",
@@ -80,92 +80,49 @@
         <h2>Build provenance</h2>
         
         <p>
-        <strong>Source:</strong> <code>1c3f96d62daec0e256e6efa7aad5a210f5037c4b</code></p>
+        <strong>Source:</strong> <code>294a69efcfb58f1c49e46e41af028ca3041d7c88</code></p>
         <p><strong>Deployment status:</strong> <code>Field validated</code></p>
         <p><strong>Verified device:</strong> <code>Samsung SM-S731U, Android 16 (API 36)</code></p>
       </section>
-      <section class="config-files"><h2>What's New</h2><h3>fix(model): validate Gemma artifacts before installation and reuse</h3><pre class="whats-new-body">## Summary
+      <section class="config-files"><h2>What's New</h2><h3>Upgrade LiteRT-LM to 0.19.1 and verify streaming callback isolation</h3><pre class="whats-new-body">&lt;h2&gt;&lt;span&gt;Summary&lt;/span&gt;&lt;/h2&gt;&lt;p&gt;&lt;span&gt;Upgrade LiteRT-LM from 0.18.0 to 0.19.1 and add deterministic regression coverage for existing streaming callback isolation and application ownership boundaries.&lt;/span&gt;&lt;/p&gt;&lt;p&gt;&lt;span&gt;Refs #201.&lt;/span&gt;&lt;/p&gt;&lt;h2&gt;&lt;span&gt;Changes&lt;/span&gt;&lt;/h2&gt;&lt;ul&gt;&lt;li&gt;&lt;p&gt;&lt;span&gt;Upgrade &lt;/span&gt;&lt;code&gt;&lt;span&gt;litertlm-android&lt;/span&gt;&lt;/code&gt;&lt;span&gt; to 0.19.1.&lt;/span&gt;&lt;/p&gt;&lt;/li&gt;&lt;li&gt;&lt;p&gt;&lt;span&gt;Extract existing callback ownership checks and terminal CAS into testable boundaries.&lt;/span&gt;&lt;/p&gt;&lt;/li&gt;&lt;li&gt;&lt;p&gt;&lt;span&gt;Extract text aggregation and repository channel delivery boundaries.&lt;/span&gt;&lt;/p&gt;&lt;/li&gt;&lt;li&gt;&lt;p&gt;&lt;span&gt;Add 38 focused JVM regression tests.&lt;/span&gt;&lt;/p&gt;&lt;/li&gt;&lt;li&gt;&lt;p&gt;&lt;span&gt;Preserve existing cancellation, Conversation lifecycle, inference serialization and recovery behavior.&lt;/span&gt;&lt;/p&gt;&lt;/li&gt;&lt;/ul&gt;&lt;p&gt;&lt;span&gt;No Kotlin API compatibility migration was required.&lt;/span&gt;&lt;/p&gt;&lt;p&gt;&lt;span&gt;No survey configuration, routing, prompts, scoring, JSON parsing or follow-up policy changes are included.&lt;/span&gt;&lt;/p&gt;&lt;h2&gt;&lt;span&gt;Validation&lt;/span&gt;&lt;/h2&gt;&lt;h3&gt;&lt;span&gt;JVM regression tests&lt;/span&gt;&lt;/h3&gt;&lt;ul&gt;&lt;li&gt;&lt;p&gt;&lt;span&gt;Focused tests: 38/38 passed.&lt;/span&gt;&lt;/p&gt;&lt;/li&gt;&lt;li&gt;&lt;p&gt;&lt;span&gt;Full JVM suite: 677/677 passed, including the focused tests.&lt;/span&gt;&lt;/p&gt;&lt;/li&gt;&lt;li&gt;&lt;p&gt;&lt;span&gt;Zero failures, errors or skipped tests.&lt;/span&gt;&lt;/p&gt;&lt;/li&gt;&lt;li&gt;&lt;p&gt;&lt;span&gt;All nine committed files match the previously validated source snapshot.&lt;/span&gt;&lt;/p&gt;&lt;/li&gt;&lt;li&gt;&lt;p&gt;&lt;code&gt;&lt;span&gt;git diff --check&lt;/span&gt;&lt;/code&gt;&lt;span&gt;: passed.&lt;/span&gt;&lt;/p&gt;&lt;/li&gt;&lt;/ul&gt;&lt;h3&gt;&lt;span&gt;Physical-device validation&lt;/span&gt;&lt;/h3&gt;&lt;p&gt;&lt;span&gt;Environment:&lt;/span&gt;&lt;/p&gt;&lt;ul&gt;&lt;li&gt;&lt;p&gt;&lt;span&gt;Pixel 9a&lt;/span&gt;&lt;/p&gt;&lt;/li&gt;&lt;li&gt;&lt;p&gt;&lt;span&gt;Android 16 / API 36&lt;/span&gt;&lt;/p&gt;&lt;/li&gt;&lt;li&gt;&lt;p&gt;&lt;span&gt;Gemma 3n E4B INT4&lt;/span&gt;&lt;/p&gt;&lt;/li&gt;&lt;li&gt;&lt;p&gt;&lt;span&gt;GPU/OpenCL&lt;/span&gt;&lt;/p&gt;&lt;/li&gt;&lt;/ul&gt;
+Metric | 0.18.0 | 0.19.1 | Additional 0.19.1 diagnostics
+-- | -- | -- | --
+Requests | 57 | 57 | 78
+Normal completions | 48 | 48 | 65
+Intentional cancellations | 9 | 9 | 13
+Observed cross-run contamination | 0 | 0 | 0
+Unexpected timeouts | 0 | 0 | 0
+Native crashes | 0 | 0 | 0
 
-Closes #120 (after validation and merge).
-
-Implement trusted model integrity validation for Gemma 3n E4B LiteRT-LM int4 across manual selection, download, local reuse, and persistent storage.
-
-### Changes
-
-- Pin the official Gemma model to an immutable Hugging Face revision.
-- Enforce the official file size and SHA-256.
-- Validate model artifacts before atomic promotion.
-- Reject invalid manual selections while preserving previously verified models.
-- Validate normal, resumed, parallel, and HTTP 416 download completion.
-- Invalidate corrupted resumable transfer state safely.
-- Validate existing private/cache files and MediaStore restoration.
-- Verify pending MediaStore contents before publication.
-- Preserve verified model bytes during native runtime failures.
-- Retain Issue #123 ownership, cancellation, and atomic replacement guarantees.
-- Add deterministic regression tests.
-
-### Verification
-
-**Automated**
-- JVM: 639/639 passed.
-- Focused model tests: 75/75 passed.
-- Android instrumentation compilation: passed.
-- Lint: 0 errors, 86 warnings.
-- Independent review: `STEP120B_R2_REVIEW_PASS`.
-
-**Pixel 9a — Android 16 / API 36**
-- Official 4,919,541,760-byte model SHA-256 verified.
-- Real-model import and MediaStore publication passed.
-- LiteRT GPU initialization passed.
-- Force-stop and model reuse passed.
-- Two fresh-process offline inference cycles passed under test-app-only network restriction.
-- Network access restored after testing.
-- Production applications and original models preserved.
-
-### Remaining validation
-
-- Installed-model preservation after invalid manual selection has not yet been demonstrated on the physical device.
-- Controlled MediaStore failure scenarios remain partially unverified.
-- Native-poison recovery was not naturally triggered.
-- Active process-death and low-storage fault injection were intentionally deferred.
-
-### Safety
-
-- Validation performed using isolated package `com.negi.survey.issue120.it`.
-- Production and development packages were not replaced.
-- No changes to the existing Gemma model format or quantization.
-
-### Merge status
-
-**Draft — do not merge until the remaining mandatory installed-model preservation test passes and final device safety checks are completed.**</pre></section>
-      <a class="download" href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-184-1c3f96d/Survey2026-1c3f96d-release.apk">Download APK</a>
+&lt;h2&gt;&lt;span&gt;Upstream investigation&lt;/span&gt;&lt;/h2&gt;&lt;p&gt;&lt;span&gt;Related issue: &lt;/span&gt;&lt;a href=&quot;https://github.com/google-ai-edge/gallery/issues/449&quot;&gt;&lt;span&gt;https://github.com/google-ai-edge/gallery/issues/449&lt;/span&gt;&lt;/a&gt;&lt;/p&gt;&lt;p&gt;&lt;span&gt;The additional 0.19.1 diagnostic investigation recorded:&lt;/span&gt;&lt;/p&gt;&lt;ul&gt;&lt;li&gt;&lt;p&gt;&lt;span&gt;910 raw Kotlin callback entries across 78 callback instances.&lt;/span&gt;&lt;/p&gt;&lt;/li&gt;&lt;li&gt;&lt;p&gt;&lt;span&gt;Zero reported dropped events.&lt;/span&gt;&lt;/p&gt;&lt;/li&gt;&lt;li&gt;&lt;p&gt;&lt;span&gt;13 &lt;/span&gt;&lt;code&gt;&lt;span&gt;onMessage&lt;/span&gt;&lt;/code&gt;&lt;span&gt; callbacks after logical cancellation and &lt;/span&gt;&lt;code&gt;&lt;span&gt;cancelProcess()&lt;/span&gt;&lt;/code&gt;&lt;span&gt; invocation.&lt;/span&gt;&lt;/p&gt;&lt;/li&gt;&lt;li&gt;&lt;p&gt;&lt;span&gt;All 13 rejected by existing application guards.&lt;/span&gt;&lt;/p&gt;&lt;/li&gt;&lt;li&gt;&lt;p&gt;&lt;span&gt;No observed old callbacks after confirmed Conversation close or successor request admission.&lt;/span&gt;&lt;/p&gt;&lt;/li&gt;&lt;li&gt;&lt;p&gt;&lt;span&gt;No observed foreign payload delivery through successor callbacks.&lt;/span&gt;&lt;/p&gt;&lt;/li&gt;&lt;/ul&gt;&lt;p&gt;&lt;strong&gt;&lt;span&gt;Investigation verdict: &lt;/span&gt;&lt;/strong&gt;&lt;code&gt;&lt;strong&gt;&lt;span&gt;NOT_REPRODUCED_ON_0191&lt;/span&gt;&lt;/strong&gt;&lt;/code&gt;&lt;strong&gt;&lt;span&gt;.&lt;/span&gt;&lt;/strong&gt;&lt;/p&gt;&lt;p&gt;&lt;span&gt;These findings do not establish that upstream #449 has been fixed.&lt;/span&gt;&lt;/p&gt;&lt;h2&gt;&lt;span&gt;Known limitations&lt;/span&gt;&lt;/h2&gt;&lt;ul&gt;&lt;li&gt;&lt;p&gt;&lt;span&gt;Behavior after &lt;/span&gt;&lt;code&gt;&lt;span&gt;cancelProcess()&lt;/span&gt;&lt;/code&gt;&lt;span&gt; returns was not independently verified.&lt;/span&gt;&lt;/p&gt;&lt;/li&gt;&lt;li&gt;&lt;p&gt;&lt;span&gt;Equivalent raw callback evidence for 0.18.0 is unavailable.&lt;/span&gt;&lt;/p&gt;&lt;/li&gt;&lt;li&gt;&lt;p&gt;&lt;span&gt;Kotlin callback instrumentation does not establish native pointer or buffer ownership.&lt;/span&gt;&lt;/p&gt;&lt;/li&gt;&lt;li&gt;&lt;p&gt;&lt;span&gt;Physical validation covers one device/model/backend combination.&lt;/span&gt;&lt;/p&gt;&lt;/li&gt;&lt;li&gt;&lt;p&gt;&lt;span&gt;A partial accepted before cancellation may still reach its captured direct listener after queued dispatch. Existing repository ownership checks remain intact.&lt;/span&gt;&lt;/p&gt;&lt;/li&gt;&lt;li&gt;&lt;p&gt;&lt;span&gt;Both runtime versions produced incomplete JSON in specific test scenarios. This is a separate generation/parsing limitation.&lt;/span&gt;&lt;/p&gt;&lt;/li&gt;&lt;/ul&gt;&lt;h2&gt;&lt;span&gt;Scope exclusions&lt;/span&gt;&lt;/h2&gt;&lt;p&gt;&lt;span&gt;This PR contains nine files only:&lt;/span&gt;&lt;/p&gt;&lt;ul&gt;&lt;li&gt;&lt;p&gt;&lt;span&gt;One dependency catalog.&lt;/span&gt;&lt;/p&gt;&lt;/li&gt;&lt;li&gt;&lt;p&gt;&lt;span&gt;Two production Kotlin files.&lt;/span&gt;&lt;/p&gt;&lt;/li&gt;&lt;li&gt;&lt;p&gt;&lt;span&gt;Six JVM regression test files.&lt;/span&gt;&lt;/p&gt;&lt;/li&gt;&lt;/ul&gt;&lt;p&gt;&lt;span&gt;Physical diagnostic harnesses, raw callback probes, diagnostic observer hooks, logs, APKs, models and unrelated AI architecture changes are excluded.&lt;/span&gt;&lt;/p&gt;&lt;h2&gt;&lt;span&gt;Checklist&lt;/span&gt;&lt;/h2&gt;&lt;ul&gt;&lt;li&gt;&lt;span&gt;&lt;input type=&quot;checkbox&quot; disabled=&quot;&quot; checked=&quot;&quot;&gt;&lt;/span&gt;&lt;div&gt;&lt;p&gt;&lt;span&gt;Dependency upgrade validated&lt;/span&gt;&lt;/p&gt;&lt;/div&gt;&lt;/li&gt;&lt;li&gt;&lt;span&gt;&lt;input type=&quot;checkbox&quot; disabled=&quot;&quot; checked=&quot;&quot;&gt;&lt;/span&gt;&lt;div&gt;&lt;p&gt;&lt;span&gt;JVM regression tests passed&lt;/span&gt;&lt;/p&gt;&lt;/div&gt;&lt;/li&gt;&lt;li&gt;&lt;span&gt;&lt;input type=&quot;checkbox&quot; disabled=&quot;&quot; checked=&quot;&quot;&gt;&lt;/span&gt;&lt;div&gt;&lt;p&gt;&lt;span&gt;Physical-device comparison completed&lt;/span&gt;&lt;/p&gt;&lt;/div&gt;&lt;/li&gt;&lt;li&gt;&lt;span&gt;&lt;input type=&quot;checkbox&quot; disabled=&quot;&quot; checked=&quot;&quot;&gt;&lt;/span&gt;&lt;div&gt;&lt;p&gt;&lt;span&gt;Raw callback evidence audited&lt;/span&gt;&lt;/p&gt;&lt;/div&gt;&lt;/li&gt;&lt;li&gt;&lt;span&gt;&lt;input type=&quot;checkbox&quot; disabled=&quot;&quot; checked=&quot;&quot;&gt;&lt;/span&gt;&lt;div&gt;&lt;p&gt;&lt;span&gt;Production patch reviewed&lt;/span&gt;&lt;/p&gt;&lt;/div&gt;&lt;/li&gt;&lt;li&gt;&lt;span&gt;&lt;input type=&quot;checkbox&quot; disabled=&quot;&quot; checked=&quot;&quot;&gt;&lt;/span&gt;&lt;div&gt;&lt;p&gt;&lt;span&gt;Diagnostic files excluded&lt;/span&gt;&lt;/p&gt;&lt;/div&gt;&lt;/li&gt;&lt;li&gt;&lt;span&gt;&lt;input type=&quot;checkbox&quot; disabled=&quot;&quot;&gt;&lt;/span&gt;&lt;div&gt;&lt;p&gt;&lt;span&gt;GitHub Actions passed&lt;/span&gt;&lt;/p&gt;&lt;/div&gt;&lt;/li&gt;&lt;li&gt;&lt;span&gt;&lt;input type=&quot;checkbox&quot; disabled=&quot;&quot;&gt;&lt;/span&gt;&lt;div&gt;&lt;p&gt;&lt;span&gt;Final merge review&lt;/span&gt;&lt;/p&gt;&lt;/div&gt;&lt;/li&gt;&lt;li&gt;&lt;span&gt;&lt;input type=&quot;checkbox&quot; disabled=&quot;&quot;&gt;&lt;/span&gt;&lt;div&gt;&lt;p&gt;&lt;span&gt;Post-merge validation on main&lt;/span&gt;&lt;/p&gt;&lt;/div&gt;&lt;/li&gt;&lt;/ul&gt;</pre></section>
+      <a class="download" href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-185-294a69e/Survey2026-294a69e-release.apk">Download APK</a>
       <p class="note">Direct GitHub Release asset. No ZIP extraction is required.</p>
       <section class="config-files">
         <h2>Config files included in this APK</h2>
         <p class="note">These config files were extracted from the exact APK build shown on this page.</p>
-        <p><strong>English — survey_config10.yaml</strong><br><a href="https://github.com/ishizuki-tech/Survey2026/blob/1c3f96d62daec0e256e6efa7aad5a210f5037c4b/app/src/main/assets/survey_config10.yaml">View in browser</a> · <a href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-184-1c3f96d/survey_config10.yaml">Download</a><br><code>SHA-256: 9c6e8f8959b7d5bd7370bc1dc9af4833d8b81a8c2f9e025bb0ec5dbddab171d2</code></p>
-        <p><strong>Swahili — survey_config_sw_10.yaml</strong><br><a href="https://github.com/ishizuki-tech/Survey2026/blob/1c3f96d62daec0e256e6efa7aad5a210f5037c4b/app/src/main/assets/survey_config_sw_10.yaml">View in browser</a> · <a href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-184-1c3f96d/survey_config_sw_10.yaml">Download</a><br><code>SHA-256: 8dc233b93569de815ad36257019e2418839c3351a77e87bb84f8421eff33cc32</code></p>
+        <p><strong>English — survey_config10.yaml</strong><br><a href="https://github.com/ishizuki-tech/Survey2026/blob/294a69efcfb58f1c49e46e41af028ca3041d7c88/app/src/main/assets/survey_config10.yaml">View in browser</a> · <a href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-185-294a69e/survey_config10.yaml">Download</a><br><code>SHA-256: 9c6e8f8959b7d5bd7370bc1dc9af4833d8b81a8c2f9e025bb0ec5dbddab171d2</code></p>
+        <p><strong>Swahili — survey_config_sw_10.yaml</strong><br><a href="https://github.com/ishizuki-tech/Survey2026/blob/294a69efcfb58f1c49e46e41af028ca3041d7c88/app/src/main/assets/survey_config_sw_10.yaml">View in browser</a> · <a href="https://github.com/ishizuki-tech/Survey2026/releases/download/build-185-294a69e/survey_config_sw_10.yaml">Download</a><br><code>SHA-256: 8dc233b93569de815ad36257019e2418839c3351a77e87bb84f8421eff33cc32</code></p>
       </section>
       <div class="qr-panel">
-        <div class="qr-box"><img src="qr.png" alt="QR code that downloads the Survey2026 APK for build-184-1c3f96d" width="300" height="300"></div>
-        <div><h2>Scan with Android</h2><p class="subtitle">This QR code downloads the APK for this build (build-184-1c3f96d).</p><code>https://github.com/ishizuki-tech/Survey2026/releases/download/build-184-1c3f96d/Survey2026-1c3f96d-release.apk</code></div>
+        <div class="qr-box"><img src="qr.png" alt="QR code that downloads the Survey2026 APK for build-185-294a69e" width="300" height="300"></div>
+        <div><h2>Scan with Android</h2><p class="subtitle">This QR code downloads the APK for this build (build-185-294a69e).</p><code>https://github.com/ishizuki-tech/Survey2026/releases/download/build-185-294a69e/Survey2026-294a69e-release.apk</code></div>
       </div>
       <div class="grid">
-        <div class="item"><span class="label">Release tag</span><code>build-184-1c3f96d</code></div>
+        <div class="item"><span class="label">Release tag</span><code>build-185-294a69e</code></div>
         <div class="item"><span class="label">Branch</span><code>main</code></div>
-        <div class="item"><span class="label">Commit SHA</span><code>1c3f96d</code></div>
-        <div class="item"><span class="label">APK filename</span><code>Survey2026-1c3f96d-release.apk</code></div>
-        <div class="item"><span class="label">Workflow run number</span><code>184</code></div>
-        <div class="item"><span class="label">APK SHA-256</span><code>bdbe8703d070bcbf19e911dc244f1bd48422774106217f1cb059a296bb8bb266</code></div>
+        <div class="item"><span class="label">Commit SHA</span><code>294a69e</code></div>
+        <div class="item"><span class="label">APK filename</span><code>Survey2026-294a69e-release.apk</code></div>
+        <div class="item"><span class="label">Workflow run number</span><code>185</code></div>
+        <div class="item"><span class="label">APK SHA-256</span><code>132b31a193205bdf62e6a762e39e0eac0b23da5d3957c86a63e88b6ee2eb4f9d</code></div>
         <div class="item"><span class="label">Signing certificate SHA-256</span><code>d6edef47ec6734a46122ab7fddb5e4f17d19d4d51ae3eaddfb32f309ee5036ea</code></div>
-        <div class="item"><span class="label">Generated timestamp</span><code>2026-11-22T17:53:13Z</code></div>
+        <div class="item"><span class="label">Generated timestamp</span><code>2026-11-24T21:06:57Z</code></div>
       </div>
       <div class="links">
-        <a href="https://github.com/ishizuki-tech/Survey2026/releases/tag/build-184-1c3f96d">GitHub Release</a>
-        <a href="https://github.com/ishizuki-tech/Survey2026/actions/runs/45051115199">GitHub Actions run</a>
+        <a href="https://github.com/ishizuki-tech/Survey2026/releases/tag/build-185-294a69e">GitHub Release</a>
+        <a href="https://github.com/ishizuki-tech/Survey2026/actions/runs/45486349888">GitHub Actions run</a>
         <a href="https://github.com/ishizuki-tech/Survey2026">Repository</a>
       </div>
-      <footer>Survey2026 release metadata generated 2026-11-22T17:53:13Z.</footer>
+      <footer>Survey2026 release metadata generated 2026-11-24T21:06:57Z.</footer>
     </section>
   </main>
 </body>
