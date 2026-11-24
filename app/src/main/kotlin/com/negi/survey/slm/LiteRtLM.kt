@@ -64,6 +64,83 @@ import kotlinx.coroutines.asCoroutineDispatcher
 
 private const val TAG = "LiteRtLM"
 
+/** The existing terminal-owner CAS, shared by normal completion and hard-close. */
+internal fun claimLiteRtTerminalRun(
+    runId: AtomicLong,
+    terminalRunId: AtomicLong,
+    expectedRunId: Long,
+): Boolean {
+    while (true) {
+        if (runId.get() != expectedRunId) return false
+        val observedOwner = terminalRunId.get()
+        if (observedOwner == expectedRunId) return false
+        if (terminalRunId.compareAndSet(observedOwner, expectedRunId)) return true
+    }
+}
+
+/**
+ * Run-local callback entry and delivery boundary. The atomics are the live RunState
+ * fields, not a snapshot. Production supplies its existing Main dispatcher; JVM tests
+ * can own a queue without loading an Engine or changing any process-global hook.
+ *
+ * Deliberately does not revalidate ownership inside queued delivery. Terminal handlers
+ * retain responsibility for claiming terminal ownership and all lifecycle transitions.
+ */
+internal class LiteRtCallbackOwner(
+    private val runId: AtomicLong,
+    private val terminated: AtomicBoolean,
+    private val logicalDone: AtomicBoolean,
+    private val cancelRequested: AtomicBoolean,
+    private val terminalRunId: AtomicLong,
+    private val expectedRunId: Long,
+    private val dispatch: (() -> Unit) -> Unit,
+) {
+    fun claimTerminal(): Boolean = claimLiteRtTerminalRun(runId, terminalRunId, expectedRunId)
+
+    fun postPartial(delta: String, listener: (String, Boolean) -> Unit) {
+        dispatch { listener(delta, false) }
+    }
+
+    fun callback(
+        onAcceptedMessage: (Message) -> Unit,
+        onCurrentDone: () -> Unit,
+        onCurrentError: (Throwable) -> Unit,
+    ): MessageCallback = object : MessageCallback {
+        override fun onMessage(message: Message) {
+            if (runId.get() != expectedRunId) return
+            if (terminated.get()) return
+            if (logicalDone.get() || cancelRequested.get()) return
+            onAcceptedMessage(message)
+        }
+
+        override fun onDone() {
+            if (runId.get() != expectedRunId) return
+            onCurrentDone()
+        }
+
+        override fun onError(throwable: Throwable) {
+            if (runId.get() != expectedRunId) return
+            onCurrentError(throwable)
+        }
+    }
+}
+
+/** Existing generateText aggregation listener, independent of caller/job ownership. */
+internal fun liteRtTextResultListener(
+    buffer: StringBuilder,
+    doneSignal: CompletableDeferred<String>,
+    onPartial: (String) -> Unit,
+    onPartialFailure: (Throwable) -> Unit,
+): (String, Boolean) -> Unit = { partial, done ->
+    if (partial.isNotEmpty()) {
+        buffer.append(partial)
+        runCatching { onPartial(partial) }.onFailure(onPartialFailure)
+    }
+    if (done && !doneSignal.isCompleted) {
+        doneSignal.complete(buffer.toString())
+    }
+}
+
 internal data class ModelFilesystemIdentity(
     val device: Long,
     val inode: Long,
@@ -767,18 +844,7 @@ object LiteRtLM {
     private fun claimTerminalRun(
         rs: RunState,
         expectedRunId: Long,
-    ): Boolean {
-        while (true) {
-            if (rs.runId.get() != expectedRunId) return false
-
-            val observedOwner = rs.terminalRunId.get()
-            if (observedOwner == expectedRunId) return false
-
-            if (rs.terminalRunId.compareAndSet(observedOwner, expectedRunId)) {
-                return true
-            }
-        }
-    }
+    ): Boolean = claimLiteRtTerminalRun(rs.runId, rs.terminalRunId, expectedRunId)
 
     /** Touch last-use time and invalidate any scheduled cleanup. */
     private fun markUsed(key: String) {
@@ -5061,6 +5127,15 @@ object LiteRtLM {
                 val callbackLock = Any()
                 var emittedChars = 0L
                 var msgCount = 0
+                val callbackOwner = LiteRtCallbackOwner(
+                    runId = rs.runId,
+                    terminated = rs.terminated,
+                    logicalDone = rs.logicalDone,
+                    cancelRequested = rs.cancelRequested,
+                    terminalRunId = rs.terminalRunId,
+                    expectedRunId = myRunId,
+                    dispatch = ::postToMain,
+                )
 
                 /*
                  * Inference timing probes:
@@ -5198,7 +5273,7 @@ object LiteRtLM {
                     isCancel: Boolean = false,
                 ) {
                     runControlTestHooks?.beforeTerminalClaim?.invoke(myRunId)
-                    if (!claimTerminalRun(rs, myRunId)) return
+                    if (!callbackOwner.claimTerminal()) return
 
                     rs.terminated.set(true)
 
@@ -5500,13 +5575,8 @@ object LiteRtLM {
                     if (!nativeStarted.get()) markNativeDoneOnce("Timeout before native start")
                 }
 
-                val callback = object : MessageCallback {
-
-                    override fun onMessage(message: Message) {
-                        if (rs.runId.get() != myRunId) return
-                        if (rs.terminated.get()) return
-                        if (rs.logicalDone.get() || rs.cancelRequested.get()) return
-
+                val callback = callbackOwner.callback(
+                    onAcceptedMessage = message@{ message ->
                         if (firstNativeMessage.compareAndSet(false, true)) {
                             runControlTestHooks?.beforeFirstNativeMessage?.invoke(myRunId)
                         }
@@ -5525,7 +5595,7 @@ object LiteRtLM {
                             extractChunkText(message)
 
                         if (deltaRaw.isEmpty()) {
-                            return
+                            return@message
                         }
 
                         val delta =
@@ -5598,17 +5668,12 @@ object LiteRtLM {
                             }
                         }
 
-                        postToMain { resultListener(delta, false) }
-                    }
-
-                    override fun onDone() {
-                        if (rs.runId.get() != myRunId) return
+                        callbackOwner.postPartial(delta, resultListener)
+                    },
+                    onCurrentDone = {
                         markNativeDoneOnce(null)
-                    }
-
-                    override fun onError(throwable: Throwable) {
-                        if (rs.runId.get() != myRunId) return
-
+                    },
+                    onCurrentError = error@{ throwable ->
                         val rawMsg = throwable.message ?: throwable.toString()
                         val msg = cleanError(rawMsg)
                         val code = extractStatusCodeBestEffort(throwable)
@@ -5628,14 +5693,14 @@ object LiteRtLM {
                         if (cancelled) {
                             RuntimeLogStore.d(TAG, "LiteRT-LM inference cancelled: key='$key' runId=$myRunId")
                             markNativeDoneOnce(errorMessage = "Cancelled", isCancel = true)
-                            return
+                            return@error
                         }
 
                         val decorated = if (code != null) "Error($code): $msg" else "Error: $msg"
                         RuntimeLogStore.e(TAG, "LiteRT-LM inference error: key='$key' runId=$myRunId $decorated")
                         markNativeDoneOnce(decorated)
-                    }
-                }
+                    },
+                )
 
                 try {
                     if (!hasMm) {
@@ -5788,16 +5853,10 @@ object LiteRtLM {
                 input = input,
                 images = images,
                 audioClips = audioClips,
-                resultListener = { partial, done ->
-                    if (partial.isNotEmpty()) {
-                        buffer.append(partial)
-                        runCatching { onPartial(partial) }
-                            .onFailure { t -> RuntimeLogStore.w(TAG, "onPartial failed: ${t.message}", t) }
-                    }
-                    if (done && !doneSignal.isCompleted) {
-                        doneSignal.complete(buffer.toString())
-                    }
-                },
+                resultListener = liteRtTextResultListener(
+                    buffer, doneSignal, onPartial,
+                    onPartialFailure = { t -> RuntimeLogStore.w(TAG, "onPartial failed: ${t.message}", t) },
+                ),
                 cleanUpListener = { /* no-op */ },
                 onError = { message ->
                     if (!doneSignal.isCompleted) {
